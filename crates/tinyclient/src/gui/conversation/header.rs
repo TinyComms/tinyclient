@@ -86,6 +86,44 @@ impl Shell {
             .tooltip(tip("Search in conversation", Some("⌘F")))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_conversation_search(window, cx)));
+        let threads_btn = (open.key.network == Network::Discord
+            && matches!(open.kind, ConversationKind::Channel | ConversationKind::Announcement))
+        .then(|| {
+            icon_button("channel-threads", "icons/messages-square.svg", self.pane_shows(|layer| matches!(layer, Layer::Threads(_))))
+                .tooltip(tip("Threads", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_channel_threads(cx)))
+        });
+        let thread_settings = (open.key.network == Network::Discord
+            && open.kind == ConversationKind::Thread
+            && (open.rights.manage_threads || open.rights.rename))
+        .then(|| {
+            icon_button("thread-settings", "icons/pencil.svg", false)
+                .tooltip(tip("Thread settings", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.composer_toggle_thread_settings(cx)))
+        });
+        let thread_membership = (open.key.network == Network::Discord && open.kind == ConversationKind::Thread).then(|| {
+            let key = open.key.clone();
+            let joined = open.followed;
+            let label = if joined { "Leave thread" } else { "Join thread" };
+            div()
+                .id("thread-follow-toggle")
+                .h(px(26.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .type_small()
+                .text_color(theme::text_soft())
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_follow_thread(key.clone(), !joined, cx)))
+                .child(label)
+        });
         let live_hint = self.snapshot.as_ref().and_then(|snapshot| self.call_live_hint(snapshot, cx));
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
             let call = call.h(px(28.)).rounded(px(theme::R_CONTROL)).whitespace_nowrap();
@@ -208,7 +246,8 @@ impl Shell {
             )
             .children(live_hint.map(|hint| div().flex_none().ml(px(8.)).child(hint)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).child(search).children(members).children(details))
+            .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(thread_settings).children(threads_btn).child(search).children(members).children(details))
     }
 
     /// Whether the conversation is end-to-end encrypted, where its network says: a lock and the

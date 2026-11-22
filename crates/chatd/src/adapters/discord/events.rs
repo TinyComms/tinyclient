@@ -98,6 +98,31 @@ struct ThreadList {
 }
 
 #[derive(Deserialize)]
+struct ThreadMemberUpdate {
+    id: String,
+    #[serde(default)]
+    user_id: Option<String>,
+    /// Discord thread notification flags. Absent on older events.
+    #[serde(default)]
+    flags: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ThreadMemberEntry {
+    #[serde(default)]
+    user_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ThreadMembersUpdate {
+    id: String,
+    #[serde(default)]
+    added_members: Vec<ThreadMemberEntry>,
+    #[serde(default)]
+    removed_member_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct SettingsProto {
     #[serde(default)]
     proto: String,
@@ -159,6 +184,27 @@ impl Discord {
                 for thread in list.threads {
                     self.thread_changed(thread, true)?;
                 }
+            }
+            "THREAD_MEMBER_UPDATE" => {
+                let update: ThreadMemberUpdate = from_str(data)?;
+                let me = self.me();
+                if update.user_id.as_deref().is_none_or(|id| id == me) {
+                    self.set_thread_membership(&update.id, true)?;
+                    if let Some(word) = update.flags.and_then(super::info::thread_notify_word) {
+                        self.note_thread_notify(&update.id, word);
+                    }
+                }
+            }
+            "THREAD_MEMBERS_UPDATE" => {
+                let update: ThreadMembersUpdate = from_str(data)?;
+                let me = self.me();
+                if update.added_members.iter().any(|m| m.user_id.as_deref() == Some(me.as_str())) {
+                    self.set_thread_membership(&update.id, true)?;
+                } else if update.removed_member_ids.iter().any(|id| id == &me) {
+                    self.set_thread_membership(&update.id, false)?;
+                }
+                self.ctx.members_changed(&update.id);
+                self.ctx.info_stale(&update.id);
             }
             "GUILD_CREATE" => self.guild_created(from_str(data)?)?,
             "GUILD_UPDATE" => self.guild_updated(from_str(data)?)?,

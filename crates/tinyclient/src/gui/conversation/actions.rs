@@ -160,6 +160,8 @@ pub struct Can {
     pub unsent: bool,
     /// May report this message to the server's moderators (Tiny `abuse_reports`, other people's messages).
     pub report: bool,
+    /// Moderator may remove reactions from this message (`rights.delete_others` and non-empty reactions).
+    pub clear_reactions: bool,
 }
 
 /// What the menu and the toolbar call this message's thread.
@@ -323,6 +325,7 @@ pub fn can_with_network_topic(
         remind: act && caps.save_messages,
         unsent,
         report: act && network == Network::Tiny && !message.outgoing && caps.abuse_reports,
+        clear_reactions: act && network == Network::Discord && caps.reactions && rights.delete_others && !message.reactions.is_empty(),
     }
 }
 
@@ -387,6 +390,8 @@ enum MenuAct {
     Remind,
     /// Report another person's message on a Tiny server.
     Report,
+    /// Moderator: remove all reactions from a message.
+    ClearReactions,
     /// A sent message: ask, unless the click held Shift.
     Delete,
 }
@@ -582,6 +587,9 @@ fn menu_acts(
     }
     if can.report {
         acts.push(MenuAct::Report);
+    }
+    if can.clear_reactions {
+        acts.push(MenuAct::ClearReactions);
     }
     if can.delete {
         acts.push(MenuAct::Delete);
@@ -1410,8 +1418,51 @@ impl Pane {
                     });
                 }
             }
+            MenuAct::ClearReactions => self.clear_reactions(&message.id, None, None, cx),
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
+    }
+
+    /// Moderator removal of all reactions, all of one emoji, or one person's reaction.
+    fn clear_reactions(&mut self, message_id: &str, emoji: Option<String>, user_id: Option<String>, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let mid = message_id.to_owned();
+        let evict_emoji = emoji.clone();
+        let request = Request::ClearReactions {
+            conversation,
+            message_id: mid.clone(),
+            emoji,
+            user_id,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    match evict_emoji {
+                        Some(emoji) => {
+                            let cache_key = (mid, emoji);
+                            this.fetched_reactors.remove(&cache_key);
+                            if this.reactors_loading.as_ref() == Some(&cache_key) {
+                                this.reactors_loading = None;
+                            }
+                        }
+                        None => {
+                            this.fetched_reactors.retain(|(id, _), _| id != &mid);
+                            if this.reactors_loading.as_ref().is_some_and(|(id, _)| id == &mid) {
+                                this.reactors_loading = None;
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                Err(err) => this.say(crate::client::trouble_words("remove reactions", &err), cx),
+                _ => {}
+            });
+        })
+        .detach();
     }
 
     /// A file attachment already on disk, as `(path, name)`, for Save as….
@@ -1660,6 +1711,14 @@ impl Pane {
                                 });
                             }
                         }))
+                        .into_any_element(),
+                );
+            }
+            if can.clear_reactions {
+                rows.push(rule().into_any_element());
+                rows.push(
+                    row("sheet-clear-reactions", "icons/trash-2.svg", "Remove all reactions".into(), true)
+                        .on_click(then(|this, message, _, cx| this.clear_reactions(&message.id, None, None, cx)))
                         .into_any_element(),
                 );
             }
@@ -1915,6 +1974,13 @@ impl Pane {
                         .on_click(go(MenuAct::Report)),
                 );
             }
+            if can.clear_reactions {
+                items = items.child(menu_separator()).child(
+                    menu_item_danger("clear-reactions", Some("icons/trash-2.svg"), "Remove all reactions")
+                        .when(lit(MenuAct::ClearReactions), |row| row.bg(theme::danger_soft()))
+                        .on_click(go(MenuAct::ClearReactions)),
+                );
+            }
             if can.delete {
                 items = items.child(menu_separator()).child(
                     menu_item_danger("delete", Some("icons/trash-2.svg"), "Delete…").when(lit(MenuAct::Delete), |row| row.bg(theme::danger_soft()))
@@ -1940,6 +2006,11 @@ impl Pane {
     fn reactors_layer(&self, message: &Rc<Message>, reactor: usize, at: Point<Pixels>,
         window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let reaction = message.reactions.get(reactor)?;
+        let can_mod = self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.key.network == Network::Discord && (open.rights.delete_others || open.moderate));
+        let emoji_key = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
         let mut list = menu().w(px(248.));
         if !reaction.who.is_empty() {
             for (ix, id) in reaction.who.iter().enumerate() {
@@ -1970,8 +2041,7 @@ impl Pane {
                 );
             }
         } else {
-            let emoji_key = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
-            let cache_key = (message.id.clone(), emoji_key);
+            let cache_key = (message.id.clone(), emoji_key.clone());
             if let Some((reactors, more)) = self.fetched_reactors.get(&cache_key) {
                 if reactors.is_empty() {
                     list = list.child(menu_item("reactors-empty", None, "No reactions found", None));
@@ -1985,13 +2055,44 @@ impl Pane {
                         }
                         let label = if person.name.is_empty() { "Someone".to_owned() } else { person.name.clone() };
                         let key = person.key.clone();
-                        list = list.child(menu_item(("reactor", ix), None, label, None).on_click(cx.listener(
+                        let row = menu_item(("reactor", ix), None, label, None).on_click(cx.listener(
                             move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
                                 this.close_menu(cx);
                                 let at = window.mouse_position();
                                 let _ = this.shell.update(cx, |shell, cx| shell.open_profile(key.clone(), at, cx));
                             },
-                        )));
+                        ));
+                        if can_mod {
+                            let mid = message.id.clone();
+                            let em = emoji_key.clone();
+                            let uid = person.key.id.clone();
+                            list = list.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child(div().flex_1().min_w_0().child(row))
+                                    .child(
+                                        div()
+                                            .id(("reactor-rm", ix))
+                                            .px(px(6.))
+                                            .py(px(4.))
+                                            .rounded(px(theme::R_CONTROL))
+                                            .cursor_pointer()
+                                            .type_small()
+                                            .text_color(theme::text_faint())
+                                            .hover(|style| style.text_color(theme::danger()).bg(theme::danger_soft()))
+                                            .tooltip(tip("Remove reaction", None))
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.close_menu(cx);
+                                                this.clear_reactions(&mid, Some(em.clone()), Some(uid.clone()), cx);
+                                            }))
+                                            .child("×"),
+                                    ),
+                            );
+                        } else {
+                            list = list.child(row);
+                        }
                     }
                     if reactors.len() <= REACTORS_SHOWN && *more {
                         list = list.child(menu_separator()).child(menu_item("reactors-more", None, "and more…", None));
@@ -2002,6 +2103,17 @@ impl Pane {
             } else {
                 list = list.child(menu_item("reactors-empty", None, "No reactions found", None));
             }
+        }
+        if can_mod {
+            let mid = message.id.clone();
+            let em = emoji_key;
+            list = list.child(menu_separator()).child(
+                menu_item_danger("clear-emoji-reactions", Some("icons/trash-2.svg"), "Remove all of this reaction")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        this.clear_reactions(&mid, Some(em.clone()), None, cx);
+                    })),
+            );
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
         Some(placed(
@@ -3139,10 +3251,17 @@ mod tests {
         assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Voice, false, 1_100).thread);
         assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Forum, false, 1_100).thread);
 
-        // Moderator rights grant delete on others' messages and pin.
+        // Moderator rights grant delete on others' messages, pin, and clearing reactions on Discord only.
         let mod_rights = ConversationRights { pin: true, delete_others: true, manage_members: true, ..ConversationRights::default() };
-        let moderated = can(&theirs, &discord_caps(), mod_rights, channel, false, 1_100);
-        assert!(moderated.delete && moderated.pin && !moderated.edit);
+        let moderated = can_with_network(&theirs, Network::Discord, &discord_caps(), mod_rights, channel, false, 1_100);
+        assert!(moderated.delete && moderated.delete_everyone && moderated.pin && !moderated.edit && !moderated.clear_reactions);
+        let mut reacted = theirs.clone();
+        reacted.reactions.push(protocol::Reaction { emoji: "👍".into(), file: None, count: 2, mine: false, who: Vec::new() });
+        assert!(can_with_network(&reacted, Network::Discord, &discord_caps(), mod_rights, channel, false, 1_100).clear_reactions);
+        assert!(!can_with_network(&reacted, Network::Discord, &discord_caps(), none, channel, false, 1_100).clear_reactions);
+        assert!(!can_with_network(&reacted, Network::Tiny, &tiny_caps(), mod_rights, channel, false, 1_100).clear_reactions);
+        assert!(!can_with_rights(&reacted, Network::Telegram, ConversationKind::Group, false, mod_rights).clear_reactions);
+        assert!(!can_with_rights(&reacted, Network::Signal, ConversationKind::Group, false, mod_rights).clear_reactions);
 
         // Slack fixture: no inline reply, threads in both channels and DMs.
         let slack = can(&theirs, &slack_caps(), none, channel, false, 1_100);

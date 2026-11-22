@@ -26,6 +26,19 @@ const SEARCH_MAX_CHARS: usize = 1024;
 /// asked twice in a session.
 const REMEMBERED_SEARCHES: usize = 32;
 
+/// Discord thread-member flags: 2 all messages, 4 mentions, 8 nothing.
+pub(super) fn thread_notify_word(flags: u32) -> Option<&'static str> {
+    if flags & 8 != 0 {
+        Some("nothing")
+    } else if flags & 4 != 0 {
+        Some("mentions")
+    } else if flags & 2 != 0 {
+        Some("all")
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 pub(super) struct MessageSearch {
     in_flight: bool,
@@ -193,12 +206,18 @@ impl Discord {
         let kept = guild.as_ref().and_then(|guild| self.ctx.note(&format!("kept:{guild}")));
         let kept: Vec<model::Kept> = kept.and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
         let topic = kept.into_iter().find(|kept| kept.id == channel).and_then(|kept| kept.topic);
+        let noted = (known.kind == ConversationKind::Thread).then(|| self.ctx.note(&format!("thread-notify:{channel}"))).flatten();
         let state = crate::hub::lock(&self.state);
         let parent = known.parent.as_deref().or(known.group.as_deref());
-        let notify = match guild.as_ref().map(|guild| state.guilds.get(guild)) {
-            Some(Some(info)) => info.quiet.notify(channel, parent, now()),
-            Some(None) => Notify::All,
-            None => state.quiet_directs.notify(channel, None, now()),
+        let notify = match noted.as_deref() {
+            Some("all") => Notify::All,
+            Some("mentions") => Notify::Mentions,
+            Some("nothing") => Notify::Nothing,
+            _ => match guild.as_ref().map(|guild| state.guilds.get(guild)) {
+                Some(Some(info)) => info.quiet.notify(channel, parent, now()),
+                Some(None) => Notify::All,
+                None => state.quiet_directs.notify(channel, None, now()),
+            },
         };
         let members = match known.kind {
             ConversationKind::Direct => Some(2),
@@ -245,11 +264,38 @@ impl Discord {
         })
     }
 
+    /// Remembers a thread's own notification level so Details does not show the parent channel's.
+    pub(super) fn note_thread_notify(&self, channel: &str, word: &str) {
+        self.ctx.set_note(&format!("thread-notify:{channel}"), word);
+        self.ctx.info_stale(channel);
+    }
+
     /// Sets a conversation's notifications as Discord's own menu does: one settings change for
     /// its server (`@me` for direct and group conversations). Discord answers with the server's
     /// settings whole, which are applied as if they came from the gateway.
     pub(super) fn set_mute(&self, channel: &str, notify: Notify, until: Option<i64>) -> Result<(), Refusal> {
         let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind == ConversationKind::Thread {
+            let (flags, muted) = match notify {
+                Notify::All => (2u32, false),
+                Notify::Mentions => (4u32, false),
+                Notify::Nothing => (8u32, true),
+            };
+            let body = json!({
+                "flags": flags,
+                "muted": muted,
+                "mute_config": {"end_time": null, "selected_time_window": -1},
+            });
+            self.call("PATCH", &format!("/channels/{channel}/thread-members/@me/settings"), Some(body))
+                .map_err(refusal)?;
+            let word = match notify {
+                Notify::All => "all",
+                Notify::Mentions => "mentions",
+                Notify::Nothing => "nothing",
+            };
+            self.note_thread_notify(channel, word);
+            return self.ctx.muted(channel, notify == Notify::Nothing).map_err(refused);
+        }
         let guild = self.guild_of(&known);
         let body = mute_override_body(channel, notify, until, now());
         let path = format!("/users/@me/guilds/{}/settings", guild.as_deref().unwrap_or("@me"));

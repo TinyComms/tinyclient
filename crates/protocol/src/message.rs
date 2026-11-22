@@ -902,6 +902,9 @@ pub struct Message {
     /// Inline keyboard button rows under a bot message (Telegram `replyInlineMarkup`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<Vec<InlineButton>>,
+    /// Target message id for a system line (pins, thread starter, poll result), so clicking opens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump: Option<String>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -1012,6 +1015,7 @@ impl Message {
             permalink: String::new(),
             controls: Vec::new(),
             buttons: Vec::new(),
+            jump: None,
         }
     }
 
@@ -1087,6 +1091,9 @@ impl Message {
         }
         if let Some(via) = &mut self.sent_via {
             clip(via, 64);
+        }
+        if let Some(jump) = &mut self.jump {
+            clip(jump, 128);
         }
         self.controls.truncate(MESSAGE_CONTROLS_LIMIT);
         for control in &mut self.controls {
@@ -1177,6 +1184,7 @@ impl Message {
         self.cards.clear();
         self.controls.clear();
         self.buttons.clear();
+        self.jump = None;
         self.poll = None;
         self.deliveries.clear();
         self.receipt_note.clear();
@@ -1444,5 +1452,20 @@ mod tests {
         assert_eq!(back.buttons, msg.buttons);
         msg.tombstone();
         assert!(msg.buttons.is_empty());
+    }
+
+    #[test]
+    fn system_jump_round_trips_bounds_and_clears_on_tombstone() {
+        let mut msg = Message::plain("m4", "Ada", "Ada pinned a message.", 1_700_000_000, false);
+        msg.kind = MessageKind::System;
+        assert!(!serde_json::to_string(&msg).unwrap().contains("\"jump\""));
+        msg.jump = Some("x".repeat(200));
+        msg.bound();
+        assert_eq!(msg.jump.as_deref().map(str::len), Some(128));
+        let wire = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.jump, msg.jump);
+        msg.tombstone();
+        assert_eq!(msg.jump, None);
     }
 }

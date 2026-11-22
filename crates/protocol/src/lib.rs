@@ -579,6 +579,16 @@ pub struct Conversation {
     /// Whether this account has joined the conversation (`false` when previewing an unjoined public channel).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub joined: bool,
+    /// Slowmode interval in seconds. `0` when off. Exemption is [`ConversationRights::slowmode_exempt`], not a zeroed interval.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub slowmode_seconds: u32,
+    /// Unix seconds until this account may send again in a slowmode conversation. Never stored:
+    /// kept live by chatd and rides on the row when read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowmode_until: Option<i64>,
+    /// Thread is locked by a moderator (Discord `thread_metadata.locked`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -650,6 +660,9 @@ impl Conversation {
             moderate: false,
             can_pin: false,
             joined: true,
+            slowmode_seconds: 0,
+            slowmode_until: None,
+            locked: false,
         }
     }
 
@@ -1473,10 +1486,40 @@ pub enum Request {
         limit: u32,
     },
     /// Follow (`on: true`) or unfollow (`on: false`) a thread for reply notifications
-    /// (Slack `subscriptions.thread.add` / `subscriptions.thread.remove`).
+    /// (Slack `subscriptions.thread.add` / `subscriptions.thread.remove`, Discord thread-members/@me).
     FollowThread {
         conversation: Key,
         on: bool,
+    },
+    /// Active or archived threads of one channel (Discord). Opening any returned thread works
+    /// without joining it first.
+    ChannelThreads {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        archived: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Rename, archive/reopen, lock/unlock, or update auto-archive/slowmode on a thread (Discord).
+    /// Only fields that are `Some` are sent to the network.
+    ThreadUpdate {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locked: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_archive_minutes: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slowmode_seconds: Option<u32>,
+    },
+    /// Delete a thread channel (Discord `DELETE /channels/{thread}`).
+    DeleteThread {
+        conversation: Key,
     },
     /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
     /// first, then newest first. From the cache; opening a topic is opening a conversation.
@@ -1580,12 +1623,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
-    /// The thread a channel message starts. Discord only: its thread is a new channel, so this
-    /// creates it and answers with that conversation. Slack and Teams name a thread from the
-    /// message, and opening or sending there is enough.
+    /// Start a Discord thread — attached to `message` when `Some`, or standalone from the channel
+    /// when `None` (public, announcement, or private). Answers with the created thread conversation.
     StartThread {
         conversation: Key,
-        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        private: bool,
+        /// Auto-archive duration in minutes: 60 (1 h), 1440 (24 h), 4320 (3 d), or 10080 (1 w).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_archive_minutes: Option<u32>,
+        /// Optional first message posted into a newly created standalone thread.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        first_message: String,
     },
     /// One person's card, asked of the network when the card opens and kept five minutes.
     /// `space` is where it was opened from, for the nickname, roles and join date there.
@@ -1980,6 +2033,17 @@ pub enum Request {
         after: Option<String>,
         #[serde(default)]
         limit: u32,
+    },
+    /// Moderator reaction removal (Discord `MANAGE_MESSAGES`): clears all reactions when
+    /// `emoji` is `None`, all reactions for `emoji` when `user_id` is `None`, or one user's
+    /// reaction when both `emoji` and `user_id` are set.
+    ClearReactions {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
     },
     /// Replaces the text of one of our own messages. Nothing changes on screen until the
     /// network accepts it; a refusal is the answer. `spans` are the styled ranges of `text`;
@@ -2930,6 +2994,21 @@ impl Change {
     }
 }
 
+/// One thread listed by `Request::ChannelThreads`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelThread {
+    pub conversation: Conversation,
+    /// Number of replies in the thread, when the network reports it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replies: u32,
+    /// Unix seconds of the most recent message or archive event.
+    #[serde(default)]
+    pub last_activity: i64,
+    /// Whether the thread is locked by a moderator.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
@@ -2983,6 +3062,15 @@ pub enum Response {
         /// For `Inbox`: what each filter would hold. Zero for `Find`.
         #[serde(default)]
         counts: InboxCounts,
+    },
+    /// Active or archived threads of one channel (`Request::ChannelThreads`).
+    ChannelThreads {
+        conversation: Key,
+        threads: Vec<ChannelThread>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
     },
     Conversation {
         conversation: Conversation,
@@ -3833,6 +3921,11 @@ mod tests {
             rename: true,
             edit_topic: true,
             edit_picture: true,
+            create_public_threads: true,
+            create_private_threads: true,
+            send_in_threads: true,
+            manage_threads: true,
+            slowmode_exempt: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
     }

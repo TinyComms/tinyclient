@@ -374,6 +374,15 @@ pub enum Command {
         limit: u32,
         reply: Reply<ReactorsPage>,
     },
+    /// Moderator reaction removal: all reactions (`emoji: None`), one emoji (`user_id: None`),
+    /// or one person's reaction (`emoji: Some`, `user_id: Some`).
+    ClearReactions {
+        conversation_id: String,
+        message_id: String,
+        emoji: Option<String>,
+        user_id: Option<String>,
+        reply: Reply<()>,
+    },
     /// Replace the text of one of our messages. Report the edited message through
     /// [`Context::message`] before answering: nothing was changed locally. `spans` are the
     /// styled ranges of `text`; an adapter that cannot send them leaves them unused.
@@ -477,12 +486,15 @@ pub enum Command {
         name: Option<String>,
         reply: Reply<String>,
     },
-    /// The id of the thread a channel message starts. Discord only: create the thread channel,
-    /// record it, and answer with its id. `name` is already one line, at most 100 characters.
+    /// Creates a Discord thread, attached to `message_id` when `Some` or standalone when `None`,
+    /// records it, and answers with its id. `name` is already one line, at most 100 characters.
     StartThread {
         conversation_id: String,
-        message_id: String,
+        message_id: Option<String>,
         name: String,
+        private: bool,
+        auto_archive_minutes: Option<u32>,
+        first_message: String,
         reply: Reply<String>,
     },
     /// One person's card. One request to the network, and only because the user opened it.
@@ -660,10 +672,33 @@ pub enum Command {
         post_at: i64,
         reply: Reply<protocol::ScheduledMessage>,
     },
-    /// Follow (`on: true`) or unfollow (`on: false`) a thread (Slack `subscriptions.thread.add` / `remove`).
+    /// Follow (`on: true`) or unfollow (`on: false`) a thread (Slack `subscriptions.thread.add` / `remove`, Discord thread-members/@me).
     FollowThread {
         conversation_id: String,
         on: bool,
+        reply: Reply<()>,
+    },
+    /// Lists active or archived threads of one channel (Discord).
+    ChannelThreads {
+        conversation_id: String,
+        archived: bool,
+        query: String,
+        cursor: Option<String>,
+        reply: Reply<ChannelThreadsPage>,
+    },
+    /// Rename, archive/reopen, lock/unlock, or update auto-archive/slowmode on a thread (Discord).
+    ThreadUpdate {
+        conversation_id: String,
+        name: Option<String>,
+        archived: Option<bool>,
+        locked: Option<bool>,
+        auto_archive_minutes: Option<u32>,
+        slowmode_seconds: Option<u32>,
+        reply: Reply<()>,
+    },
+    /// Delete a thread channel (Discord `DELETE /channels/{thread}`).
+    DeleteThread {
+        conversation_id: String,
         reply: Reply<()>,
     },
     /// Accept or decline/ignore a message request (Discord).
@@ -958,6 +993,14 @@ pub enum Command {
     Stop,
 }
 
+/// One page of a channel's active or archived threads (`Command::ChannelThreads`).
+#[derive(Debug, Clone, Default)]
+pub struct ChannelThreadsPage {
+    pub threads: Vec<protocol::ChannelThread>,
+    pub cursor: Option<String>,
+    pub more: bool,
+}
+
 impl Command {
     /// Answers a command this adapter does not serve, so nothing waits for it.
     pub fn unsupported(self, ctx: &Context) {
@@ -998,9 +1041,12 @@ impl Command {
             | Command::StarMessage { reply, .. }
             | Command::Remind { reply, .. }
             | Command::CancelScheduled { reply, .. }
-            | Command::FollowThread { reply, .. } => {
+            | Command::FollowThread { reply, .. }
+            | Command::ThreadUpdate { reply, .. }
+            | Command::DeleteThread { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::ChannelThreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1046,6 +1092,7 @@ impl Command {
             | Command::TogglePaidReactionPrivacy { reply, .. }
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ClearReactions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
                 ctx.sent(&conversation_id, &client_id, Err(why));
@@ -1251,6 +1298,11 @@ impl Context {
     /// is not announced: the row is told alone.
     pub fn occupants(&self, conversation_id: &str, people: Vec<Occupant>, total: u32) {
         self.hub.set_occupants(self.key(conversation_id), Occupants { people, total });
+    }
+
+    /// Records when this account may send again in a slowmode conversation (Unix seconds).
+    pub fn slowmode_until(&self, conversation_id: &str, until: i64) {
+        self.hub.set_slowmode_until(self.key(conversation_id), until);
     }
 
     /// One conversation: a direct message, or a channel created, renamed or moved.
@@ -1683,6 +1735,11 @@ impl Context {
     /// The row as stored, or `None` for a conversation never recorded.
     pub fn known(&self, conversation_id: &str) -> rusqlite::Result<Option<protocol::Conversation>> {
         self.hub.store().conversation(&self.key(conversation_id))
+    }
+
+    /// Known threads whose parent conversation is `parent_id`.
+    pub fn child_threads(&self, parent_id: &str) -> rusqlite::Result<Vec<protocol::Conversation>> {
+        self.hub.store().child_threads(&self.key(parent_id))
     }
 
     pub(crate) fn unread_telegram_channels(&self, after: &str, limit: u32) -> rusqlite::Result<Vec<String>> {

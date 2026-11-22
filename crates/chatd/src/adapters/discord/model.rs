@@ -39,6 +39,7 @@ pub const MEDIA_FORUM: u8 = 16;
 pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;
+pub const MANAGE_CHANNELS: u64 = 1 << 4;
 pub const ADD_REACTIONS: u64 = 1 << 6;
 #[allow(dead_code)]
 pub const STREAM: u64 = 1 << 9;
@@ -54,6 +55,10 @@ pub const USE_VAD: u64 = 1 << 25;
 pub const MANAGE_NICKNAMES: u64 = 1 << 27;
 pub const MANAGE_ROLES: u64 = 1 << 28;
 pub const MODERATE_MEMBERS: u64 = 1 << 40;
+pub const MANAGE_THREADS: u64 = 1 << 34;
+pub const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
+pub const CREATE_PRIVATE_THREADS: u64 = 1 << 36;
+pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Formats Unix seconds as UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) for Discord REST bodies.
@@ -324,10 +329,16 @@ pub struct Overwrite {
     pub deny: u64,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, Default)]
 pub struct ThreadMetadata {
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub auto_archive_duration: u32,
+    #[serde(default)]
+    pub archive_timestamp: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -378,6 +389,12 @@ pub struct Channel {
     pub is_message_request: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub is_spam: bool,
+    /// Slowmode interval in seconds, 0 when off.
+    #[serde(default, deserialize_with = "nullable")]
+    pub rate_limit_per_user: u32,
+    /// Default slowmode interval for newly created threads under this channel.
+    #[serde(default, deserialize_with = "nullable")]
+    pub default_thread_rate_limit_per_user: u32,
 }
 
 /// What is kept of a server's channel between connects, in a note: enough to work out again
@@ -405,6 +422,9 @@ pub struct Kept {
     pub topic: Option<String>,
     #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
     pub overwrites: Vec<(String, bool, u64, u64)>,
+    /// Slowmode interval in seconds, 0 when off.
+    #[serde(rename = "s", default, skip_serializing_if = "no_limit")]
+    pub slowmode: u32,
 }
 
 /// A count that means "none" stays off a note.
@@ -425,6 +445,7 @@ impl Kept {
             parent: channel.parent_id.clone(),
             topic: channel.topic.clone().filter(|topic| !topic.is_empty()),
             overwrites: overwrites.map(|over| (over.id.clone(), over.member, over.allow, over.deny)).collect(),
+            slowmode: channel.rate_limit_per_user,
         }
     }
 
@@ -440,6 +461,7 @@ impl Kept {
             parent_id: self.parent,
             topic: self.topic,
             permission_overwrites: overwrites.collect(),
+            rate_limit_per_user: self.slowmode,
             ..Channel::default()
         }
     }
@@ -1063,6 +1085,34 @@ pub struct Posted {
     pub nonce: Option<String>,
     #[serde(default)]
     pub call: Option<CallPayload>,
+    #[serde(default)]
+    pub role_subscription_data: Option<RoleSubscriptionData>,
+    #[serde(default)]
+    pub purchase_notification: Option<PurchaseNotification>,
+}
+
+/// Discord's `role_subscription_data` on a type-25 role subscription purchase message.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct RoleSubscriptionData {
+    #[serde(default, deserialize_with = "nullable")]
+    pub tier_name: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub total_months_subscribed: u32,
+    #[serde(default, deserialize_with = "nullable")]
+    pub is_renewal: bool,
+}
+
+/// Discord's `purchase_notification.guild_product_purchase` on a type-44 purchase message.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct GuildProductPurchase {
+    #[serde(default, deserialize_with = "nullable")]
+    pub product_name: String,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct PurchaseNotification {
+    #[serde(default)]
+    pub guild_product_purchase: Option<GuildProductPurchase>,
 }
 
 /// Discord's `call` object on a type-3 call system message.

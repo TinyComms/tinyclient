@@ -35,6 +35,8 @@ pub enum Layer {
     Thread { conversation: Key, root: Rc<Message> },
     /// The messages pinned in a conversation.
     Pinned(Key),
+    /// Active and archived threads of a channel (Discord).
+    Threads(Key),
     /// A Space's own details, opened from its name in the sidebar.
     Space(Key),
     /// The search pane: the field, its scopes, the cache's hits. It never follows a
@@ -50,6 +52,7 @@ impl Layer {
             Layer::Members(_) => "Members",
             Layer::Thread { .. } => "Thread",
             Layer::Pinned(_) => "Pinned",
+            Layer::Threads(_) => "Threads",
             Layer::Space(_) => "Details",
             Layer::Search => "Search",
         }
@@ -58,7 +61,7 @@ impl Layer {
     /// The conversation this layer is about, when it is about one.
     pub fn conversation(&self) -> Option<&Key> {
         match self {
-            Layer::Details(key) | Layer::Members(key) | Layer::Pinned(key) => Some(key),
+            Layer::Details(key) | Layer::Members(key) | Layer::Pinned(key) | Layer::Threads(key) => Some(key),
             Layer::Thread { conversation, .. } => Some(conversation),
             Layer::Profile(_) | Layer::Space(_) | Layer::Search => None,
         }
@@ -239,8 +242,8 @@ pub fn open(stack: &Stack, layer: Layer) -> Stack {
         // Search is how you move around: always the base.
         _ if layer == Layer::Search => Stack { base: Some(layer), push: None },
         Some(base) if base.is_details() && *base != layer => Stack { base: Some(base.clone()), push: Some(layer) },
-        // A thread or pins with someone pushed over them: the person replaces the push.
-        Some(base @ (Layer::Thread { .. } | Layer::Pinned(_))) if matches!(layer, Layer::Profile(_)) => {
+        // A thread, pins, or threads list with someone pushed over them: the person replaces the push.
+        Some(base @ (Layer::Thread { .. } | Layer::Pinned(_) | Layer::Threads(_))) if matches!(layer, Layer::Profile(_)) => {
             Stack { base: Some(base.clone()), push: Some(layer) }
         }
         _ => Stack { base: Some(layer), push: None },

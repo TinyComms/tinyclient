@@ -755,6 +755,11 @@ impl Chat {
         if conversation.kind == ConversationKind::Voice || conversation.call == CallSupport::Native {
             conversation.occupants = self.hub.occupants(&conversation.key);
         }
+        conversation.slowmode_until = if conversation.slowmode_seconds == 0 || conversation.rights.slowmode_exempt {
+            None
+        } else {
+            self.hub.slowmode_until(&conversation.key)
+        };
         conversation
     }
 
@@ -911,14 +916,27 @@ impl Chat {
         Ok(())
     }
 
-    /// Discord creates the thread channel. The name comes from the message, so the click does
-    /// not ask for one. The adapter records the conversation before it answers.
-    fn start_thread(&self, conversation: Key, message: String) -> Response {
+    /// Discord creates the thread channel (attached to a message or standalone). The adapter
+    /// records the conversation before answering.
+    fn start_thread(
+        &self,
+        conversation: Key,
+        message: Option<String>,
+        name: String,
+        private: bool,
+        auto_archive_minutes: Option<u32>,
+        first_message: String,
+    ) -> Response {
         if conversation.network != Network::Discord {
             return error(ErrorCode::Unsupported, format!("{} cannot do this yet", conversation.network.label()));
         }
         if let Err(refused) = self.online(&conversation.account()) {
             return *refused;
+        }
+        if let Some(minutes) = auto_archive_minutes {
+            if !matches!(minutes, 60 | 1440 | 4320 | 10080) {
+                return error(ErrorCode::Refused, "Unsupported auto-archive duration.");
+            }
         }
         let parent = match self.hub.store().conversation(&conversation) {
             Ok(Some(parent)) => parent,
@@ -926,22 +944,43 @@ impl Chat {
             Err(err) => return internal(err),
         };
         if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement) {
-            return error(ErrorCode::Refused, "A thread starts from a channel message.");
+            return error(ErrorCode::Refused, "A thread can only be started in a channel.");
         }
-        let stored = match self.hub.store().message(&conversation, &message) {
-            Ok(Some(stored)) => stored,
-            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
-            Err(err) => return internal(err),
+        let message = message.filter(|id| !id.trim().is_empty());
+        let name = if let Some(ref message_id) = message {
+            if private {
+                return error(ErrorCode::Refused, "A thread started from a message cannot be private.");
+            }
+            let stored = match self.hub.store().message(&conversation, message_id) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+                Err(err) => return internal(err),
+            };
+            if stored.deleted || matches!(stored.kind, MessageKind::System) {
+                return error(ErrorCode::Refused, "That message cannot start a thread.");
+            }
+            if !name.trim().is_empty() {
+                thread_name(&name)
+            } else {
+                thread_name(&stored.text)
+            }
+        } else {
+            if name.trim().is_empty() {
+                return error(ErrorCode::Refused, "Enter a name for the thread.");
+            }
+            if private && parent.kind == ConversationKind::Announcement {
+                return error(ErrorCode::Refused, "Private threads cannot be created in an announcement channel.");
+            }
+            thread_name(&name)
         };
-        if stored.deleted || matches!(stored.kind, MessageKind::System) {
-            return error(ErrorCode::Refused, "That message cannot start a thread.");
-        }
-        let name = thread_name(&stored.text);
         let conversation_id = conversation.id.clone();
         let started = self.ask(&conversation.account(), |reply| Command::StartThread {
             conversation_id,
             message_id: message,
             name,
+            private,
+            auto_archive_minutes,
+            first_message,
             reply,
         });
         let id = match started {
@@ -1602,6 +1641,35 @@ impl Chat {
                 }
                 *refused
             }
+        }
+    }
+
+    /// Moderator removal of all reactions, all of one emoji, or one person's reaction.
+    fn clear_reactions(&self, conversation: Key, message_id: String, emoji: Option<String>, user_id: Option<String>) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        if user_id.is_some() && emoji.is_none() {
+            return error(ErrorCode::Refused, "An emoji is required to remove one person's reaction.");
+        }
+        let message = match self.hub.store().message(&conversation, &message_id) {
+            Ok(Some(message)) => message,
+            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+            Err(err) => return internal(err),
+        };
+        if message.state != SendState::Sent {
+            return error(ErrorCode::Refused, "This message was never sent.");
+        }
+        match self.ask(&account, |reply| Command::ClearReactions {
+            conversation_id: conversation.id,
+            message_id,
+            emoji,
+            user_id,
+            reply,
+        }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
         }
     }
 
@@ -2785,6 +2853,70 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::ChannelThreads { conversation, archived, query, cursor } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
+                }
+                match self.ask(&conversation.account(), |reply| Command::ChannelThreads {
+                    conversation_id: conversation.id.clone(),
+                    archived,
+                    query,
+                    cursor,
+                    reply,
+                }) {
+                    Ok(mut page) => {
+                        for item in &mut page.threads {
+                            item.conversation = self.row(item.conversation.clone());
+                        }
+                        Response::ChannelThreads {
+                            conversation,
+                            threads: page.threads,
+                            cursor: page.cursor,
+                            more: page.more,
+                        }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ThreadUpdate {
+                conversation,
+                name,
+                archived,
+                locked,
+                auto_archive_minutes,
+                slowmode_seconds,
+            } => {
+                if let Some(ref title) = name {
+                    if title.trim().is_empty() {
+                        return error(ErrorCode::Refused, "Enter a name for the thread.");
+                    }
+                }
+                if let Some(minutes) = auto_archive_minutes {
+                    if !matches!(minutes, 60 | 1440 | 4320 | 10080) {
+                        return error(ErrorCode::Refused, "Unsupported auto-archive duration.");
+                    }
+                }
+                if let Some(secs) = slowmode_seconds {
+                    if secs > 21_600 {
+                        return error(ErrorCode::Refused, "Slowmode cannot exceed 6 hours.");
+                    }
+                }
+                self.act(&conversation, |conversation_id, reply| Command::ThreadUpdate {
+                    conversation_id,
+                    name,
+                    archived,
+                    locked,
+                    auto_archive_minutes,
+                    slowmode_seconds,
+                    reply,
+                })
+            }
+            Request::DeleteThread { conversation } => {
+                self.act(&conversation, |conversation_id, reply| Command::DeleteThread { conversation_id, reply })
+            }
             Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
@@ -3293,7 +3425,14 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::StartThread { conversation, message } => self.start_thread(conversation, message),
+            Request::StartThread {
+                conversation,
+                message,
+                name,
+                private,
+                auto_archive_minutes,
+                first_message,
+            } => self.start_thread(conversation, message, name, private, auto_archive_minutes, first_message),
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
             Request::SpaceInfo { space } => self.space_info(space),
@@ -3555,6 +3694,9 @@ impl Chat {
             }
             Request::Reactors { conversation, message_id, emoji, burst, after, limit } => {
                 self.reactors(conversation, message_id, emoji, burst, after, limit)
+            }
+            Request::ClearReactions { conversation, message_id, emoji, user_id } => {
+                self.clear_reactions(conversation, message_id, emoji, user_id)
             }
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),

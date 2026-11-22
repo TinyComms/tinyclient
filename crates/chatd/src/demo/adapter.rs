@@ -1042,6 +1042,7 @@ impl Demo {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ClearReactions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AddFriend { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetFriendNickname { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1061,6 +1062,9 @@ impl Demo {
             Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChannelThreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ThreadUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

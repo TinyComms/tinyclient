@@ -458,6 +458,21 @@ pub struct ConversationRights {
     /// May change this conversation's picture (`Request::ConversationPicture`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit_picture: bool,
+    /// May create public threads in this channel (Discord `CREATE_PUBLIC_THREADS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_public_threads: bool,
+    /// May create private threads in this channel (Discord `CREATE_PRIVATE_THREADS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_private_threads: bool,
+    /// May send messages in threads of this channel (Discord `SEND_MESSAGES_IN_THREADS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub send_in_threads: bool,
+    /// May rename, archive, lock, or delete threads here (Discord `MANAGE_THREADS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_threads: bool,
+    /// Exempt from channel/thread slowmode (Discord `MANAGE_MESSAGES` / `MANAGE_CHANNELS` / `MANAGE_THREADS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub slowmode_exempt: bool,
 }
 
 impl ConversationRights {
@@ -469,6 +484,11 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
+    const CREATE_PUBLIC_THREADS: i64 = 1 << 8;
+    const CREATE_PRIVATE_THREADS: i64 = 1 << 9;
+    const SEND_IN_THREADS: i64 = 1 << 10;
+    const MANAGE_THREADS: i64 = 1 << 11;
+    const SLOWMODE_EXEMPT: i64 = 1 << 12;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -504,6 +524,21 @@ impl ConversationRights {
         if self.edit_picture {
             bits |= Self::EDIT_PICTURE;
         }
+        if self.create_public_threads {
+            bits |= Self::CREATE_PUBLIC_THREADS;
+        }
+        if self.create_private_threads {
+            bits |= Self::CREATE_PRIVATE_THREADS;
+        }
+        if self.send_in_threads {
+            bits |= Self::SEND_IN_THREADS;
+        }
+        if self.manage_threads {
+            bits |= Self::MANAGE_THREADS;
+        }
+        if self.slowmode_exempt {
+            bits |= Self::SLOWMODE_EXEMPT;
+        }
         bits
     }
 
@@ -517,6 +552,11 @@ impl ConversationRights {
             rename: (bits & Self::RENAME) != 0,
             edit_topic: (bits & Self::EDIT_TOPIC) != 0,
             edit_picture: (bits & Self::EDIT_PICTURE) != 0,
+            create_public_threads: (bits & Self::CREATE_PUBLIC_THREADS) != 0,
+            create_private_threads: (bits & Self::CREATE_PRIVATE_THREADS) != 0,
+            send_in_threads: (bits & Self::SEND_IN_THREADS) != 0,
+            manage_threads: (bits & Self::MANAGE_THREADS) != 0,
+            slowmode_exempt: (bits & Self::SLOWMODE_EXEMPT) != 0,
         }
     }
 }

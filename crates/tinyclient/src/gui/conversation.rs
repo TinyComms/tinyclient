@@ -129,7 +129,7 @@ struct Place {
     bottom: bool,
 }
 
-struct Open {
+pub(super) struct Open {
     key: Key,
     title: String,
     kind: ConversationKind,

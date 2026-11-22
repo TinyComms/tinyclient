@@ -467,7 +467,21 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.max_file_bytes = known.max_file_bytes;
     row.read_only_reason = known.read_only_reason.clone();
     row.spam = known.spam;
+    row.rights = known.rights;
+    row.slowmode_seconds = known.slowmode_seconds;
+    row.locked = known.locked;
     row
+}
+
+/// Filing written with a thread row. Folders, pin, and hidden stay as stored.
+pub(super) fn kept_filing(known: Option<&protocol::Conversation>, archived: bool, followed: bool) -> crate::store::Filing {
+    crate::store::Filing {
+        folders: known.map(|row| row.folders.clone()).unwrap_or_default(),
+        pin: known.and_then(|row| row.pin),
+        hidden: known.is_some_and(|row| row.hidden),
+        archived,
+        followed,
+    }
 }
 
 /// Everything the adapter remembers. All of it is bounded by what the user owns or has on screen.
@@ -801,6 +815,15 @@ impl Discord {
     /// A request, with the socket thread woken when it shows the session is over.
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
         let answer = self.rest.call(method, path, body);
+        if matches!(answer, Err(Refused::Expired)) {
+            self.wake();
+        }
+        answer
+    }
+
+    /// One-shot request (never retried on 429; wakes socket on 401).
+    fn call_once(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
+        let answer = self.rest.call_once_with(method, path, body, &[]);
         if matches!(answer, Err(Refused::Expired)) {
             self.wake();
         }
@@ -1246,6 +1269,46 @@ impl Discord {
             false => self.call("DELETE", &format!("{reaction}/0/%40me?location=Message%20Inline%20Button&burst=false"), None),
         };
         asked.map(drop).map_err(refusal)
+    }
+
+    /// Moderator reaction removal:
+    /// - `emoji: None`: `DELETE /channels/{channel}/messages/{message}/reactions`
+    /// - `emoji: Some(e), user_id: None`: `DELETE /channels/{channel}/messages/{message}/reactions/{e}`
+    /// - `emoji: Some(e), user_id: Some(u)`: `DELETE /channels/{channel}/messages/{message}/reactions/{e}/{u}`
+    fn clear_reactions(&self, channel: &str, message: &str, emoji: Option<&str>, user_id: Option<&str>) -> Result<(), Refusal> {
+        let base = format!("/channels/{channel}/messages/{message}/reactions");
+        match (emoji, user_id) {
+            (None, _) => {
+                self.call("DELETE", &base, None).map_err(refusal)?;
+                if let Ok(Some(mut stored)) = self.ctx.stored_message(channel, message) {
+                    if !stored.reactions.is_empty() {
+                        stored.reactions.clear();
+                        let _ = self.ctx.message(channel, &stored);
+                    }
+                }
+                Ok(())
+            }
+            (Some(emoji), None) => {
+                let named = self.reaction_emoji(channel, message, emoji)?;
+                self.call("DELETE", &format!("{base}/{}", escaped(&named)), None).map_err(refusal)?;
+                if let Ok(Some(mut stored)) = self.ctx.stored_message(channel, message) {
+                    let before = stored.reactions.len();
+                    stored.reactions.retain(|r| {
+                        r.emoji != emoji && !r.file.as_ref().is_some_and(|f| f.id == emoji)
+                    });
+                    if stored.reactions.len() != before {
+                        let _ = self.ctx.message(channel, &stored);
+                    }
+                }
+                Ok(())
+            }
+            (Some(emoji), Some(user)) => {
+                let named = self.reaction_emoji(channel, message, emoji)?;
+                self.call("DELETE", &format!("{base}/{}/{}", escaped(&named), escaped(user)), None)
+                    .map(drop)
+                    .map_err(refusal)
+            }
+        }
     }
 
     /// Fetches one page of users who reacted to `message` with `emoji`.
@@ -1726,6 +1789,24 @@ impl Discord {
         (unread, mentions, marker)
     }
 
+    /// Updates live slowmode cooldown after a send succeeds or is refused with Discord code 20016.
+    pub(super) fn note_send_slowmode(&self, channel: &str, conversation: &Conversation, outcome: &Result<String, Refused>) {
+        match outcome {
+            Ok(_) if conversation.slowmode_seconds > 0 && !conversation.rights.slowmode_exempt => {
+                self.ctx.slowmode_until(channel, crate::hub::now() + i64::from(conversation.slowmode_seconds));
+            }
+            Err(Refused::Status { code: 20016, retry_after, .. }) => {
+                let wait = retry_after
+                    .filter(|seconds| seconds.is_finite())
+                    .map(|seconds| seconds.clamp(1.0, 21_600.0))
+                    .unwrap_or(1.0)
+                    .ceil() as i64;
+                self.ctx.slowmode_until(channel, crate::hub::now() + wait);
+            }
+            _ => {}
+        }
+    }
+
     fn send(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, String> {
         let premium = self.state.lock().unwrap().premium;
         if let Some(why) = too_long(premium, text) {
@@ -1749,9 +1830,9 @@ impl Discord {
             body["message_reference"] = reference;
             body["allowed_mentions"] = json!({"parse": ["users", "roles", "everyone"], "replied_user": true});
         }
-        let accepted = self
-            .call("POST", &format!("/channels/{channel}/messages"), Some(body))
-            .map_err(|refused| refused.reason())?;
+        let asked = self.call("POST", &format!("/channels/{channel}/messages"), Some(body));
+        self.note_send_slowmode(channel, &conversation, &asked);
+        let accepted = asked.map_err(|refused| refused.reason())?;
         let posted: Posted = serde_json::from_str(&accepted).map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let _ = files.register(&self.ctx);
@@ -1787,9 +1868,17 @@ impl Discord {
         Ok(channel.id)
     }
 
-    /// The thread a channel message starts. One request, and only when the user asked: Discord
-    /// watches thread creation. A message that already has a thread answers with that channel.
-    fn start_thread(&self, channel: &str, message_id: &str, name: &str) -> Result<String, Refusal> {
+    /// Creates a Discord thread, attached to `message_id` when `Some` or standalone when `None`.
+    /// Never retried automatically: Discord watches thread creation closely.
+    fn start_thread(
+        &self,
+        channel: &str,
+        message_id: Option<&str>,
+        name: &str,
+        private: bool,
+        auto_archive_minutes: Option<u32>,
+        first_message: &str,
+    ) -> Result<String, Refusal> {
         let refuse = |why: String| Refusal::Refused(why);
         let parent = self
             .ctx
@@ -1797,62 +1886,489 @@ impl Discord {
             .map_err(|err| refuse(err.to_string()))?
             .ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
         if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement) {
-            return Err(refuse("A thread starts from a channel message.".to_owned()));
+            return Err(refuse("A thread can only be started in a channel.".to_owned()));
         }
-        let stored = self
-            .ctx
-            .stored_message(channel, message_id)
-            .map_err(|err| refuse(err.to_string()))?
-            .ok_or_else(|| refuse("That message is not here.".to_owned()))?;
-        if stored.deleted || matches!(stored.kind, MessageKind::System) {
-            return Err(refuse("That message cannot start a thread.".to_owned()));
+        if private && !parent.rights.create_private_threads {
+            return Err(refuse("You do not have permission to create private threads here.".to_owned()));
+        }
+        if !private && !parent.rights.create_public_threads {
+            return Err(refuse("You do not have permission to create threads here.".to_owned()));
         }
         let name = thread_name(name);
-        if let Some(existing) = stored.thread.as_ref() {
-            self.record_thread(&parent, &existing.id, message_id, &name)?;
-            return Ok(existing.id.clone());
+        if let Some(message_id) = message_id {
+            if private {
+                return Err(refuse("A thread started from a message cannot be private.".to_owned()));
+            }
+            let stored = self
+                .ctx
+                .stored_message(channel, message_id)
+                .map_err(|err| refuse(err.to_string()))?
+                .ok_or_else(|| refuse("That message is not here.".to_owned()))?;
+            if stored.deleted || matches!(stored.kind, MessageKind::System) {
+                return Err(refuse("That message cannot start a thread.".to_owned()));
+            }
+            if let Some(existing) = stored.thread.as_ref() {
+                let stub = model::Channel {
+                    id: existing.id.clone(),
+                    kind: model::PUBLIC_THREAD,
+                    name: Some(name.clone()),
+                    parent_id: Some(parent.key.id.clone()),
+                    ..model::Channel::default()
+                };
+                self.record_thread(&parent, &stub, Some(message_id), &name)?;
+                return Ok(existing.id.clone());
+            }
+            let mut body = json!({ "name": name });
+            if let Some(minutes) = auto_archive_minutes {
+                body["auto_archive_duration"] = json!(minutes);
+            }
+            let created = self
+                .call_once("POST", &format!("/channels/{channel}/messages/{message_id}/threads"), Some(body))
+                .map_err(refusal)?;
+            let thread: model::Channel = serde_json::from_str(&created)
+                .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
+            let title = thread.name.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| name.clone());
+            self.record_thread(&parent, &thread, Some(message_id), &title)?;
+            self.remember_starter(&thread, channel, message_id);
+            let unread = self.ctx.known(&thread.id).ok().flatten().map(|row| row.unread).unwrap_or(0);
+            let mut message = stored;
+            message.thread = Some(ThreadSummary {
+                id: thread.id.clone(),
+                replies: thread.message_count.unwrap_or(0),
+                last: thread.last_message_id.as_deref().map_or(0, seconds),
+                participants: Vec::new(),
+                unread,
+            });
+            self.ctx.history(channel, &[message]).map_err(|err| refuse(err.to_string()))?;
+            return Ok(thread.id);
+        }
+
+        // Standalone thread from the channel/composer.
+        if private && parent.kind == ConversationKind::Announcement {
+            return Err(refuse("Private threads cannot be created in an announcement channel.".to_owned()));
+        }
+        let thread_type = if parent.kind == ConversationKind::Announcement {
+            model::NEWS_THREAD
+        } else if private {
+            model::PRIVATE_THREAD
+        } else {
+            model::PUBLIC_THREAD
+        };
+        let mut body = json!({
+            "name": name,
+            "type": thread_type,
+        });
+        if let Some(minutes) = auto_archive_minutes {
+            body["auto_archive_duration"] = json!(minutes);
+        }
+        if private {
+            body["invitable"] = json!(true);
         }
         let created = self
-            .call(
-                "POST",
-                &format!("/channels/{channel}/messages/{message_id}/threads"),
-                Some(json!({ "name": name })),
-            )
+            .call_once("POST", &format!("/channels/{channel}/threads"), Some(body))
             .map_err(refusal)?;
         let thread: model::Channel = serde_json::from_str(&created)
             .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
         let title = thread.name.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| name.clone());
-        self.record_thread(&parent, &thread.id, message_id, &title)?;
-        self.remember_starter(&thread, channel, message_id);
-        let unread = self.ctx.known(&thread.id).ok().flatten().map(|row| row.unread).unwrap_or(0);
-        let mut message = stored;
-        message.thread = Some(ThreadSummary {
-            id: thread.id.clone(),
-            replies: thread.message_count.unwrap_or(0),
-            last: thread.last_message_id.as_deref().map_or(0, seconds),
-            participants: Vec::new(),
-            unread,
-        });
-        self.ctx.history(channel, &[message]).map_err(|err| refuse(err.to_string()))?;
+        self.record_thread(&parent, &thread, None, &title)?;
+        if !first_message.trim().is_empty() {
+            let nonce = format!("{}", crate::hub::now().unsigned_abs().saturating_mul(1000).saturating_add(1));
+            match self.send(&thread.id, &nonce, first_message.trim(), None) {
+                Ok(message) => {
+                    let _ = self.ctx.message(&thread.id, &message);
+                }
+                Err(why) => self.log("thread first message", why),
+            }
+        }
         Ok(thread.id)
     }
 
-    /// The thread's conversation, when it is not recorded yet. Its root is the message it hangs
-    /// off. A thread kept outside the tree still needs its server, which `guild_of` reads back.
-    fn record_thread(&self, parent: &Conversation, thread_id: &str, root: &str, title: &str) -> Result<(), Refusal> {
-        let refuse = |err: rusqlite::Error| Refusal::Refused(err.to_string());
-        if self.ctx.known(thread_id).map_err(refuse)?.is_some() {
+    /// Adds one or more users to a Discord thread (`PUT /channels/{thread}/thread-members/{user}`).
+    fn add_members(&self, channel: &str, people: &[String]) -> Result<(), Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let known = self
+            .ctx
+            .known(channel)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
+        if known.kind != ConversationKind::Thread {
+            return Err(Refusal::Unsupported);
+        }
+        for person in people {
+            let person = person.trim();
+            if person.is_empty() {
+                continue;
+            }
+            self.call("PUT", &format!("/channels/{channel}/thread-members/{}", escaped(person)), None)
+                .map_err(refusal)?;
+        }
+        self.ctx.info_stale(channel);
+        self.ctx.members_changed(channel);
+        Ok(())
+    }
+
+    /// Updates our membership (`followed`) and sidebar tree listing for one Discord thread.
+    pub(super) fn set_thread_membership(&self, thread_id: &str, joined: bool) -> rusqlite::Result<()> {
+        let Some(known) = self.ctx.known(thread_id)? else {
+            return Ok(());
+        };
+        if known.kind != ConversationKind::Thread {
             return Ok(());
         }
-        if let Some(guild) = self.guild_of(parent) {
-            self.ctx.set_note(&format!("guild:{thread_id}"), &guild);
+        let guild = self.guild_of(&known);
+        let parent = known.parent.as_deref().and_then(|id| self.ctx.known(id).ok().flatten());
+        let forum = parent.as_ref().is_some_and(|row| row.kind == ConversationKind::Forum);
+        let in_tree = joined && !known.archived && !forum;
+        let mut row = renamed(&known, &known.title);
+        if in_tree {
+            if row.space.is_none() {
+                if let Some(parent) = parent.as_ref() {
+                    row.space = parent.space.clone();
+                    row.group = parent.group.clone();
+                    row.position = parent.position + 1;
+                }
+            }
+        } else {
+            row.space = None;
+            row.group = None;
         }
-        let mut row = ConversationRow::new(thread_id, ConversationKind::Thread, title);
+        row.filing = Some(kept_filing(Some(&known), known.archived, joined));
+        if let Some(guild) = &guild {
+            self.note_thread_listed(guild, thread_id, known.parent.as_deref(), in_tree);
+        }
+        self.ctx.conversation(&row)
+    }
+
+    /// Joins (`on == true`) or leaves (`on == false`) a Discord thread.
+    fn follow_thread(&self, thread_id: &str, on: bool) -> Result<(), Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let known = self
+            .ctx
+            .known(thread_id)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This thread is gone.".to_owned()))?;
+        if known.kind != ConversationKind::Thread {
+            return Err(Refusal::Unsupported);
+        }
+        let method = if on { "PUT" } else { "DELETE" };
+        self.call(method, &format!("/channels/{thread_id}/thread-members/@me"), None)
+            .map_err(refusal)?;
+        self.set_thread_membership(thread_id, on).map_err(|err| refuse(err.to_string()))?;
+        self.ctx.info_stale(thread_id);
+        self.ctx.members_changed(thread_id);
+        Ok(())
+    }
+
+    /// Lists active or archived threads of one Discord channel and records each so clicking
+    /// opens it without joining first.
+    fn channel_threads(
+        &self,
+        channel_id: &str,
+        archived: bool,
+        query: &str,
+        cursor: Option<&str>,
+    ) -> Result<super::ChannelThreadsPage, Refusal> {
+        #[derive(serde::Deserialize, Default)]
+        struct ThreadMemberId {
+            #[serde(default)]
+            id: String,
+        }
+        #[derive(serde::Deserialize, Default)]
+        struct ThreadsList {
+            #[serde(default)]
+            threads: Vec<model::Channel>,
+            /// Membership rows sit beside `threads`, keyed by the thread id.
+            #[serde(default)]
+            members: Vec<ThreadMemberId>,
+            #[serde(default)]
+            has_more: bool,
+        }
+        fn thread_member_ids(members: &[ThreadMemberId]) -> HashSet<String> {
+            members.iter().map(|member| member.id.clone()).filter(|id| !id.is_empty()).collect()
+        }
+
+        let refuse = |why: String| Refusal::Refused(why);
+        let parent = self
+            .ctx
+            .known(channel_id)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
+        if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Forum) {
+            return Err(refuse("Only channels and forums have threads.".to_owned()));
+        }
+        let trimmed = query.trim();
+        let (raw_threads, member_ids, next_cursor, more) = if !archived {
+            let offset: usize = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
+            let mut path = format!(
+                "/channels/{channel_id}/threads/search?archived=false&sort_by=last_message_time&sort_order=desc&limit=25"
+            );
+            if !trimmed.is_empty() {
+                path.push_str(&format!("&name={}", escaped(trimmed)));
+            }
+            if offset > 0 {
+                path.push_str(&format!("&offset={offset}"));
+            }
+            let body = self.call("GET", &path, None).map_err(refusal)?;
+            let parsed: ThreadsList = serde_json::from_str(&body)
+                .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
+            let members = thread_member_ids(&parsed.members);
+            let next = (parsed.has_more && !parsed.threads.is_empty()).then(|| (offset + parsed.threads.len()).to_string());
+            let more = next.is_some();
+            (parsed.threads, members, next, more)
+        } else {
+            let mut path = format!("/channels/{channel_id}/threads/archived/public?limit=25");
+            if let Some(before) = cursor.filter(|c| !c.is_empty()) {
+                path.push_str(&format!("&before={}", escaped(before)));
+            }
+            let body = self.call("GET", &path, None).map_err(refusal)?;
+            let parsed: ThreadsList = serde_json::from_str(&body)
+                .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
+            let last_ts = parsed
+                .threads
+                .last()
+                .and_then(|t| t.thread_metadata.as_ref())
+                .and_then(|m| m.archive_timestamp.clone());
+            let mut members = thread_member_ids(&parsed.members);
+            let any = !parsed.threads.is_empty();
+            let mut combined = parsed.threads;
+            if cursor.is_none() {
+                if let Ok(priv_body) = self.call("GET", &format!("/channels/{channel_id}/users/@me/threads/archived/private?limit=25"), None) {
+                    if let Ok(priv_parsed) = serde_json::from_str::<ThreadsList>(&priv_body) {
+                        members.extend(thread_member_ids(&priv_parsed.members));
+                        for thread in priv_parsed.threads {
+                            if !combined.iter().any(|existing| existing.id == thread.id) {
+                                combined.push(thread);
+                            }
+                        }
+                    }
+                }
+            }
+            if !trimmed.is_empty() {
+                let needle = trimmed.to_lowercase();
+                combined.retain(|t| t.name.as_deref().unwrap_or("").to_lowercase().contains(&needle));
+            }
+            let next = (parsed.has_more && any).then_some(last_ts).flatten();
+            (combined, members, next.clone(), next.is_some())
+        };
+
+        let guild = self.guild_of(&parent);
+        let exempt = guild
+            .as_deref()
+            .and_then(|g| self.channel_permissions(g, &parent.key.id))
+            .map_or(parent.rights.slowmode_exempt || parent.rights.manage_threads, |perms| ready::slowmode_exempt(perms, true));
+        let clock = crate::hub::now();
+        let timed_out = guild.as_deref().and_then(|g| {
+            let state = self.state.lock().unwrap();
+            state.guilds.get(g).and_then(|info| info.timed_out(clock))
+        });
+        let mut items = Vec::with_capacity(raw_threads.len());
+        for thread in raw_threads {
+            let existing = self.ctx.known(&thread.id).ok().flatten();
+            let title = thread.name.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "Thread".to_owned());
+            let is_archived = archived || thread.thread_metadata.as_ref().is_some_and(|m| m.archived);
+            let is_locked = thread.thread_metadata.as_ref().is_some_and(|m| m.locked);
+            let followed = member_ids.contains(&thread.id) || thread.member.is_some() || existing.as_ref().is_some_and(|k| k.followed);
+            let mut row = ConversationRow::new(&thread.id, ConversationKind::Thread, &title);
+            row.parent = Some(parent.key.id.clone());
+            row.root = existing.as_ref().and_then(|k| k.root.clone()).or_else(|| Some(thread.id.clone()));
+            row.private = thread.kind == model::PRIVATE_THREAD;
+            row.rights = parent.rights;
+            row.rights.add_members = timed_out.is_none() && (parent.rights.send_in_threads || parent.rights.manage_threads);
+            row.rights.rename = timed_out.is_none() && (parent.rights.manage_threads || thread.owner_id.as_deref() == Some(self.me().as_str()));
+            row.rights.slowmode_exempt = exempt;
+            row.slowmode_seconds = thread.rate_limit_per_user;
+            row.locked = is_locked;
+            let (read_only, read_only_reason) = ready::thread_read_only(timed_out, clock, is_locked, &row.rights);
+            row.read_only = read_only;
+            row.read_only_reason = read_only_reason;
+            let in_tree = followed && !is_archived && parent.kind != ConversationKind::Forum;
+            if in_tree {
+                row.space = parent.space.clone();
+                row.group = parent.group.clone();
+                row.position = parent.position + 1;
+            }
+            if let Some(guild) = &guild {
+                self.note_thread_listed(guild, &thread.id, Some(channel_id), in_tree);
+            }
+            row.filing = Some(kept_filing(existing.as_ref(), is_archived, followed));
+            let _ = self.ctx.conversation(&row);
+            self.release_slowmode(&thread.id, row.slowmode_seconds, row.rights.slowmode_exempt);
+            let conversation = self
+                .ctx
+                .known(&thread.id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| Conversation::new(self.ctx.key(&thread.id), ConversationKind::Thread, &title));
+            let last_activity = thread
+                .last_message_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(seconds)
+                .or_else(|| {
+                    thread
+                        .thread_metadata
+                        .as_ref()
+                        .and_then(|m| m.archive_timestamp.as_deref())
+                        .and_then(model::iso_seconds)
+                })
+                .unwrap_or(conversation.updated);
+            items.push(protocol::ChannelThread {
+                conversation,
+                replies: thread.message_count.unwrap_or(0),
+                last_activity,
+                locked: is_locked,
+            });
+        }
+        Ok(super::ChannelThreadsPage {
+            threads: items,
+            cursor: next_cursor,
+            more,
+        })
+    }
+
+    /// Updates a Discord thread (`PATCH /channels/{thread}`) with only the provided fields.
+    fn thread_update(
+        &self,
+        thread_id: &str,
+        name: Option<String>,
+        archived: Option<bool>,
+        locked: Option<bool>,
+        auto_archive_minutes: Option<u32>,
+        slowmode_seconds: Option<u32>,
+    ) -> Result<(), Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let known = self
+            .ctx
+            .known(thread_id)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This thread is gone.".to_owned()))?;
+        if known.kind != ConversationKind::Thread {
+            return Err(refuse("Only threads can be updated here.".to_owned()));
+        }
+        let mut body = serde_json::Map::new();
+        if let Some(name) = name {
+            body.insert("name".to_owned(), json!(thread_name(&name)));
+        }
+        if let Some(archived) = archived {
+            body.insert("archived".to_owned(), json!(archived));
+        }
+        if let Some(locked) = locked {
+            body.insert("locked".to_owned(), json!(locked));
+        }
+        if let Some(minutes) = auto_archive_minutes {
+            body.insert("auto_archive_duration".to_owned(), json!(minutes));
+        }
+        if let Some(secs) = slowmode_seconds {
+            body.insert("rate_limit_per_user".to_owned(), json!(secs));
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
+        let answer = self
+            .call("PATCH", &format!("/channels/{thread_id}"), Some(Value::Object(body)))
+            .map_err(refusal)?;
+        let mut updated: model::Channel = serde_json::from_str(&answer)
+            .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
+        if updated.id.is_empty() {
+            updated.id = thread_id.to_owned();
+        }
+        if updated.parent_id.is_none() {
+            updated.parent_id = known.parent.clone();
+        }
+        self.thread_changed(updated, known.followed).map_err(|failed| match failed {
+            Failure::SignedOut(why) | Failure::Dropped(why) => refuse(why),
+        })?;
+        self.ctx.info_stale(thread_id);
+        Ok(())
+    }
+
+    /// Deletes a Discord thread (`DELETE /channels/{thread}`).
+    fn delete_thread(&self, thread_id: &str) -> Result<(), Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let known = self
+            .ctx
+            .known(thread_id)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This thread is gone.".to_owned()))?;
+        if known.kind != ConversationKind::Thread {
+            return Err(refuse("Only threads can be deleted here.".to_owned()));
+        }
+        self.call("DELETE", &format!("/channels/{thread_id}"), None).map_err(refusal)?;
+        let guild = self.guild_of(&known);
+        {
+            let mut state = crate::hub::lock(&self.state);
+            state.covered.remove(thread_id);
+            if let Some(info) = guild.as_deref().and_then(|g| state.guilds.get_mut(g)) {
+                info.channels.retain(|(id, _)| *id != number(thread_id));
+            }
+        }
+        if let Some(guild) = guild {
+            let note = format!("threads:{guild}");
+            let before = self.ctx.note(&note).unwrap_or_default();
+            let after: Vec<&str> = before.split(',').filter(|id| !id.is_empty() && *id != thread_id).collect();
+            let after = after.join(",");
+            if after != before {
+                self.ctx.set_note(&note, &after);
+            }
+        }
+        self.ctx.conversation_gone(thread_id).map_err(|err| refuse(err.to_string()))
+    }
+
+    /// The thread's conversation, when it is not recorded yet. Its root is the message it hangs
+    /// off (when attached to one). A thread kept outside the tree still needs its server, which
+    /// `guild_of` reads back.
+    fn record_thread(
+        &self,
+        parent: &Conversation,
+        thread: &model::Channel,
+        root: Option<&str>,
+        title: &str,
+    ) -> Result<(), Refusal> {
+        let refuse = |err: rusqlite::Error| Refusal::Refused(err.to_string());
+        if self.ctx.known(&thread.id).map_err(refuse)?.is_some() {
+            return Ok(());
+        }
+        let in_tree = parent.kind != ConversationKind::Forum;
+        if let Some(guild) = self.guild_of(parent) {
+            self.note_thread_listed(&guild, &thread.id, Some(&parent.key.id), in_tree);
+        }
+        let me = self.me();
+        let is_owner = thread.owner_id.as_deref() == Some(me.as_str());
+        let guild = self.guild_of(parent);
+        let exempt = guild
+            .as_deref()
+            .and_then(|g| self.channel_permissions(g, &parent.key.id))
+            .map_or(parent.rights.slowmode_exempt || parent.rights.manage_threads, |perms| ready::slowmode_exempt(perms, true));
+        let clock = crate::hub::now();
+        let timed_out = guild.as_deref().and_then(|g| {
+            let state = self.state.lock().unwrap();
+            state.guilds.get(g).and_then(|info| info.timed_out(clock))
+        });
+        let open = timed_out.is_none();
+        let mut rights = parent.rights;
+        rights.add_members = open && (rights.send_in_threads || rights.manage_threads);
+        rights.rename = open && (rights.manage_threads || is_owner);
+        rights.slowmode_exempt = exempt;
+        let locked = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.locked);
+        let (read_only, read_only_reason) = ready::thread_read_only(timed_out, clock, locked, &rights);
+        let mut row = ConversationRow::new(&thread.id, ConversationKind::Thread, title);
         row.parent = Some(parent.key.id.clone());
-        row.root = Some(root.to_owned());
-        row.private = parent.private;
-        row.read_only = parent.read_only;
-        self.ctx.conversation(&row).map_err(refuse)
+        row.root = root.map(str::to_owned);
+        if in_tree {
+            row.space = parent.space.clone();
+            row.group = parent.group.clone();
+            row.position = parent.position + 1;
+        }
+        row.private = thread.kind == model::PRIVATE_THREAD;
+        row.read_only = read_only;
+        row.read_only_reason = read_only_reason;
+        row.rights = rights;
+        row.slowmode_seconds = thread.rate_limit_per_user;
+        row.locked = locked;
+        row.filing = Some(kept_filing(None, false, true));
+        self.ctx.conversation(&row).map_err(refuse)?;
+        self.release_slowmode(&thread.id, row.slowmode_seconds, exempt);
+        Ok(())
     }
 
     /// Where a registered file is fetched now. Attachment addresses are signed and run out
@@ -2070,6 +2586,9 @@ impl Discord {
             Command::Reactors { conversation_id, message_id, emoji, burst, after, limit, reply } => {
                 answer(reply, self.reactors(&conversation_id, &message_id, &emoji, burst, after.as_deref(), limit))
             }
+            Command::ClearReactions { conversation_id, message_id, emoji, user_id, reply } => {
+                answer(reply, self.clear_reactions(&conversation_id, &message_id, emoji.as_deref(), user_id.as_deref()))
+            }
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text))
             }
@@ -2138,10 +2657,47 @@ impl Discord {
             Command::Members { conversation_id, offset, limit, reply } => {
                 self.members(conversation_id, offset, limit, reply)
             }
-            Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
-            Command::StartThread { conversation_id, message_id, name, reply } => {
-                drop(reply.send(self.start_thread(&conversation_id, &message_id, &name)))
+            Command::MembersAdd { conversation_id, people, reply } => {
+                answer(reply, self.add_members(&conversation_id, &people))
             }
+            Command::FollowThread { conversation_id, on, reply } => {
+                answer(reply, self.follow_thread(&conversation_id, on))
+            }
+            Command::ChannelThreads { conversation_id, archived, query, cursor, reply } => {
+                answer(reply, self.channel_threads(&conversation_id, archived, &query, cursor.as_deref()))
+            }
+            Command::ThreadUpdate {
+                conversation_id,
+                name,
+                archived,
+                locked,
+                auto_archive_minutes,
+                slowmode_seconds,
+                reply,
+            } => answer(
+                reply,
+                self.thread_update(&conversation_id, name, archived, locked, auto_archive_minutes, slowmode_seconds),
+            ),
+            Command::DeleteThread { conversation_id, reply } => {
+                answer(reply, self.delete_thread(&conversation_id))
+            }
+            Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
+            Command::StartThread {
+                conversation_id,
+                message_id,
+                name,
+                private,
+                auto_archive_minutes,
+                first_message,
+                reply,
+            } => drop(reply.send(self.start_thread(
+                &conversation_id,
+                message_id.as_deref(),
+                &name,
+                private,
+                auto_archive_minutes,
+                &first_message,
+            ))),
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
             Command::CallJoin(conversation_id) => self.call_join(&conversation_id),

@@ -1019,6 +1019,9 @@ mod tests {
             moderate: false,
             can_pin: false,
             joined: true,
+            slowmode_seconds: 0,
+            slowmode_until: None,
+            locked: false,
         }
     }
 

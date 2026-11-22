@@ -210,6 +210,19 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             shared.push("MESSAGE_REACTION_REMOVE", event);
             (204, Value::Null)
         }
+        ("DELETE", ["channels", channel, "messages", message, "reactions"]) => {
+            shared.push("MESSAGE_REACTION_REMOVE_ALL", json!({"channel_id": channel, "message_id": message}));
+            (204, Value::Null)
+        }
+        ("DELETE", ["channels", channel, "messages", message, "reactions", emoji]) => {
+            shared.push("MESSAGE_REACTION_REMOVE_EMOJI", json!({"channel_id": channel, "message_id": message, "emoji": emoji_of(emoji)}));
+            (204, Value::Null)
+        }
+        ("DELETE", ["channels", channel, "messages", message, "reactions", emoji, user]) => {
+            let event = json!({"user_id": unescaped(user), "channel_id": channel, "message_id": message, "emoji": emoji_of(emoji), "type": 0});
+            shared.push("MESSAGE_REACTION_REMOVE", event);
+            (204, Value::Null)
+        }
         ("PATCH", ["channels", channel, "messages", message]) => {
             let edited = json!({
                 "id": message, "channel_id": channel, "type": 0, "author": me(), "content": seen.body["content"],
@@ -393,6 +406,7 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         ("POST", ["channels", channel, "messages", _message, "threads"]) => {
             let id = shared.snowflake();
             let name = seen.body["name"].as_str().unwrap_or("Thread");
+            let auto_archive = seen.body["auto_archive_duration"].as_u64().unwrap_or(1440);
             (
                 200,
                 json!({
@@ -404,11 +418,175 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                     "owner_id": "1000",
                     "message_count": 0,
                     "member_count": 1,
-                    "thread_metadata": {"archived": false, "locked": false},
+                    "thread_metadata": {"archived": false, "locked": false, "auto_archive_duration": auto_archive},
                     "newly_created": true,
                 }),
             )
         }
+        ("POST", ["channels", channel, "threads"]) => {
+            let id = shared.snowflake();
+            let name = seen.body["name"].as_str().unwrap_or("Thread");
+            let kind = seen.body["type"].as_u64().unwrap_or(11);
+            let auto_archive = seen.body["auto_archive_duration"].as_u64().unwrap_or(1440);
+            let invitable = seen.body["invitable"].as_bool().unwrap_or(true);
+            (
+                200,
+                json!({
+                    "id": id,
+                    "type": kind,
+                    "name": name,
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 0,
+                    "member_count": 1,
+                    "thread_metadata": {
+                        "archived": false,
+                        "locked": false,
+                        "auto_archive_duration": auto_archive,
+                        "invitable": invitable
+                    },
+                    "newly_created": true,
+                }),
+            )
+        }
+        ("PUT", ["channels", _thread, "thread-members", _user]) => (204, Value::Null),
+        ("DELETE", ["channels", _thread, "thread-members", _user]) => (204, Value::Null),
+        ("PATCH", ["channels", _thread, "thread-members", "@me", "settings"]) => (
+            200,
+            json!({
+                "flags": seen.body["flags"].as_u64().unwrap_or(2),
+                "muted": seen.body["muted"].as_bool().unwrap_or(false),
+                "mute_config": seen.body["mute_config"],
+            }),
+        ),
+        ("GET", ["channels", thread, "thread-members"]) => (
+            200,
+            json!([
+                {
+                    "id": thread,
+                    "user_id": "1000",
+                    "member": {
+                        "user": me(),
+                        "nick": "jscroggins",
+                        "roles": ["4010"]
+                    }
+                },
+                {
+                    "id": thread,
+                    "user_id": "2001",
+                    "member": {
+                        "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "a1b2c3"},
+                        "nick": null,
+                        "roles": []
+                    }
+                }
+            ]),
+        ),
+        ("PATCH", ["channels", thread]) => {
+            let name = seen.body["name"].as_str().unwrap_or("thread-updated");
+            let archived = seen.body["archived"].as_bool().unwrap_or(false);
+            let locked = seen.body["locked"].as_bool().unwrap_or(false);
+            let auto_archive = seen.body["auto_archive_duration"].as_u64().unwrap_or(1440);
+            let rate_limit = seen.body["rate_limit_per_user"].as_u64().unwrap_or(0);
+            (
+                200,
+                json!({
+                    "id": thread,
+                    "type": 11,
+                    "name": name,
+                    "parent_id": "4101",
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "rate_limit_per_user": rate_limit,
+                    "thread_metadata": {
+                        "archived": archived,
+                        "locked": locked,
+                        "auto_archive_duration": auto_archive
+                    }
+                }),
+            )
+        }
+        ("GET", ["channels", channel, "threads", "search"]) => {
+            let mut threads = vec![
+                json!({
+                    "id": "4510",
+                    "type": 11,
+                    "name": "Active API refactor",
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "2001",
+                    "message_count": 7,
+                    "last_message_id": "1300000000000000800",
+                    "thread_metadata": {"archived": false, "locked": false, "auto_archive_duration": 1440},
+                }),
+                json!({
+                    "id": "4511",
+                    "type": 11,
+                    "name": "Active docs cleanup",
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 2,
+                    "last_message_id": "1300000000000000790",
+                    "thread_metadata": {"archived": false, "locked": false, "auto_archive_duration": 1440},
+                }),
+            ];
+            if let Some(q) = seen.path.split("name=").nth(1).map(|s| s.split('&').next().unwrap_or("")) {
+                let needle = q.to_lowercase();
+                threads.retain(|t| t["name"].as_str().unwrap_or("").to_lowercase().contains(&needle));
+            }
+            let members: Vec<Value> = threads
+                .iter()
+                .filter(|thread| thread["id"] == "4511")
+                .map(|thread| json!({"id": thread["id"], "user_id": "1000"}))
+                .collect();
+            (200, json!({"threads": threads, "members": members, "has_more": false, "total_results": threads.len()}))
+        }
+        ("GET", ["channels", channel, "threads", "archived", "public"]) => (
+            200,
+            json!({
+                "threads": [{
+                    "id": "4520",
+                    "type": 11,
+                    "name": "Old 0.9 release notes",
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "2001",
+                    "message_count": 19,
+                    "last_message_id": "1300000000000000500",
+                    "thread_metadata": {
+                        "archived": true,
+                        "locked": false,
+                        "auto_archive_duration": 1440,
+                        "archive_timestamp": "2026-10-01T12:00:00.000000+00:00"
+                    },
+                }],
+                "has_more": false,
+            }),
+        ),
+        ("GET", ["channels", channel, "users", "@me", "threads", "archived", "private"]) => (
+            200,
+            json!({
+                "threads": [{
+                    "id": "4521",
+                    "type": 12,
+                    "name": "Old private triage",
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 5,
+                    "last_message_id": "1300000000000000510",
+                    "thread_metadata": {
+                        "archived": true,
+                        "locked": true,
+                        "auto_archive_duration": 4320,
+                        "archive_timestamp": "2026-10-02T12:00:00.000000+00:00"
+                    },
+                }],
+                "has_more": false,
+            }),
+        ),
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
         ("POST", ["read-states", "ack-bulk"]) => (200, json!({})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
@@ -1351,12 +1529,26 @@ fn a_channel_message_can_start_a_thread_and_a_direct_message_cannot() {
 
     // One that already has a thread answers with it and does not create another.
     let existing = "1300000000000000100";
-    let opened = world.ask(Request::StartThread { conversation: world.key("4101"), message: existing.to_owned() });
+    let opened = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: Some(existing.to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
+    });
     let Response::Conversation { conversation } = opened else { panic!("{opened:?}") };
     assert_eq!(conversation.key.id, "4500");
     assert!(world.discord.requests_to("POST", "/channels/4101/messages/1300000000000000100/threads").is_empty());
 
-    let started = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let started = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: Some(starter.to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
+    });
     let Response::Conversation { conversation } = started else { panic!("{started:?}") };
     assert_eq!(conversation.kind, ConversationKind::Thread);
     assert_eq!((conversation.parent.as_deref(), conversation.root.as_deref()), (Some("4101"), Some(starter)));
@@ -1368,21 +1560,36 @@ fn a_channel_message_can_start_a_thread_and_a_direct_message_cannot() {
     assert_eq!(hung.thread.as_ref().map(|thread| thread.id.as_str()), Some(conversation.key.id.as_str()));
 
     // The same click again is the thread that now exists, not a second channel.
-    let again = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let again = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: Some(starter.to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
+    });
     let Response::Conversation { conversation: again } = again else { panic!("{again:?}") };
     assert_eq!(again.key.id, conversation.key.id);
     assert_eq!(world.discord.requests_to("POST", &format!("/channels/4101/messages/{starter}/threads")).len(), 1);
 
     let system = world.ask(Request::StartThread {
         conversation: world.key("4101"),
-        message: "1300000000000000095".to_owned(),
+        message: Some("1300000000000000095".to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
     });
     assert!(matches!(system, Response::Error { code: ErrorCode::Refused, .. }), "{system:?}");
 
     wait("the direct conversation", || Some(world.messages("3001")).filter(|messages| !messages.is_empty()));
     let direct = world.ask(Request::StartThread {
         conversation: world.key("3001"),
-        message: "1300000010000000010".to_owned(),
+        message: Some("1300000010000000010".to_owned()),
+        name: String::new(),
+        private: false,
+        auto_archive_minutes: None,
+        first_message: String::new(),
     });
     assert!(matches!(direct, Response::Error { code: ErrorCode::Refused, .. }), "{direct:?}");
     assert!(world.discord.requests_to("POST", "/channels/3001/messages/").iter().all(|seen| !seen.path.contains("/threads")));
@@ -5216,4 +5423,653 @@ fn report_message_posts_once_and_does_not_retry_rate_limit_or_captcha() {
         4,
         "a 429 on a report must not be retried"
     );
+}
+
+#[test]
+fn system_messages_render_boosts_pins_thread_starter_and_all_types() {
+    let world = World::launch(&[], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    // Open channel 4101 so live messages are stored.
+    wait("channel 4101 history", || (!world.messages("4101").is_empty()).then_some(()));
+
+    // Boost tier 2 with count 2.
+    let boost_id = world.discord.snowflake();
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": boost_id, "channel_id": "4101", "guild_id": "4000", "type": 10, "content": "2",
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara O"},
+        "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+    }));
+    let boost = wait("boost tier 2 message", || {
+        world.messages("4101").into_iter().find(|m| m.id == boost_id)
+    });
+    assert_eq!(boost.kind, MessageKind::System);
+    assert_eq!(boost.text, "Mara O boosted the server 2 times! Rustaceans has reached Level 2.");
+
+    // Pinned message system line carries jump target.
+    let pin_id = world.discord.snowflake();
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": pin_id, "channel_id": "4101", "guild_id": "4000", "type": 6, "content": "",
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara O"},
+        "message_reference": {"message_id": "1300000000000000201", "channel_id": "4101", "guild_id": "4000", "type": 0},
+        "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+    }));
+    let pin = wait("pin system message", || {
+        world.messages("4101").into_iter().find(|m| m.id == pin_id)
+    });
+    assert_eq!(pin.kind, MessageKind::System);
+    assert_eq!(pin.text, "Mara O pinned a message.");
+    assert_eq!(pin.jump.as_deref(), Some("1300000000000000201"));
+
+    // Thread starter (type 21) in thread 4500 renders as System with quoted original and jump.
+    let starter_id = world.discord.snowflake();
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": starter_id, "channel_id": "4500", "guild_id": "4000", "type": 21, "content": "",
+        "author": {"id": "2002", "username": "sam", "global_name": "Sam"},
+        "message_reference": {"message_id": "1300000000000000201", "channel_id": "4101", "guild_id": "4000", "type": 0},
+        "referenced_message": {
+            "id": "1300000000000000201", "channel_id": "4101", "type": 0, "content": "Ship it Friday",
+            "author": {"id": "2002", "username": "sam", "global_name": "Sam"}
+        },
+        "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+    }));
+    let starter = wait("thread starter message", || {
+        world.messages("4500").into_iter().find(|m| m.id == starter_id)
+    });
+    assert_eq!(starter.kind, MessageKind::System);
+    assert!(starter.jump.is_none(), "a thread starter does not jump into its parent channel");
+    let quote = starter.reply_to.as_ref().expect("type 21 carries reply_to quote");
+    assert_eq!(quote.snippet, "Ship it Friday");
+
+    // Newly added discovery/incident/purchase types are System, not Unsupported.
+    let incident_id = world.discord.snowflake();
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": incident_id, "channel_id": "4101", "guild_id": "4000", "type": 36, "content": "",
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara O"},
+        "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+    }));
+    let incident = wait("incident alert message", || {
+        world.messages("4101").into_iter().find(|m| m.id == incident_id)
+    });
+    assert_eq!(incident.kind, MessageKind::System);
+    assert_eq!(incident.text, "Mara O enabled security actions for this server.");
+}
+
+#[test]
+fn moderator_manage_messages_flag_delete_others_and_clear_reactions() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Give role 4010 (which our user holds in guild 4000) MANAGE_MESSAGES (1 << 13 = 8192).
+    if let Some(roles) = ready["guilds"][0]["roles"].as_array_mut() {
+        for role in roles {
+            if role["id"] == "4010" {
+                role["permissions"] = json!("8192");
+            }
+        }
+    }
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Channel 4101 reports delete_others because role 4010 has MANAGE_MESSAGES; DM 3001 does not.
+    assert!(world.conversation("4101").rights.delete_others);
+    assert!(!world.conversation("3001").rights.delete_others);
+
+    // Load messages in 4101 and add reactions from another user onto a message by someone else.
+    let history = wait("channel 4101 messages", || Some(world.messages("4101")).filter(|m| m.len() >= 3));
+    let other_msg = history.iter().find(|m| !m.outgoing && m.kind == MessageKind::Normal).unwrap().clone();
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": "4101", "message_id": other_msg.id,
+        "emoji": {"id": null, "name": "👍"}, "type": 0
+    }));
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": "4101", "message_id": other_msg.id,
+        "emoji": {"id": null, "name": "🔥"}, "type": 0
+    }));
+    wait("two reactions recorded", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && m.reactions.len() == 2)
+    });
+
+    // 1. Remove a single user's reaction: DELETE .../reactions/{emoji}/{user}
+    assert_eq!(
+        world.ask(Request::ClearReactions {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            emoji: Some("👍".into()),
+            user_id: Some("2002".into()),
+        }),
+        Response::Ok
+    );
+    let user_del = world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}/reactions/%F0%9F%91%8D/2002", other_msg.id));
+    assert_eq!(user_del.len(), 1);
+    wait("user reaction removed", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && m.reactions.len() == 1)
+    });
+
+    // 2. Remove all reactions of one emoji: DELETE .../reactions/{emoji}
+    assert_eq!(
+        world.ask(Request::ClearReactions {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            emoji: Some("🔥".into()),
+            user_id: None,
+        }),
+        Response::Ok
+    );
+    let emoji_del = world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}/reactions/%F0%9F%94%A5", other_msg.id));
+    assert_eq!(emoji_del.len(), 1);
+
+    // A custom emoji is removed as name:id, with the colon escaped.
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": "4101", "message_id": other_msg.id,
+        "emoji": {"id": "555", "name": "party_blob"}, "type": 0
+    }));
+    wait("custom reaction recorded", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && m.reactions.iter().any(|reaction| reaction.emoji == ":party_blob:"))
+    });
+    assert_eq!(
+        world.ask(Request::ClearReactions {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            emoji: Some(":party_blob:".into()),
+            user_id: None,
+        }),
+        Response::Ok
+    );
+    let custom_del = world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}/reactions/party_blob%3A555", other_msg.id));
+    assert_eq!(custom_del.len(), 1);
+
+    // 3. Remove all reactions on a message: DELETE .../reactions
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": "4101", "message_id": other_msg.id,
+        "emoji": {"id": null, "name": "🎉"}, "type": 0
+    }));
+    wait("reaction re-added", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && !m.reactions.is_empty())
+    });
+    assert_eq!(
+        world.ask(Request::ClearReactions {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            emoji: None,
+            user_id: None,
+        }),
+        Response::Ok
+    );
+    let all_del = world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}/reactions", other_msg.id));
+    assert!(all_del.iter().any(|r| r.path == format!("/channels/4101/messages/{}/reactions", other_msg.id)));
+    wait("all reactions cleared", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_msg.id && m.reactions.is_empty())
+    });
+
+    // 4. Moderator can delete another person's message.
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: world.key("4101"),
+            message_id: other_msg.id.clone(),
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}", other_msg.id)).len(),
+        1
+    );
+
+    // 5. Revoking MANAGE_MESSAGES via GUILD_ROLE_UPDATE clears rights.delete_others.
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": "0"}
+    }));
+    wait("manage_messages revoked", || {
+        (!world.conversation("4101").rights.delete_others).then_some(())
+    });
+}
+
+#[test]
+fn slowmode_reports_interval_exemption_and_cooldown() {
+    // 4101 has 30 s slowmode in READY; user 1000 has no MANAGE_MESSAGES / MANAGE_CHANNELS initially.
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    for channel in ready["guilds"][0]["channels"].as_array_mut().unwrap() {
+        if channel["id"] == "4101" {
+            channel["rate_limit_per_user"] = json!(30);
+        }
+    }
+    let world = World::launch(&[], |shared| *shared.ready.lock().unwrap() = ready.to_string());
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("slowmode on 4101", || (world.conversation("4101").slowmode_seconds == 30).then_some(()));
+    assert_eq!(world.conversation("4101").slowmode_until, None);
+
+    // Sending a message starts the local cooldown immediately on success.
+    let sent = world.ask(Request::Send {
+        conversation: world.key("4101"),
+        client_id: "slow-1".into(),
+        text: "first message".into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    wait("slowmode cooldown after send", || {
+        world.conversation("4101").slowmode_until.filter(|until| *until > 0)
+    });
+
+    // A Discord 20016 slowmode refusal updates slowmode_until from retry_after.
+    world.discord.script(
+        "/channels/4101/messages",
+        429,
+        json!({"message": "This message cannot be sent because you are sending messages too quickly.", "code": 20016, "retry_after": 17.2}),
+    );
+    let _ = world.ask(Request::Send {
+        conversation: world.key("4101"),
+        client_id: "slow-2".into(),
+        text: "too fast".into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    });
+    wait("slowmode failure recorded", || {
+        world.messages("4101").into_iter().find(|m| {
+            m.client_id.as_deref() == Some("slow-2") && matches!(m.state, SendState::Failed { .. })
+        })
+    });
+    assert!(world.conversation("4101").slowmode_until.is_some());
+
+    // CHANNEL_UPDATE updates the interval (e.g. raised to 60 s).
+    world.discord.push("CHANNEL_UPDATE", json!({
+        "id": "4101",
+        "guild_id": "4000",
+        "type": 0,
+        "name": "general",
+        "parent_id": "4100",
+        "position": 0,
+        "rate_limit_per_user": 60
+    }));
+    wait("slowmode updated to 60", || (world.conversation("4101").slowmode_seconds == 60).then_some(()));
+
+    // Granting MANAGE_MESSAGES exempts this account. The interval stays 60 so settings can show it.
+    let manage_messages: u64 = 1 << 13;
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": manage_messages.to_string()}
+    }));
+    wait("slowmode exempt for moderator", || {
+        let row = world.conversation("4101");
+        (row.rights.slowmode_exempt && row.slowmode_seconds == 60 && row.slowmode_until.is_none()).then_some(())
+    });
+}
+
+#[test]
+fn role_update_refreshes_child_thread_rights_and_slowmode() {
+    let world = World::start();
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("thread 4500 loaded", || (world.conversation("4500").key.id == "4500").then_some(()));
+
+    world.discord.push("CHANNEL_UPDATE", json!({
+        "id": "4101",
+        "guild_id": "4000",
+        "type": 0,
+        "name": "general",
+        "parent_id": "4100",
+        "position": 0,
+        "rate_limit_per_user": 40
+    }));
+    wait("parent slowmode 40", || (world.conversation("4101").slowmode_seconds == 40).then_some(()));
+
+    assert_eq!(
+        world.ask(Request::ThreadUpdate {
+            conversation: world.key("4500"),
+            name: None,
+            archived: None,
+            locked: None,
+            auto_archive_minutes: None,
+            slowmode_seconds: Some(20),
+        }),
+        Response::Ok
+    );
+    wait("thread slowmode 20", || (world.conversation("4500").slowmode_seconds == 20).then_some(()));
+    let sent = world.ask(Request::Send {
+        conversation: world.key("4500"),
+        client_id: "thread-slow".into(),
+        text: "inside the thread".into(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    wait("thread cooldown", || world.conversation("4500").slowmode_until.filter(|until| *until > 0));
+
+    let manage_messages: u64 = 1 << 13;
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": manage_messages.to_string()}
+    }));
+    wait("role update refreshes the thread without a thread event", || {
+        let thread = world.conversation("4500");
+        let parent = world.conversation("4101");
+        (thread.slowmode_seconds == 20
+            && thread.rights.slowmode_exempt
+            && thread.slowmode_until.is_none()
+            && parent.slowmode_seconds == 40
+            && parent.rights.slowmode_exempt
+            && parent.slowmode_until.is_none())
+        .then_some(())
+    });
+}
+
+#[test]
+fn standalone_public_private_and_announcement_threads_with_first_message_and_invites() {
+    let world = World::start();
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("channel rights populated", || {
+        world.conversation("4101").rights.create_public_threads.then_some(())
+    });
+    // Without CREATE_PRIVATE_THREADS, private thread creation is refused without hitting Discord.
+    assert!(!world.conversation("4101").rights.create_private_threads);
+    let denied = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: None,
+        name: "Secret Plan".into(),
+        private: true,
+        auto_archive_minutes: Some(1440),
+        first_message: String::new(),
+    });
+    assert!(matches!(denied, Response::Error { code: ErrorCode::Refused, .. }), "{denied:?}");
+    assert!(world.discord.requests_to("POST", "/channels/4101/threads").is_empty());
+
+    // Standalone public thread with custom auto_archive_duration and first message.
+    let public = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: None,
+        name: "Release Checklist".into(),
+        private: false,
+        auto_archive_minutes: Some(4320),
+        first_message: "Let's track launch items here.".into(),
+    });
+    let Response::Conversation { conversation: pub_thread } = public else { panic!("{public:?}") };
+    assert_eq!(pub_thread.kind, ConversationKind::Thread);
+    assert_eq!(pub_thread.title, "Release Checklist");
+    assert!(!pub_thread.private);
+    assert!(pub_thread.followed);
+    let created_posts = world.discord.requests_to("POST", "/channels/4101/threads");
+    assert_eq!(created_posts.len(), 1);
+    assert_eq!(created_posts[0].body["type"], json!(11));
+    assert_eq!(created_posts[0].body["auto_archive_duration"], json!(4320));
+    let first_posts = world.discord.requests_to("POST", &format!("/channels/{}/messages", pub_thread.key.id));
+    assert_eq!(first_posts.len(), 1);
+    assert_eq!(first_posts[0].body["content"], json!("Let's track launch items here."));
+
+    // Announcement channel standalone thread uses type 10 (NEWS_THREAD).
+    let news = world.ask(Request::StartThread {
+        conversation: world.key("4102"),
+        message: None,
+        name: "Changelog Discussion".into(),
+        private: false,
+        auto_archive_minutes: Some(60),
+        first_message: String::new(),
+    });
+    let Response::Conversation { conversation: news_thread } = news else { panic!("{news:?}") };
+    assert_eq!(news_thread.kind, ConversationKind::Thread);
+    let news_posts = world.discord.requests_to("POST", "/channels/4102/threads");
+    assert_eq!(news_posts.len(), 1);
+    assert_eq!(news_posts[0].body["type"], json!(10));
+    assert_eq!(news_posts[0].body["auto_archive_duration"], json!(60));
+
+    // Grant CREATE_PRIVATE_THREADS to role 4010 and create a private thread (type 12), then invite a user.
+    let create_private: u64 = 1 << 36;
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": create_private.to_string()}
+    }));
+    wait("create_private_threads granted", || {
+        world.conversation("4101").rights.create_private_threads.then_some(())
+    });
+    let priv_res = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: None,
+        name: "Incident Room".into(),
+        private: true,
+        auto_archive_minutes: Some(10080),
+        first_message: String::new(),
+    });
+    let Response::Conversation { conversation: priv_thread } = priv_res else { panic!("{priv_res:?}") };
+    assert!(priv_thread.private);
+    assert!(priv_thread.rights.add_members);
+    let priv_posts = world.discord.requests_to("POST", "/channels/4101/threads");
+    assert_eq!(priv_posts.len(), 2);
+    assert_eq!(priv_posts[1].body["type"], json!(12));
+    assert_eq!(priv_posts[1].body["invitable"], json!(true));
+    assert_eq!(priv_posts[1].body["auto_archive_duration"], json!(10080));
+
+    // Invite a member into the private thread via MembersAdd -> PUT /channels/{thread}/thread-members/{user}.
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: priv_thread.key.clone(),
+            people: vec!["2001".into(), "2002".into()],
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("PUT", &format!("/channels/{}/thread-members/2001", priv_thread.key.id)).len(),
+        1
+    );
+    assert_eq!(
+        world.discord.requests_to("PUT", &format!("/channels/{}/thread-members/2002", priv_thread.key.id)).len(),
+        1
+    );
+}
+
+#[test]
+fn browse_active_and_archived_channel_threads_and_join_leave_with_events() {
+    let world = World::start();
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("channel 4101 loaded", || (world.conversation("4101").key.id == "4101").then_some(()));
+
+    // 1. Active threads via GET /channels/4101/threads/search.
+    let active = world.ask(Request::ChannelThreads {
+        conversation: world.key("4101"),
+        archived: false,
+        query: String::new(),
+        cursor: None,
+    });
+    let Response::ChannelThreads { threads, more, .. } = active else { panic!("{active:?}") };
+    assert!(!more);
+    assert_eq!(threads.len(), 2);
+    assert_eq!(threads[0].conversation.key.id, "4510");
+    assert_eq!(threads[0].replies, 7);
+    assert!(!threads[0].conversation.followed, "unjoined thread is recorded without joining");
+    assert_eq!(threads[1].conversation.key.id, "4511");
+    assert!(threads[1].conversation.followed);
+    // Searching active threads passes &name= to Discord.
+    let filtered = world.ask(Request::ChannelThreads {
+        conversation: world.key("4101"),
+        archived: false,
+        query: "docs".into(),
+        cursor: None,
+    });
+    let Response::ChannelThreads { threads: found, .. } = filtered else { panic!("{filtered:?}") };
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].conversation.key.id, "4511");
+
+    // 2. Archived threads fetch both public archived and private archived routes.
+    let archived = world.ask(Request::ChannelThreads {
+        conversation: world.key("4101"),
+        archived: true,
+        query: String::new(),
+        cursor: None,
+    });
+    let Response::ChannelThreads { threads: old, .. } = archived else { panic!("{archived:?}") };
+    assert_eq!(old.len(), 2);
+    let pub_old = old.iter().find(|t| t.conversation.key.id == "4520").expect("public archived");
+    let priv_old = old.iter().find(|t| t.conversation.key.id == "4521").expect("private archived");
+    assert!(pub_old.conversation.archived && !pub_old.locked);
+    assert!(priv_old.conversation.archived && priv_old.conversation.private && priv_old.locked);
+    assert!(priv_old.conversation.read_only, "locked thread is read-only without MANAGE_THREADS");
+    assert_eq!(world.discord.requests_to("GET", "/channels/4101/threads/archived/public").len(), 1);
+    assert_eq!(world.discord.requests_to("GET", "/channels/4101/users/@me/threads/archived/private").len(), 1);
+
+    // 3. Join and leave thread 4510 via FollowThread -> PUT/DELETE /channels/4510/thread-members/@me.
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: world.key("4510"), on: true }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("PUT", "/channels/4510/thread-members/@me").len(), 1);
+    assert!(world.conversation("4510").followed);
+    assert_eq!(world.conversation("4510").space.as_deref(), Some("4000"));
+
+    assert_eq!(
+        world.ask(Request::FollowThread { conversation: world.key("4510"), on: false }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/4510/thread-members/@me").len(), 1);
+    assert!(!world.conversation("4510").followed);
+    assert_eq!(world.conversation("4510").space, None, "leaving removes thread from sidebar tree");
+
+    // 4. Gateway THREAD_MEMBER_UPDATE and THREAD_MEMBERS_UPDATE keep followed in sync.
+    world.discord.push("THREAD_MEMBER_UPDATE", json!({ "id": "4510", "user_id": "1000" }));
+    wait("joined via THREAD_MEMBER_UPDATE", || world.conversation("4510").followed.then_some(()));
+    world.discord.push("THREAD_MEMBERS_UPDATE", json!({
+        "id": "4510",
+        "guild_id": "4000",
+        "member_count": 1,
+        "added_members": [],
+        "removed_member_ids": ["1000"]
+    }));
+    wait("left via THREAD_MEMBERS_UPDATE", || (!world.conversation("4510").followed).then_some(()));
+}
+
+#[test]
+fn thread_settings_rename_archive_lock_delete_notifications_and_members() {
+    let world = World::start();
+    wait("connected", || (world.link() == Link::Connected).then_some(()));
+    wait("thread 4500 loaded", || (world.conversation("4500").key.id == "4500").then_some(()));
+
+    // 1. Thread member list hits GET /channels/4500/thread-members?with_member=true.
+    let members = world.ask(Request::Members {
+        conversation: world.key("4500"),
+        offset: 0,
+        limit: 50,
+    });
+    let Response::Members { members: list, sections, .. } = members else { panic!("{members:?}") };
+    assert_eq!(sections[0].count, 2);
+    let ids: Vec<&str> = list.iter().map(|p| p.key.id.as_str()).collect();
+    assert_eq!(ids, ["1000", "2001"]);
+    let fetched = world.discord.requests_to("GET", "/channels/4500/thread-members");
+    assert_eq!(fetched.len(), 1);
+    assert!(fetched[0].path.contains("with_member=true"), "{}", fetched[0].path);
+
+    // 2. Thread notification setting hits PATCH /channels/4500/thread-members/@me/settings.
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: world.key("4500"),
+            notify: protocol::Notify::Mentions,
+            until: None,
+        }),
+        Response::Ok
+    );
+    let notif = world.discord.requests_to("PATCH", "/channels/4500/thread-members/@me/settings");
+    assert_eq!(notif.len(), 1);
+    assert_eq!(notif[0].body["flags"], json!(4));
+    assert_eq!(notif[0].body["muted"], json!(false));
+    assert!(!world.conversation("4500").muted);
+
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: world.key("4500"),
+            notify: protocol::Notify::Nothing,
+            until: None,
+        }),
+        Response::Ok
+    );
+    let notif = world.discord.requests_to("PATCH", "/channels/4500/thread-members/@me/settings");
+    assert_eq!(notif.len(), 2);
+    assert_eq!(notif[1].body["flags"], json!(8));
+    assert_eq!(notif[1].body["muted"], json!(true));
+    assert!(world.conversation("4500").muted);
+    let info = match world.ask(Request::ConversationInfo { conversation: world.key("4500") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(info.notify, protocol::Notify::Nothing, "a thread's level is its own, not the parent channel's");
+
+    world.discord.push("THREAD_MEMBER_UPDATE", json!({ "id": "4500", "user_id": "1000", "flags": 2 }));
+    wait("thread member update stores all-messages", || {
+        match world.ask(Request::ConversationInfo { conversation: world.key("4500") }) {
+            Response::ConversationInfo { info } if info.notify == protocol::Notify::All => Some(()),
+            _ => None,
+        }
+    });
+
+    // 3. ThreadUpdate PATCH sends only the specified fields (rename, slowmode, auto-archive, archive, lock).
+    assert_eq!(
+        world.ask(Request::ThreadUpdate {
+            conversation: world.key("4500"),
+            name: Some("Renamed thread".into()),
+            archived: None,
+            locked: None,
+            auto_archive_minutes: Some(4320),
+            slowmode_seconds: Some(15),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/channels/4500");
+    let thread_patches: Vec<_> = patches.iter().filter(|r| r.path == "/channels/4500").collect();
+    assert_eq!(thread_patches.len(), 1);
+    assert_eq!(thread_patches[0].body["name"], json!("Renamed thread"));
+    assert_eq!(thread_patches[0].body["auto_archive_duration"], json!(4320));
+    assert_eq!(thread_patches[0].body["rate_limit_per_user"], json!(15));
+    assert!(thread_patches[0].body.get("archived").is_none());
+    assert!(thread_patches[0].body.get("locked").is_none());
+    let updated = world.conversation("4500");
+    assert_eq!(updated.title, "Renamed thread");
+    assert_eq!(updated.slowmode_seconds, 15);
+
+    // 4. Locking a thread without MANAGE_THREADS marks it read_only with "This thread is locked.".
+    assert_eq!(
+        world.ask(Request::ThreadUpdate {
+            conversation: world.key("4500"),
+            name: None,
+            archived: Some(true),
+            locked: Some(true),
+            auto_archive_minutes: None,
+            slowmode_seconds: None,
+        }),
+        Response::Ok
+    );
+    let locked = world.conversation("4500");
+    assert!(locked.archived);
+    assert!(locked.locked);
+    assert!(locked.read_only);
+    assert_eq!(locked.read_only_reason, "This thread is locked.");
+
+    // 5. With MANAGE_THREADS, a moderator can still post in a locked thread (not read_only) and delete it.
+    let manage_threads: u64 = 1 << 34;
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4010", "name": "mods", "permissions": manage_threads.to_string()}
+    }));
+    wait("manage_threads granted on 4101", || {
+        world.conversation("4101").rights.manage_threads.then_some(())
+    });
+    assert_eq!(
+        world.ask(Request::ThreadUpdate {
+            conversation: world.key("4500"),
+            name: None,
+            archived: Some(false),
+            locked: Some(true),
+            auto_archive_minutes: None,
+            slowmode_seconds: None,
+        }),
+        Response::Ok
+    );
+    let mod_locked = world.conversation("4500");
+    assert!(mod_locked.locked && !mod_locked.archived);
+    assert!(!mod_locked.read_only, "moderator with MANAGE_THREADS is not blocked by thread lock");
+
+    // 6. DeleteThread hits DELETE /channels/4500 and removes the conversation.
+    assert_eq!(
+        world.ask(Request::DeleteThread { conversation: world.key("4500") }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/4500").len(), 1);
+    assert!(matches!(
+        world.ask(Request::Conversation { conversation: world.key("4500") }),
+        Response::Error { code: ErrorCode::NotFound, .. }
+    ));
 }

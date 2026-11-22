@@ -130,7 +130,9 @@ impl Discord {
             // The ping toggle: the author of the original is notified only when it is on.
             body["allowed_mentions"] = json!({"parse": ["users", "roles", "everyone"], "replied_user": with.ping});
         }
-        let accepted = self.call("POST", &format!("/channels/{channel}/messages"), Some(body)).map_err(|refused| refused.reason())?;
+        let asked = self.call("POST", &format!("/channels/{channel}/messages"), Some(body));
+        self.note_send_slowmode(channel, &conversation, &asked);
+        let accepted = asked.map_err(|refused| refused.reason())?;
         let posted: Posted = serde_json::from_str(&accepted).map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let _ = files.register(&self.ctx);
