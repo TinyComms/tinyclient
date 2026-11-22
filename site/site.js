@@ -6,10 +6,10 @@
   "use strict";
 
   var systems = {
-    mac: { label: "Download for macOS", hint: "For Apple silicon, macOS 13 or later; a disk image", href: "/download/macos" },
+    mac: { label: "Download for macOS", hint: "Disk images for Apple silicon and Intel on macOS 13 or later", href: "/docs/#download" },
     // Linux has a format per distribution, so the button opens the choice and the formats are listed.
     linux: { label: "Download for Linux", hint: "For x86_64 and arm64: .deb, .rpm, AppImage or .tar.gz", href: "/docs/#linux" },
-    windows: { label: "Download for Windows", hint: "For x86_64; an installer that needs no administrator", href: "/download/windows" }
+    windows: { label: "Download for Windows", hint: "Installers for x86_64 and Windows 11 on Arm", href: "/docs/#download" }
   };
 
   function detect() {

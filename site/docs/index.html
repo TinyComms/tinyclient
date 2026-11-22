@@ -80,13 +80,15 @@
         <thead><tr><th scope="col">System</th><th scope="col">Download</th><th scope="col">What it is</th></tr></thead>
         <tbody>
           <tr><th scope="row">macOS 13 or later, Apple silicon</th><td><a href="/download/macos"><code>.dmg</code></a> or <a href="/download/macos-zip"><code>.zip</code></a></td><td><code>tinyclient.app</code>, to drag to Applications</td></tr>
+          <tr><th scope="row">macOS 13 or later, Intel</th><td><a href="/download/macos-intel"><code>.dmg</code></a> or <a href="/download/macos-intel-zip"><code>.zip</code></a></td><td><code>tinyclient.app</code>, to drag to Applications</td></tr>
           <tr><th scope="row">Debian, Ubuntu</th><td><a href="/download/deb"><code>.deb</code></a> (<a href="/download/deb-arm64">arm64</a>)</td><td>A package for apt, with a menu entry</td></tr>
           <tr><th scope="row">Fedora, openSUSE</th><td><a href="/download/rpm"><code>.rpm</code></a> (<a href="/download/rpm-arm64">arm64</a>)</td><td>A package for dnf or zypper, with a menu entry</td></tr>
           <tr><th scope="row">Any Linux</th><td><a href="/download/appimage"><code>.AppImage</code></a> (<a href="/download/appimage-arm64">arm64</a>)</td><td>One file that runs without installing</td></tr>
           <tr><th scope="row">Any Linux</th><td><a href="/download/linux-tar"><code>.tar.gz</code></a> (<a href="/download/linux-tar-arm64">arm64</a>)</td><td>The four programs and <code>install.sh</code></td></tr>
           <tr><th scope="row">NixOS, Nix on Linux</th><td><a href="#nix">The flake</a></td><td>Built from source by Nix, with a Home Manager module</td></tr>
           <tr><th scope="row">Windows 10 or 11, x86_64</th><td><a href="/download/windows"><code>-setup.exe</code></a></td><td>An installer that needs no administrator</td></tr>
-          <tr><th scope="row">Windows, portable</th><td><a href="/download/windows-portable"><code>.zip</code></a></td><td>The four programs, run where you unpack them</td></tr>
+          <tr><th scope="row">Windows 11 on Arm</th><td><a href="/download/windows-arm64"><code>-setup.exe</code></a></td><td>A native Arm64 installer that needs no administrator</td></tr>
+          <tr><th scope="row">Windows, portable</th><td><a href="/download/windows-portable">x86_64 <code>.zip</code></a> or <a href="/download/windows-arm64-portable">Arm64 <code>.zip</code></a></td><td>The four programs, run where you unpack them</td></tr>
         </tbody>
       </table>
     </div>
@@ -148,7 +150,7 @@ nix profile remove tinyclient  <span class="c"># to remove it</span></code></pre
 
     <h2 id="windows">Windows</h2>
     <ol>
-      <li>Run <code>tinyclient-windows-x86_64-setup.exe</code>. It installs for you only, in <code>%LOCALAPPDATA%\Programs\tinyclient</code>, without asking for an administrator, and adds tinyclient to the Start menu.</li>
+      <li>Run <code>tinyclient-windows-x86_64-setup.exe</code> or <code>tinyclient-windows-aarch64-setup.exe</code> on Windows 11 on Arm. It installs for you only, in <code>%LOCALAPPDATA%\Programs\tinyclient</code>, without asking for an administrator, and adds tinyclient to the Start menu.</li>
       <li>The installer is not code-signed, so SmartScreen may say <strong>Windows protected your PC</strong>. Choose <strong>More info &rsaquo; Run anyway</strong>, if you trust the build.</li>
     </ol>
     <ul>
