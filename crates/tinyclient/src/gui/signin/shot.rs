@@ -80,6 +80,10 @@ pub(super) fn canned() -> Option<Canned> {
         "qr-waiting" => qr("", None),
         "qr" => qr(LINK, None),
         "qr-offline" => qr("", Some(SignInProblem::Unreachable)),
+        "signal-qr" => {
+            canned.network = Network::Signal;
+            qr("sgnl://linkdevice?uuid=shot-device-1&pub_key=BshotPubKey1&capabilities=transfer", None)
+        }
         "phone" => {
             canned.number = "555 010 0142";
             SignInStep::Phone { problem: None }

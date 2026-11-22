@@ -1,7 +1,8 @@
-//! Signing in to Signal, as the shell's sheet draws it: this computer is linked to the account as
-//! one more device, from the phone (Settings > Linked devices > Link new device), by scanning a
-//! code. There is no number to type: registering a number here would make this computer the
-//! account's phone and sign the real phone out, so it is never offered.
+//! Signing in to Signal, as the shell's sheet draws it: this device is linked to the account as
+//! one more companion device, from your primary phone (Settings > Linked devices > Link new
+//! device), by scanning a code or opening the `sgnl://linkdevice` link URI. There is no number to
+//! type: registering a number here would make this device the account's primary phone and sign the
+//! real phone out, so it is never offered.
 //!
 //! One sign-in at a time. It lives from `SignInBegin` to the step that ends it or to
 //! `SignInCancel`, on a thread of its own; nothing of Signal's is loaded before it begins. A link
@@ -70,7 +71,7 @@ pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<
                 link,
                 expires,
                 problem: Some(SignInProblem::Other {
-                    reason: "Signal links a computer from your phone: open Signal there and scan this code.".to_owned(),
+                    reason: "Signal links this device from your primary phone: open Signal there and scan this code.".to_owned(),
                 }),
             },
             other => other,

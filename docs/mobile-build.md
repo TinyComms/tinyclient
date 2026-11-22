@@ -199,6 +199,16 @@ Done, at the feature-graph level:
 * The Android dependency is target-gated, so a desktop build never links `android-activity`.
 * The library re-declares `gui`'s modules only for mobile targets, so a desktop
   `cargo check --features gui` does not compile the window twice.
+* **Signal feature on mobile (`chatd/signal`):** `crates/tinyclient/Cargo.toml` currently pins the
+  in-process Android/iOS `chatd` dependency with `default-features = false`, so mobile builds do
+  **not** link `presage`, `libsignal-service`, `libsignal`, or require `protoc` at cross-compile
+  time yet. The phone and tablet sign-in UI offers Signal as a linked companion device (via
+  `sgnl://linkdevice?...` link-URI handoff and QR code, with an explicit open-app delivery note):
+  in builds compiled without `chatd/signal`, tapping Signal cleanly reports the `Unsupported`
+  message from `chatd`; in scripted test builds (`TINYCLIENT_SIGNAL_FAKE=1`), the full linking and
+  chat-list flow runs end to end. Enabling live Signal on mobile requires installing `protoc` in
+  `.github/workflows/mobile.yml` and verifying `presage`/libsignal cross-compilation for
+  `aarch64-linux-android` and `aarch64-apple-ios` before turning `chatd`'s `signal` feature on.
 
 Not done, on purpose: the in-file `#[cfg]`s for the desktop-only surfaces — `gui/chrome.rs`,
 `gui/app/menubar.rs`, the Settings second window, `src/update.rs`, `drags_window`, the web

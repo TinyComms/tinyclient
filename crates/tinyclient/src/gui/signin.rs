@@ -60,6 +60,34 @@ const RETRY: Duration = Duration::from_secs(2);
 /// Above the popovers and menus of the shell, which use 1 to 3.
 const PRIORITY: usize = 8;
 
+/// Valid Signal device-linking URI that the primary Signal app can open directly on the same
+/// phone or tablet (`sgnl://linkdevice?uuid=...&pub_key=...`).
+pub(super) fn is_signal_link_uri(link: &str) -> bool {
+    let Some(query) = link.strip_prefix("sgnl://linkdevice?") else {
+        return false;
+    };
+    if query.is_empty() || query.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let mut has_uuid = false;
+    let mut has_pub_key = false;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "uuid" && !v.is_empty() {
+                has_uuid = true;
+            } else if k == "pub_key" && !v.is_empty() {
+                has_pub_key = true;
+            }
+        }
+    }
+    has_uuid && has_pub_key
+}
+
+/// Clear disclosure shown when linking Signal on a phone or tablet: companion devices receive
+/// messages over a websocket only while the app is open, with no background push notifications.
+pub(super) const SIGNAL_MOBILE_DELIVERY_NOTE: &str =
+    "Linked Signal devices do not receive background push notifications on phones or tablets. New Signal messages arrive while tinyclient is open.";
+
 /// The invite, when present, is authoritative even if another server was typed first.
 fn invite_notice(input: &str, server: &str) -> String {
     if let Some((origin, _)) = protocol::parse_invite_link(input) {
@@ -1055,24 +1083,49 @@ impl Sheet {
         };
         let phone_only = matches!(self.network, Network::Signal | Network::Messages | Network::Tiny);
         let steps = match self.network {
-            Network::Signal => ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."],
+            Network::Signal => ["Open Signal on your primary phone.", "Go to Settings > Linked devices > Link new device.", "Point your phone at this code."],
             Network::Messages => unreachable!("Messages uses Google sign-in and emoji confirmation"),
             Network::Tiny => ["Paste the code you were given.", "Continue in your browser.", "Come back here when it's done."],
             Network::Telegram | Network::Discord | Network::Slack | Network::Teams => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
         };
-        // Signal links a computer only from the phone: there is no other way in to offer.
-        // On a phone the code cannot be scanned by the phone it is on: the number is the way in,
-        // and the code is for linking from another device.
+        if phone::active() && self.network == Network::Signal {
+            return self.phone_signal_qr_step(tile, problem.is_some(), cx);
+        }
+        // On a phone Telegram's code cannot be scanned by the phone it is on: the number is the
+        // way in, and the code is for linking from another device.
         if phone::active() && !phone_only {
             return self.phone_qr_step(tile, steps, cx);
         }
-        let other_way = (!phone_only).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx));
+        let open_signal_uri = (self.network == Network::Signal && phone::HANDHELD && problem.is_none())
+            .then(|| self.code.as_ref().map(|(uri, _)| uri.clone()).filter(|uri| is_signal_link_uri(uri)))
+            .flatten();
+        let other_way: Option<Stateful<Div>> = if !phone_only {
+            Some(self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx))
+        } else {
+            open_signal_uri.map(|uri| {
+                link("signin-open-signal", "Open Signal to link").on_click(move |_, _, cx| {
+                    cx.open_url(&uri);
+                })
+            })
+        };
+        let tablet_delivery_note = (self.network == Network::Signal && phone::HANDHELD).then(|| {
+            div()
+                .mt(px(14.))
+                .p(px(10.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::raised())
+                .type_small()
+                .whitespace_normal()
+                .text_color(theme::text_soft())
+                .child(SIGNAL_MOBILE_DELIVERY_NOTE)
+        });
         div()
             .flex()
             .flex_col()
             .child(self.header(self.title(), false, cx))
             .child(div().mt(px(20.)).mb(px(18.)).flex().justify_center().child(tile))
             .child(div().flex().flex_col().gap(px(8.)).children(steps.into_iter().enumerate().map(|(at, words)| numbered(at + 1, words))))
+            .children(tablet_delivery_note)
             .child(footer(22.).child(other_way.map_or_else(|| div().into_any_element(), IntoElement::into_any_element)).child(self.cancel("Cancel", cx)))
     }
 
@@ -1986,4 +2039,16 @@ mod tests {
         assert_eq!(matching_server(&link, &servers), Some(account));
         let other = protocol::invite_url("http://example.com", "token").unwrap();
         assert_eq!(matching_server(&other, &servers), None);
+    }
+
+    #[test]
+    fn signal_link_uri_requires_scheme_uuid_and_pub_key() {
+        assert!(is_signal_link_uri("sgnl://linkdevice?uuid=abc-123&pub_key=BpubKey1"));
+        assert!(is_signal_link_uri("sgnl://linkdevice?uuid=abc-123&pub_key=BpubKey1&capabilities=transfer"));
+        assert!(!is_signal_link_uri(""));
+        assert!(!is_signal_link_uri("https://signal.org/linkdevice?uuid=a&pub_key=b"));
+        assert!(!is_signal_link_uri("sgnl://linkdevice?uuid=abc-123"));
+        assert!(!is_signal_link_uri("sgnl://linkdevice?pub_key=BpubKey1"));
+        assert!(!is_signal_link_uri("sgnl://linkdevice?uuid=abc 123&pub_key=BpubKey1"));
+        assert!(SIGNAL_MOBILE_DELIVERY_NOTE.contains("background push") && SIGNAL_MOBILE_DELIVERY_NOTE.contains("while tinyclient is open"));
     }

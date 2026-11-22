@@ -109,8 +109,8 @@ impl SettingsWindow {
         let mut pane = div().flex().flex_col().gap(px(20.));
         for network in NETWORK_ORDER {
             let mine: Vec<&AccountStatus> = accounts.iter().filter(|a| a.key.network == network && a.link != Link::SignedOut).collect();
-            // A phone cannot sign in to Signal or Messages (`signin::welcome::on_phone`): their
-            // groups show only for an account that came from elsewhere.
+            // A phone offers only networks supported on phone (`signin::welcome::on_phone`): any
+            // other group shows only for an account that came from elsewhere.
             if phone::active() && mine.is_empty() && !crate::gui::signin::welcome::on_phone(network) {
                 continue;
             }
