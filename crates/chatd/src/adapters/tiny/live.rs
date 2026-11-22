@@ -3455,6 +3455,9 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
                 if seat.names.len() < NAMES || seat.names.contains_key(user) {
                     seat.names.insert(user.to_owned(), name.to_owned());
                 }
+                if kind == "member.renamed" {
+                    super::messages::member_renamed(ctx, saved, user, name);
+                }
             }
             if let Some(role) = role.filter(|role| user == seat.me && *role != seat.role && matches!(*role, "owner" | "admin" | "member")) {
                 seat.role = role.to_owned();
