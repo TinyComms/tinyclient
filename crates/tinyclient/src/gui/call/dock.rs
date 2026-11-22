@@ -400,7 +400,7 @@ fn discord_column(window: f32, sidebar: f32, hidden: bool, right: Option<f32>, s
 }
 
 /// "General / Tiny Client Official Server". The server's own title wins over the account host.
-fn compact_place_label(room: &str, server_title: Option<&str>, account_name: &str) -> String {
+pub(in crate::gui) fn compact_place_label(room: &str, server_title: Option<&str>, account_name: &str) -> String {
     let server = server_title.map(str::trim).filter(|name| !name.is_empty()).unwrap_or_else(|| account_name.trim());
     if room.is_empty() {
         return server.to_owned();

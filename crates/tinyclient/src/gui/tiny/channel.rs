@@ -3,7 +3,7 @@
 //! with Join, full room, join-blocked, preset mute/deafen, server-held mute).
 
 use super::{join_blocked, model, Page};
-use crate::gui::call::stage::{Stage, self};
+use crate::gui::call::stage::Stage;
 use crate::gui::call::view::ViewBar;
 use crate::gui::components::{button, button_disabled, button_with_icon, glyph, tip, ButtonKind};
 use crate::gui::state::Shell;
@@ -15,7 +15,7 @@ pub(in crate::gui) use crate::gui::call::stage::{as_heard, with_me};
 pub(in crate::gui) use crate::gui::call::view::chip;
 
 /// The occupancy pill's tooltip: who is in, then the room's bitrate and whether it needs end-to-end encryption.
-fn occupancy_tip(room: &TinyRoom) -> String {
+pub(in crate::gui) fn occupancy_tip(room: &TinyRoom) -> String {
     let mut parts = vec![model::channel_occupancy(room)];
     if room.bitrate_kbps > 0 {
         parts.push(format!("{} kb/s Opus", room.bitrate()));

@@ -17,7 +17,7 @@
 //! socket (`Change::Tiny`, `Occupants`, `Presence`); nothing here polls, except the connection
 //! numbers while a call is up.
 
-mod channel;
+pub(super) mod channel;
 pub(super) mod column;
 pub(super) mod feed;
 mod home;
@@ -28,7 +28,7 @@ mod menus;
 mod modals;
 pub(super) mod model;
 mod pane;
-mod panel;
+pub(super) mod panel;
 pub(super) mod settings;
 mod setup;
 mod share;

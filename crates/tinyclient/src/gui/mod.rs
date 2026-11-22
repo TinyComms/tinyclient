@@ -246,6 +246,72 @@ pub(crate) fn prove_message_ux_polish() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The lab's tiny-call-ux driver. Verifies responsive side-by-side duo tile sizing, 1:1 ringing
+/// callee seats, history peek, deduplicated panel latency, server display name in the compact
+/// dock, and voice-room occupancy/bitrate tooltips.
+pub(crate) fn prove_tiny_call_ux() -> Result<(), &'static str> {
+    let (duo_w, duo_h) = call::view::stage_tile_size(464., 2, false);
+    if duo_w < 168. || duo_w * 2. + 12. + 48. > 464. || duo_h < 132. {
+        return Err("two callers did not fit side by side at 464 px");
+    }
+    let (wide_w, _) = call::view::stage_tile_size(900., 2, false);
+    if (wide_w - 280.).abs() > 0.5 {
+        return Err("wide duo tile did not cap at 280 px");
+    }
+
+    let mut history = sidebar::history::History::default();
+    history.leave("general");
+    history.leave("voice");
+    if history.peek(true) != Some(&"voice") || history.peek(false).is_some() {
+        return Err("history peek did not report previous stop without mutating cursor");
+    }
+
+    let mut ring: protocol::Call = serde_json::from_value(serde_json::json!({
+        "conversation": { "network": "tiny", "account": "private.tinyclient.io", "id": "dm-1" },
+        "state": "joined",
+        "participants": [],
+        "muted": false,
+        "deafened": false,
+        "joined": 1,
+        "engine_linked": true,
+        "video": []
+    }))
+    .map_err(|_| "failed to construct sample call")?;
+    ring.state = protocol::CallState::RingingOut;
+    let subject = call::Subject {
+        title: "unRekable".into(),
+        kind: protocol::ConversationKind::Direct,
+        avatar: None,
+        space: None,
+    };
+    let stage = call::stage::Stage::of_call(&ring, &subject, "me", "Blitz", Some("peer-1"));
+    if stage.seats.len() != 2 || !stage.seats.iter().any(|seat| !seat.me && seat.ringing) {
+        return Err("1:1 outgoing ringing stage did not include the callee seat");
+    }
+
+    let health = call::health::Health::from_polls(
+        None,
+        &protocol::CallStats { rtt_ms: 52, jitter_ms: 3, ..protocol::CallStats::default() },
+    );
+    if tiny::panel::call_line(&protocol::CallState::Joined, Some(&health), false).map(|line| line.0).as_deref() != Some("52 ms") {
+        return Err("user panel repeated Voice connected instead of compact latency");
+    }
+    if tiny::panel::call_tooltip(&protocol::CallState::Joined, Some("General"), Some(&health), false) != "Voice connected · General · 52 ms" {
+        return Err("user panel tooltip did not carry full room and latency status");
+    }
+    if call::dock::compact_place_label("General", Some("Tiny Client Official Server"), "private.tinyclient.io") != "General / Tiny Client Official Server" {
+        return Err("compact dock did not prefer server display name over raw hostname");
+    }
+    let mut room = protocol::TinyRoom::new("general", "General");
+    room.bitrate_kbps = 64;
+    room.e2ee_required = true;
+    let tip = tiny::channel::occupancy_tip(&room);
+    if !tip.contains("64 kb/s") || !tip.contains("End-to-end encrypted") {
+        return Err("voice room occupancy tooltip missing bitrate or encryption details");
+    }
+    Ok(())
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, MenuItem, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 

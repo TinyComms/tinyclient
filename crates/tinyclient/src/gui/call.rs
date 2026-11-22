@@ -6,7 +6,7 @@
 //! chatd says `Joined`.
 
 mod devices;
-mod dock;
+pub(super) mod dock;
 pub(in crate::gui) mod health;
 mod people;
 mod permission;

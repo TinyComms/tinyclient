@@ -55,7 +55,7 @@ pub(super) fn quality(health: &Health) -> Rgba {
 /// Call health. `None` when the call is not one to speak of (failed: the dock says so).
 /// The dock above already prints "Voice connected", so the joined line stays compact and
 /// never truncates the latency reading.
-fn call_line(state: &CallState, health: Option<&Health>, securing: bool) -> Option<(String, Rgba)> {
+pub(in crate::gui) fn call_line(state: &CallState, health: Option<&Health>, securing: bool) -> Option<(String, Rgba)> {
     Some(match state {
         CallState::Joined if securing => ("Securing…".to_owned(), theme::warning()),
         CallState::Connecting | CallState::RingingOut => ("Connecting…".to_owned(), theme::warning()),
@@ -69,7 +69,7 @@ fn call_line(state: &CallState, health: Option<&Health>, securing: bool) -> Opti
 }
 
 /// Full voice connection status shown on hover over the compact status line.
-fn call_tooltip(state: &CallState, room: Option<&str>, health: Option<&Health>, securing: bool) -> String {
+pub(in crate::gui) fn call_tooltip(state: &CallState, room: Option<&str>, health: Option<&Health>, securing: bool) -> String {
     let mut parts = Vec::new();
     match state {
         CallState::Joined if securing => parts.push("Securing voice connection".to_owned()),

@@ -1,0 +1,12 @@
+{
+  "id": "tiny-call-ux",
+  "title": "Tiny server, direct, and group call UX overhaul and unified headers",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window; mobile call stage centering shares the same layout pattern.",
+    "ios": "The phone proof build does not run the desktop window; mobile call stage centering shares the same layout pattern."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
