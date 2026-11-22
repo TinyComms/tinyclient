@@ -4131,53 +4131,47 @@ fn scheduled_messages_list_reschedule_send_now_cancel_and_when_online() {
     assert!(can.schedule, "Telegram must advertise schedule capability");
 
     let future = 1_900_000_000i64;
-    // Schedule a timed message to Odalys.
-    assert_eq!(
-        world.ask(Request::Send {
-            conversation: key("u7002"),
-            client_id: "sched-1".into(),
-            text: "Morning check-in".into(),
-            reply_to: None,
-            with: protocol::Outgoing { schedule: Some(future), ..protocol::Outgoing::default() },
-        }),
-        Response::Ok
-    );
+    // A scheduled send is still a send: the row is pending until Telegram names the placeholder.
+    let scheduled = world.ask(Request::Send {
+        conversation: key("u7002"),
+        client_id: "sched-1".into(),
+        text: "Morning check-in".into(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future), ..protocol::Outgoing::default() },
+    });
+    assert!(matches!(scheduled, Response::Sent { .. }), "expected Sent, got {scheduled:?}");
     world.until("first scheduled placeholder", || {
         world.messages("u7002").into_iter().find(|m| m.text == "Morning check-in")
     });
 
     // Schedule a "when online" message to Odalys (last seen visible).
-    assert_eq!(
-        world.ask(Request::Send {
-            conversation: key("u7002"),
-            client_id: "sched-2".into(),
-            text: "Ping when you are online".into(),
-            reply_to: None,
-            with: protocol::Outgoing {
-                schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
-                ..protocol::Outgoing::default()
-            },
-        }),
-        Response::Ok
-    );
+    let when_online = world.ask(Request::Send {
+        conversation: key("u7002"),
+        client_id: "sched-2".into(),
+        text: "Ping when you are online".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
+            ..protocol::Outgoing::default()
+        },
+    });
+    assert!(matches!(when_online, Response::Sent { .. }), "expected Sent, got {when_online:?}");
     world.until("second scheduled placeholder", || {
         world.messages("u7002").into_iter().find(|m| m.text == "Ping when you are online")
     });
 
     // "Send when online" to Tobin (hidden last seen) fails with a clear message.
-    assert_eq!(
-        world.ask(Request::Send {
-            conversation: key("u7003"),
-            client_id: "sched-bad".into(),
-            text: "Hidden last seen".into(),
-            reply_to: None,
-            with: protocol::Outgoing {
-                schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
-                ..protocol::Outgoing::default()
-            },
-        }),
-        Response::Ok
-    );
+    let hidden = world.ask(Request::Send {
+        conversation: key("u7003"),
+        client_id: "sched-bad".into(),
+        text: "Hidden last seen".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
+            ..protocol::Outgoing::default()
+        },
+    });
+    assert!(matches!(hidden, Response::Sent { .. }), "expected Sent, got {hidden:?}");
     let failed = world.until("when-online refused for hidden last seen", || {
         world
             .messages("u7003")
@@ -4391,8 +4385,13 @@ fn delete_modes_admin_batch_participant_history_and_report_spam() {
 
     // Supergroup/forum with admin rights advertises delete_others, refuses DeleteScope::Me,
     // and deletes another member's message via channels.deleteMessages.
+    // The topic's posts are not on the forum row. Open it so message 41 is stored before
+    // the delete is asked: a missing row is "no such message", and the channel rule never runs.
     let workshop = world.conversation("c9002").expect("Workshop row");
     assert!(workshop.rights.delete_others, "admin forum must set delete_others: {:?}", workshop.rights);
+    world.messages("c9002");
+    world.until("the tools topic", || world.conversation("c9002_31"));
+    world.until("the topic's history", || world.message("c9002_31", "41"));
     match world.ask(Request::Delete {
         conversation: key("c9002_31"),
         message_id: "41".into(),
