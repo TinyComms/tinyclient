@@ -10,6 +10,7 @@
 //! the user owns, one visible member window, the voice states of the servers. Trees, people and
 //! messages go to the store as READY and the events arrive.
 
+mod account;
 mod audit;
 mod automod;
 mod admin;
@@ -715,6 +716,8 @@ struct State {
     renewed: HashMap<String, String>,
     /// Our plan (`premium_type`), which says what may be sent.
     premium: u8,
+    /// The authentication session, distinct from the resumable gateway session.
+    auth_session_id_hash: Option<String>,
     /// `true` only when Discord's sensitive-media filter is set to Show (`0`); otherwise flagged media is blurred.
     show_explicit_media: bool,
     /// Friends' status emoji and what they are doing, as their presence last said, so a voice
@@ -3923,6 +3926,11 @@ impl Discord {
                     reset_channel.as_deref(),
                 ),
             ),
+            Command::ActiveSessions { reply } => answer(reply, self.active_sessions()),
+            Command::EndSession { session_id, reply } => answer(reply, self.end_session(&session_id)),
+            Command::EndOtherDiscordSessions { reply } => answer(reply, self.end_other_sessions()),
+            Command::DiscordAccountEntries { list, reply } => answer(reply, self.account_entries(list)),
+            Command::RemoveDiscordAccountEntry { target, reply } => answer(reply, self.remove_account_entry(target)),
             Command::GetNetworkPrivacy { reply } => answer(reply, self.get_network_privacy()),
             Command::SetNetworkPrivacy { privacy, reply } => answer(reply, self.set_network_privacy(privacy)),
             Command::SetSpacePrivacy { space_id, privacy, reply } => answer(reply, self.set_space_privacy(&space_id, privacy)),

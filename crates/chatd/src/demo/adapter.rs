@@ -1400,7 +1400,10 @@ impl Demo {
             Command::SavedDialogs { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EndSession { reply, .. }
+            | Command::EndOtherDiscordSessions { reply }
+            | Command::RemoveDiscordAccountEntry { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DiscordAccountEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ChannelThreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

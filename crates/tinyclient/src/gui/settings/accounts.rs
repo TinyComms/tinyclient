@@ -170,13 +170,16 @@ impl SettingsWindow {
                     group = group.child(self.telegram_call_privacy_rows(account, ix, cx));
                     group = group.child(self.telegram_download_rows(account, ix, cx));
                 }
-                if network == Network::Discord && account.link == Link::Connected {
-                    group = group.child(self.discord_privacy_rows(account, ix, cx));
+                if network == Network::Discord {
+                    group = group.child(self.discord_account_rows(account, ix, cx));
+                    if account.link == Link::Connected {
+                        group = group.child(self.discord_privacy_rows(account, ix, cx));
+                    }
                 }
                 if account.can.notify_defaults && account.link == Link::Connected {
                     group = group.child(self.notify_defaults_rows(account, ix, cx));
                 }
-                if account.can.active_sessions && account.link == Link::Connected {
+                if network == Network::Telegram && account.can.active_sessions && account.link == Link::Connected {
                     group = group.child(self.active_sessions_rows(account, ix, cx));
                 }
             }

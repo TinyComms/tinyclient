@@ -1884,7 +1884,7 @@ pub struct Capabilities {
     /// This account supports browsing Saved Messages grouped by source chat and reaction tags (Telegram).
     #[serde(default, skip_serializing_if = "is_false")]
     pub saved_subdialogs: bool,
-    /// This account supports listing active signed-in devices/sessions and ending another session (Telegram).
+    /// This account supports listing active signed-in devices and ending another session.
     #[serde(default, skip_serializing_if = "is_false")]
     pub active_sessions: bool,
     /// This account supports jumping to unread mentions and reactions per conversation (Telegram).
@@ -1972,7 +1972,7 @@ pub struct SavedTag {
     pub count: u32,
 }
 
-/// One active signed-in device/session on an account (`account.getAuthorizations`).
+/// One active signed-in device/session on an account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSession {
     /// Opaque session identifier (`"0"` for the current session on Telegram).
@@ -1989,6 +1989,27 @@ pub struct ActiveSession {
     pub last_active: i64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub current: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordAccountList {
+    AuthorizedApps,
+    Connections,
+}
+
+/// The identity of a revocable Discord authorization or connection, never its credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiscordAccountEntryId {
+    AuthorizedApp { id: String },
+    Connection { provider: String, id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordAccountEntry {
+    pub target: DiscordAccountEntryId,
+    pub name: String,
 }
 
 /// Which unread markers to list or clear in a conversation (`UnreadItems` / `MarkUnreadItemsRead`).

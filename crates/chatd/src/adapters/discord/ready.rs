@@ -46,6 +46,8 @@ pub struct Ready<'a> {
     user: User,
     session_id: String,
     #[serde(default)]
+    auth_session_id_hash: Option<String>,
+    #[serde(default)]
     resume_gateway_url: Option<String>,
     /// Every user the rest of the payload names by id, when the session asked for that.
     #[serde(default)]
@@ -1258,6 +1260,7 @@ impl Discord {
             profile_server: premium > 0,
             mentions_history: true,
             manage_space_folders: true,
+            active_sessions: true,
             ..Default::default()
         }
     }
@@ -1326,6 +1329,7 @@ impl Discord {
                 id: ready.session_id.clone(),
                 url,
             });
+            state.auth_session_id_hash = ready.auth_session_id_hash;
             state.me = me.clone();
             state.verified = ready.user.verified;
             state.phone = ready.user.phone;

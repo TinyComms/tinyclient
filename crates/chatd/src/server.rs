@@ -7146,6 +7146,24 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::EndOtherDiscordSessions { account } => {
+                match self.ask(&account, |reply| Command::EndOtherDiscordSessions { reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DiscordAccountEntries { account, list } => {
+                match self.ask(&account, |reply| Command::DiscordAccountEntries { list, reply }) {
+                    Ok(entries) => Response::DiscordAccountEntries { entries },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RemoveDiscordAccountEntry { account, target } => {
+                match self.ask(&account, |reply| Command::RemoveDiscordAccountEntry { target, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::UnreadItems { conversation, kind, limit } => {
                 let account = conversation.account();
                 let conversation_id = conversation.id;

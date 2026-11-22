@@ -449,7 +449,9 @@ impl Discord {
     }
 
     fn forget_session(&self) {
-        self.state.lock().unwrap().session = None;
+        let mut state = self.state.lock().unwrap();
+        state.session = None;
+        state.auth_session_id_hash = None;
         self.sequence.store(0, Ordering::Relaxed);
     }
 
