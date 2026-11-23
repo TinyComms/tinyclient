@@ -542,6 +542,18 @@ struct PollComposer {
     duration_secs: Option<u32>,
 }
 
+/// Inline location sharing panel for Telegram (#452):
+/// - Phone: "Send current location" or explicit live duration choice (15m / 1h / 8h / until turned off),
+///   plus optional proximity alert radius in direct chats. Never starts without explicit chat + duration.
+/// - Desktop: honest one-time typed coordinates only, never estimated from IP.
+struct LocationComposer {
+    coords: Entity<TextInput>,
+    proximity: Entity<TextInput>,
+    selected_period: Option<u32>,
+    error: Option<String>,
+    sending: bool,
+}
+
 struct ThreadComposer {
     name: Entity<TextInput>,
     first_message: Entity<TextInput>,
@@ -730,6 +742,8 @@ pub struct Composer {
     pending_file: Option<(Key, String)>,
     /// Inline poll creation form when the user clicks "Create poll".
     poll_composer: Option<PollComposer>,
+    /// Inline location / live-location sharing panel on Telegram (#452).
+    location_composer: Option<LocationComposer>,
     /// Inline Discord thread creation form when the user clicks "Create thread".
     thread_composer: Option<ThreadComposer>,
     /// Inline Discord thread management panel when the user clicks "Thread settings".
@@ -989,6 +1003,7 @@ impl Composer {
             held_files: crate::tiny_attach::Holds::default(),
             pending_file: None,
             poll_composer: None,
+            location_composer: None,
             thread_composer: None,
             thread_settings: None,
             send_as: HashMap::new(),
@@ -3525,6 +3540,288 @@ impl Composer {
         )
     }
 
+    fn toggle_location_composer(&mut self, cx: &mut Context<Self>) {
+        if self.location_composer.is_some() {
+            self.location_composer = None;
+            cx.notify();
+            return;
+        }
+        let coords = cx.new(|cx| TextInput::new("Latitude, Longitude (e.g. 37.7749, -122.4194)", cx));
+        let proximity = cx.new(|cx| TextInput::new("Proximity alert radius in meters (optional)", cx));
+        self.location_composer = Some(LocationComposer {
+            coords,
+            proximity,
+            selected_period: None,
+            error: None,
+            sending: false,
+        });
+        cx.notify();
+    }
+
+    fn resolve_location_point(&self, cx: &Context<Self>, allow_device_gps: bool) -> Result<protocol::GeoPoint, String> {
+        let Some(form) = self.location_composer.as_ref() else {
+            return Err("Location panel is closed.".to_owned());
+        };
+        let typed = form.coords.read(cx).text().trim().to_owned();
+        if !typed.is_empty() {
+            return protocol::GeoPoint::parse_typed(&typed)
+                .ok_or_else(|| "Enter valid coordinates as lat, lon (for example 37.7749, -122.4194).".to_owned());
+        }
+        if allow_device_gps {
+            if let Some(provider) = protocol::location::provider() {
+                return provider.current_location();
+            }
+            return Err("No device GPS fix is available. Enter coordinates as lat, lon.".to_owned());
+        }
+        Err("Enter coordinates as lat, lon. tinyclient never estimates your location from your IP.".to_owned())
+    }
+
+    fn submit_one_time_location(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        let phone = crate::gui::phone::active();
+        let point = match self.resolve_location_point(cx, phone) {
+            Ok(pt) => pt,
+            Err(why) => {
+                if let Some(form) = self.location_composer.as_mut() {
+                    form.error = Some(why);
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let reply_to = self.reply.as_ref().map(|r| r.id.clone());
+        let client_id = format!("loc{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+        if let Some(form) = self.location_composer.as_mut() {
+            form.sending = true;
+            form.error = None;
+        }
+        cx.notify();
+
+        let conv = target.key;
+        cx.spawn(async move |this, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    ask(&Request::SendLocation {
+                        conversation: conv,
+                        client_id,
+                        point,
+                        reply_to,
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(Response::Ok) => {
+                        this.location_composer = None;
+                        this.reply = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        if let Some(form) = this.location_composer.as_mut() {
+                            form.sending = false;
+                            form.error = Some(detail);
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(form) = this.location_composer.as_mut() {
+                            form.sending = false;
+                            form.error = Some(err.to_string());
+                        }
+                    }
+                    _ => {
+                        this.location_composer = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_live_location(&mut self, period_secs: u32, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        let point = match self.resolve_location_point(cx, true) {
+            Ok(pt) => pt,
+            Err(why) => {
+                if let Some(form) = self.location_composer.as_mut() {
+                    form.error = Some(why);
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let proximity = if target.kind == ConversationKind::Direct {
+            self.location_composer
+                .as_ref()
+                .and_then(|f| f.proximity.read(cx).text().trim().parse::<u32>().ok())
+                .filter(|&r| r > 0)
+        } else {
+            None
+        };
+        let reply_to = self.reply.as_ref().map(|r| r.id.clone());
+        let client_id = format!("live{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+        if let Some(form) = self.location_composer.as_mut() {
+            form.sending = true;
+            form.error = None;
+        }
+        cx.notify();
+
+        let conv = target.key;
+        cx.spawn(async move |this, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    ask(&Request::StartLiveLocation {
+                        conversation: conv,
+                        client_id,
+                        point,
+                        period_secs,
+                        proximity_alert_radius: proximity,
+                        reply_to,
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(Response::LiveLocation { .. }) => {
+                        this.location_composer = None;
+                        this.reply = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        if let Some(form) = this.location_composer.as_mut() {
+                            form.sending = false;
+                            form.error = Some(detail);
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(form) = this.location_composer.as_mut() {
+                            form.sending = false;
+                            form.error = Some(err.to_string());
+                        }
+                    }
+                    _ => {
+                        this.location_composer = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn location_composer_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let form = self.location_composer.as_ref()?;
+        let target = self.target.as_ref()?;
+        let phone = crate::gui::phone::active();
+        let is_direct = target.kind == ConversationKind::Direct;
+
+        let heading = if phone {
+            format!("Share location in {}", target.title)
+        } else {
+            format!("Send coordinates to {}", target.title)
+        };
+        let note = if phone {
+            "Choose current location or pick a live duration. Live sharing never starts until you pick a chat and duration."
+        } else {
+            "Typed coordinates only — tinyclient never guesses your location from your IP."
+        };
+
+        let live_row = phone.then(|| {
+            let selected = form.selected_period;
+            let presets = protocol::LIVE_LOCATION_PRESETS.iter().enumerate().map(|(ix, &(secs, label))| {
+                let is_selected = selected == Some(secs);
+                button(
+                    ("live-loc-preset", ix),
+                    if is_selected { ButtonKind::Primary } else { ButtonKind::Secondary },
+                    label,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(f) = this.location_composer.as_mut() {
+                        f.selected_period = Some(secs);
+                        f.error = None;
+                    }
+                    cx.notify();
+                }))
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child("Share live location for:"))
+                .child(div().flex().flex_wrap().items_center().gap(px(6.)).children(presets))
+                .children(is_direct.then(|| {
+                    div()
+                        .px(px(8.))
+                        .py(px(5.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::canvas())
+                        .border_1()
+                        .border_color(theme::hairline())
+                        .type_ui()
+                        .child(form.proximity.clone())
+                }))
+                .children(selected.map(|secs| {
+                    button("live-loc-start", ButtonKind::Primary, if form.sending { "Starting…" } else { "Start live location" })
+                        .when(!form.sending, |b| b.on_click(cx.listener(move |this, _, _, cx| this.submit_live_location(secs, cx))))
+                }))
+        });
+
+        Some(
+            div()
+                .mb(px(6.))
+                .p(px(10.))
+                .rounded(px(theme::R_FLOAT))
+                .bg(theme::raised())
+                .border_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(heading))
+                .child(div().type_small().text_color(theme::text_faint()).child(note))
+                .child(
+                    div()
+                        .px(px(8.))
+                        .py(px(5.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::canvas())
+                        .border_1()
+                        .border_color(theme::hairline())
+                        .type_ui()
+                        .child(form.coords.clone()),
+                )
+                .children(live_row)
+                .children(form.error.as_ref().map(|err| {
+                    div().type_small().text_color(theme::danger()).child(err.clone())
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(button("loc-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                            this.location_composer = None;
+                            cx.notify();
+                        })))
+                        .child(
+                            button(
+                                "loc-send-once",
+                                ButtonKind::Primary,
+                                if form.sending {
+                                    "Sending…"
+                                } else if phone {
+                                    "Send current location"
+                                } else {
+                                    "Send location"
+                                },
+                            )
+                            .when(!form.sending, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_one_time_location(cx)))),
+                        ),
+                ),
+        )
+    }
+
     fn attach_files(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone().filter(|target| target.locked().is_none())
         else {
@@ -5399,6 +5696,17 @@ impl Composer {
                 .tooltip(tip("Attach files", Some("⌘U")))
                 .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
         });
+        let location_btn = (self.editing.is_none()
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|t| t.key.network == Network::Telegram))
+        .then(|| {
+            self.card_button("attach-location", Some("icons/pin.svg"), self.location_composer.is_some(), None)
+                .aria_label("Share location")
+                .tooltip(tip("Location", None))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_location_composer(cx)))
+        });
         let poll_btn = controls.poll.then(|| {
             self.card_button("create-poll", Some("icons/list.svg"), self.poll_composer.is_some(), None)
                 .aria_label("Create poll")
@@ -5567,6 +5875,7 @@ impl Composer {
                 .items_end()
                 .gap(px(2.))
                 .children(attach)
+                .children(location_btn)
                 .child(field)
                 .children(sim_btn)
                 .children(video_mode)
@@ -5574,7 +5883,7 @@ impl Composer {
                 .children(smile)
                 .child(send)
         } else {
-            let has_leading = controls.attach || poll_btn.is_some() || thread_btn.is_some();
+            let has_leading = controls.attach || location_btn.is_some() || poll_btn.is_some() || thread_btn.is_some();
             div()
                 .min_h(px(card_height() - 2.))
                 .pl(px(if has_leading { 5. } else { 12. }))
@@ -5583,6 +5892,7 @@ impl Composer {
                 .flex()
                 .items_end()
                 .children(attach.map(|attach| attach.mr(px(2.))))
+                .children(location_btn.map(|btn| btn.mr(px(2.))))
                 .children(poll_btn.map(|btn| btn.mr(px(2.))))
                 .children(thread_btn.map(|btn| btn.mr(px(2.))))
                 .child(field.when(has_leading, |field| field.ml(px(2.))))
@@ -6565,6 +6875,7 @@ impl Render for Composer {
             .children(self.ooo_banner(&target, cx))
             .children(self.send_options_bar(cx))
             .children(self.poll_composer_panel(cx))
+            .children(self.location_composer_panel(cx))
             .children(self.thread_composer_panel(cx))
             .children(self.thread_settings_panel(cx))
             .child(div().relative().children(undo).child(body).children(self.popover(cx)))

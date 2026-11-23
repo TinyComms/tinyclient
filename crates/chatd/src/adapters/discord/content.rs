@@ -1453,6 +1453,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         jump,
         media_unread: false,
         keyboard: None,
+        story: None,
     };
     (message, rich.files)
 }

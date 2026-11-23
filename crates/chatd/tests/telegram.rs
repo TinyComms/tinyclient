@@ -7061,3 +7061,278 @@ fn group_voice_chat_joins_muted_pages_participants_keepalives_mutes_speaks_and_l
     world.until("group call cleared", || current_call(&world).is_none().then_some(()));
     world.until("leaveGroupCall logged", || calls_log_contains(&world, "LeaveGroupCall").then_some(()));
 }
+
+#[test]
+fn stories_never_read_before_open_then_read_react_reply_and_forwarded_story() {
+    let world = World::signed_in();
+    world.connected();
+
+    // Sign-on fetched rings via stories.getAllStories, NEVER stories.readStories.
+    assert!(world.called("GetAllStories") >= 1, "sign-on should query story rings");
+    assert_eq!(world.called("ReadStories"), 0, "sign-on must never mark stories read");
+
+    // Listing a contact's stories via Request::Stories fetches GetPeerStories and still NEVER calls ReadStories.
+    let (rings, stories) = match world.ask(Request::Stories {
+        account: account(),
+        peer_id: Some("u7002".into()),
+    }) {
+        Response::Stories { rings, stories } => (rings, stories),
+        other => panic!("expected Stories response, got {other:?}"),
+    };
+    assert_eq!(world.called("GetPeerStories u7002"), 1);
+    assert_eq!(world.called("ReadStories"), 0, "fetching peer stories must never mark stories read");
+    let odalys_ring = rings.iter().find(|r| r.peer == key("u7002")).expect("Odalys ring present");
+    assert_eq!(odalys_ring.total, 2);
+    assert_eq!(odalys_ring.unseen, 2);
+    assert!(odalys_ring.close_friends);
+    assert_eq!(stories.len(), 2);
+    assert_eq!(stories[0].id, "301");
+    assert!(!stories[0].seen);
+    assert_eq!(stories[0].caption, "Morning ridge view");
+    assert_eq!(stories[1].id, "302");
+    assert!(!stories[1].seen);
+    assert!(stories[1].close_friends);
+
+    // Own story reports viewer count.
+    let (_, own_stories) = match world.ask(Request::Stories {
+        account: account(),
+        peer_id: Some("u7001".into()),
+    }) {
+        Response::Stories { rings, stories } => (rings, stories),
+        other => panic!("expected own Stories response, got {other:?}"),
+    };
+    assert_eq!(own_stories.len(), 1);
+    assert_eq!(own_stories[0].views_count, Some(14));
+    assert_eq!(world.called("ReadStories"), 0, "viewing own story metadata must not send ReadStories");
+
+    // Explicitly opening story 301 sends stories.readStories for 301 only.
+    assert_eq!(
+        world.ask(Request::ReadStory {
+            account: account(),
+            peer_id: "u7002".into(),
+            story_id: "301".into(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("ReadStories u7002 301"), 1);
+    let (rings_after_read, stories_after_read) = match world.ask(Request::Stories {
+        account: account(),
+        peer_id: Some("u7002".into()),
+    }) {
+        Response::Stories { rings, stories } => (rings, stories),
+        other => panic!("expected Stories after read, got {other:?}"),
+    };
+    let odalys_ring = rings_after_read.iter().find(|r| r.peer == key("u7002")).unwrap();
+    assert_eq!(odalys_ring.unseen, 1, "only story 302 should remain unseen");
+    assert!(stories_after_read[0].seen);
+    assert!(!stories_after_read[1].seen);
+
+    // React to story 301 via stories.sendReaction.
+    assert_eq!(
+        world.ask(Request::ReactStory {
+            account: account(),
+            peer_id: "u7002".into(),
+            story_id: "301".into(),
+            emoji: Some("🔥".into()),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("SendStoryReaction u7002 301 🔥"), 1);
+
+    // Reply privately to story 301 via inputReplyToStory.
+    let (reply_conv, reply_msg) = match world.ask(Request::ReplyStory {
+        account: account(),
+        peer_id: "u7002".into(),
+        story_id: "301".into(),
+        client_id: "sr-1".into(),
+        text: "Love that view!".into(),
+    }) {
+        Response::StoryReplied { conversation, message } => (conversation, message),
+        other => panic!("expected StoryReplied, got {other:?}"),
+    };
+    assert_eq!(reply_conv, key("u7002"));
+    assert_eq!(world.called("SendMessage u7002 Love that view! [reply-story=u7002:301]"), 1);
+    let reply_header = reply_msg.reply_to.as_ref().expect("story reply preserves ReplyTo");
+    assert!(reply_header.story);
+    assert_eq!(reply_header.id, "301");
+    assert_eq!(reply_header.snippet, "Story");
+
+    // Live updateStory adds story 303, and live updateReadStories marks up to 302 seen.
+    world.steer("story-new");
+    let rings_new = world.until("updateStory adds story 303", || {
+        match world.ask(Request::Stories { account: account(), peer_id: None }) {
+            Response::Stories { rings, .. } => rings
+                .into_iter()
+                .find(|r| r.peer == key("u7002") && r.total >= 3 && r.max_id == 303),
+            _ => None,
+        }
+    });
+    assert_eq!(rings_new.unseen, 2);
+
+    world.steer("story-read");
+    let rings_synced = world.until("updateReadStories advances max_read_id to 302", || {
+        match world.ask(Request::Stories { account: account(), peer_id: None }) {
+            Response::Stories { rings, .. } => rings
+                .into_iter()
+                .find(|r| r.peer == key("u7002") && r.max_read_id >= 302),
+            _ => None,
+        }
+    });
+    assert_eq!(rings_synced.unseen, 1, "only 303 should stay unseen after updateReadStories(302)");
+
+    // Forwarded story in chat hydrates media via stories.getStoriesByID (NOT generic Unsupported,
+    // and NEVER calls ReadStories).
+    let read_calls_before = world.called("ReadStories");
+    world.steer("forward-story");
+    let fwd = world.until("forwarded story hydrated in chat", || {
+        world.messages("u7002").into_iter().find(|m| m.story.is_some())
+    });
+    assert!(matches!(fwd.kind, MessageKind::Normal), "forwarded story must not fall back to Unsupported");
+    assert!(world.called("GetStoriesById u7002 301") >= 1, "forwarded story must hydrate via getStoriesByID");
+    assert_eq!(world.called("ReadStories"), read_calls_before, "hydrating forwarded story must not send ReadStories");
+    let shared = fwd.story.as_ref().unwrap();
+    assert_eq!(shared.story_id, "301");
+    assert_eq!(shared.caption, "Morning ridge view");
+    assert!(!shared.expired);
+    assert!(fwd.attachments.iter().any(|a| a.name == "Story"), "forwarded story renders media attachment with 'Story' label");
+}
+
+#[test]
+fn location_one_time_live_updates_stop_stop_all_and_restart_recovery() {
+    let mut world = World::signed_in();
+    world.connected();
+
+    // 1. One-time location via inputMediaGeoPoint.
+    let one_time = protocol::GeoPoint::from_deg(37.7749, -122.4194).unwrap().with_accuracy(Some(10));
+    assert_eq!(
+        world.ask(Request::SendLocation {
+            conversation: key("u7002"),
+            client_id: "loc-once-1".into(),
+            point: one_time,
+            reply_to: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("SendMedia u7002 geo-point:37.7749:-122.4194"), 1);
+    let once_msg = world.until("one-time location card stored", || {
+        world.messages("u7002").into_iter().find(|m| {
+            m.card.as_ref().is_some_and(|c| c.title == "Location" && c.text.contains("37.7749"))
+        })
+    });
+    assert!(once_msg.outgoing);
+
+    // 2. Start live location in direct chat (u7002) for 1 hour with 250m proximity alert radius.
+    let live_dm = match world.ask(Request::StartLiveLocation {
+        conversation: key("u7002"),
+        client_id: "loc-live-dm".into(),
+        point: one_time,
+        period_secs: 3_600,
+        proximity_alert_radius: Some(250),
+        reply_to: None,
+    }) {
+        Response::LiveLocation { share } => share,
+        other => panic!("expected LiveLocation for DM, got {other:?}"),
+    };
+    assert_eq!(live_dm.conversation, key("u7002"));
+    assert_eq!(live_dm.period_secs, 3_600);
+    assert_eq!(live_dm.proximity_alert_radius, Some(250));
+    assert_eq!(
+        world.called("SendMedia u7002 geo-live:stopped=false:period=3600:lat=37.7749:lon=-122.4194:prox=250"),
+        1
+    );
+
+    // 3. Start a second indefinite live location in a group (g8001): proximity alert must be omitted for non-DMs.
+    let live_group = match world.ask(Request::StartLiveLocation {
+        conversation: key("g8001"),
+        client_id: "loc-live-grp".into(),
+        point: one_time,
+        period_secs: protocol::LIVE_LOCATION_INDEFINITE,
+        proximity_alert_radius: Some(100),
+        reply_to: None,
+    }) {
+        Response::LiveLocation { share } => share,
+        other => panic!("expected LiveLocation for group, got {other:?}"),
+    };
+    assert!(live_group.is_indefinite());
+    assert_eq!(live_group.proximity_alert_radius, None, "proximity alert only applies to direct chats");
+    assert_eq!(
+        world.called("SendMedia g8001 geo-live:stopped=false:period=2147483647:lat=37.7749:lon=-122.4194:prox=0"),
+        1
+    );
+
+    // 4. Coordinate update via messages.editMessage (wait past the 50ms scripted rate-limit window).
+    sleep(Duration::from_millis(80));
+    let moved = protocol::GeoPoint::from_deg(37.7810, -122.4050).unwrap().with_heading(Some(45));
+    let updated = match world.ask(Request::UpdateLiveLocation {
+        conversation: key("u7002"),
+        message_id: live_dm.message_id.clone(),
+        point: moved,
+        proximity_alert_radius: None,
+    }) {
+        Response::LiveLocation { share } => share,
+        other => panic!("expected LiveLocation after update, got {other:?}"),
+    };
+    assert_eq!(updated.point.lat_e7, moved.lat_e7);
+    assert_eq!(
+        world.called(&format!(
+            "EditMessage u7002 {} media=geo-live:stopped=false:period=3600:lat=37.7810:lon=-122.4050:prox=250",
+            live_dm.message_id
+        )),
+        1
+    );
+
+    // 5. Restart chatd and verify BOTH active live shares recover from Telegram via GetMessages.
+    world.restart();
+    world.connected();
+    let recovered = match world.ask(Request::ActiveLiveLocations { account: Some(account()) }) {
+        Response::LiveLocations { shares } => shares,
+        other => panic!("expected LiveLocations after restart, got {other:?}"),
+    };
+    assert_eq!(recovered.len(), 2, "both live shares must survive chatd restart: {recovered:?}");
+    assert!(recovered.iter().any(|s| s.conversation == key("u7002") && s.message_id == live_dm.message_id));
+    assert!(recovered.iter().any(|s| s.conversation == key("g8001") && s.message_id == live_group.message_id));
+    assert!(world.called("GetMessages") >= 1, "reconnect must verify persisted live shares against Telegram");
+
+    // 6. Stop one chat explicitly (`stopped: true`).
+    assert_eq!(
+        world.ask(Request::StopLiveLocation {
+            conversation: key("u7002"),
+            message_id: live_dm.message_id.clone(),
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.called(&format!("EditMessage u7002 {} media=geo-live:stopped=true", live_dm.message_id)) >= 1,
+        "StopLiveLocation must send editMessage with stopped=true"
+    );
+    let remaining = match world.ask(Request::ActiveLiveLocations { account: Some(account()) }) {
+        Response::LiveLocations { shares } => shares,
+        other => panic!("expected LiveLocations after single stop, got {other:?}"),
+    };
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].conversation, key("g8001"));
+
+    // 7. Stop all remaining live shares.
+    assert_eq!(
+        world.ask(Request::StopAllLiveLocations { account: None }),
+        Response::Ok
+    );
+    assert!(
+        world.called(&format!("EditMessage g8001 {} media=geo-live:stopped=true", live_group.message_id)) >= 1,
+        "StopAllLiveLocations must stop remaining shares with stopped=true"
+    );
+    let after_stop_all = match world.ask(Request::ActiveLiveLocations { account: None }) {
+        Response::LiveLocations { shares } => shares,
+        other => panic!("expected empty LiveLocations after stop all, got {other:?}"),
+    };
+    assert!(after_stop_all.is_empty());
+
+    // 8. Restart again: stopped shares stay stopped and are never resurrected.
+    world.restart();
+    world.connected();
+    let after_second_restart = match world.ask(Request::ActiveLiveLocations { account: None }) {
+        Response::LiveLocations { shares } => shares,
+        other => panic!("expected empty LiveLocations after second restart, got {other:?}"),
+    };
+    assert!(after_second_restart.is_empty());
+}

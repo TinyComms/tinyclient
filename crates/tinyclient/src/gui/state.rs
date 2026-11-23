@@ -196,7 +196,9 @@ impl Dirty {
             | Change::Open { .. }
             | Change::Tiny { .. }
             | Change::InteractionModal { .. }
-            | Change::InteractionFailed { .. } => {}
+            | Change::InteractionFailed { .. }
+            | Change::Stories { .. }
+            | Change::LiveLocations { .. } => {}
             Change::Folders { .. } => self.spaces = true,
         }
     }
@@ -249,6 +251,8 @@ pub struct Shell {
     pub(super) composer_state: composer::State,
     #[allow(dead_code)]
     pub(super) call_state: call::State,
+    pub(super) story_state: super::stories::State,
+    pub(super) live_location_state: super::live_location::State,
     pub(super) meeting_form: Option<super::meetings::Form>,
     /// The voice message or audio file playing, across conversations.
     pub(super) playing_state: super::playing::State,
@@ -346,6 +350,8 @@ impl Shell {
             people_state: people::State::default(),
             composer_state: composer::State::default(),
             call_state: call::State::default(),
+            story_state: super::stories::State::default(),
+            live_location_state: super::live_location::State::default(),
             meeting_form: None,
             playing_state: super::playing::State::default(),
             tiny_state: super::tiny::State::new(cx),
@@ -678,6 +684,8 @@ impl Shell {
         };
         self.reload(dirty, cx);
         self.load_directs(cx);
+        self.load_stories_for_accounts(cx);
+        self.load_active_live_locations(cx);
         self.tiny_e2ee_load(cx);
     }
 
@@ -711,6 +719,8 @@ impl Shell {
                 Change::Settings => self.load_settings(cx),
                 Change::Open { conversation } => self.open_from_notification(conversation, cx),
                 Change::Meter { level } => super::settings::meter(*level, cx),
+                Change::Stories { account, rings } => self.stories_changed(account, rings, cx),
+                Change::LiveLocations { account, shares } => self.live_locations_changed(account, shares.clone(), cx),
                 _ => {}
             }
             self.composer_changed(change, cx);

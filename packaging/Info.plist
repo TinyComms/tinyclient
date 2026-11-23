@@ -32,5 +32,9 @@
 	<string>NSApplication</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>tinyclient uses the microphone so the people in your call can hear you.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>tinyclient uses your location only when you explicitly choose to share your location in a chat.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>tinyclient updates your live location only while you have an active live location share running, and stops as soon as you stop sharing or it expires.</string>
 </dict>
 </plist>

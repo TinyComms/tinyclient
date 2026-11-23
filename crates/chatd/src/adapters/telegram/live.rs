@@ -332,6 +332,9 @@ fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, cove
     let Some((conversation, mut mapped)) = placed(account, raw) else {
         return;
     };
+    if let tl::enums::Message::Message(msg) = raw {
+        super::location::observe_message(account, &conversation, msg);
+    }
     if let tl::enums::Message::Service(svc) = raw {
         match &svc.action {
             tl::enums::MessageAction::SetMessagesTtl(ttl) => {
@@ -834,6 +837,8 @@ pub(super) fn apply(account: &Account, update: &Update) {
         Update::GroupCall(gc) => super::group_call::on_group_call(account, gc),
         Update::GroupCallParticipants(gp) => super::group_call::on_participants(account, gp),
         Update::GroupCallConnection(conn) => super::group_call::on_connection(account, conn),
+        Update::Story(story) => super::stories::apply_story(account, story),
+        Update::ReadStories(read) => super::stories::apply_read(account, read),
         // A chat joined, left or changed: what changed came with the update's chats, which
         // `learn` has already written.
         _ => {}
@@ -890,6 +895,7 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
             wants: Vec::new(),
             group: None,
             members: Vec::new(),
+            pending_story: None,
         };
         finish(account, conversation, &mut mapped, &HashMap::new());
         return Some(mapped.message);

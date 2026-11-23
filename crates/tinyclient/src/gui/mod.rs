@@ -25,6 +25,7 @@ mod hotkeys;
 mod input;
 mod keymap;
 mod layout;
+mod live_location;
 // `pub(crate)` so the mobile layer can read `lock::hides_switcher()`.
 pub(crate) mod lock;
 mod logs;
@@ -42,6 +43,7 @@ mod shortcuts;
 #[cfg(any(feature = "gui-shot", feature = "demo"))]
 pub(crate) mod shot_demo;
 mod state;
+mod stories;
 pub(in crate::gui) mod streamer;
 mod theme;
 mod tiny;

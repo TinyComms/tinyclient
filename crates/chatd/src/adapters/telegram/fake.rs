@@ -825,6 +825,10 @@ struct World {
     /// Scripted group/channel video chats for `#462`, `#465`, `#461`.
     group_calls: HashMap<Who, FakeGroupCall>,
     next_group_call_id: i64,
+    /// Active stories per peer: `(max_read_id, items)` for Wave 15C (#540).
+    stories: HashMap<Who, (i32, Vec<tl::types::StoryItem>)>,
+    /// Story reply header pending for the current `messages.sendMessage` with `InputReplyTo::Story`.
+    pending_reply_story: Option<(Who, i32)>,
 }
 
 #[derive(Clone)]
@@ -1120,7 +1124,79 @@ impl World {
                 map
             },
             next_group_call_id: 88_100,
+            stories: HashMap::new(),
+            pending_reply_story: None,
         };
+        // Seed Odalys with two active stories (unseen) and Mira with one own story (views=14).
+        let now_s = crate::hub::now() as i32;
+        let story_item = |id: i32, out: bool, close_friends: bool, caption: &str, views: Option<tl::enums::StoryViews>| {
+            tl::types::StoryItem {
+                pinned: false,
+                public: true,
+                close_friends,
+                min: false,
+                noforwards: false,
+                edited: false,
+                contacts: false,
+                selected_contacts: false,
+                out,
+                id,
+                date: now_s - 600,
+                from_id: None,
+                fwd_from: None,
+                expire_date: now_s + 86_400,
+                caption: Some(caption.to_owned()),
+                entities: None,
+                media: tl::types::MessageMediaPhoto {
+                    spoiler: false,
+                    live_photo: false,
+                    photo: Some(ridge()),
+                    ttl_seconds: None,
+                    video: None,
+                }
+                .into(),
+                media_areas: None,
+                privacy: None,
+                views,
+                sent_reaction: None,
+                albums: None,
+                music: None,
+            }
+        };
+        world.stories.insert(
+            Who::User(ODALYS),
+            (
+                0,
+                vec![
+                    story_item(301, false, false, "Morning ridge view", None),
+                    story_item(302, false, true, "Coffee at base camp", None),
+                ],
+            ),
+        );
+        world.stories.insert(
+            Who::User(ME),
+            (
+                401,
+                vec![story_item(
+                    401,
+                    true,
+                    false,
+                    "Packing for the summit",
+                    Some(
+                        tl::types::StoryViews {
+                            has_viewers: true,
+                            views_count: 14,
+                            forwards_count: Some(1),
+                            reactions: None,
+                            reactions_count: Some(3),
+                            recent_viewers: Some(vec![ODALYS]),
+                        }
+                        .into(),
+                    ),
+                )],
+            ),
+        );
+        world.load_persisted_live_geo();
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
         world.store(None, message(odalys, 11, ME, t0() - 240, "Yes. I'll bring the stove."));
@@ -1263,6 +1339,14 @@ impl World {
                 let mut header: tl::types::MessageReplyHeader = blank(&[&put(0u32)]);
                 header.reply_to_msg_id = Some(reply_to_msg_id);
                 sent.reply_to = Some(header.into());
+            } else if let Some((story_peer, story_id)) = self.pending_reply_story.take() {
+                sent.reply_to = Some(
+                    tl::types::MessageReplyStoryHeader {
+                        peer: story_peer.peer(),
+                        story_id,
+                    }
+                    .into(),
+                );
             }
             if let Some(topic) = topic {
                 sent = in_topic(sent, topic);
@@ -1280,6 +1364,9 @@ impl World {
                 continue;
             }
             self.store(topic, sent.clone());
+            if matches!(sent.media, Some(tl::enums::MessageMedia::GeoLive(_))) {
+                self.save_persisted_live_geo();
+            }
             // Telegram answers a send with the id it gave and the message itself, and the
             // library hands the same two to the update stream.
             let named: tl::enums::Update = tl::types::UpdateMessageId { id, random_id }.into();
@@ -2437,6 +2524,76 @@ impl World {
                 } else {
                     vec![new(message)]
                 }
+            }
+            "forward-story" => {
+                let mut msg = message(odalys, 45, ODALYS, crate::hub::now() as i32, "");
+                msg.media = Some(
+                    tl::types::MessageMediaStory {
+                        via_mention: false,
+                        peer: Who::User(ODALYS).peer(),
+                        id: 301,
+                        story: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            "story-new" => {
+                let now_s = crate::hub::now() as i32;
+                let item = tl::types::StoryItem {
+                    pinned: false,
+                    public: true,
+                    close_friends: false,
+                    min: false,
+                    noforwards: false,
+                    edited: false,
+                    contacts: false,
+                    selected_contacts: false,
+                    out: false,
+                    id: 303,
+                    date: now_s,
+                    from_id: None,
+                    fwd_from: None,
+                    expire_date: now_s + 86_400,
+                    caption: Some("Evening trail".to_owned()),
+                    entities: None,
+                    media: tl::types::MessageMediaPhoto {
+                        spoiler: false,
+                        live_photo: false,
+                        photo: Some(ridge()),
+                        ttl_seconds: None,
+                        video: None,
+                    }
+                    .into(),
+                    media_areas: None,
+                    privacy: None,
+                    views: None,
+                    sent_reaction: None,
+                    albums: None,
+                    music: None,
+                };
+                let entry = self.stories.entry(odalys).or_insert((0, Vec::new()));
+                entry.1.retain(|s| s.id != 303);
+                entry.1.push(item.clone());
+                vec![update(
+                    tl::types::UpdateStory {
+                        peer: odalys.peer(),
+                        story: tl::enums::StoryItem::Item(Box::new(item)),
+                    }
+                    .into(),
+                )]
+            }
+            "story-read" => {
+                let entry = self.stories.entry(odalys).or_insert((0, Vec::new()));
+                entry.0 = entry.0.max(302);
+                vec![update(
+                    tl::types::UpdateReadStories {
+                        peer: odalys.peer(),
+                        max_id: 302,
+                    }
+                    .into(),
+                )]
             }
             "delete" => {
                 if let Some(held) = self.messages.get_mut(&odalys.text()) {
@@ -5202,13 +5359,18 @@ impl World {
                     return Err(rpc(403, "ALLOW_PAYMENT_REQUIRED", Some(price as u32)));
                 }
             }
-            let (topic, reply) = match &request.reply_to {
-                Some(tl::enums::InputReplyTo::Message(reply)) if peer == Who::Channel(WORKSHOP) => (Some(reply.top_msg_id.unwrap_or(reply.reply_to_msg_id)), None),
-                Some(tl::enums::InputReplyTo::Message(reply)) => (None, Some(reply.reply_to_msg_id)),
-                _ => (None, None),
+            let (topic, reply, reply_story) = match &request.reply_to {
+                Some(tl::enums::InputReplyTo::Message(reply)) if peer == Who::Channel(WORKSHOP) => (Some(reply.top_msg_id.unwrap_or(reply.reply_to_msg_id)), None, None),
+                Some(tl::enums::InputReplyTo::Message(reply)) => (None, Some(reply.reply_to_msg_id), None),
+                Some(tl::enums::InputReplyTo::Story(story)) => (None, None, Some((input_who(&story.peer), story.story_id))),
+                _ => (None, None, None),
             };
             let options = [("silent", request.silent), ("no-preview", request.no_webpage), ("scheduled", request.schedule_date.is_some())];
             let mut options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
+            if let Some((story_peer, story_id)) = reply_story {
+                options.push_str(&format!(" [reply-story={}:{story_id}]", story_peer.text()));
+                self.pending_reply_story = Some((story_peer, story_id));
+            }
             if let Some(stars) = request.allow_paid_stars {
                 options.push_str(&format!(" [stars={stars}]"));
             }
@@ -5266,12 +5428,28 @@ impl World {
                 edited.message = text;
             }
             edited.entities = request.entities.clone();
-            if let Some((_, media)) = replaced {
+            if let Some((_, mut media)) = replaced {
+                if let (
+                    Some(tl::enums::MessageMedia::GeoLive(prev)),
+                    tl::enums::MessageMedia::GeoLive(ref mut next),
+                ) = (&edited.media, &mut media)
+                {
+                    if let Some(tl::enums::InputMedia::GeoLive(req_live)) = &request.media {
+                        if req_live.stopped {
+                            next.period = 0;
+                        } else if req_live.period.is_none() {
+                            next.period = prev.period;
+                        }
+                    }
+                }
                 edited.media = Some(media);
             }
             edited.invert_media = request.invert_media;
             edited.edit_date = Some(crate::hub::now() as i32);
             self.store(None, edited.clone());
+            if matches!(edited.media, Some(tl::enums::MessageMedia::GeoLive(_))) {
+                self.save_persisted_live_geo();
+            }
             let upd: tl::enums::Update = match peer {
                 Who::Channel(_) => tl::types::UpdateEditChannelMessage { message: edited.into(), pts: 0, pts_count: 0 }.into(),
                 _ => tl::types::UpdateEditMessage { message: edited.into(), pts: 0, pts_count: 0 }.into(),
@@ -7456,7 +7634,262 @@ impl World {
             ));
             return Some(answer(true));
         }
+        if asked::<f::stories::GetAllStories>(body).is_some() {
+            self.log("GetAllStories");
+            let mut peer_stories = Vec::new();
+            for (&who, (max_read_id, items)) in &self.stories {
+                if items.is_empty() {
+                    continue;
+                }
+                peer_stories.push(
+                    tl::types::PeerStories {
+                        peer: who.peer(),
+                        max_read_id: (*max_read_id > 0).then_some(*max_read_id),
+                        stories: items
+                            .iter()
+                            .cloned()
+                            .map(|item| tl::enums::StoryItem::Item(Box::new(item)))
+                            .collect(),
+                    }
+                    .into(),
+                );
+            }
+            return Some(answer(tl::enums::stories::AllStories::Stories(
+                tl::types::stories::AllStories {
+                    has_more: false,
+                    count: peer_stories.len() as i32,
+                    state: "s1".to_owned(),
+                    peer_stories,
+                    chats: chats(),
+                    users: users(),
+                    stealth_mode: tl::types::StoriesStealthMode {
+                        active_until_date: None,
+                        cooldown_until_date: None,
+                    }
+                    .into(),
+                },
+            )));
+        }
+        if let Some(request) = asked::<f::stories::GetPeerStories>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetPeerStories {}", peer.text()));
+            let (max_read_id, items) = self
+                .stories
+                .get(&peer)
+                .cloned()
+                .unwrap_or((0, Vec::new()));
+            return Some(answer(tl::enums::stories::PeerStories::Stories(
+                tl::types::stories::PeerStories {
+                    stories: tl::types::PeerStories {
+                        peer: peer.peer(),
+                        max_read_id: (max_read_id > 0).then_some(max_read_id),
+                        stories: items
+                            .into_iter()
+                            .map(|item| tl::enums::StoryItem::Item(Box::new(item)))
+                            .collect(),
+                    }
+                    .into(),
+                    chats: chats(),
+                    users: users(),
+                },
+            )));
+        }
+        if let Some(request) = asked::<f::stories::GetStoriesById>(body) {
+            let peer = input_who(&request.peer);
+            let ids_s: Vec<String> = request.id.iter().map(i32::to_string).collect();
+            self.log(&format!("GetStoriesById {} {}", peer.text(), ids_s.join(",")));
+            let items = self
+                .stories
+                .get(&peer)
+                .map(|(_, list)| list.as_slice())
+                .unwrap_or(&[]);
+            let found: Vec<tl::enums::StoryItem> = request
+                .id
+                .iter()
+                .map(|&id| {
+                    if let Some(item) = items.iter().find(|s| s.id == id) {
+                        tl::enums::StoryItem::Item(Box::new(item.clone()))
+                    } else {
+                        tl::enums::StoryItem::Deleted(tl::types::StoryItemDeleted { id })
+                    }
+                })
+                .collect();
+            return Some(answer(tl::enums::stories::Stories::Stories(
+                tl::types::stories::Stories {
+                    count: found.len() as i32,
+                    stories: found,
+                    pinned_to_top: None,
+                    chats: chats(),
+                    users: users(),
+                },
+            )));
+        }
+        if let Some(request) = asked::<f::stories::ReadStories>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("ReadStories {} {}", peer.text(), request.max_id));
+            let mut read_ids = Vec::new();
+            if let Some((max_read_id, items)) = self.stories.get_mut(&peer) {
+                *max_read_id = (*max_read_id).max(request.max_id);
+                for item in items.iter() {
+                    if item.id <= *max_read_id {
+                        read_ids.push(item.id);
+                    }
+                }
+            }
+            let _ = events.send(update(
+                tl::types::UpdateReadStories {
+                    peer: peer.peer(),
+                    max_id: request.max_id,
+                }
+                .into(),
+            ));
+            return Some(answer(read_ids));
+        }
+        if let Some(request) = asked::<f::stories::SendReaction>(body) {
+            let peer = input_who(&request.peer);
+            let emoji = match &request.reaction {
+                tl::enums::Reaction::Emoji(e) => e.emoticon.clone(),
+                tl::enums::Reaction::CustomEmoji(c) => format!("e{}", c.document_id),
+                tl::enums::Reaction::Paid => "paid".to_owned(),
+                tl::enums::Reaction::Empty => "clear".to_owned(),
+            };
+            self.log(&format!("SendStoryReaction {} {} {}", peer.text(), request.story_id, emoji));
+            if let Some((_, items)) = self.stories.get_mut(&peer) {
+                if let Some(item) = items.iter_mut().find(|s| s.id == request.story_id) {
+                    item.sent_reaction = match &request.reaction {
+                        tl::enums::Reaction::Empty => None,
+                        other => Some(other.clone()),
+                    };
+                }
+            }
+            return Some(answer(updates(Vec::new())));
+        }
+        if let Some(request) = asked::<f::messages::GetMessages>(body) {
+            let wanted: Vec<i32> = request
+                .id
+                .iter()
+                .filter_map(|id| match id {
+                    tl::enums::InputMessage::Id(one) => Some(one.id),
+                    _ => None,
+                })
+                .collect();
+            let ids_s: Vec<String> = wanted.iter().map(i32::to_string).collect();
+            self.log(&format!("GetMessages {}", ids_s.join(",")));
+            let mut found = Vec::new();
+            for id in wanted {
+                for held in self.messages.values() {
+                    if let Some(msg) = held.get(&id) {
+                        found.push(msg.clone());
+                        break;
+                    }
+                }
+            }
+            return Some(answer(tl::enums::messages::Messages::Messages(
+                tl::types::messages::Messages {
+                    messages: found,
+                    topics: Vec::new(),
+                    chats: chats(),
+                    users: users(),
+                },
+            )));
+        }
+        if let Some(request) = asked::<f::channels::GetMessages>(body) {
+            let peer = match &request.channel {
+                tl::enums::InputChannel::Channel(c) => Who::Channel(c.channel_id),
+                _ => Who::Channel(0),
+            };
+            let wanted: Vec<i32> = request
+                .id
+                .iter()
+                .filter_map(|id| match id {
+                    tl::enums::InputMessage::Id(one) => Some(one.id),
+                    _ => None,
+                })
+                .collect();
+            let ids_s: Vec<String> = wanted.iter().map(i32::to_string).collect();
+            self.log(&format!("ChannelGetMessages {} {}", peer.text(), ids_s.join(",")));
+            let found = self
+                .messages
+                .get(&peer.text())
+                .map(|held| wanted.iter().filter_map(|id| held.get(id).cloned()).collect())
+                .unwrap_or_default();
+            return Some(answer(tl::enums::messages::Messages::ChannelMessages(
+                tl::types::messages::ChannelMessages {
+                    inexact: false,
+                    pts: 1,
+                    count: 1,
+                    offset_id_offset: None,
+                    messages: found,
+                    topics: Vec::new(),
+                    chats: chats(),
+                    users: users(),
+                },
+            )));
+        }
         None
+    }
+
+    fn live_geo_path(&self) -> Option<PathBuf> {
+        let dir = self.calls.parent()?;
+        Some(dir.join("fake-live-geo.json"))
+    }
+
+    fn save_persisted_live_geo(&self) {
+        let Some(path) = self.live_geo_path() else { return };
+        let mut records: Vec<(String, i32, i32, f64, f64, i32, Option<i32>)> = Vec::new();
+        for (conv, held) in &self.messages {
+            for (&id, raw) in held {
+                if let tl::enums::Message::Message(m) = raw {
+                    if m.out {
+                        if let Some(tl::enums::MessageMedia::GeoLive(gl)) = &m.media {
+                            if let tl::enums::GeoPoint::Point(pt) = &gl.geo {
+                                records.push((
+                                    conv.clone(),
+                                    id,
+                                    m.date,
+                                    pt.lat,
+                                    pt.long,
+                                    gl.period,
+                                    gl.proximity_notification_radius,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(json) = serde_json::to_string(&records) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    fn load_persisted_live_geo(&mut self) {
+        let Some(path) = self.live_geo_path() else { return };
+        let Ok(json) = std::fs::read_to_string(path) else { return };
+        let Ok(records) = serde_json::from_str::<Vec<(String, i32, i32, f64, f64, i32, Option<i32>)>>(&json) else {
+            return;
+        };
+        for (conv, id, date, lat, long, period, prox) in records {
+            let Some((who, _)) = Who::parse(&conv) else { continue };
+            let mut m = message(who, id, ME, date, "");
+            m.media = Some(
+                tl::types::MessageMediaGeoLive {
+                    geo: tl::types::GeoPoint {
+                        long,
+                        lat,
+                        access_hash: 0,
+                        accuracy_radius: None,
+                    }
+                    .into(),
+                    heading: None,
+                    period,
+                    proximity_notification_radius: prox,
+                }
+                .into(),
+            );
+            self.next = self.next.max(id);
+            self.store(None, m);
+        }
     }
 }
 
@@ -7718,6 +8151,53 @@ fn held_media(media: &tl::enums::InputMedia, id: i32) -> (String, tl::enums::Mes
             }
             .into(),
         ),
+        tl::enums::InputMedia::GeoPoint(one) => {
+            let (lat, long, acc) = match &one.geo_point {
+                tl::enums::InputGeoPoint::Point(p) => (p.lat, p.long, p.accuracy_radius),
+                tl::enums::InputGeoPoint::Empty => (0.0, 0.0, None),
+            };
+            (
+                format!("geo-point:{lat:.4}:{long:.4}"),
+                tl::types::MessageMediaGeo {
+                    geo: tl::types::GeoPoint {
+                        long,
+                        lat,
+                        access_hash: 0,
+                        accuracy_radius: acc,
+                    }
+                    .into(),
+                }
+                .into(),
+            )
+        }
+        tl::enums::InputMedia::GeoLive(one) => {
+            let (lat, long, acc) = match &one.geo_point {
+                tl::enums::InputGeoPoint::Point(p) => (p.lat, p.long, p.accuracy_radius),
+                tl::enums::InputGeoPoint::Empty => (0.0, 0.0, None),
+            };
+            let period = if one.stopped { 0 } else { one.period.unwrap_or(3_600) };
+            (
+                format!(
+                    "geo-live:stopped={}:period={}:lat={lat:.4}:lon={long:.4}:prox={}",
+                    one.stopped,
+                    period,
+                    one.proximity_notification_radius.unwrap_or(0)
+                ),
+                tl::types::MessageMediaGeoLive {
+                    geo: tl::types::GeoPoint {
+                        long,
+                        lat,
+                        access_hash: 0,
+                        accuracy_radius: acc,
+                    }
+                    .into(),
+                    heading: one.heading,
+                    period,
+                    proximity_notification_radius: one.proximity_notification_radius,
+                }
+                .into(),
+            )
+        }
         _ => ("other".to_owned(), tl::enums::MessageMedia::Empty),
     }
 }
