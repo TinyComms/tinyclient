@@ -1484,8 +1484,15 @@ impl Demo {
             | Command::Watch(_)
             | Command::Wanted(_)
             | Command::WantedSpan { .. }
+            | Command::TelegramCallSignal { .. }
+            | Command::TelegramCallSpeaking { .. }
             | Command::Played { .. }
             | Command::Stop => {}
+            Command::GroupCallSchedule { reply, .. }
+            | Command::GroupCallStart { reply, .. }
+            | Command::GroupCallSubscribe { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
         }
     }
 }

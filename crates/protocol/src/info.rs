@@ -1335,6 +1335,9 @@ pub struct ConversationRights {
     /// Admin posts anonymously as the group/channel (`anonymous` admin right).
     #[serde(default, skip_serializing_if = "is_false")]
     pub anonymous: bool,
+    /// May start, schedule, or manage voice/video chats (Telegram `manage_call`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_call: bool,
 }
 
 impl ConversationRights {
@@ -1369,6 +1372,7 @@ impl ConversationRights {
     const VOICE_MUTE: i64 = 1 << 25;
     const VOICE_DEAFEN: i64 = 1 << 26;
     const VOICE_MOVE: i64 = 1 << 27;
+    const MANAGE_CALL: i64 = 1 << 28;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -1464,6 +1468,9 @@ impl ConversationRights {
         if self.anonymous {
             bits |= Self::ANONYMOUS;
         }
+        if self.manage_call {
+            bits |= Self::MANAGE_CALL;
+        }
         bits
     }
 
@@ -1497,6 +1504,7 @@ impl ConversationRights {
             view_admin_log: (bits & Self::VIEW_ADMIN_LOG) != 0,
             transfer_owner: (bits & Self::TRANSFER_OWNER) != 0,
             anonymous: (bits & Self::ANONYMOUS) != 0,
+            manage_call: (bits & Self::MANAGE_CALL) != 0,
         }
     }
 }

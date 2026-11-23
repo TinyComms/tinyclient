@@ -3372,7 +3372,7 @@ impl Pane {
             return None;
         }
         let open = self.open.as_ref()?;
-        let (key, kind, occupants) = self.shell.upgrade().and_then(|shell| {
+        let (key, kind, call_support, manage_call, occupants) = self.shell.upgrade().and_then(|shell| {
             let shell = shell.read(cx);
             let conv = shell.snapshot.as_ref()?.open.as_ref()?;
             if conv.key != open.key || conv.kind == protocol::ConversationKind::Voice {
@@ -3382,22 +3382,105 @@ impl Pane {
             if mine {
                 return None;
             }
-            let occ = conv.occupants.as_ref().filter(|o| o.total > 0)?;
-            Some((conv.key.clone(), conv.kind, occ.clone()))
+            let occ = conv.occupants.as_ref().filter(|o| o.active())?;
+            Some((conv.key.clone(), conv.kind, conv.call, conv.rights.manage_call, occ.clone()))
         })?;
-        let names: Vec<&str> = occupants.people.iter().take(3).map(|p| p.name.as_str()).collect();
-        let summary = if kind == protocol::ConversationKind::Group {
-            if names.is_empty() {
-                format!("{} in this call", occupants.total)
-            } else {
-                format!("{} in this call · {}", occupants.total, names.join(", "))
-            }
-        } else if names.is_empty() {
-            format!("Call in progress · {}", occupants.total)
-        } else {
-            format!("Call in progress · {}", names.join(", "))
-        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let summary = live_call_summary(key.network, kind, &occupants, now_unix);
         let shell = self.shell.clone();
+
+        if occupants.is_scheduled() {
+            let subscribed = occupants.subscribed;
+            let shell_sub = shell.clone();
+            let key_sub = key.clone();
+            let remind_label = if subscribed { "Reminder set" } else { "Notify me" };
+            let mut bar = div()
+                .absolute()
+                .left(px(self.metrics.inset))
+                .right(px(self.metrics.inset))
+                .bottom(px(10.))
+                .h(px(40.))
+                .px(px(12.))
+                .rounded(px(theme::R_CARD))
+                .bg(theme::raised())
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .size(px(26.))
+                        .rounded_full()
+                        .bg(theme::accent_soft())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::gui::components::glyph("icons/clock.svg", 13., theme::accent())),
+                )
+                .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text()).child(summary))
+                .child(
+                    div()
+                        .id("scheduled-call-subscribe")
+                        .flex_none()
+                        .h(px(26.))
+                        .px(px(10.))
+                        .rounded_full()
+                        .bg(if subscribed { theme::selected() } else { theme::accent_soft() })
+                        .text_color(if subscribed { theme::text() } else { theme::accent() })
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let _ = shell_sub.update(cx, |shell, cx| {
+                                shell.group_call_subscribe(key_sub.clone(), !subscribed, cx);
+                            });
+                        }))
+                        .child(remind_label),
+                );
+            if manage_call {
+                let shell_start = shell.clone();
+                let key_start = key.clone();
+                bar = bar.child(
+                    div()
+                        .id("scheduled-call-start")
+                        .flex_none()
+                        .h(px(26.))
+                        .px(px(12.))
+                        .rounded_full()
+                        .bg(theme::accent())
+                        .text_color(theme::on_accent())
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let _ = shell_start.update(cx, |shell, cx| shell.group_call_start(key_start.clone(), cx));
+                        }))
+                        .child("Start now"),
+                );
+            }
+            return Some(bar);
+        }
+
+        let avatars: Vec<gpui::Div> = occupants
+            .people
+            .iter()
+            .take(3)
+            .map(|p| crate::gui::components::Avatar::named(&p.name, 20.).build())
+            .collect();
+        let handoff = call_support == protocol::CallSupport::Handoff;
+        let join_label = if handoff {
+            format!("Open in {}", key.network.label())
+        } else {
+            "Join".to_owned()
+        };
         Some(
             div()
                 .absolute()
@@ -3423,6 +3506,9 @@ impl Pane {
                         .justify_center()
                         .child(crate::gui::components::glyph("icons/phone.svg", 13., theme::accent())),
                 )
+                .when(!avatars.is_empty(), |row| {
+                    row.child(div().flex().items_center().gap(px(2.)).children(avatars))
+                })
                 .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text()).child(summary))
                 .child(
                     div()
@@ -3439,9 +3525,15 @@ impl Pane {
                         .type_micro()
                         .font_weight(theme::SEMIBOLD)
                         .on_click(cx.listener(move |_, _, _, cx| {
-                            let _ = shell.update(cx, |shell, cx| shell.call_start(key.clone(), cx));
+                            let _ = shell.update(cx, |shell, cx| {
+                                if handoff {
+                                    shell.call_handoff(key.clone(), cx);
+                                } else {
+                                    shell.call_start(key.clone(), cx);
+                                }
+                            });
                         }))
-                        .child("Join"),
+                        .child(join_label),
                 ),
         )
     }
@@ -4678,5 +4770,128 @@ mod tests {
         assert_eq!(is_away(true, false, false, 600., 600., Some(750.)), Some(false));
         assert_eq!(is_away(true, false, false, 600., 600., Some(850.)), Some(true));
         assert_eq!(is_away(false, false, false, 600., 600., None), Some(false));
+    }
+
+    #[test]
+    fn telegram_live_and_scheduled_video_chat_summaries_format_cleanly() {
+        let scheduled = protocol::Occupants {
+            title: "Trail briefing".into(),
+            scheduled_at: Some(2_000 + 3_900),
+            subscribed: false,
+            live: false,
+            ..protocol::Occupants::default()
+        };
+        assert_eq!(
+            live_call_summary(Network::Telegram, ConversationKind::Group, &scheduled, 2_000),
+            "Video chat: Trail briefing · Starts in 1 h 5 min"
+        );
+        let live_group = protocol::Occupants {
+            title: "Trail planning".into(),
+            total: 3,
+            live: true,
+            people: vec![
+                protocol::Occupant {
+                    person: Key { network: Network::Telegram, account: "7001".into(), id: "u1".into() },
+                    name: "Odalys".into(),
+                    avatar: None,
+                    muted: false,
+                    deafened: false,
+                    server_muted: false,
+                    server_deafened: false,
+                    suppressed: false,
+                    speaking: true,
+                    streaming: false,
+                    camera: false,
+                },
+            ],
+            ..protocol::Occupants::default()
+        };
+        assert_eq!(
+            live_call_summary(Network::Telegram, ConversationKind::Group, &live_group, 2_000),
+            "Video chat: Trail planning · 3 · Odalys"
+        );
+        let live_channel = protocol::Occupants {
+            total: 12,
+            live: true,
+            ..protocol::Occupants::default()
+        };
+        assert_eq!(
+            live_call_summary(Network::Telegram, ConversationKind::Channel, &live_channel, 2_000),
+            "Live stream · 12"
+        );
+        assert_eq!(format_schedule_countdown(1_000, 1_000), "Starting soon");
+        assert_eq!(format_schedule_countdown(1_000 + 90_000, 1_000), "Starts in 1 day");
+    }
+}
+
+/// Formats a scheduled video chat countdown (`#465`).
+pub(crate) fn format_schedule_countdown(scheduled_at: i64, now_unix: i64) -> String {
+    let diff = scheduled_at - now_unix;
+    if diff <= 60 {
+        return "Starting soon".to_owned();
+    }
+    let mins = diff / 60;
+    if mins < 60 {
+        return format!("Starts in {mins} min");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        if rem_mins == 0 {
+            format!("Starts in {hours} h")
+        } else {
+            format!("Starts in {hours} h {rem_mins} min")
+        }
+    } else {
+        let days = hours / 24;
+        if days == 1 {
+            "Starts in 1 day".to_owned()
+        } else {
+            format!("Starts in {days} days")
+        }
+    }
+}
+
+/// Summary text for the live or scheduled call banner (`#462`, `#465`).
+pub(crate) fn live_call_summary(
+    network: Network,
+    kind: ConversationKind,
+    occupants: &protocol::Occupants,
+    now_unix: i64,
+) -> String {
+    if let Some(scheduled_at) = occupants.scheduled_at.filter(|_| !occupants.live) {
+        let label = if kind == ConversationKind::Channel { "Live stream" } else { "Video chat" };
+        let countdown = format_schedule_countdown(scheduled_at, now_unix);
+        return if occupants.title.is_empty() {
+            format!("{label} · {countdown}")
+        } else {
+            format!("{label}: {} · {countdown}", occupants.title)
+        };
+    }
+    let names: Vec<&str> = occupants.people.iter().take(3).map(|p| p.name.as_str()).collect();
+    if network == Network::Telegram {
+        let label = if kind == ConversationKind::Channel { "Live stream" } else { "Video chat" };
+        let head = if occupants.title.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{label}: {}", occupants.title)
+        };
+        return match (occupants.total, names.is_empty()) {
+            (0, true) => head,
+            (n, true) => format!("{head} · {n}"),
+            (0, false) => format!("{head} · {}", names.join(", ")),
+            (n, false) => format!("{head} · {n} · {}", names.join(", ")),
+        };
+    }
+    if kind == ConversationKind::Group {
+        if names.is_empty() {
+            format!("{} in this call", occupants.total)
+        } else {
+            format!("{} in this call · {}", occupants.total, names.join(", "))
+        }
+    } else if names.is_empty() {
+        format!("Call in progress · {}", occupants.total)
+    } else {
+        format!("Call in progress · {}", names.join(", "))
     }
 }

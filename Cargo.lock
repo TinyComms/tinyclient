@@ -5880,11 +5880,13 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 name = "mediad"
 version = "0.2.86"
 dependencies = [
+ "aes 0.8.4",
  "aes-gcm",
  "base64 0.22.1",
  "block2 0.6.2",
  "bzip2-rs",
  "chacha20poly1305",
+ "cipher 0.4.4",
  "core-graphics 0.24.0",
  "cpal",
  "davey",

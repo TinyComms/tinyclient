@@ -119,6 +119,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>) -> 
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        incoming_video: false,
     }
 }
 

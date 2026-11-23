@@ -542,8 +542,8 @@ pub struct Occupant {
     pub speaking: bool,
 }
 
-/// Who is in a voice channel, whether or not we are. Never stored: it arrives as
-/// `Change::Occupants` and rides on the row when the row is read.
+/// Who is in a voice channel or live/scheduled group call, whether or not we are. Never stored:
+/// it arrives as `Change::Occupants` and rides on the row when the row is read.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Occupants {
     /// At most [`OCCUPANTS_LIMIT`], in the network's order. We are in it when we are in the
@@ -551,6 +551,30 @@ pub struct Occupants {
     pub people: Vec<Occupant>,
     /// How many are in the channel in all.
     pub total: u32,
+    /// Title of the live or scheduled group video chat / live stream, when set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Unix seconds when a scheduled video chat starts. `None` when live now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_at: Option<i64>,
+    /// Whether this account is subscribed to a start reminder for the scheduled call.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub subscribed: bool,
+    /// True when a group video chat is live even if `total == 0` (e.g. just started).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub live: bool,
+}
+
+impl Occupants {
+    /// True when there is an active or scheduled call on this conversation.
+    pub fn active(&self) -> bool {
+        self.total > 0 || self.live || self.scheduled_at.is_some()
+    }
+
+    /// True when this represents a scheduled (not yet started) video chat.
+    pub fn is_scheduled(&self) -> bool {
+        self.scheduled_at.is_some() && !self.live
+    }
 }
 
 /// What a row shows beside its title.
@@ -3265,6 +3289,24 @@ pub enum Request {
     Handoff {
         conversation: Key,
     },
+    /// Schedules a group/channel video chat (`phone.createGroupCall` with `schedule_date`).
+    GroupCallSchedule {
+        conversation: Key,
+        schedule_date: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Starts a scheduled group/channel video chat now (`phone.startScheduledGroupCall`),
+    /// or starts a live one when none is scheduled.
+    GroupCallStart {
+        conversation: Key,
+    },
+    /// Toggles the start reminder subscription for a scheduled video chat
+    /// (`phone.toggleGroupCallStartSubscription`).
+    GroupCallSubscribe {
+        conversation: Key,
+        subscribed: bool,
+    },
     Media(MediaRequest),
     /// A voice message or audio file: play, pause, seek, speed, stop. Answers `Ok`; the rest is
     /// `Change::Playback`.
@@ -5752,6 +5794,7 @@ mod tests {
             view_admin_log: true,
             transfer_owner: true,
             anonymous: true,
+            manage_call: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
         let webhooks = ConversationRights { manage_webhooks: true, ..ConversationRights::default() };

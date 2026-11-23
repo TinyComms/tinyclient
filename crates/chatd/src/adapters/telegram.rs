@@ -51,6 +51,7 @@
 //! socket against a scripted wire (`fake`); `real` has only been run as far as a datacenter's
 //! refusal of a missing app id.
 
+mod call;
 mod catalog;
 mod content;
 mod open_link;
@@ -58,6 +59,7 @@ mod translate;
 mod fake;
 mod files;
 mod filing;
+mod group_call;
 mod info;
 mod live;
 mod manage;
@@ -75,12 +77,17 @@ pub(crate) fn capability_ceiling() -> protocol::Capabilities {
     sync::capability_ceiling()
 }
 
-/// A normal person's call before the full profile arrives: open it in Telegram.
+/// Direct 1:1 voice calls run natively inside tinyclient (`#469`).
 pub(crate) fn direct_call_ceiling() -> protocol::CallSupport {
     sync::user_call(false, false, None).support
 }
 
-/// Groups and channels do not place a call here.
+/// Live group and channel voice chats join natively (`#461`).
+pub(crate) fn group_call_ceiling() -> protocol::CallSupport {
+    sync::group_call_ceiling()
+}
+
+/// Replies or chats without an active live video chat.
 pub(crate) fn other_call() -> protocol::CallSupport {
     sync::other_call()
 }
@@ -278,6 +285,12 @@ struct Live {
     /// Recent phone calls seen on this connection: `(call_id, access_hash, peer)` so
     /// `phoneCallDiscarded` can prompt for a rating and `phone.setCallRating` can name the call.
     phone_calls: VecDeque<(i64, i64, Option<Who>)>,
+    /// Cached DH parameters from `messages.getDhConfig` for 1:1 calls (`#469`).
+    dh_params: Option<call::DhParams>,
+    /// Currently ringing or active 1:1 Telegram voice call (`#451`, `#469`).
+    active_call: Option<call::ActiveCall>,
+    /// Live and scheduled group/channel video chats (`#462`, `#465`, `#461`).
+    group_calls: group_call::GroupCalls,
     /// The newest post of each broadcast channel told to Telegram as viewed (`sync::viewed`).
     viewed: HashMap<Who, i32>,
     /// What the picker's items send.
@@ -669,11 +682,21 @@ fn connect(
         }
         live::retry_pending(&account);
         sync::retry_unread_channels(&account);
+        group_call::tick_keepalive(&account);
+        let unread_check = account.live().unread_check;
+        let keepalive = group_call::keepalive_deadline(&account);
         let wait = [
             Some(said + HERE_EVERY),
             live::pending_deadline(&account),
-            account.live().unread_check,
-        ].into_iter().flatten().min().unwrap_or(said + HERE_EVERY).saturating_duration_since(Instant::now());
+            unread_check,
+            keepalive,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(said + HERE_EVERY)
+        .saturating_duration_since(Instant::now())
+        .min(group_call::poll_cap());
         match events.recv_timeout(wait) {
             Ok(Event::Update { update, users, chats }) => {
                 account.learn(&users, &chats);
@@ -833,6 +856,9 @@ fn offline(ctx: &Context, command: Command) {
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
         Command::ResolveUsername { reply, .. } => drop(reply.send(Err(down()))),
         Command::PreviewChannel { reply, .. } | Command::Join { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GroupCallSchedule { reply, .. }
+        | Command::GroupCallStart { reply, .. }
+        | Command::GroupCallSubscribe { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
     }
@@ -1340,6 +1366,32 @@ fn serve(account: &Arc<Account>, command: Command) {
                 action => relate(account, &person_id, action).map_err(refused),
             };
             let _ = reply.send(answer);
+        }
+        Command::CallJoin(conversation_id) => match Who::parse(&conversation_id) {
+            Some((who @ Who::User(_), None)) => call::join_direct(account, who),
+            Some((who @ (Who::Group(_) | Who::Channel(_)), None)) => group_call::join_group(account, who),
+            _ => ctx.call_failed(&conversation_id, protocol::CallFailure::Refused, "Calls aren't available in this conversation."),
+        },
+        Command::CallLeave(conversation_id) => match Who::parse(&conversation_id) {
+            Some((who @ Who::User(_), None)) => call::leave_direct(account, who),
+            Some((who @ (Who::Group(_) | Who::Channel(_)), None)) => group_call::leave_group(account, who),
+            _ => {}
+        },
+        Command::CallAudio { muted, deafened } => group_call::set_group_audio(account, muted, deafened),
+        Command::GroupCallSchedule { conversation_id, schedule_date, title, reply } => {
+            let _ = reply.send(group_call::schedule(account, &conversation_id, schedule_date, title).map_err(refused));
+        }
+        Command::GroupCallStart { conversation_id, reply } => {
+            let _ = reply.send(group_call::start(account, &conversation_id).map_err(refused));
+        }
+        Command::GroupCallSubscribe { conversation_id, subscribed, reply } => {
+            let _ = reply.send(group_call::subscribe(account, &conversation_id, subscribed).map_err(refused));
+        }
+        Command::TelegramCallSignal { conversation_id, data } => {
+            call::send_signal(account, &conversation_id, &data);
+        }
+        Command::TelegramCallSpeaking { speaking, .. } => {
+            group_call::on_local_speaking(account, speaking);
         }
         Command::Played { conversation_id, message_id } => played(account, &conversation_id, &message_id),
         Command::SignOut(reply) => {

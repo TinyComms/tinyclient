@@ -783,11 +783,12 @@ impl Hub {
         for occupant in &mut occupants.people {
             clip(&mut occupant.name, 80);
         }
+        clip(&mut occupants.title, 120);
         occupants.total = occupants.total.max(occupants.people.len() as u32);
         {
             let mut live = lock(&self.live);
             let known = live.occupants.get(&conversation);
-            let empty = occupants.total == 0;
+            let empty = !occupants.active();
             if known == Some(&occupants) || (known.is_none() && (empty || live.occupants.len() >= OCCUPIED)) {
                 return;
             }

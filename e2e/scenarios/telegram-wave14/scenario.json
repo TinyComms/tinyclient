@@ -1,0 +1,12 @@
+{
+  "id": "telegram-wave14",
+  "title": "Wave 14B Telegram incoming call rings, live and scheduled group/channel video chats, native 1:1 MTProto DH voice calls, and group voice chat joining",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 14B Telegram voice calls and group video chats verified by unit, mediad, and fake-server integration suites.",
+    "ios": "Desktop Wave 14B Telegram voice calls and group video chats verified by unit, mediad, and fake-server integration suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

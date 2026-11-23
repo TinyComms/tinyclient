@@ -36,6 +36,15 @@ A camera is one H.264 layer on the voice connection (rid `100`). Go Live is a se
 
 DAVE seals the picture as well as the voice. The transport encryption is the same AES-GCM or XChaCha the voice already uses. The client offers H.264 and does not offer another video codec. There is no simulcast, no AV1, VP8 or VP9, no system audio on the share, and no clips. A stage is still not joined.
 
+## Telegram 1:1 voice calls and group video chats
+
+Telegram 1:1 voice calls and group/channel voice chats run natively inside tinyclient using a pure-Rust media engine (`str0m` + `unsafe-libopus` + `sonora` + MTProto 2.0 AES-256-IGE) rather than `tgcalls`, avoiding a C++/CMake/libwebrtc build dependency while sharing the same microphone processing, echo cancellation, and device picker as Discord and Tiny calls.
+
+- **Incoming calls:** `UpdatePhoneCall` (`phoneCallRequested`) acknowledges delivery (`phone.receivedCall`) and rings with caller name, audio/video indication, system notification, and Accept / Decline (`phone.discardCall`). Answering or discarding on another device stops the ring cleanly.
+- **1:1 voice calls:** Full MTProto 2048-bit Diffie-Hellman key exchange (`messages.getDhConfig`, `phone.getCallConfig`, `phone.requestCall`, `phone.acceptCall`, `phone.confirmCall`) with safe-prime and range checks, `g_a_hash` commitment check, 64-bit `key_fingerprint` verification, and the 4 verification emoji shown in the call header. In-call frames and `phone.sendSignalingData` / `updatePhoneCallSignalingData` messages are sealed with MTProto 2.0 AES-256-IGE. A second incoming call while already in a call is automatically declined as busy.
+- **Live and scheduled video chats:** Opening a group or channel with an active video chat reads `chatFull.call` / `channelFull.call` and `phone.getGroupCall` once (never polling unopened chats), shows a live banner with title, count, and participants plus a `LIVE` badge in the sidebar, and clears on `groupCallDiscarded`. Scheduled video chats show a local-time service message, countdown banner, **Notify me** toggle (`phone.toggleGroupCallStartSubscription`), and admin controls to schedule (`phone.createGroupCall`) or **Start now** (`phone.startScheduledGroupCall`).
+- **Joining group voice chats:** Joining sends local `str0m` WebRTC parameters (`phone.joinGroupCall`, muted by default), applies `updateGroupCallConnection` transport JSON, pages participants (`phone.getGroupParticipants`), runs `phone.checkGroupCall` keepalives, updates mute via `phone.editGroupCallParticipant`, reports speech via `speakingInGroupCallAction`, caps simultaneous decoded streams to the 12 loudest speakers, and leaves via `phone.leaveGroupCall`. Group voice chats do not display the 1:1 E2EE lock or emoji.
+
 ## Hand-off
 
 Which call control is native, a hand-off, or missing is [the generated table](../parity.md). A control that table does not mark native names the official app and does not start mediad.
@@ -44,6 +53,6 @@ A multi-stream video gallery (more than one simultaneous remote video feed), rec
 
 ## Still open
 
-A native Slack huddle, a native Telegram call, and a native Teams call are not in this tree. Each official path is large, undocumented or unofficial, and none of it is started here. Whether a Slack huddle is worth a spike is still a product choice.
+A native Slack huddle and a native Teams call are not in this tree. Each official path is large, undocumented or unofficial, and none of it is started here. Whether a Slack huddle is worth a spike is still a product choice. Telegram camera and screen share in calls remain future work; voice is native.
 
 Discord voice from a user account on an unofficial client can lose the account. DAVE makes the client distinguishable, and a picture makes it more so.

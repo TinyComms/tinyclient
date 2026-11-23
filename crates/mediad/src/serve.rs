@@ -2,7 +2,7 @@
 //! call served over stdin and stdout (`serve`), and the other modes `main` dispatches on.
 
 use crate::session::{self, Controls};
-use crate::{audio, out, permission, picture, tiny};
+use crate::{audio, out, permission, picture, telegram, tiny};
 use protocol::{
     media_process_needed, read_frame, CallFailure, Content, Direction, MediaRequest, MediaResponse, SecurityMode, VideoStream,
     DEVICES_LIMIT,
@@ -69,6 +69,10 @@ struct Call {
     offer: Option<tiny::Offer>,
     /// Our user id on that server, and whether the call running is one.
     tiny: Option<String>,
+    /// A Telegram group voice chat's local offer, waiting for `updateGroupCallConnection`.
+    tg_group_offer: Option<telegram::GroupOffer>,
+    /// Our user id in a Telegram group voice chat.
+    tg_user_id: Option<String>,
 }
 
 impl Call {
@@ -348,6 +352,89 @@ impl Call {
             MediaRequest::TinyRoster { user_ids } => {
                 self.controls.e2ee(|e2ee| e2ee.roster(user_ids));
                 self.controls.e2ee_report();
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramCall(join) => {
+                if self.voice.is_some() {
+                    return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
+                }
+                self.controls.muted.store(join.muted, Ordering::Relaxed);
+                self.controls.deafened.store(join.deafened, Ordering::Relaxed);
+                self.video = Video::default();
+                let controls = self.controls.clone();
+                let spawned = out::spawn(std::thread::Builder::new().name("tg-voice".to_owned()), move || {
+                    out::or_fail(CallFailure::Engine, ENGINE_STOPPED, || telegram::run_direct(join, controls));
+                    tracing::warn!("mediad: telegram call over, exiting");
+                    out::exit(0);
+                });
+                match spawned {
+                    Ok(voice) => self.voice = Some(voice),
+                    Err(err) => {
+                        tracing::warn!("mediad: the telegram call thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramSignal { data } => {
+                use base64::Engine as _;
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&data) {
+                    self.controls.push_tg_signal(bytes);
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramGroupOffer(spec) => {
+                if self.voice.is_some() {
+                    return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
+                }
+                self.controls.muted.store(spec.muted, Ordering::Relaxed);
+                self.controls.deafened.store(spec.deafened, Ordering::Relaxed);
+                return match telegram::GroupOffer::new(&spec) {
+                    Ok(offer) => {
+                        let params = offer.params_json().to_owned();
+                        let ssrc = offer.ssrc();
+                        self.tg_group_offer = Some(offer);
+                        self.tg_user_id = Some(spec.user_id);
+                        MediaResponse::TelegramGroupJoin { params, ssrc }
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: telegram group offer failed: {err}");
+                        MediaResponse::Refused { detail: ENGINE.to_owned() }
+                    }
+                };
+            }
+            MediaRequest::TelegramGroupAnswer { params } => {
+                let Some(offer) = self.tg_group_offer.take() else {
+                    return MediaResponse::Refused { detail: "No Telegram group call offer is waiting for an answer.".to_owned() };
+                };
+                let link = match offer.accept(&params) {
+                    Ok(link) => link,
+                    Err(err) => {
+                        tracing::warn!("mediad: telegram group transport answer refused: {err}");
+                        return MediaResponse::Refused {
+                            detail: "Telegram sent a group voice setup this tinyclient couldn't use. Try again.".to_owned(),
+                        };
+                    }
+                };
+                self.video = Video::default();
+                let controls = self.controls.clone();
+                let user_id = self.tg_user_id.clone().unwrap_or_default();
+                let spawned = out::spawn(std::thread::Builder::new().name("tg-group".to_owned()), move || {
+                    out::or_fail(CallFailure::Engine, ENGINE_STOPPED, || telegram::run_group(link, user_id, controls));
+                    tracing::warn!("mediad: telegram group call over, exiting");
+                    out::exit(0);
+                });
+                match spawned {
+                    Ok(voice) => self.voice = Some(voice),
+                    Err(err) => {
+                        tracing::warn!("mediad: the telegram group call thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramGroupSources { sources } => {
+                self.controls.set_tg_sources(sources);
                 return MediaResponse::Done;
             }
             MediaRequest::Devices { input, output, camera } => {

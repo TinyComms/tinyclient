@@ -129,12 +129,22 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
                 };
             }
         }
-        Who::Group(_) | Who::Channel(_) if !known.broadcast => {
-            if known.voice_banned {
+        Who::Group(_) | Who::Channel(_) => {
+            if !known.broadcast && known.voice_banned {
                 row.voice_notes_forbidden = "Voice and video messages aren't allowed in this group.".to_owned();
             }
+            let live_call = {
+                let live = account.live();
+                if live.group_calls.is_live(who) {
+                    true
+                } else if live.group_calls.has_call(who) {
+                    false
+                } else {
+                    known.call_active && known.call_not_empty
+                }
+            };
+            row.call = if live_call { CallSupport::Native } else { CallSupport::None };
         }
-        _ => row.call = other_call(),
     }
     row
 }
@@ -394,14 +404,19 @@ pub(super) fn user_call(bot: bool, deleted: bool, flags: Option<CallFlags>) -> U
         return UserCall { support: CallSupport::None, video: false };
     }
     match flags {
-        None => UserCall { support: CallSupport::Handoff, video: false },
+        None => UserCall { support: CallSupport::Native, video: false },
         Some(flags) if flags.phone_private => UserCall { support: CallSupport::Restricted, video: false },
         Some(flags) if !flags.phone_available => UserCall { support: CallSupport::None, video: false },
-        Some(flags) => UserCall { support: CallSupport::Handoff, video: flags.video_available },
+        Some(flags) => UserCall { support: CallSupport::Native, video: flags.video_available },
     }
 }
 
-/// A group, a channel, or Replies. None of them place a call here.
+/// Group and channel live video chats join natively (`#461`).
+pub(super) fn group_call_ceiling() -> CallSupport {
+    CallSupport::Native
+}
+
+/// Replies or chats without an active live video chat.
 pub(super) fn other_call() -> CallSupport {
     CallSupport::None
 }
@@ -439,7 +454,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         abuse_reports: true,
         voice_notes: true,
         video_notes: true,
-        direct_calls: false,
+        direct_calls: true,
         revisions: false,
         close_direct: false,
         clear_history: true,
@@ -913,6 +928,14 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     fresh.filing = Some(filing);
     fresh.disappearing = dialog.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
     account.ctx.conversation(&fresh)?;
+    if matches!(who, Who::Group(_) | Who::Channel(_)) && !account.live().group_calls.has_call(who) {
+        if known.call_active {
+            account.ctx.group_call_occupants(
+                &id,
+                protocol::Occupants { live: true, ..protocol::Occupants::default() },
+            );
+        }
+    }
     if dialog.ttl_period.is_some() {
         account.ctx.disappearing(&id, fresh.disappearing)?;
     }
@@ -1035,6 +1058,9 @@ pub(super) fn on_screen(account: &Account, watching: &Watching) {
     };
     if let Some((held, _)) = left {
         filing::refile(account, [held]);
+    }
+    if let Some(who @ (Who::Group(_) | Who::Channel(_))) = open {
+        super::group_call::open_chat(account, who);
     }
     let rows: Vec<Who> = watching
         .rows
@@ -2159,6 +2185,9 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
         }
     }
     let newest = history(account, conversation, Around::Newest);
+    if topic.is_none() && matches!(who, Who::Group(_) | Who::Channel(_)) {
+        super::group_call::open_chat(account, who);
+    }
     // The sponsored post belongs at the foot of the channel's own page; a comments thread
     // under one of its posts is read the same way but is not that page.
     if broadcast && topic.is_none() {

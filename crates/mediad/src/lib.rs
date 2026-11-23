@@ -62,6 +62,7 @@ pub mod session;
 pub mod stats;
 pub mod stretch;
 pub mod talk;
+pub mod telegram;
 pub mod tiny;
 pub mod video;
 pub mod video_stats;

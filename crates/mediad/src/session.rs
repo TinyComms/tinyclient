@@ -117,6 +117,10 @@ pub struct Controls {
     bitrate: AtomicU32,
     /// The connection over the last second, from the loop that carries the call.
     stats: Mutex<Option<CallStats>>,
+    /// Incoming Telegram 1:1 signaling packets (`updatePhoneCallSignalingData`).
+    tg_signals: Mutex<std::collections::VecDeque<Vec<u8>>>,
+    /// Updated Telegram group voice chat SSRC -> participant mapping.
+    tg_sources: Mutex<Option<Vec<protocol::TelegramGroupSource>>>,
 }
 
 impl Controls {
@@ -376,6 +380,26 @@ impl Controls {
 
     fn moving(&self) -> bool {
         self.moved.lock().unwrap().is_some()
+    }
+
+    pub fn push_tg_signal(&self, data: Vec<u8>) {
+        let mut queue = self.tg_signals.lock().unwrap();
+        if queue.len() >= 128 {
+            queue.pop_front();
+        }
+        queue.push_back(data);
+    }
+
+    pub fn take_tg_signals(&self) -> Vec<Vec<u8>> {
+        self.tg_signals.lock().unwrap().drain(..).collect()
+    }
+
+    pub fn set_tg_sources(&self, sources: Vec<protocol::TelegramGroupSource>) {
+        *self.tg_sources.lock().unwrap() = Some(sources);
+    }
+
+    pub fn take_tg_sources(&self) -> Option<Vec<protocol::TelegramGroupSource>> {
+        self.tg_sources.lock().unwrap().take()
     }
 }
 
