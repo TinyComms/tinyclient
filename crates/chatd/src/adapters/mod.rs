@@ -1912,6 +1912,34 @@ pub enum Command {
         remove: bool,
         reply: Reply<()>,
     },
+    /// Starts or stops server-side recording (`phone.toggleGroupCallRecord`, requires `manage_call`) (#463).
+    GroupCallRecord {
+        conversation_id: String,
+        start: bool,
+        video: bool,
+        video_portrait: Option<bool>,
+        title: Option<String>,
+        reply: Reply<(bool, Option<String>)>,
+    },
+    /// Syncs a local participant volume/mute-for-me change to Telegram (debounced `editGroupCallParticipant`) (#468).
+    GroupCallParticipantGain {
+        conversation_id: String,
+        participant_id: String,
+        percent: u16,
+        muted: bool,
+    },
+    /// Queries or revokes the RTMP server URL & stream key (`phone.getGroupCallStreamRtmpUrl`, requires `manage_call`) (#454).
+    GroupCallRtmpUrl {
+        conversation_id: String,
+        revoke: bool,
+        reply: Reply<protocol::GroupCallRtmpUrl>,
+    },
+    /// Switches the requested quality tier (0..=2) on a watched RTMP live stream (#454).
+    GroupCallRtmpQuality {
+        conversation_id: String,
+        quality: u8,
+        reply: Reply<()>,
+    },
     /// In-call signalling bytes from mediad for Telegram `phone.sendSignalingData` (base64).
     TelegramCallSignal { conversation_id: String, data: String },
     /// Local speaking state changed in a Telegram group call (`speakingInGroupCallAction`).
@@ -3542,6 +3570,71 @@ impl Context {
         self.hub.calls.telegram_group_sources(&self.hub, &self.key(conversation_id), sources);
     }
 
+    /// Asks mediad for a Telegram presentation offer (`phone.joinGroupCallPresentation`) (#467).
+    pub fn telegram_group_presentation_offer(&self, conversation_id: &str) -> Result<(String, u32), String> {
+        self.hub.calls.telegram_group_presentation_offer(&self.hub, &self.key(conversation_id))
+    }
+
+    /// Passes Telegram presentation answer JSON to mediad (#467).
+    pub fn telegram_group_presentation_answer(&self, conversation_id: &str, params: String) {
+        self.hub.calls.telegram_group_presentation_answer(&self.hub, &self.key(conversation_id), params);
+    }
+
+    /// Tears down Telegram presentation transport in mediad (#467).
+    pub fn telegram_group_presentation_leave(&self, conversation_id: &str) {
+        self.hub.calls.telegram_group_presentation_leave(&self.hub, &self.key(conversation_id));
+    }
+
+    /// Updates remote video & presentation sources in mediad (#467).
+    pub fn telegram_group_video_sources(
+        &self,
+        conversation_id: &str,
+        sources: Vec<protocol::TelegramGroupVideoSource>,
+    ) {
+        self.hub.calls.telegram_group_video_sources(&self.hub, &self.key(conversation_id), sources);
+    }
+
+    /// Starts receive-only RTMP live stream playback in mediad (#454).
+    pub fn telegram_rtmp_start(&self, conversation_id: &str) -> Result<(), String> {
+        self.hub.calls.telegram_rtmp_start(&self.hub, &self.key(conversation_id))
+    }
+
+    /// Delivers one fetched RTMP segment to mediad (#454).
+    pub fn telegram_rtmp_segment(
+        &self,
+        conversation_id: &str,
+        time_ms: i64,
+        scale: i32,
+        video_channel: Option<i32>,
+        video_quality: Option<u8>,
+        data: String,
+    ) {
+        self.hub.calls.telegram_rtmp_segment(
+            &self.hub,
+            &self.key(conversation_id),
+            time_ms,
+            scale,
+            video_channel,
+            video_quality,
+            data,
+        );
+    }
+
+    /// Updates RTMP live stream playback state in mediad (#454).
+    pub fn telegram_rtmp_state(&self, conversation_id: &str, state: protocol::RtmpStreamState) {
+        self.hub.calls.telegram_rtmp_state(&self.hub, &self.key(conversation_id), state);
+    }
+
+    /// Applies one participant's local gain/mute in mediad (#468).
+    pub fn call_gain(&self, user_id: String, percent: u16, muted: bool) {
+        self.hub.calls.gain(&self.hub, &self.account, user_id, percent, muted);
+    }
+
+    /// Plays one notice cue on the active call (e.g. `Cue::RecordingStarted` #463).
+    pub fn call_cue(&self, conversation_id: &str, cue: protocol::Cue) {
+        self.hub.calls.play_cue(&self.hub, &self.key(conversation_id), cue);
+    }
+
     /// The caller gave up, or another device answered.
     pub fn ring_stopped(&self, conversation_id: &str) {
         self.hub.calls.ring_stopped(&self.hub, &self.key(conversation_id));
@@ -3601,26 +3694,8 @@ impl Context {
     }
 
     /// Updates Telegram group call metadata on the active call snapshot.
-    pub fn group_call_meta(
-        &self,
-        conversation_id: &str,
-        title: String,
-        hand_raised: bool,
-        join_muted: bool,
-        can_change_join_muted: bool,
-        participants_count: u32,
-        joined_as: Option<String>,
-    ) {
-        self.hub.calls.set_group_call_meta(
-            &self.hub,
-            &self.key(conversation_id),
-            title,
-            hand_raised,
-            join_muted,
-            can_change_join_muted,
-            participants_count,
-            joined_as,
-        );
+    pub fn group_call_meta(&self, conversation_id: &str, meta: crate::media::GroupCallMeta) {
+        self.hub.calls.set_group_call_meta(&self.hub, &self.key(conversation_id), meta);
     }
 
     /// A Tiny server call: mediad's offer for this room, with mediad started for it first. A

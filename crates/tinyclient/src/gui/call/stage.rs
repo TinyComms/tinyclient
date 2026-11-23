@@ -189,7 +189,7 @@ impl Stage {
             sharing: my_sharing,
         });
         let video = call.video_allowed
-            && matches!(call.conversation.network, Network::Tiny | Network::Discord);
+            && matches!(call.conversation.network, Network::Tiny | Network::Discord | Network::Telegram);
         Stage {
             key: call.conversation.clone(),
             title: subject.title.clone(),

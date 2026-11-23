@@ -306,6 +306,15 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         can_change_join_muted: false,
         participants_count: 0,
         joined_as: None,
+        record_start_date: None,
+        record_video_active: false,
+        can_start_video: true,
+        unmuted_video_count: 0,
+        unmuted_video_limit: 0,
+        rtmp_stream: false,
+        rtmp_state: None,
+        rtmp_quality: None,
+        rtmp_qualities: Vec::new(),
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -652,6 +661,7 @@ impl Live {
             | MediaResponse::Done
             | MediaResponse::Offer { .. }
             | MediaResponse::TelegramGroupJoin { .. }
+            | MediaResponse::TelegramGroupPresentationJoin { .. }
             | MediaResponse::TelegramSignal { .. }
             | MediaResponse::Stats(_)
             | MediaResponse::Refused { .. }
@@ -2054,36 +2064,51 @@ impl Calls {
         }
     }
 
-    /// Updates Telegram group call metadata (`title`, `hand_raised`, `join_muted`,
-    /// `can_change_join_muted`, `participants_count`, `joined_as`) on the active call snapshot.
-    pub fn set_group_call_meta(
-        &self,
-        hub: &Hub,
-        conversation: &Key,
-        title: String,
-        hand_raised: bool,
-        join_muted: bool,
-        can_change_join_muted: bool,
-        participants_count: u32,
-        joined_as: Option<String>,
-    ) {
+    /// Updates Telegram group call metadata on the active call snapshot.
+    pub fn set_group_call_meta(&self, hub: &Hub, conversation: &Key, meta: GroupCallMeta) {
         let mut changed = false;
         let known = self.update(hub, conversation, |live| {
-            changed = live.call.title != title
-                || live.call.hand_raised != hand_raised
-                || live.call.join_muted != join_muted
-                || live.call.can_change_join_muted != can_change_join_muted
-                || live.call.participants_count != participants_count
-                || live.call.joined_as != joined_as;
-            live.call.title = title;
-            live.call.hand_raised = hand_raised;
-            live.call.join_muted = join_muted;
-            live.call.can_change_join_muted = can_change_join_muted;
-            live.call.participants_count = participants_count;
-            live.call.joined_as = joined_as;
+            changed = live.call.title != meta.title
+                || live.call.hand_raised != meta.hand_raised
+                || live.call.join_muted != meta.join_muted
+                || live.call.can_change_join_muted != meta.can_change_join_muted
+                || live.call.participants_count != meta.participants_count
+                || live.call.joined_as != meta.joined_as
+                || live.call.record_start_date != meta.record_start_date
+                || live.call.record_video_active != meta.record_video_active
+                || live.call.can_start_video != meta.can_start_video
+                || live.call.unmuted_video_count != meta.unmuted_video_count
+                || live.call.unmuted_video_limit != meta.unmuted_video_limit
+                || live.call.rtmp_stream != meta.rtmp_stream
+                || live.call.rtmp_state != meta.rtmp_state
+                || live.call.rtmp_quality != meta.rtmp_quality
+                || live.call.rtmp_qualities != meta.rtmp_qualities;
+            live.call.title = meta.title;
+            live.call.hand_raised = meta.hand_raised;
+            live.call.join_muted = meta.join_muted;
+            live.call.can_change_join_muted = meta.can_change_join_muted;
+            live.call.participants_count = meta.participants_count;
+            live.call.joined_as = meta.joined_as;
+            live.call.record_start_date = meta.record_start_date;
+            live.call.record_video_active = meta.record_video_active;
+            live.call.can_start_video = meta.can_start_video;
+            live.call.unmuted_video_count = meta.unmuted_video_count;
+            live.call.unmuted_video_limit = meta.unmuted_video_limit;
+            live.call.rtmp_stream = meta.rtmp_stream;
+            live.call.rtmp_state = meta.rtmp_state;
+            live.call.rtmp_quality = meta.rtmp_quality;
+            live.call.rtmp_qualities = meta.rtmp_qualities;
         });
         if known && changed {
             self.tell(hub);
+        }
+    }
+
+    /// Plays one notice cue on the active call if `conversation` is currently running.
+    pub fn play_cue(&self, hub: &Hub, conversation: &Key, cue: Cue) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|call| call.conversation == *conversation) {
+            let _ = self.request(hub, &MediaRequest::Cue { cue });
         }
     }
 
@@ -2157,6 +2182,130 @@ impl Calls {
             let _ = self.request(hub, &MediaRequest::TelegramGroupSources { sources });
         }
     }
+
+    /// Asks mediad for a presentation (screen-share) WebRTC offer for `phone.joinGroupCallPresentation` (#467).
+    pub fn telegram_group_presentation_offer(&self, hub: &Hub, conversation: &Key) -> Result<(String, u32), String> {
+        let (call, running) = self.describe();
+        if !running || !call.is_some_and(|c| c.conversation == *conversation) {
+            return Err(ENGINE_STOPPED.to_owned());
+        }
+        match self.request(hub, &MediaRequest::TelegramGroupPresentationOffer) {
+            Ok(MediaResponse::TelegramGroupPresentationJoin { params, ssrc }) => Ok((params, ssrc)),
+            Err(CallError::Media(err)) if err.kind() == io::ErrorKind::Other => Err(err.to_string()),
+            _ => Err(ENGINE_SILENT.to_owned()),
+        }
+    }
+
+    /// Passes Telegram's `updateGroupCallConnection(presentation=true)` JSON to mediad (#467).
+    pub fn telegram_group_presentation_answer(&self, hub: &Hub, conversation: &Key, params: String) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|c| c.conversation == *conversation) {
+            let _ = self.request(hub, &MediaRequest::TelegramGroupPresentationAnswer { params });
+        }
+    }
+
+    /// Tears down Telegram's presentation transport in mediad (#467).
+    pub fn telegram_group_presentation_leave(&self, hub: &Hub, conversation: &Key) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|c| c.conversation == *conversation) {
+            let _ = self.request(hub, &MediaRequest::TelegramGroupPresentationLeave);
+        }
+    }
+
+    /// Updates remote video & presentation endpoint/SSRC mappings in mediad (#467).
+    pub fn telegram_group_video_sources(
+        &self,
+        hub: &Hub,
+        conversation: &Key,
+        sources: Vec<protocol::TelegramGroupVideoSource>,
+    ) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|c| c.conversation == *conversation) {
+            let _ = self.request(hub, &MediaRequest::TelegramGroupVideoSources { sources });
+        }
+    }
+
+    /// Starts receive-only RTMP live stream playback in mediad (no microphone) (#454).
+    pub fn telegram_rtmp_start(&self, hub: &Arc<Hub>, conversation: &Key) -> Result<(), String> {
+        let (call, running) = self.describe();
+        let here = call.as_ref().is_some_and(|c| c.conversation == *conversation) && running;
+        if !here {
+            self.start(hub, conversation.clone()).map_err(|err| match err {
+                CallError::Active => IN_ANOTHER_CALL.to_owned(),
+                CallError::NoCall => ENGINE_STOPPED.to_owned(),
+                CallError::Media(err) => err.to_string(),
+            })?;
+        }
+        self.update(hub, conversation, |live| {
+            live.call.muted = true;
+            live.call.suppressed = true;
+            live.call.rtmp_stream = true;
+            live.call.rtmp_state = Some(protocol::RtmpStreamState::Waiting);
+            live.call.security = None;
+            live.joining = true;
+            live.since = Instant::now();
+        });
+        match self.request(hub, &MediaRequest::TelegramRtmpStart { channel_id: conversation.id.clone() }) {
+            Ok(MediaResponse::Done) => Ok(()),
+            other => {
+                if !here {
+                    self.end_if(hub, conversation);
+                }
+                Err(match other {
+                    Err(CallError::Media(err)) if err.kind() == io::ErrorKind::Other => err.to_string(),
+                    _ => ENGINE_SILENT.to_owned(),
+                })
+            }
+        }
+    }
+
+    /// Delivers one fetched RTMP live stream segment to mediad (#454).
+    pub fn telegram_rtmp_segment(
+        &self,
+        hub: &Hub,
+        conversation: &Key,
+        time_ms: i64,
+        scale: i32,
+        video_channel: Option<i32>,
+        video_quality: Option<u8>,
+        data: String,
+    ) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|c| c.conversation == *conversation) {
+            let _ = self.request(
+                hub,
+                &MediaRequest::TelegramRtmpSegment { time_ms, scale, video_channel, video_quality, data },
+            );
+        }
+    }
+
+    /// Updates RTMP live stream playback state in mediad (#454).
+    pub fn telegram_rtmp_state(&self, hub: &Hub, conversation: &Key, state: protocol::RtmpStreamState) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|c| c.conversation == *conversation) {
+            let _ = self.request(hub, &MediaRequest::TelegramRtmpState { state });
+        }
+    }
+}
+
+/// Snapshot of Telegram group call metadata synced onto `protocol::Call`.
+#[derive(Clone, Debug, Default)]
+pub struct GroupCallMeta {
+    pub title: String,
+    pub hand_raised: bool,
+    pub join_muted: bool,
+    pub can_change_join_muted: bool,
+    pub participants_count: u32,
+    pub joined_as: Option<String>,
+    pub record_start_date: Option<i64>,
+    pub record_video_active: bool,
+    pub can_start_video: bool,
+    pub unmuted_video_count: u32,
+    pub unmuted_video_limit: u32,
+    pub rtmp_stream: bool,
+    pub rtmp_state: Option<protocol::RtmpStreamState>,
+    pub rtmp_quality: Option<u8>,
+    pub rtmp_qualities: Vec<u8>,
 }
 
 /// Shown when the person only joins end-to-end encrypted calls and the server cannot encrypt them.

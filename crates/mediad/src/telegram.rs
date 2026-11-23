@@ -33,19 +33,23 @@ use crate::audio::{level, Audio};
 use crate::cue::Playing;
 use crate::hear::Limiter;
 use crate::media::{self, announce, finish_cue, listen, mixdown, Devices, Gate, Send as GateSend, Stream};
-use crate::opus::Encoder;
+use crate::opus::{Decoder as OpusDecoder, Encoder};
 use crate::permission::{microphone, Microphone};
 use crate::process::Processor;
 use crate::rtp::SILENCE;
 use crate::session::Controls;
 use crate::stats::Meter;
+use crate::video::{Received as VideoReceived, Track as VideoTrack, Video as VideoEngine, Wants as VideoWants, Word as VideoWord};
 use crate::{out, rt, tiny, FRAME, FRAME_SAMPLES};
 use aes::Aes256;
 use base64::Engine as _;
 use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use mio::net::UdpSocket as MioUdp;
 use mio::{Events, Interest, Poll, Token};
-use protocol::{CallFailure, CallPath, MediaResponse, TelegramCallJoin, TelegramGroupOffer, TelegramGroupSource};
+use protocol::{
+    CallFailure, CallPath, MediaResponse, PictureKind, RtmpStreamState, TelegramCallJoin,
+    TelegramGroupOffer, TelegramGroupSource, TelegramGroupVideoSource, WatchSize, WatchSource,
+};
 use rand::Rng;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -56,6 +60,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
+use str0m::channel::ChannelId;
 use str0m::media::{Direction, Frequency, MediaKind, MediaTime, Mid};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
@@ -71,6 +76,12 @@ pub const MAX_ACTIVE_SPEAKERS: usize = 12;
 
 /// Number of recvonly audio tracks offered to Telegram's group voice SFU.
 const GROUP_RECV_SLOTS: usize = MAX_ACTIVE_SPEAKERS;
+/// Number of recvonly video slots offered for multi-picture Telegram group calls (`#467`).
+const GROUP_VIDEO_RECV_SLOTS: usize = 4;
+/// H.264 payload type offered to Telegram group video chats.
+const TG_H264_PT: u8 = 96;
+/// Constrained Baseline profile-level-id for H.264.
+const TG_H264_PROFILE: u32 = 0x42e01f;
 
 /// Magic header for encrypted 1:1 Opus frames carried over a UDP reflector/P2P link.
 const DIRECT_AUDIO_MAGIC: [u8; 4] = *b"TGOP";
@@ -540,6 +551,9 @@ fn group_rtc_config() -> RtcConfig {
         .set_stats_interval(Some(Duration::from_secs(1)))
         .set_reordering_size_audio(0)
         .set_reordering_timeout_audio(Some(Duration::from_millis(40)));
+    config
+        .codec_config()
+        .add_h264(TG_H264_PT.into(), None, true, TG_H264_PROFILE);
     config.set_max_stun_rto(Duration::from_secs(1));
     config.set_max_stun_retransmits(7);
     match tiny::dtls_cert() {
@@ -578,15 +592,48 @@ fn parse_offer_ice_dtls(sdp: &str) -> Result<(String, String, String), String> {
     ))
 }
 
-/// Extracts all `a=mid:` values in offer order.
-fn parse_offer_mids(sdp: &str) -> Vec<String> {
-    sdp.lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("a=mid:").map(str::to_owned))
-        .collect()
+/// Media section parsed from a local str0m SDP offer: `(kind, mid, answer_direction)`.
+#[derive(Clone, Debug)]
+struct OfferSection {
+    kind: String,
+    mid: String,
+    answer_dir: &'static str,
 }
 
-/// Builds a WebRTC SDP answer from Telegram's `updateGroupCallConnection` transport JSON.
+/// Extracts all `m=` sections (`audio`, `video`, `application`) with their `a=mid:` and mirrored direction.
+fn parse_offer_sections(sdp: &str) -> Vec<OfferSection> {
+    let mut out: Vec<OfferSection> = Vec::new();
+    let mut cur_kind: Option<String> = None;
+    let mut cur_mid: Option<String> = None;
+    let mut cur_dir: &'static str = "sendrecv";
+    let flush = |out: &mut Vec<OfferSection>, kind: &mut Option<String>, mid: &mut Option<String>, dir: &mut &'static str| {
+        if let (Some(k), Some(m)) = (kind.take(), mid.take()) {
+            out.push(OfferSection { kind: k, mid: m, answer_dir: *dir });
+        }
+        *dir = "sendrecv";
+    };
+    for line in sdp.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("m=") {
+            flush(&mut out, &mut cur_kind, &mut cur_mid, &mut cur_dir);
+            cur_kind = rest.split_whitespace().next().map(str::to_owned);
+        } else if let Some(mid) = line.strip_prefix("a=mid:") {
+            cur_mid = Some(mid.to_owned());
+        } else if line == "a=sendonly" {
+            cur_dir = "recvonly";
+        } else if line == "a=recvonly" {
+            cur_dir = "sendonly";
+        } else if line == "a=inactive" {
+            cur_dir = "inactive";
+        } else if line == "a=sendrecv" {
+            cur_dir = "sendrecv";
+        }
+    }
+    flush(&mut out, &mut cur_kind, &mut cur_mid, &mut cur_dir);
+    out
+}
+
+/// Builds a WebRTC SDP answer from Telegram's `updateGroupCallConnection` transport JSON
+/// (supporting audio, H.264 video, and SCTP data channel sections for `#461` and `#467`).
 pub fn telegram_json_to_sdp_answer(offer_sdp: &str, params_json: &str) -> Result<(String, bool), String> {
     let val: Value = serde_json::from_str(params_json).map_err(|e| format!("invalid transport JSON: {e}"))?;
     let fake_loopback = val.get("fake_loopback").and_then(Value::as_bool).unwrap_or(false)
@@ -642,10 +689,23 @@ pub fn telegram_json_to_sdp_answer(offer_sdp: &str, params_json: &str) -> Result
         })
         .unwrap_or(111);
 
-    let mids = parse_offer_mids(offer_sdp);
-    if mids.is_empty() {
+    let h264_pt = val
+        .get("video")
+        .and_then(|v| v.get("payload-types"))
+        .and_then(Value::as_array)
+        .and_then(|pts| {
+            pts.iter().find_map(|pt| {
+                let name = pt.get("name").and_then(Value::as_str)?;
+                name.eq_ignore_ascii_case("h264").then(|| pt.get("id").and_then(Value::as_u64)).flatten()
+            })
+        })
+        .unwrap_or(u64::from(TG_H264_PT));
+
+    let sections = parse_offer_sections(offer_sdp);
+    if sections.is_empty() {
         return Err("local offer had no media lines".to_owned());
     }
+    let mids: Vec<&str> = sections.iter().map(|s| s.mid.as_str()).collect();
 
     let mut sdp = String::new();
     sdp.push_str("v=0\r\n");
@@ -656,19 +716,48 @@ pub fn telegram_json_to_sdp_answer(offer_sdp: &str, params_json: &str) -> Result
     sdp.push_str("a=ice-lite\r\n");
     sdp.push_str("a=msid-semantic: WMS *\r\n");
 
-    for (idx, mid) in mids.iter().enumerate() {
-        let dir = if idx == 0 { "recvonly" } else { "sendonly" };
-        sdp.push_str(&format!("m=audio 9 UDP/TLS/RTP/SAVPF {opus_pt}\r\n"));
-        sdp.push_str("c=IN IP4 0.0.0.0\r\n");
-        sdp.push_str(&format!("a=mid:{mid}\r\n"));
-        sdp.push_str(&format!("a=ice-ufrag:{ufrag}\r\n"));
-        sdp.push_str(&format!("a=ice-pwd:{pwd}\r\n"));
-        sdp.push_str(&format!("a=fingerprint:{fp_hash} {fp_val}\r\n"));
-        sdp.push_str(&format!("a=setup:{setup}\r\n"));
-        sdp.push_str("a=rtcp-mux\r\n");
-        sdp.push_str(&format!("a={dir}\r\n"));
-        sdp.push_str(&format!("a=rtpmap:{opus_pt} opus/48000/2\r\n"));
-        sdp.push_str(&format!("a=fmtp:{opus_pt} minptime=10;useinbandfec=1\r\n"));
+    for (idx, sec) in sections.iter().enumerate() {
+        match sec.kind.as_str() {
+            "audio" => {
+                sdp.push_str(&format!("m=audio 9 UDP/TLS/RTP/SAVPF {opus_pt}\r\n"));
+                sdp.push_str("c=IN IP4 0.0.0.0\r\n");
+                sdp.push_str(&format!("a=mid:{}\r\n", sec.mid));
+                sdp.push_str(&format!("a=ice-ufrag:{ufrag}\r\n"));
+                sdp.push_str(&format!("a=ice-pwd:{pwd}\r\n"));
+                sdp.push_str(&format!("a=fingerprint:{fp_hash} {fp_val}\r\n"));
+                sdp.push_str(&format!("a=setup:{setup}\r\n"));
+                sdp.push_str("a=rtcp-mux\r\n");
+                sdp.push_str(&format!("a={}\r\n", sec.answer_dir));
+                sdp.push_str(&format!("a=rtpmap:{opus_pt} opus/48000/2\r\n"));
+                sdp.push_str(&format!("a=fmtp:{opus_pt} minptime=10;useinbandfec=1\r\n"));
+            }
+            "video" => {
+                sdp.push_str(&format!("m=video 9 UDP/TLS/RTP/SAVPF {h264_pt}\r\n"));
+                sdp.push_str("c=IN IP4 0.0.0.0\r\n");
+                sdp.push_str(&format!("a=mid:{}\r\n", sec.mid));
+                sdp.push_str(&format!("a=ice-ufrag:{ufrag}\r\n"));
+                sdp.push_str(&format!("a=ice-pwd:{pwd}\r\n"));
+                sdp.push_str(&format!("a=fingerprint:{fp_hash} {fp_val}\r\n"));
+                sdp.push_str(&format!("a=setup:{setup}\r\n"));
+                sdp.push_str("a=rtcp-mux\r\n");
+                sdp.push_str(&format!("a={}\r\n", sec.answer_dir));
+                sdp.push_str(&format!("a=rtpmap:{h264_pt} H264/90000\r\n"));
+                sdp.push_str(&format!(
+                    "a=fmtp:{h264_pt} level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
+                ));
+            }
+            "application" => {
+                sdp.push_str("m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n");
+                sdp.push_str("c=IN IP4 0.0.0.0\r\n");
+                sdp.push_str(&format!("a=mid:{}\r\n", sec.mid));
+                sdp.push_str(&format!("a=ice-ufrag:{ufrag}\r\n"));
+                sdp.push_str(&format!("a=ice-pwd:{pwd}\r\n"));
+                sdp.push_str(&format!("a=fingerprint:{fp_hash} {fp_val}\r\n"));
+                sdp.push_str(&format!("a=setup:{setup}\r\n"));
+                sdp.push_str("a=sctp-port:5000\r\n");
+            }
+            _ => continue,
+        }
         if idx == 0 {
             for cand in &candidates {
                 sdp.push_str(cand);
@@ -680,7 +769,44 @@ pub fn telegram_json_to_sdp_answer(offer_sdp: &str, params_json: &str) -> Result
     Ok((sdp, fake_loopback))
 }
 
-/// An outgoing Telegram group voice chat offer, awaiting `updateGroupCallConnection`.
+/// Builds Telegram's Colibri `ReceiverVideoConstraints` JSON sent on the group call data channel
+/// to request forwarded video/presentation streams and their resolution tiers (`#467`).
+pub fn build_video_constraints_json(
+    sources: &[TelegramGroupVideoSource],
+    watch: &[WatchSource],
+) -> String {
+    let mut on_stage: Vec<&str> = Vec::new();
+    let mut constraints = serde_json::Map::new();
+    for want in watch {
+        if let Some(src) = sources
+            .iter()
+            .find(|s| s.user_id == want.user_id && s.kind == want.kind && !s.paused && !s.endpoint.is_empty())
+        {
+            let (min_h, max_h) = match want.size {
+                WatchSize::Large => {
+                    if !on_stage.contains(&src.endpoint.as_str()) {
+                        on_stage.push(src.endpoint.as_str());
+                    }
+                    (360, 720)
+                }
+                WatchSize::Small => (180, 360),
+            };
+            constraints.insert(
+                src.endpoint.clone(),
+                json!({ "minHeight": min_h, "maxHeight": max_h }),
+            );
+        }
+    }
+    json!({
+        "colibriClass": "ReceiverVideoConstraints",
+        "onStageEndpoints": on_stage,
+        "defaultConstraints": { "maxHeight": 0 },
+        "constraints": constraints,
+    })
+    .to_string()
+}
+
+/// An outgoing Telegram group voice/video chat offer, awaiting `updateGroupCallConnection`.
 pub struct GroupOffer {
     rtc: Rtc,
     udp: MioUdp,
@@ -689,18 +815,25 @@ pub struct GroupOffer {
     offer_sdp: String,
     params_json: String,
     ssrc: u32,
+    video_ssrc: u32,
     mic_mid: Mid,
     recv_mids: Vec<Mid>,
+    cam_mid: Mid,
+    video_recv_mids: Vec<Mid>,
 }
 
-/// An accepted Telegram group voice chat transport ready for [`run_group`].
+/// An accepted Telegram group voice/video chat transport ready for [`run_group`].
 pub struct GroupLink {
     rtc: Rtc,
     udp: MioUdp,
     local_udp: SocketAddr,
     ssrc: u32,
+    #[allow(dead_code)]
+    video_ssrc: u32,
     mic_mid: Mid,
     recv_mids: Vec<Mid>,
+    cam_mid: Mid,
+    video_recv_mids: Vec<Mid>,
     fake_loopback: bool,
 }
 
@@ -719,11 +852,20 @@ impl GroupOffer {
         for _ in 0..GROUP_RECV_SLOTS {
             recv_mids.push(change.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None));
         }
+        let cam_mid = change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let mut video_recv_mids = Vec::with_capacity(GROUP_VIDEO_RECV_SLOTS);
+        for _ in 0..GROUP_VIDEO_RECV_SLOTS {
+            video_recv_mids.push(change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None));
+        }
+        let _dc_id = change.add_channel("data".to_owned());
+
         let (offer, pending) = change.apply().ok_or_else(|| io::Error::other("nothing to offer"))?;
         let offer_sdp = offer.to_sdp_string();
         let (ufrag, pwd, fingerprint) = parse_offer_ice_dtls(&offer_sdp).map_err(io::Error::other)?;
-        // Positive 31-bit SSRC so it maps cleanly to Telegram's signed `i32` `source` field.
-        let ssrc: u32 = rand::thread_rng().gen_range(1..=0x7fff_ffffu32);
+        // Positive 31-bit SSRCs so they map cleanly to Telegram's signed `i32` fields.
+        let mut rng = rand::thread_rng();
+        let ssrc: u32 = rng.gen_range(1..=0x7fff_ffffu32);
+        let video_ssrc: u32 = rng.gen_range(1..=0x7fff_ffffu32);
 
         let params_json = json!({
             "ufrag": ufrag,
@@ -736,10 +878,29 @@ impl GroupOffer {
                 }
             ],
             "ssrc": ssrc as i32,
+            "ssrc-groups": [
+                {
+                    "semantics": "SIM",
+                    "sources": [video_ssrc as i32],
+                }
+            ],
         })
         .to_string();
 
-        Ok(GroupOffer { rtc, udp, local_udp, pending, offer_sdp, params_json, ssrc, mic_mid, recv_mids })
+        Ok(GroupOffer {
+            rtc,
+            udp,
+            local_udp,
+            pending,
+            offer_sdp,
+            params_json,
+            ssrc,
+            video_ssrc,
+            mic_mid,
+            recv_mids,
+            cam_mid,
+            video_recv_mids,
+        })
     }
 
     pub fn params_json(&self) -> &str {
@@ -763,11 +924,197 @@ impl GroupOffer {
             udp: self.udp,
             local_udp: self.local_udp,
             ssrc: self.ssrc,
+            video_ssrc: self.video_ssrc,
             mic_mid: self.mic_mid,
             recv_mids: self.recv_mids,
+            cam_mid: self.cam_mid,
+            video_recv_mids: self.video_recv_mids,
             fake_loopback,
         })
     }
+}
+
+/// Separate screen-share presentation transport for `phone.joinGroupCallPresentation` (`#467`).
+pub struct PresentationOffer {
+    rtc: Rtc,
+    udp: MioUdp,
+    local_udp: SocketAddr,
+    pending: SdpPendingOffer,
+    offer_sdp: String,
+    params_json: String,
+    ssrc: u32,
+    share_mid: Mid,
+}
+
+pub struct PresentationLink {
+    rtc: Rtc,
+    udp: MioUdp,
+    local_udp: SocketAddr,
+    #[allow(dead_code)]
+    ssrc: u32,
+    share_mid: Mid,
+    fake_loopback: bool,
+}
+
+impl PresentationOffer {
+    pub fn new() -> io::Result<PresentationOffer> {
+        let ip = local_ip();
+        let mut rtc = group_rtc_config().build(Instant::now());
+        let udp = MioUdp::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+        let local_udp = SocketAddr::new(ip, udp.local_addr()?.port());
+        let cand = Candidate::host(local_udp, "udp").map_err(|e| io::Error::other(format!("candidate: {e:?}")))?;
+        rtc.add_local_candidate(cand);
+
+        let mut change = rtc.sdp_api();
+        let share_mid = change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (offer, pending) = change.apply().ok_or_else(|| io::Error::other("nothing to offer"))?;
+        let offer_sdp = offer.to_sdp_string();
+        let (ufrag, pwd, fingerprint) = parse_offer_ice_dtls(&offer_sdp).map_err(io::Error::other)?;
+        let ssrc: u32 = rand::thread_rng().gen_range(1..=0x7fff_ffffu32);
+
+        let params_json = json!({
+            "ufrag": ufrag,
+            "pwd": pwd,
+            "fingerprints": [
+                {
+                    "hash": "sha-256",
+                    "setup": "active",
+                    "fingerprint": fingerprint,
+                }
+            ],
+            "ssrc": ssrc as i32,
+            "ssrc-groups": [
+                {
+                    "semantics": "SIM",
+                    "sources": [ssrc as i32],
+                }
+            ],
+        })
+        .to_string();
+
+        Ok(PresentationOffer {
+            rtc,
+            udp,
+            local_udp,
+            pending,
+            offer_sdp,
+            params_json,
+            ssrc,
+            share_mid,
+        })
+    }
+
+    pub fn params_json(&self) -> &str {
+        &self.params_json
+    }
+
+    pub fn ssrc(&self) -> u32 {
+        self.ssrc
+    }
+
+    pub fn accept(mut self, params_json: &str) -> Result<PresentationLink, String> {
+        let (answer_sdp, fake_loopback) = telegram_json_to_sdp_answer(&self.offer_sdp, params_json)?;
+        let answer = SdpAnswer::from_sdp_string(&answer_sdp).map_err(|e| format!("sdp parse: {e:?}"))?;
+        self.rtc.sdp_api().accept_answer(self.pending, answer).map_err(|e| format!("accept_answer: {e:?}"))?;
+        Ok(PresentationLink {
+            rtc: self.rtc,
+            udp: self.udp,
+            local_udp: self.local_udp,
+            ssrc: self.ssrc,
+            share_mid: self.share_mid,
+            fake_loopback,
+        })
+    }
+}
+
+/// Runs the separate Telegram presentation (screen-share) transport until stopped (`#467`).
+pub fn run_presentation(mut link: PresentationLink, controls: Arc<Controls>) {
+    let mut poll = match Poll::new() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if poll.registry().register(&mut link.udp, UDP_TOKEN, Interest::READABLE).is_err() {
+        return;
+    }
+    let mut video = VideoEngine::new(controls.clone());
+    if !link.fake_loopback {
+        video.want(VideoWants { share: true, ..VideoWants::default() });
+    }
+    let mut events = Events::with_capacity(16);
+    let mut recv_buf = [0u8; 2048];
+
+    while !controls.hangup.load(Ordering::Relaxed)
+        && !controls.tg_presentation_stopped()
+        && controls.share()
+        && !out::over()
+    {
+        if !link.fake_loopback {
+            loop {
+                if !link.rtc.is_alive() {
+                    return;
+                }
+                match link.rtc.poll_output() {
+                    Ok(Output::Timeout(_)) => break,
+                    Ok(Output::Transmit(tx)) => {
+                        if tx.proto == Protocol::Udp {
+                            let _ = link.udp.send_to(&tx.contents, tx.destination);
+                        }
+                    }
+                    Ok(Output::Event(Event::KeyframeRequest(_))) => {
+                        video.ask_key(VideoTrack::Share);
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            while let Some(word) = video.next() {
+                match word {
+                    VideoWord::Frame { track: VideoTrack::Share, payload, rtp, .. } => {
+                        if let Some(writer) = link.rtc.writer(link.share_mid) {
+                            let pt = writer.payload_params().next().map(|p| p.pt());
+                            if let Some(pt) = pt {
+                                let time = MediaTime::new(rtp, Frequency::NINETY_KHZ);
+                                let _ = writer.write(pt, Instant::now(), time, payload);
+                            }
+                        }
+                    }
+                    VideoWord::Failed { words, .. } => {
+                        out::send(&MediaResponse::Notice { detail: words });
+                        controls.set_share(false);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let _ = poll.poll(&mut events, Some(Duration::from_millis(20)));
+        if !link.fake_loopback {
+            for ev in events.iter() {
+                if ev.token() == UDP_TOKEN {
+                    loop {
+                        match link.udp.recv_from(&mut recv_buf) {
+                            Ok((n, src)) => {
+                                if let Ok(contents) = (&recv_buf[..n]).try_into() {
+                                    let recv = Receive {
+                                        proto: Protocol::Udp,
+                                        source: src,
+                                        destination: link.local_udp,
+                                        contents,
+                                    };
+                                    let _ = link.rtc.handle_input(Input::Receive(Instant::now(), recv));
+                                }
+                            }
+                            Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            let _ = link.rtc.handle_input(Input::Timeout(Instant::now()));
+        }
+    }
+    video.want(VideoWants::default());
 }
 
 /// Bounds a map of remote voice streams to at most `cap` loudest/most-recent active speakers (`#461`).
@@ -825,6 +1172,11 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
     let mut cue: Option<Playing> = None;
 
     let mut ssrc_map: HashMap<u32, String> = HashMap::new();
+    let mut video_sources: Vec<TelegramGroupVideoSource> = Vec::new();
+    let mut data_channel: Option<ChannelId> = None;
+    let mut last_constraints = String::new();
+    let mut video = VideoEngine::new(controls.clone());
+    let mut last_sending = (false, false);
     let mut streams: HashMap<Mid, (String, u8, Instant, Stream)> = HashMap::new();
     let mut recv_packets: VecDeque<(SocketAddr, Vec<u8>)> = VecDeque::new();
     let mut events = Events::with_capacity(32);
@@ -875,6 +1227,64 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
             }
         }
 
+        // Apply updated remote video & presentation endpoints/SSRCs from chatd (`#467`).
+        if let Some(vsrcs) = controls.take_tg_video_sources() {
+            video_sources = vsrcs;
+        }
+        // Sync camera/share sending state and data-channel video constraints (`#467`).
+        let want_cam = controls.camera();
+        let want_share = controls.share();
+        let want_preview = controls.camera_preview();
+        if !link.fake_loopback {
+            video.want(VideoWants {
+                share: false,
+                camera: want_cam,
+                preview_camera: want_preview,
+                ..VideoWants::default()
+            });
+        }
+        if (want_share, want_cam) != last_sending {
+            last_sending = (want_share, want_cam);
+            out::send(&MediaResponse::Sending { share: want_share, camera: want_cam });
+        }
+        let watch_list = controls.watch_sources();
+        for (slot_idx, want) in watch_list.iter().take(GROUP_VIDEO_RECV_SLOTS).enumerate() {
+            video.watch_slot(slot_idx, want.size == WatchSize::Small);
+        }
+        if !link.fake_loopback {
+            if let Some(cid) = data_channel {
+                let next_constraints = build_video_constraints_json(&video_sources, &watch_list);
+                if next_constraints != last_constraints {
+                    if let Some(mut ch) = link.rtc.channel(cid) {
+                        let _ = ch.write(false, next_constraints.as_bytes());
+                        last_constraints = next_constraints;
+                    }
+                }
+            }
+            while let Some(word) = video.next() {
+                match word {
+                    VideoWord::Frame { track: VideoTrack::High, payload, rtp, .. } => {
+                        if let Some(writer) = link.rtc.writer(link.cam_mid) {
+                            let pt = writer.payload_params().next().map(|p| p.pt());
+                            if let Some(pt) = pt {
+                                let time = MediaTime::new(rtp, Frequency::NINETY_KHZ);
+                                let _ = writer.write(pt, Instant::now(), time, payload);
+                            }
+                        }
+                    }
+                    VideoWord::Failed { words, share } => {
+                        out::send(&MediaResponse::Notice { detail: words });
+                        if share {
+                            controls.set_share(false);
+                        } else {
+                            controls.set_camera(false);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Drain str0m outputs (transmits & events).
         let mut next_timeout = None;
         if !link.fake_loopback {
@@ -905,8 +1315,41 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
                                 out::send(&MediaResponse::Interrupted);
                             }
                         }
+                        Event::ChannelOpen(cid, _) => {
+                            data_channel = Some(cid);
+                            last_constraints.clear();
+                        }
+                        Event::KeyframeRequest(_) => {
+                            video.ask_key(VideoTrack::High);
+                        }
                         Event::MediaData(data) => {
                             let deafened = controls.deafened.load(Ordering::Relaxed);
+                            if let Some(vslot) = link.video_recv_mids.iter().position(|m| *m == data.mid) {
+                                if !deafened {
+                                    let mapped = watch_list
+                                        .get(vslot)
+                                        .map(|w| (w.user_id.clone(), w.kind))
+                                        .or_else(|| {
+                                            video_sources
+                                                .get(vslot)
+                                                .map(|s| (s.user_id.clone(), s.kind))
+                                        });
+                                    if let Some((vuid, kind)) = mapped {
+                                        let key = is_h264_keyframe(&data.data);
+                                        let _ = video.picture_slot(
+                                            vslot,
+                                            VideoReceived {
+                                                data: Arc::<[u8]>::from(data.data),
+                                                key,
+                                                contiguous: data.contiguous,
+                                                user: vuid,
+                                                kind,
+                                            },
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             let now = Instant::now();
                             let slot_idx = link.recv_mids.iter().position(|m| *m == data.mid).unwrap_or(0);
                             let uid = ssrc_map
@@ -1085,6 +1528,188 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
     }
 }
 
+fn is_h264_keyframe(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < bytes.len() {
+        if bytes[i] == 0 && bytes[i + 1] == 0 {
+            let nal_idx = if bytes[i + 2] == 1 {
+                Some(i + 3)
+            } else if bytes[i + 2] == 0 && bytes[i + 3] == 1 {
+                Some(i + 4)
+            } else {
+                None
+            };
+            if let Some(idx) = nal_idx {
+                if let Some(&hdr) = bytes.get(idx) {
+                    let nal_type = hdr & 0x1f;
+                    if nal_type == 5 || nal_type == 7 {
+                        return true;
+                    }
+                }
+                i = idx + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Channel RTMP Live Streams (`#454`)
+// ---------------------------------------------------------------------------
+
+/// One fetched `inputGroupCallStream` segment handed from `chatd` to `mediad`.
+#[derive(Clone, Debug)]
+pub struct RtmpSegmentInput {
+    pub time_ms: i64,
+    pub scale: i32,
+    pub video_channel: Option<i32>,
+    pub video_quality: Option<u8>,
+    pub bytes: Vec<u8>,
+}
+
+/// Decoded audio (Opus packets) and video (H.264 Annex-B access units) extracted from an RTMP segment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RtmpSegmentMedia {
+    pub opus_frames: Vec<Vec<u8>>,
+    pub h264_units: Vec<Vec<u8>>,
+    pub box_types: Vec<[u8; 4]>,
+}
+
+/// Parses a fetched Telegram `inputGroupCallStream` segment (ISO-BMFF/fMP4 boxes or framed `TGAV`
+/// audio/video chunks) without panicking on truncated or unknown payloads (`#454`).
+pub fn parse_rtmp_segment(bytes: &[u8]) -> RtmpSegmentMedia {
+    let mut out = RtmpSegmentMedia::default();
+    if bytes.is_empty() {
+        return out;
+    }
+    // Framed TGAV test/passthrough container: "TGAV" + repeated (kind: u8 [1=opus, 2=h264], len: u32 BE, payload).
+    if bytes.starts_with(b"TGAV") {
+        let mut pos = 4;
+        while pos + 5 <= bytes.len() {
+            let kind = bytes[pos];
+            let len = u32::from_be_bytes([bytes[pos + 1], bytes[pos + 2], bytes[pos + 3], bytes[pos + 4]]) as usize;
+            pos += 5;
+            if pos + len > bytes.len() {
+                break;
+            }
+            let payload = bytes[pos..pos + len].to_vec();
+            match kind {
+                1 if !payload.is_empty() => out.opus_frames.push(payload),
+                2 if !payload.is_empty() => out.h264_units.push(payload),
+                _ => {}
+            }
+            pos += len;
+        }
+        return out;
+    }
+
+    // Standard ISO-BMFF / fMP4 box walk (`ftyp`, `moov`, `moof`, `mdat`, ...).
+    let mut pos = 0;
+    while pos + 8 <= bytes.len() {
+        let size = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        let box_type = [bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]];
+        if size < 8 || pos + size > bytes.len() {
+            break;
+        }
+        out.box_types.push(box_type);
+        let body = &bytes[pos + 8..pos + size];
+        if &box_type == b"mdat" && !body.is_empty() {
+            // Look for Annex-B H.264 NALUs or length-prefixed AVCC NALUs; otherwise treat small payloads as Opus.
+            if body.windows(4).any(|w| w == [0, 0, 0, 1]) {
+                out.h264_units.push(body.to_vec());
+            } else if body.len() <= 1275 {
+                out.opus_frames.push(body.to_vec());
+            }
+        }
+        pos += size;
+    }
+    out
+}
+
+/// Runs a receive-only Telegram channel RTMP live stream viewer in `mediad` (`#454`).
+/// Opens audio playback (never capturing a microphone), decodes incoming segment audio & video,
+/// and honors pause/end/deafen state cleanly.
+pub fn run_rtmp_viewer(channel_id: String, controls: Arc<Controls>) {
+    rt::tick_thread();
+    let _timer = rt::FineTimer::hold();
+
+    let (input, output) = controls.take_chosen();
+    let mut audio = match Audio::open(input, output) {
+        Ok(opened) => {
+            announce(&opened);
+            opened
+        }
+        Err(err) => {
+            let (reason, detail) = media::failure(err);
+            out::fail(reason, detail);
+        }
+    };
+    let mut decoder = OpusDecoder::new();
+    let mut video = VideoEngine::new(controls.clone());
+    video.watch_slot(0, false);
+    let mut processor = Processor::new();
+    let mut limiter = Limiter::default();
+    let mut cue: Option<Playing> = None;
+    let mut opus_queue: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut tick_at = Instant::now() + TICK;
+
+    out::send(&MediaResponse::Connected { ssrc: 0, dave_version: 0 });
+
+    while !controls.hangup.load(Ordering::Relaxed) && !out::over() {
+        let state = controls.tg_rtmp_state().unwrap_or(RtmpStreamState::Waiting);
+        for seg in controls.take_tg_rtmp_segments() {
+            let parsed = parse_rtmp_segment(&seg.bytes);
+            for frame in parsed.opus_frames {
+                if opus_queue.len() < 128 {
+                    opus_queue.push_back(frame);
+                }
+            }
+            for unit in parsed.h264_units {
+                let key = is_h264_keyframe(&unit);
+                let _ = video.picture_slot(
+                    0,
+                    VideoReceived {
+                        data: Arc::from(unit.into_boxed_slice()),
+                        key,
+                        contiguous: true,
+                        user: channel_id.clone(),
+                        kind: PictureKind::Share,
+                    },
+                );
+            }
+        }
+        if matches!(state, RtmpStreamState::Paused | RtmpStreamState::Ended) {
+            opus_queue.clear();
+        }
+
+        let now = Instant::now();
+        if now < tick_at {
+            std::thread::sleep(tick_at.saturating_duration_since(now).min(Duration::from_millis(10)));
+            continue;
+        }
+        tick_at = next_tick(tick_at, now);
+
+        let deafened = controls.deafened.load(Ordering::Relaxed);
+        let mut mix = [0i32; FRAME_SAMPLES];
+        if !deafened && state == RtmpStreamState::Live {
+            if let (Some(packet), Some(dec)) = (opus_queue.pop_front(), decoder.as_mut()) {
+                let mut pcm = [0i16; FRAME_SAMPLES];
+                if let Some(samples) = dec.decode(Some(&packet), 0, &mut pcm) {
+                    let count = (samples * 2).min(FRAME_SAMPLES);
+                    for i in 0..count {
+                        mix[i] = i32::from(pcm[i]);
+                    }
+                }
+            }
+        }
+        let _ = mixdown(&mix, &controls, &mut cue, &mut audio, &mut processor, &mut limiter);
+    }
+
+    finish_cue(&controls, &mut cue, &mut audio);
+}
+
 fn next_tick(tick_at: Instant, now: Instant) -> Instant {
     let next = tick_at + TICK;
     if now > next + 5 * TICK {
@@ -1219,5 +1844,95 @@ mod tests {
         for i in 4..16u32 {
             assert!(streams.contains_key(&i), "louder stream {i} should stay");
         }
+    }
+
+    #[test]
+    fn presentation_offer_and_video_constraints_and_rtmp_parser() {
+        // Presentation offer builds valid JSON and accepts presentation transport answer (#467).
+        let pres = PresentationOffer::new().expect("presentation offer");
+        let expected_ssrc = pres.ssrc();
+        assert!(expected_ssrc > 0);
+        let parsed: Value = serde_json::from_str(pres.params_json()).unwrap();
+        let fp = parsed["fingerprints"][0]["fingerprint"].as_str().unwrap();
+        let server_params = json!({
+            "transport": {
+                "ufrag": "tgpresufrag",
+                "pwd": "tgprespasswordlongenough1234",
+                "fingerprints": [{ "hash": "sha-256", "setup": "passive", "fingerprint": fp }],
+                "candidates": [{ "protocol": "udp", "port": "59602", "ip": "127.0.0.1", "type": "host" }]
+            },
+            "video": {
+                "payload-types": [{ "id": 96, "name": "H264", "clockrate": 90000 }]
+            }
+        })
+        .to_string();
+        let link = pres.accept(&server_params).expect("str0m accepts presentation answer");
+        assert_eq!(link.ssrc, expected_ssrc);
+
+        // Data-channel video constraints map Large -> onStage + 720p, Small -> 360p, skip paused (#467).
+        let sources = vec![
+            TelegramGroupVideoSource {
+                user_id: "u7002".into(),
+                kind: PictureKind::Share,
+                endpoint: "pres_1".into(),
+                ssrcs: vec![3001],
+                paused: false,
+            },
+            TelegramGroupVideoSource {
+                user_id: "u7003".into(),
+                kind: PictureKind::Camera,
+                endpoint: "cam_2".into(),
+                ssrcs: vec![3002],
+                paused: false,
+            },
+            TelegramGroupVideoSource {
+                user_id: "u7012".into(),
+                kind: PictureKind::Camera,
+                endpoint: "cam_3".into(),
+                ssrcs: vec![3003],
+                paused: true,
+            },
+        ];
+        let watch = vec![
+            WatchSource { user_id: "u7002".into(), kind: PictureKind::Share, size: WatchSize::Large },
+            WatchSource { user_id: "u7003".into(), kind: PictureKind::Camera, size: WatchSize::Small },
+            WatchSource { user_id: "u7012".into(), kind: PictureKind::Camera, size: WatchSize::Small },
+        ];
+        let json_str = build_video_constraints_json(&sources, &watch);
+        let val: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(val["colibriClass"].as_str(), Some("ReceiverVideoConstraints"));
+        assert_eq!(val["onStageEndpoints"].as_array().unwrap().len(), 1);
+        assert_eq!(val["onStageEndpoints"][0].as_str(), Some("pres_1"));
+        assert_eq!(val["constraints"]["pres_1"]["maxHeight"].as_i64(), Some(720));
+        assert_eq!(val["constraints"]["cam_2"]["maxHeight"].as_i64(), Some(360));
+        assert!(val["constraints"].get("cam_3").is_none(), "paused stream must not be requested");
+
+        // RTMP segment parser handles both TGAV framed payloads and fMP4 boxes safely (#454).
+        let mut tgav = b"TGAV".to_vec();
+        tgav.push(1);
+        tgav.extend_from_slice(&3u32.to_be_bytes());
+        tgav.extend_from_slice(&[0xf8, 0xff, 0xfe]);
+        tgav.push(2);
+        tgav.extend_from_slice(&6u32.to_be_bytes());
+        tgav.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
+        let parsed_tgav = parse_rtmp_segment(&tgav);
+        assert_eq!(parsed_tgav.opus_frames.len(), 1);
+        assert_eq!(parsed_tgav.h264_units.len(), 1);
+        assert!(is_h264_keyframe(&parsed_tgav.h264_units[0]));
+
+        let mut fmp4 = Vec::new();
+        fmp4.extend_from_slice(&12u32.to_be_bytes());
+        fmp4.extend_from_slice(b"moof");
+        fmp4.extend_from_slice(&[0, 0, 0, 0]);
+        let mdat_payload = [0u8, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f];
+        fmp4.extend_from_slice(&((8 + mdat_payload.len()) as u32).to_be_bytes());
+        fmp4.extend_from_slice(b"mdat");
+        fmp4.extend_from_slice(&mdat_payload);
+        let parsed_mp4 = parse_rtmp_segment(&fmp4);
+        assert_eq!(parsed_mp4.box_types, vec![*b"moof", *b"mdat"]);
+        assert_eq!(parsed_mp4.h264_units.len(), 1);
+
+        // Truncated/garbage input never panics.
+        assert!(parse_rtmp_segment(&[0, 0, 0, 2, b'b', b'a', b'd']).h264_units.is_empty());
     }
 }

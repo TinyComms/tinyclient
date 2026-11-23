@@ -936,11 +936,12 @@ impl Shell {
     }
 
     /// Share and camera belong on a joined call that allows video (`Call::video_allowed`) on a
-    /// network that carries it (Tiny or Discord).
+    /// network that carries it (Tiny, Discord, or Telegram — excluding RTMP viewer streams).
     fn call_pictures(&self, call: &Call) -> bool {
         call.state == CallState::Joined
             && call.video_allowed
-            && matches!(call.conversation.network, Network::Discord | Network::Tiny)
+            && !call.rtmp_stream
+            && matches!(call.conversation.network, Network::Discord | Network::Tiny | Network::Telegram)
     }
 
     /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,
@@ -1233,6 +1234,10 @@ impl Shell {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
                             .child(super::telegram::call_header_display_title(call, &subject.title)),
+                    )
+                    .children(
+                        call.record_start_date
+                            .map(|since| super::telegram::recording_badge("call-dock-rec", since, call.record_video_active)),
                     ),
             )
             .child(place)
@@ -1381,34 +1386,40 @@ impl Shell {
         let pictures = self.call_pictures(call);
         let share_on = encoding(call, Content::Share);
         let camera_on = encoding(call, Content::Camera);
+        let share_limit = call.video_limit_reason(share_on);
+        let share_enabled = enabled && share_limit.is_none();
+        let share_tip: gpui::SharedString = match &share_limit {
+            Some(reason) => reason.clone().into(),
+            None if share_on => "Stop sharing".into(),
+            None => "Share your screen".into(),
+        };
         let share = pictures.then(|| {
             control(
                 "call-share",
                 "icons/monitor-up.svg",
                 if share_on { Look::On } else { Look::Rest },
-                enabled,
+                share_enabled,
             )
-            .aria_label(if share_on { "Stop sharing" } else { "Share your screen" })
-            .when(enabled, |share| {
-                share
-                    .tooltip(tip(
-                        if share_on {
-                            "Stop sharing"
-                        } else {
-                            "Share your screen"
-                        },
-                        None,
-                    ))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        if share_on {
-                            this.tiny_stop_share(cx);
-                        } else {
-                            this.tiny_share(window, cx);
-                        }
-                    }))
+            .aria_label(share_tip.clone())
+            .tooltip(tip(share_tip, None))
+            .when(share_enabled, |share| {
+                share.on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    if share_on {
+                        this.tiny_stop_share(cx);
+                    } else {
+                        this.tiny_share(window, cx);
+                    }
+                }))
             })
         });
+        let camera_limit = call.video_limit_reason(camera_on);
+        let camera_enabled = enabled && camera_limit.is_none();
+        let camera_tip: gpui::SharedString = match &camera_limit {
+            Some(reason) => reason.clone().into(),
+            None if camera_on => "Turn camera off".into(),
+            None => "Turn camera on".into(),
+        };
         let camera = pictures.then(|| {
             let call_cam = call.clone();
             control(
@@ -1421,23 +1432,15 @@ impl Shell {
                 } else {
                     Look::Rest
                 },
-                enabled,
+                camera_enabled,
             )
-            .aria_label(if camera_on { "Turn camera off" } else { "Turn camera on" })
-            .when(enabled, |camera| {
-                camera
-                    .tooltip(tip(
-                        if camera_on {
-                            "Turn camera off"
-                        } else {
-                            "Turn camera on"
-                        },
-                        None,
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.call_camera_clicked(&call_cam, camera_on, cx);
-                    }))
+            .aria_label(camera_tip.clone())
+            .tooltip(tip(camera_tip, None))
+            .when(camera_enabled, |camera| {
+                camera.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_camera_clicked(&call_cam, camera_on, cx);
+                }))
             })
         });
         let ring_again = (call.conversation.network == Network::Discord
@@ -1785,6 +1788,15 @@ mod tests {
         can_change_join_muted: false,
         participants_count: 0,
         joined_as: None,
+        record_start_date: None,
+        record_video_active: false,
+        can_start_video: true,
+        unmuted_video_count: 0,
+        unmuted_video_limit: 0,
+        rtmp_stream: false,
+        rtmp_state: None,
+        rtmp_quality: None,
+        rtmp_qualities: Vec::new(),
         }
     }
 

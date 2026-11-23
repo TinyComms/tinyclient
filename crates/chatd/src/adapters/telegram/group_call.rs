@@ -5,10 +5,12 @@
 use super::peers::Who;
 use super::wire::{self, Fault};
 use super::{live, sync, Account};
+use base64::Engine as _;
 use grammers_tl_types as tl;
 use protocol::{
-    CallFailure, GroupCallInviteRefusal, GroupCallInviteResult, GroupCallJoinAs, GroupCallJoinPeer,
-    Occupant, Occupants, Participant, TelegramGroupOffer, TelegramGroupSource,
+    CallFailure, Cue, GroupCallInviteRefusal, GroupCallInviteResult, GroupCallJoinAs,
+    GroupCallJoinPeer, GroupCallRtmpUrl, Occupant, Occupants, Participant, PictureKind,
+    RtmpStreamState, TelegramGroupOffer, TelegramGroupSource, TelegramGroupVideoSource,
 };
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +28,28 @@ fn check_interval() -> Duration {
     Duration::from_secs(15)
 }
 
+/// Debounce window for coalescing participant volume slider drags into one `editGroupCallParticipant` RPC (#468).
+fn gain_debounce() -> Duration {
+    if let Ok(ms) = std::env::var("TINYCLIENT_TELEGRAM_GAIN_DEBOUNCE_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    Duration::from_millis(250)
+}
+
+/// Poll cadence for fetching RTMP live stream segments (`upload.getFile` on `inputGroupCallStream`) (#454).
+fn rtmp_poll_interval() -> Duration {
+    if let Ok(ms) = std::env::var("TINYCLIENT_TELEGRAM_RTMP_POLL_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            if ms > 0 {
+                return Duration::from_millis(ms);
+            }
+        }
+    }
+    Duration::from_millis(500)
+}
+
 /// Minimum spacing between outgoing `speakingInGroupCallAction` typing updates.
 const SPEAKING_PACE: Duration = Duration::from_secs(4);
 /// Maximum pages fetched from `phone.getGroupParticipants` on join.
@@ -34,6 +58,33 @@ const MAX_PARTICIPANT_PAGES: usize = 5;
 const PARTICIPANT_PAGE_SIZE: i32 = 50;
 /// Safe cap on people invited in a single `phone.inviteToGroupCall` batch (#459).
 const MAX_INVITE_BATCH: usize = 10;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct GroupVideoEndpoint {
+    pub endpoint: String,
+    pub ssrcs: Vec<u32>,
+    pub paused: bool,
+    pub audio_source: Option<u32>,
+}
+
+fn extract_video_endpoint(raw: &tl::enums::GroupCallParticipantVideo) -> GroupVideoEndpoint {
+    let tl::enums::GroupCallParticipantVideo::Video(v) = raw;
+    let mut ssrcs = Vec::new();
+    for grp in &v.source_groups {
+        let tl::enums::GroupCallParticipantVideoSourceGroup::Group(g) = grp;
+        for &src in &g.sources {
+            if src > 0 {
+                ssrcs.push(src as u32);
+            }
+        }
+    }
+    GroupVideoEndpoint {
+        endpoint: v.endpoint.clone(),
+        ssrcs,
+        paused: v.paused,
+        audio_source: v.audio_source.filter(|&s| s > 0).map(|s| s as u32),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct GroupParticipant {
@@ -45,6 +96,9 @@ pub(super) struct GroupParticipant {
     pub raise_hand_rating: Option<i64>,
     pub about: String,
     pub muted_by_you: bool,
+    pub volume: Option<u16>,
+    pub video: Option<GroupVideoEndpoint>,
+    pub presentation: Option<GroupVideoEndpoint>,
     pub is_self: bool,
     pub order: u64,
 }
@@ -69,9 +123,59 @@ pub(super) struct TrackedGroupCall {
     pub schedule_start_subscribed: bool,
     pub join_muted: bool,
     pub can_change_join_muted: bool,
+    pub record_start_date: Option<i64>,
+    pub record_video_active: bool,
+    pub can_start_video: bool,
+    pub unmuted_video_count: u32,
+    pub unmuted_video_limit: u32,
+    pub rtmp_stream: bool,
+    pub stream_dc_id: Option<i32>,
     pub participants: HashMap<Who, GroupParticipant>,
     pub next_order: u64,
     pub fetched_once: bool,
+}
+
+impl TrackedGroupCall {
+    fn new(id: i64, access_hash: i64) -> Self {
+        Self {
+            id,
+            access_hash,
+            title: String::new(),
+            participants_count: 0,
+            schedule_date: None,
+            schedule_start_subscribed: false,
+            join_muted: false,
+            can_change_join_muted: false,
+            record_start_date: None,
+            record_video_active: false,
+            can_start_video: true,
+            unmuted_video_count: 0,
+            unmuted_video_limit: 0,
+            rtmp_stream: false,
+            stream_dc_id: None,
+            participants: HashMap::new(),
+            next_order: 0,
+            fetched_once: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingGain {
+    pub percent: u16,
+    pub muted_by_you: bool,
+    pub due: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RtmpViewer {
+    pub state: RtmpStreamState,
+    pub quality: u8,
+    pub qualities: Vec<u8>,
+    pub channel_id: Option<i32>,
+    pub scale: i32,
+    pub next_timestamp_ms: i64,
+    pub next_fetch: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +187,11 @@ pub(super) struct JoinedGroupCall {
     pub source: u32,
     pub muted: bool,
     pub deafened: bool,
+    pub camera_on: bool,
+    pub presentation_active: bool,
+    pub applied_gains: HashMap<Who, (u16, bool)>,
+    pub pending_gains: HashMap<Who, PendingGain>,
+    pub rtmp: Option<RtmpViewer>,
     pub next_check: Instant,
     pub last_speaking_sent: Option<Instant>,
 }
@@ -129,19 +238,7 @@ pub(super) fn note_full_call(account: &Account, who: Who, call: Option<&tl::enum
             c.id = id;
             c.access_hash = access_hash;
         })
-        .or_insert_with(|| TrackedGroupCall {
-            id,
-            access_hash,
-            title: String::new(),
-            participants_count: 0,
-            schedule_date: None,
-            schedule_start_subscribed: false,
-            join_muted: false,
-            can_change_join_muted: false,
-            participants: HashMap::new(),
-            next_order: 0,
-            fetched_once: false,
-        });
+        .or_insert_with(|| TrackedGroupCall::new(id, access_hash));
 }
 
 /// Fetches `InputGroupCall` for `who` via `GetFullChat` / `GetFullChannel` if not yet cached.
@@ -193,6 +290,13 @@ fn apply_group_call_obj(tracked: &mut TrackedGroupCall, gc: &tl::types::GroupCal
     tracked.schedule_start_subscribed = gc.schedule_start_subscribed;
     tracked.join_muted = gc.join_muted;
     tracked.can_change_join_muted = gc.can_change_join_muted;
+    tracked.record_start_date = gc.record_start_date.filter(|&d| d > 0).map(i64::from);
+    tracked.record_video_active = gc.record_video_active;
+    tracked.can_start_video = gc.can_start_video;
+    tracked.unmuted_video_count = gc.unmuted_video_count.unwrap_or(0).max(0) as u32;
+    tracked.unmuted_video_limit = gc.unmuted_video_limit.max(0) as u32;
+    tracked.rtmp_stream = gc.rtmp_stream;
+    tracked.stream_dc_id = gc.stream_dc_id.filter(|&dc| dc > 0);
 }
 
 fn apply_participants(tracked: &mut TrackedGroupCall, list: &[tl::enums::GroupCallParticipant]) {
@@ -222,6 +326,21 @@ fn apply_participants(tracked: &mut TrackedGroupCall, list: &[tl::enums::GroupCa
         } else {
             p.muted_by_you
         };
+        let volume = match p.volume {
+            Some(v) => Some(protocol::telegram_volume_to_percent(v)),
+            None if p.min => prev.and_then(|old| old.volume),
+            None => None,
+        };
+        let video = match p.video.as_ref() {
+            Some(v) => Some(extract_video_endpoint(v)),
+            None if p.min => prev.and_then(|old| old.video.clone()),
+            None => None,
+        };
+        let presentation = match p.presentation.as_ref() {
+            Some(v) => Some(extract_video_endpoint(v)),
+            None if p.min => prev.and_then(|old| old.presentation.clone()),
+            None => None,
+        };
         let source = p.source.max(0) as u32;
         let speaking = !p.muted && p.active_date.is_some();
         let inserted = tracked
@@ -237,6 +356,9 @@ fn apply_participants(tracked: &mut TrackedGroupCall, list: &[tl::enums::GroupCa
                     raise_hand_rating: p.raise_hand_rating,
                     about,
                     muted_by_you,
+                    volume,
+                    video,
+                    presentation,
                     is_self,
                     order,
                 },
@@ -279,7 +401,7 @@ fn sort_participants<'a>(participants: impl Iterator<Item = &'a GroupParticipant
 
 fn publish_occupants(account: &Account, who: Who) {
     let (occupants, joined_meta) = {
-        let live = account.live();
+        let mut live = account.live();
         let Some(tracked) = live.group_calls.calls.get(&who) else {
             drop(live);
             account.ctx.group_call_occupants(&who.text(), Occupants::default());
@@ -303,8 +425,8 @@ fn publish_occupants(account: &Account, who: Who) {
                     server_deafened: false,
                     suppressed: p.suppressed(),
                     speaking: p.speaking,
-                    streaming: false,
-                    camera: false,
+                    streaming: p.presentation.is_some(),
+                    camera: p.video.is_some(),
                     hand_raised: p.hand_raised(),
                     is_channel: !matches!(p.who, Who::User(_)),
                 }
@@ -323,21 +445,20 @@ fn publish_occupants(account: &Account, who: Who) {
             scheduled_at: tracked.schedule_date,
             subscribed: tracked.schedule_start_subscribed,
             live: is_live,
+            record_start_date: tracked.record_start_date,
+            record_video_active: tracked.record_video_active,
+            rtmp_stream: tracked.rtmp_stream,
         };
 
-        let joined_info = live
-            .group_calls
-            .joined
-            .as_ref()
-            .filter(|j| j.who == who)
-            .map(|j| j.join_as);
-        let joined_meta = if let Some(self_who) = joined_info {
+        let joined_here = live.group_calls.joined.as_ref().is_some_and(|j| j.who == who);
+        let joined_meta = if joined_here {
+            let self_who = live.group_calls.joined.as_ref().unwrap().join_as;
             let my_participant = tracked
                 .participants
                 .values()
                 .find(|p| p.is_self || p.who == self_who);
-            let self_suppressed = my_participant.is_some_and(GroupParticipant::suppressed);
-            let self_hand_raised = my_participant.is_some_and(GroupParticipant::hand_raised);
+            let self_suppressed = tracked.rtmp_stream || my_participant.is_some_and(GroupParticipant::suppressed);
+            let self_hand_raised = !tracked.rtmp_stream && my_participant.is_some_and(GroupParticipant::hand_raised);
             let participants: Vec<Participant> = sorted
                 .iter()
                 .filter(|p| !p.is_self && p.who != self_who)
@@ -348,11 +469,16 @@ fn publish_occupants(account: &Account, who: Who) {
                     deafened: false,
                     speaking: p.speaking,
                     suppressed: p.suppressed(),
+                    camera: p.video.is_some(),
+                    sharing: p.presentation.is_some(),
                     hand_raised: p.hand_raised(),
                     raise_hand_rating: p.raise_hand_rating,
                     about: p.about.clone(),
                     muted_by_you: p.muted_by_you,
                     is_channel: !matches!(p.who, Who::User(_)),
+                    volume: p.volume,
+                    video_paused: p.video.as_ref().is_some_and(|v| v.paused),
+                    presentation_paused: p.presentation.as_ref().is_some_and(|v| v.paused),
                     ..Participant::default()
                 })
                 .collect();
@@ -364,17 +490,76 @@ fn publish_occupants(account: &Account, who: Who) {
                     user_id: p.who.text(),
                 })
                 .collect();
-            Some((
-                participants,
-                sources,
-                self_suppressed,
-                self_hand_raised,
-                tracked.title.clone(),
-                tracked.join_muted,
-                tracked.can_change_join_muted,
-                total,
-                self_who.text(),
-            ))
+            let mut video_sources: Vec<TelegramGroupVideoSource> = Vec::new();
+            for p in sorted.iter().filter(|p| !p.is_self && p.who != self_who) {
+                let uid = p.who.text();
+                if let Some(v) = &p.video {
+                    video_sources.push(TelegramGroupVideoSource {
+                        user_id: uid.clone(),
+                        kind: PictureKind::Camera,
+                        endpoint: v.endpoint.clone(),
+                        ssrcs: v.ssrcs.clone(),
+                        paused: v.paused,
+                    });
+                }
+                if let Some(pres) = &p.presentation {
+                    video_sources.push(TelegramGroupVideoSource {
+                        user_id: uid,
+                        kind: PictureKind::Share,
+                        endpoint: pres.endpoint.clone(),
+                        ssrcs: pres.ssrcs.clone(),
+                        paused: pres.paused,
+                    });
+                }
+            }
+            let desired_gains: Vec<(Who, u16, bool)> = sorted
+                .iter()
+                .filter(|p| !p.is_self && p.who != self_who)
+                .filter_map(|p| {
+                    if p.volume.is_some() || p.muted_by_you {
+                        Some((p.who, p.volume.unwrap_or(100), p.muted_by_you))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let rtmp_meta = live
+                .group_calls
+                .joined
+                .as_ref()
+                .and_then(|j| j.rtmp.as_ref())
+                .map(|r| (r.state, r.quality, r.qualities.clone()));
+            let meta = crate::media::GroupCallMeta {
+                title: tracked.title.clone(),
+                hand_raised: self_hand_raised,
+                join_muted: tracked.join_muted,
+                can_change_join_muted: tracked.can_change_join_muted,
+                participants_count: total,
+                joined_as: Some(self_who.text()),
+                record_start_date: tracked.record_start_date,
+                record_video_active: tracked.record_video_active,
+                can_start_video: tracked.can_start_video && !tracked.rtmp_stream,
+                unmuted_video_count: tracked.unmuted_video_count,
+                unmuted_video_limit: tracked.unmuted_video_limit,
+                rtmp_stream: tracked.rtmp_stream,
+                rtmp_state: rtmp_meta.as_ref().map(|(s, _, _)| *s),
+                rtmp_quality: rtmp_meta.as_ref().map(|(_, q, _)| *q),
+                rtmp_qualities: rtmp_meta.map(|(_, _, qs)| qs).unwrap_or_default(),
+            };
+            let mut gains_to_apply: Vec<(String, u16, bool)> = Vec::new();
+            if let Some(joined) = live.group_calls.joined.as_mut() {
+                for (p_who, percent, muted_by_you) in desired_gains {
+                    if joined.pending_gains.contains_key(&p_who) {
+                        continue;
+                    }
+                    let want = (percent, muted_by_you);
+                    if joined.applied_gains.get(&p_who).copied() != Some(want) {
+                        joined.applied_gains.insert(p_who, want);
+                        gains_to_apply.push((p_who.text(), percent, muted_by_you));
+                    }
+                }
+            }
+            Some((participants, sources, video_sources, gains_to_apply, self_suppressed, meta))
         } else {
             None
         };
@@ -384,30 +569,15 @@ fn publish_occupants(account: &Account, who: Who) {
     let conv_id = who.text();
     account.ctx.group_call_occupants(&conv_id, occupants);
     sync::refresh_row(account, who);
-    if let Some((
-        call_participants,
-        sources,
-        self_suppressed,
-        self_hand_raised,
-        title,
-        join_muted,
-        can_change_join_muted,
-        total,
-        joined_as,
-    )) = joined_meta
-    {
+    if let Some((call_participants, sources, video_sources, gains_to_apply, self_suppressed, meta)) = joined_meta {
         account.ctx.participants(&conv_id, call_participants);
         account.ctx.telegram_group_sources(&conv_id, sources);
+        account.ctx.telegram_group_video_sources(&conv_id, video_sources);
+        for (uid, percent, muted) in gains_to_apply {
+            account.ctx.call_gain(uid, percent, muted);
+        }
         account.ctx.self_moderation(&conv_id, false, false, self_suppressed);
-        account.ctx.group_call_meta(
-            &conv_id,
-            title,
-            self_hand_raised,
-            join_muted,
-            can_change_join_muted,
-            total,
-            Some(joined_as),
-        );
+        account.ctx.group_call_meta(&conv_id, meta);
     }
 }
 
@@ -441,19 +611,11 @@ pub(super) fn open_chat(account: &Account, who: Who) {
             {
                 let mut live = account.live();
                 live.group_calls.by_call_id.insert(gc.id, who);
-                let tracked = live.group_calls.calls.entry(who).or_insert_with(|| TrackedGroupCall {
-                    id: gc.id,
-                    access_hash: gc.access_hash,
-                    title: String::new(),
-                    participants_count: 0,
-                    schedule_date: None,
-                    schedule_start_subscribed: false,
-                    join_muted: false,
-                    can_change_join_muted: false,
-                    participants: HashMap::new(),
-                    next_order: 0,
-                    fetched_once: false,
-                });
+                let tracked = live
+                    .group_calls
+                    .calls
+                    .entry(who)
+                    .or_insert_with(|| TrackedGroupCall::new(gc.id, gc.access_hash));
                 apply_group_call_obj(tracked, gc);
                 apply_participants(tracked, &found.participants);
                 tracked.fetched_once = true;
@@ -507,29 +669,27 @@ pub(super) fn on_group_call(account: &Account, update: &tl::types::UpdateGroupCa
     };
     match &update.call {
         tl::enums::GroupCall::Call(gc) => {
-            let need_participants = {
+            let (need_participants, recording_started) = {
                 let mut live = account.live();
                 live.group_calls.by_call_id.insert(gc.id, who);
+                let joined_here = live.group_calls.joined.as_ref().is_some_and(|j| j.who == who);
                 let prev_scheduled = live.group_calls.calls.get(&who).and_then(|c| c.schedule_date);
-                let tracked = live.group_calls.calls.entry(who).or_insert_with(|| TrackedGroupCall {
-                    id: gc.id,
-                    access_hash: gc.access_hash,
-                    title: String::new(),
-                    participants_count: 0,
-                    schedule_date: None,
-                    schedule_start_subscribed: false,
-                    join_muted: false,
-                    can_change_join_muted: false,
-                    participants: HashMap::new(),
-                    next_order: 0,
-                    fetched_once: false,
-                });
+                let prev_recording = live.group_calls.calls.get(&who).and_then(|c| c.record_start_date);
+                let tracked = live
+                    .group_calls
+                    .calls
+                    .entry(who)
+                    .or_insert_with(|| TrackedGroupCall::new(gc.id, gc.access_hash));
                 apply_group_call_obj(tracked, gc);
                 let just_went_live = prev_scheduled.is_some() && tracked.schedule_date.is_none();
-                (just_went_live || !tracked.fetched_once) && is_chat_watched(account, who)
+                let rec_started = joined_here && prev_recording.is_none() && tracked.record_start_date.is_some();
+                ((just_went_live || !tracked.fetched_once) && is_chat_watched(account, who), rec_started)
             };
             account.dir().set_call_active(who, true, gc.participants_count > 0);
             publish_occupants(account, who);
+            if recording_started {
+                account.ctx.call_cue(&who.text(), Cue::RecordingStarted);
+            }
             if need_participants {
                 let _ = fetch_participants_pages(account, who, gc.id, gc.access_hash, 1);
             }
@@ -562,15 +722,16 @@ pub(super) fn on_participants(account: &Account, update: &tl::types::UpdateGroup
     publish_occupants(account, who);
 }
 
-/// Handles `Update::GroupCallConnection` (`#461`).
+/// Handles `Update::GroupCallConnection` (`#461`, `#467`).
 pub(super) fn on_connection(account: &Account, update: &tl::types::UpdateGroupCallConnection) {
-    if update.presentation {
-        return;
-    }
     let tl::enums::DataJson::Json(json) = &update.params;
     let conv_id = account.live().group_calls.joined.as_ref().map(|j| j.who.text());
     if let Some(conv_id) = conv_id {
-        account.ctx.telegram_group_answer(&conv_id, json.data.clone());
+        if update.presentation {
+            account.ctx.telegram_group_presentation_answer(&conv_id, json.data.clone());
+        } else {
+            account.ctx.telegram_group_answer(&conv_id, json.data.clone());
+        }
     }
 }
 
@@ -874,7 +1035,7 @@ pub(super) fn create(
     if target_who != who {
         sync::refresh_row(account, target_who);
     }
-    if join && !rtmp_stream {
+    if join {
         join_group_with(account, &target_who.text(), None, None, false)?;
     }
     Ok(target_who.text())
@@ -1249,6 +1410,444 @@ pub(super) fn moderate(
 }
 
 // ---------------------------------------------------------------------------
+// Recording (#463), Per-person Gain (#468), Camera/Share (#467), RTMP (#454)
+// ---------------------------------------------------------------------------
+
+/// Starts or stops Telegram server-side recording (`phone.toggleGroupCallRecord`, requires `manage_call`) (#463).
+pub(super) fn toggle_record(
+    account: &Account,
+    conversation_id: &str,
+    start: bool,
+    video: bool,
+    video_portrait: Option<bool>,
+    title: Option<String>,
+) -> Result<(bool, Option<String>), Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("No video chat in this conversation.".to_owned()));
+    };
+    require_manage_call(account, who)?;
+    let Some((id, access_hash)) = ensure_input_call(account, who)? else {
+        return Err(Fault::Refused("There is no active video chat in this chat.".to_owned()));
+    };
+    let clean_title = if start {
+        title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
+    } else {
+        None
+    };
+    let req = tl::functions::phone::ToggleGroupCallRecord {
+        start,
+        video: start && video,
+        call: input_call_of(id, access_hash),
+        title: clean_title,
+        video_portrait: if start && video { Some(video_portrait.unwrap_or(false)) } else { None },
+    };
+    let answer = account.ask(&req)?;
+    live::answered(account, &answer);
+    {
+        let mut live = account.live();
+        if let Some(tracked) = live.group_calls.calls.get_mut(&who) {
+            if !start {
+                tracked.record_start_date = None;
+                tracked.record_video_active = false;
+            } else if tracked.record_start_date.is_none() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(1);
+                tracked.record_start_date = Some(now);
+                tracked.record_video_active = video;
+            }
+        }
+    }
+    publish_occupants(account, who);
+    let notice = if !start {
+        Some("Recording stopped. The file will arrive in your Saved Messages.".to_owned())
+    } else {
+        None
+    };
+    Ok((start, notice))
+}
+
+/// Coalesces local participant volume / mute-for-me changes into a debounced `phone.editGroupCallParticipant` (#468).
+pub(super) fn queue_participant_gain(
+    account: &Account,
+    conversation_id: &str,
+    participant_id: &str,
+    percent: u16,
+    muted_by_you: bool,
+) {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return;
+    };
+    let Some((target_who, None)) = Who::parse(participant_id) else {
+        return;
+    };
+    let percent = percent.min(protocol::GAIN_MAX);
+    let updated = {
+        let mut live = account.live();
+        let Some(joined) = live.group_calls.joined.as_mut().filter(|j| j.who == who) else {
+            return;
+        };
+        joined.applied_gains.insert(target_who, (percent, muted_by_you));
+        joined.pending_gains.insert(
+            target_who,
+            PendingGain {
+                percent,
+                muted_by_you,
+                due: Instant::now() + gain_debounce(),
+            },
+        );
+        if let Some(tracked) = live.group_calls.calls.get_mut(&who) {
+            if let Some(p) = tracked.participants.get_mut(&target_who) {
+                p.volume = Some(percent);
+                p.muted_by_you = muted_by_you;
+            }
+        }
+        true
+    };
+    if updated {
+        publish_occupants(account, who);
+    }
+}
+
+/// Flushes due debounced participant volume/mute-for-me edits to Telegram (#468).
+/// CRITICAL: When the caller has `manage_call`, Telegram treats `muted: Some(true)` as
+/// "Mute for everyone". Therefore an admin's local "Mute for me" NEVER sends `muted: Some(true)` —
+/// it stays local in `mediad` (`MediaRequest::Gain`) and only syncs `volume` safely.
+fn flush_pending_gains(account: &Account) {
+    let due_items: Vec<(Who, i64, i64, Who, PendingGain)> = {
+        let now = Instant::now();
+        let mut live = account.live();
+        let Some(joined) = live.group_calls.joined.as_mut() else {
+            return;
+        };
+        let ready: Vec<Who> = joined
+            .pending_gains
+            .iter()
+            .filter_map(|(&p_who, g)| (g.due <= now).then_some(p_who))
+            .collect();
+        let mut out = Vec::with_capacity(ready.len());
+        for p_who in ready {
+            if let Some(g) = joined.pending_gains.remove(&p_who) {
+                out.push((joined.who, joined.call_id, joined.access_hash, p_who, g));
+            }
+        }
+        out
+    };
+    for (who, call_id, access_hash, target_who, g) in due_items {
+        let manage = account.dir().get(who).is_some_and(|k| k.rights.manage_call);
+        let Ok(participant) = account.input(target_who) else {
+            continue;
+        };
+        let (muted, volume) = if manage {
+            // Admin local mute MUST NEVER send `muted: Some(true)` (which mutes for everyone on Telegram).
+            let vol = if g.muted_by_you {
+                1
+            } else {
+                protocol::percent_to_telegram_volume(g.percent)
+            };
+            (None, Some(vol))
+        } else {
+            (
+                Some(g.muted_by_you),
+                Some(protocol::percent_to_telegram_volume(g.percent)),
+            )
+        };
+        let req = tl::functions::phone::EditGroupCallParticipant {
+            call: input_call_of(call_id, access_hash),
+            participant,
+            muted,
+            volume,
+            raise_hand: None,
+            video_stopped: None,
+            video_paused: None,
+            presentation_paused: None,
+        };
+        if let Ok(answer) = wire::call(account.wire.as_ref(), &req) {
+            live::answered(account, &answer);
+        }
+    }
+}
+
+/// Reports local camera state to Telegram (`video_stopped` / `video_paused`) (#467).
+pub(super) fn on_camera(account: &Account, on: bool) {
+    let target = {
+        let mut live = account.live();
+        let Some(joined) = live.group_calls.joined.as_mut() else {
+            return;
+        };
+        if joined.rtmp.is_some() {
+            return;
+        }
+        joined.camera_on = on;
+        (joined.who, joined.call_id, joined.access_hash, joined.join_as)
+    };
+    let (who, call_id, access_hash, join_as) = target;
+    let Ok(participant) = input_peer_for_identity(account, join_as) else {
+        return;
+    };
+    let req = tl::functions::phone::EditGroupCallParticipant {
+        call: input_call_of(call_id, access_hash),
+        participant,
+        muted: None,
+        volume: None,
+        raise_hand: None,
+        video_stopped: Some(!on),
+        video_paused: Some(false),
+        presentation_paused: None,
+    };
+    if let Ok(answer) = wire::call(account.wire.as_ref(), &req) {
+        live::answered(account, &answer);
+    }
+    publish_occupants(account, who);
+}
+
+/// Starts or stops Telegram screen share (`phone.joinGroupCallPresentation` / `leaveGroupCallPresentation`) (#467).
+pub(super) fn on_share(account: &Account, on: bool) {
+    let info = {
+        let live = account.live();
+        live.group_calls
+            .joined
+            .as_ref()
+            .filter(|j| j.rtmp.is_none())
+            .map(|j| (j.who, j.call_id, j.access_hash, j.join_as, j.presentation_active))
+    };
+    let Some((who, call_id, access_hash, join_as, was_active)) = info else {
+        return;
+    };
+    let conv_id = who.text();
+    if on {
+        let Ok((params_json, _ssrc)) = account.ctx.telegram_group_presentation_offer(&conv_id) else {
+            return;
+        };
+        let req = tl::functions::phone::JoinGroupCallPresentation {
+            call: input_call_of(call_id, access_hash),
+            params: tl::types::DataJson { data: params_json }.into(),
+        };
+        match wire::call(account.wire.as_ref(), &req) {
+            Ok(answer) => {
+                if let Some(joined) = account.live().group_calls.joined.as_mut() {
+                    if joined.who == who {
+                        joined.presentation_active = true;
+                    }
+                }
+                live::answered(account, &answer);
+                if let Ok(participant) = input_peer_for_identity(account, join_as) {
+                    let unpause = tl::functions::phone::EditGroupCallParticipant {
+                        call: input_call_of(call_id, access_hash),
+                        participant,
+                        muted: None,
+                        volume: None,
+                        raise_hand: None,
+                        video_stopped: None,
+                        video_paused: None,
+                        presentation_paused: Some(false),
+                    };
+                    if let Ok(ans) = wire::call(account.wire.as_ref(), &unpause) {
+                        live::answered(account, &ans);
+                    }
+                }
+            }
+            Err(_) => {
+                account.ctx.telegram_group_presentation_leave(&conv_id);
+            }
+        }
+    } else if was_active {
+        if let Some(joined) = account.live().group_calls.joined.as_mut() {
+            if joined.who == who {
+                joined.presentation_active = false;
+            }
+        }
+        account.ctx.telegram_group_presentation_leave(&conv_id);
+        let req = tl::functions::phone::LeaveGroupCallPresentation {
+            call: input_call_of(call_id, access_hash),
+        };
+        if let Ok(answer) = wire::call(account.wire.as_ref(), &req) {
+            live::answered(account, &answer);
+        }
+    }
+    publish_occupants(account, who);
+}
+
+/// Queries or revokes the RTMP server URL & stream key (`phone.getGroupCallStreamRtmpUrl`, requires `manage_call`) (#454).
+/// Never logs the returned stream key.
+pub(super) fn rtmp_url(
+    account: &Account,
+    conversation_id: &str,
+    revoke: bool,
+) -> Result<GroupCallRtmpUrl, Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("Live stream keys are only available for groups and channels.".to_owned()));
+    };
+    require_manage_call(account, who)?;
+    let peer = account.input(who)?;
+    let tl::enums::phone::GroupCallStreamRtmpUrl::Url(found) = account.ask(
+        &tl::functions::phone::GetGroupCallStreamRtmpUrl {
+            live_story: false,
+            peer,
+            revoke,
+        },
+    )?;
+    Ok(GroupCallRtmpUrl { url: found.url, key: found.key })
+}
+
+/// Switches the requested quality tier (0 = Low, 1 = Medium, 2 = High) on a watched RTMP live stream (#454).
+pub(super) fn set_rtmp_quality(
+    account: &Account,
+    conversation_id: &str,
+    quality: u8,
+) -> Result<(), Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("No live stream in this conversation.".to_owned()));
+    };
+    let clamped = quality.min(2);
+    {
+        let mut live = account.live();
+        let Some(rtmp) = live
+            .group_calls
+            .joined
+            .as_mut()
+            .filter(|j| j.who == who)
+            .and_then(|j| j.rtmp.as_mut())
+        else {
+            return Err(Fault::Refused("Not currently watching a live stream in this chat.".to_owned()));
+        };
+        rtmp.quality = clamped;
+        rtmp.next_fetch = Instant::now();
+    }
+    publish_occupants(account, who);
+    tick_rtmp(account);
+    Ok(())
+}
+
+/// Polls `phone.getGroupCallStreamChannels` and fetches `inputGroupCallStream` segments via `upload.getFile`
+/// on `stream_dc_id` while watching an RTMP live stream (#454).
+fn tick_rtmp(account: &Account) {
+    let due = {
+        let now = Instant::now();
+        let mut live = account.live();
+        let Some(joined) = live.group_calls.joined.as_mut() else {
+            return;
+        };
+        let Some(rtmp) = joined.rtmp.as_mut() else {
+            return;
+        };
+        if now < rtmp.next_fetch || rtmp.state == RtmpStreamState::Ended {
+            return;
+        }
+        rtmp.next_fetch = now + rtmp_poll_interval();
+        let who = joined.who;
+        let call_id = joined.call_id;
+        let access_hash = joined.access_hash;
+        let channel_id = rtmp.channel_id;
+        let scale = rtmp.scale;
+        let next_ts = rtmp.next_timestamp_ms;
+        let quality = rtmp.quality;
+        let state = rtmp.state;
+        let stream_dc = live.group_calls.calls.get(&who).and_then(|c| c.stream_dc_id);
+        (who, call_id, access_hash, stream_dc, channel_id, scale, next_ts, quality, state)
+    };
+    let (who, call_id, access_hash, stream_dc, mut channel_id, mut scale, mut ts_ms, quality, prev_state) = due;
+    let conv_id = who.text();
+    let mut new_state = prev_state;
+
+    if channel_id.is_none() || matches!(prev_state, RtmpStreamState::Waiting | RtmpStreamState::Paused) {
+        let req = tl::functions::phone::GetGroupCallStreamChannels {
+            call: input_call_of(call_id, access_hash),
+        };
+        match wire::call_in(account.wire.as_ref(), stream_dc, &req) {
+            Ok(tl::enums::phone::GroupCallStreamChannels::Channels(found)) => {
+                if let Some(tl::enums::GroupCallStreamChannel::Channel(ch)) = found.channels.first() {
+                    channel_id = Some(ch.channel);
+                    scale = ch.scale;
+                    if ts_ms == 0 || ts_ms < ch.last_timestamp_ms {
+                        ts_ms = ch.last_timestamp_ms;
+                    }
+                    new_state = RtmpStreamState::Live;
+                } else {
+                    new_state = RtmpStreamState::Paused;
+                }
+            }
+            Err(fault) if fault.is("GROUPCALL_INVALID") => {
+                new_state = RtmpStreamState::Ended;
+            }
+            Err(_) => {
+                new_state = RtmpStreamState::Paused;
+            }
+        }
+    }
+
+    let mut next_ts = ts_ms;
+    if let Some(ch) = channel_id.filter(|_| new_state != RtmpStreamState::Ended) {
+        let loc = tl::types::InputGroupCallStream {
+            call: input_call_of(call_id, access_hash),
+            time_ms: ts_ms,
+            scale,
+            video_channel: Some(ch),
+            video_quality: Some(i32::from(quality)),
+        };
+        let req = tl::functions::upload::GetFile {
+            precise: false,
+            cdn_supported: false,
+            location: loc.into(),
+            offset: 0,
+            limit: 512 * 1024,
+        };
+        match wire::call_in(account.wire.as_ref(), stream_dc, &req) {
+            Ok(tl::enums::upload::File::File(piece)) => {
+                if !piece.bytes.is_empty() {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&piece.bytes);
+                    account.ctx.telegram_rtmp_segment(
+                        &conv_id,
+                        ts_ms,
+                        scale,
+                        Some(ch),
+                        Some(quality),
+                        b64,
+                    );
+                    new_state = RtmpStreamState::Live;
+                    let step_ms = (1000i64 >> scale.clamp(0, 4)).max(250);
+                    next_ts = ts_ms.saturating_add(step_ms);
+                } else {
+                    new_state = RtmpStreamState::Paused;
+                }
+            }
+            Ok(tl::enums::upload::File::CdnRedirect(_)) => {
+                new_state = RtmpStreamState::Paused;
+            }
+            Err(fault) if fault.is("GROUPCALL_INVALID") => {
+                new_state = RtmpStreamState::Ended;
+            }
+            Err(_) => {
+                // TIME_TOO_BIG / TIME_TOO_SMALL / GROUPCALL_STREAM_NOT_READY -> paused; re-query channels next tick.
+                new_state = RtmpStreamState::Paused;
+                channel_id = None;
+            }
+        }
+    }
+
+    {
+        let mut live = account.live();
+        if let Some(rtmp) = live
+            .group_calls
+            .joined
+            .as_mut()
+            .filter(|j| j.who == who)
+            .and_then(|j| j.rtmp.as_mut())
+        {
+            rtmp.channel_id = channel_id;
+            rtmp.scale = scale;
+            rtmp.next_timestamp_ms = next_ts;
+            rtmp.state = new_state;
+        }
+    }
+    if new_state != prev_state {
+        account.ctx.telegram_rtmp_state(&conv_id, new_state);
+        publish_occupants(account, who);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Join, Audio Mute, Speaking, Keepalive, Leave (`#461`, `#460`, `#459`)
 // ---------------------------------------------------------------------------
 
@@ -1312,12 +1911,43 @@ pub(super) fn join_group_with(
             return Err(fault);
         }
     };
-    // Ensure we know whether the call is live (not scheduled-only).
-    if account.live().group_calls.calls.get(&who).is_some_and(|c| c.schedule_date.is_some()) {
-        let msg = "This video chat hasn't started yet.";
-        account.ctx.call_failed(&conv_id, CallFailure::Refused, msg);
-        return Err(Fault::Refused(msg.to_owned()));
-    }
+    // Ensure we know whether the call is live (not scheduled-only) and whether it is an RTMP stream.
+    let (call_id, access_hash) = call_ref;
+    let is_rtmp = {
+        let mut tracked_opt = account
+            .live()
+            .group_calls
+            .calls
+            .get(&who)
+            .map(|c| (c.schedule_date.is_some(), c.rtmp_stream, c.fetched_once));
+        if tracked_opt.is_none_or(|(_, _, fetched)| !fetched) {
+            if let Ok(tl::enums::phone::GroupCall::Call(found)) = account.ask(&tl::functions::phone::GetGroupCall {
+                call: input_call_of(call_id, access_hash),
+                limit: 10,
+            }) {
+                account.learn(&found.users, &found.chats);
+                if let tl::enums::GroupCall::Call(gc) = &found.call {
+                    let mut live = account.live();
+                    live.group_calls.by_call_id.insert(gc.id, who);
+                    let tracked = live
+                        .group_calls
+                        .calls
+                        .entry(who)
+                        .or_insert_with(|| TrackedGroupCall::new(gc.id, gc.access_hash));
+                    apply_group_call_obj(tracked, gc);
+                    apply_participants(tracked, &found.participants);
+                    tracked.fetched_once = true;
+                    tracked_opt = Some((tracked.schedule_date.is_some(), tracked.rtmp_stream, true));
+                }
+            }
+        }
+        if tracked_opt.is_some_and(|(sched, _, _)| sched) {
+            let msg = "This video chat hasn't started yet.";
+            account.ctx.call_failed(&conv_id, CallFailure::Refused, msg);
+            return Err(Fault::Refused(msg.to_owned()));
+        }
+        tracked_opt.is_some_and(|(_, rtmp, _)| rtmp)
+    };
 
     // Mid-call identity switch: cleanly leave the existing participant slot before rejoining.
     let switching_here = account
@@ -1330,23 +1960,54 @@ pub(super) fn join_group_with(
         leave_group(account, who);
     }
 
-    // Always join muted by default (`#461`).
-    let (params_json, ssrc) = match account.ctx.telegram_group_offer(
-        &conv_id,
-        TelegramGroupOffer {
-            user_id: join_as_who.text(),
-            muted: true,
-            deafened: false,
-        },
-    ) {
-        Ok(pair) => pair,
-        Err(detail) => {
+    let (params_json, ssrc, rtmp_viewer) = if is_rtmp {
+        if let Err(detail) = account.ctx.telegram_rtmp_start(&conv_id) {
             account.ctx.call_failed(&conv_id, CallFailure::Engine, &detail);
             return Err(Fault::Refused(detail));
         }
+        let viewer_params = serde_json::json!({
+            "ufrag": "rtmp",
+            "pwd": "rtmpviewerpassword123456",
+            "fingerprints": [{
+                "hash": "sha-256",
+                "setup": "active",
+                "fingerprint": "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00"
+            }],
+            "ssrc": 1
+        })
+        .to_string();
+        (
+            viewer_params,
+            1u32,
+            Some(RtmpViewer {
+                state: RtmpStreamState::Waiting,
+                quality: 1,
+                qualities: vec![0, 1, 2],
+                channel_id: None,
+                scale: 0,
+                next_timestamp_ms: 0,
+                next_fetch: Instant::now(),
+            }),
+        )
+    } else {
+        // Always join muted by default (`#461`).
+        let (params_json, ssrc) = match account.ctx.telegram_group_offer(
+            &conv_id,
+            TelegramGroupOffer {
+                user_id: join_as_who.text(),
+                muted: true,
+                deafened: false,
+            },
+        ) {
+            Ok(pair) => pair,
+            Err(detail) => {
+                account.ctx.call_failed(&conv_id, CallFailure::Engine, &detail);
+                return Err(Fault::Refused(detail));
+            }
+        };
+        (params_json, ssrc, None)
     };
 
-    let (call_id, access_hash) = call_ref;
     account.live().group_calls.joined = Some(JoinedGroupCall {
         who,
         call_id,
@@ -1355,6 +2016,11 @@ pub(super) fn join_group_with(
         source: ssrc,
         muted: true,
         deafened: false,
+        camera_on: false,
+        presentation_active: false,
+        applied_gains: HashMap::new(),
+        pending_gains: HashMap::new(),
+        rtmp: rtmp_viewer,
         next_check: Instant::now() + check_interval(),
         last_speaking_sent: None,
     });
@@ -1372,10 +2038,15 @@ pub(super) fn join_group_with(
     };
     match account.ask(&req) {
         Ok(answer) => {
-            live::answered(account, &answer);
+            if !is_rtmp {
+                live::answered(account, &answer);
+            }
             // Fetch paged participants so the roster and SSRC map are complete.
             let _ = fetch_participants_pages(account, who, call_id, access_hash, MAX_PARTICIPANT_PAGES);
             publish_occupants(account, who);
+            if is_rtmp {
+                tick_rtmp(account);
+            }
             Ok(())
         }
         Err(fault) => {
@@ -1478,6 +2149,14 @@ pub(super) fn leave_group(account: &Account, who: Who) {
     let Some(joined) = joined else {
         return;
     };
+    if joined.presentation_active {
+        let _ = wire::call(
+            account.wire.as_ref(),
+            &tl::functions::phone::LeaveGroupCallPresentation {
+                call: input_call_of(joined.call_id, joined.access_hash),
+            },
+        );
+    }
     let req = tl::functions::phone::LeaveGroupCall {
         call: input_call_of(joined.call_id, joined.access_hash),
         source: joined.source as i32,
@@ -1487,18 +2166,31 @@ pub(super) fn leave_group(account: &Account, who: Who) {
     }
 }
 
-/// Next deadline for `phone.checkGroupCall` keepalive.
+/// Next deadline for `phone.checkGroupCall`, debounced participant gain flushes, or RTMP stream segment fetch.
 pub(super) fn keepalive_deadline(account: &Account) -> Option<Instant> {
-    account.live().group_calls.joined.as_ref().map(|j| j.next_check)
+    let live = account.live();
+    let j = live.group_calls.joined.as_ref()?;
+    let gain_due = j.pending_gains.values().map(|g| g.due).min();
+    let rtmp_due = j
+        .rtmp
+        .as_ref()
+        .filter(|r| r.state != RtmpStreamState::Ended)
+        .map(|r| r.next_fetch);
+    [Some(j.next_check), gain_due, rtmp_due].into_iter().flatten().min()
 }
 
-/// Upper bound on event-loop sleep so a newly joined group call starts its keepalive promptly.
+/// Upper bound on event-loop sleep so keepalives, debounced gain flushes, and RTMP polls fire promptly.
 pub(super) fn poll_cap() -> Duration {
-    check_interval().min(Duration::from_secs(5))
+    check_interval()
+        .min(gain_debounce().max(Duration::from_millis(25)))
+        .min(Duration::from_millis(250))
 }
 
-/// Sends `phone.checkGroupCall` when due on the event loop (`#461`).
+/// Drives debounced participant gain flushes (#468), RTMP segment polling (#454), and
+/// `phone.checkGroupCall` keepalives (#461) on the event loop.
 pub(super) fn tick_keepalive(account: &Account) {
+    flush_pending_gains(account);
+    tick_rtmp(account);
     let due = {
         let mut live = account.live();
         let Some(joined) = live.group_calls.joined.as_mut() else {
@@ -1541,6 +2233,9 @@ mod tests {
             raise_hand_rating,
             about: String::new(),
             muted_by_you: false,
+            volume: None,
+            video: None,
+            presentation: None,
             is_self: false,
             order,
         }

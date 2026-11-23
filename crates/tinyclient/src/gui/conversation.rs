@@ -3510,6 +3510,8 @@ impl Pane {
         let handoff = call_support == protocol::CallSupport::Handoff;
         let join_label = if handoff {
             format!("Open in {}", key.network.label())
+        } else if occupants.rtmp_stream {
+            "Watch".to_owned()
         } else {
             "Join".to_owned()
         };
@@ -3536,8 +3538,15 @@ impl Pane {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(crate::gui::components::glyph("icons/phone.svg", 13., theme::accent())),
+                        .child(crate::gui::components::glyph(
+                            if occupants.rtmp_stream { "icons/radio.svg" } else { "icons/phone.svg" },
+                            13.,
+                            theme::accent(),
+                        )),
                 )
+                .children(occupants.record_start_date.map(|since| {
+                    super::call::telegram::recording_badge("live-bar-rec", since, occupants.record_video_active)
+                }))
                 .when(!avatars.is_empty(), |row| {
                     row.child(div().flex().items_center().gap(px(2.)).children(avatars))
                 })
@@ -4858,6 +4867,17 @@ mod tests {
             live_call_summary(Network::Telegram, ConversationKind::Channel, &live_channel, 2_000),
             "Live stream · 12"
         );
+        let rtmp_channel = protocol::Occupants {
+            title: "Summit Live".into(),
+            total: 42,
+            live: true,
+            rtmp_stream: true,
+            ..protocol::Occupants::default()
+        };
+        assert_eq!(
+            live_call_summary(Network::Telegram, ConversationKind::Channel, &rtmp_channel, 2_000),
+            "Live stream: Summit Live · 42 viewers"
+        );
         assert_eq!(format_schedule_countdown(1_000, 1_000), "Starting soon");
         assert_eq!(format_schedule_countdown(1_000 + 90_000, 1_000), "Starts in 1 day");
     }
@@ -4909,6 +4929,18 @@ pub(crate) fn live_call_summary(
     }
     let names: Vec<&str> = occupants.people.iter().take(3).map(|p| p.name.as_str()).collect();
     if network == Network::Telegram {
+        if occupants.rtmp_stream {
+            let head = if occupants.title.is_empty() {
+                "Live stream".to_owned()
+            } else {
+                format!("Live stream: {}", occupants.title)
+            };
+            return match occupants.total {
+                0 => head,
+                1 => format!("{head} · 1 viewer"),
+                n => format!("{head} · {n} viewers"),
+            };
+        }
         let label = if kind == ConversationKind::Channel { "Live stream" } else { "Video chat" };
         let head = if occupants.title.is_empty() {
             label.to_owned()

@@ -71,8 +71,14 @@ struct Call {
     tiny: Option<String>,
     /// A Telegram group voice chat's local offer, waiting for `updateGroupCallConnection`.
     tg_group_offer: Option<telegram::GroupOffer>,
+    /// A Telegram group screen-share presentation offer, waiting for `updateGroupCallConnection(presentation=true)` (#467).
+    tg_presentation_offer: Option<telegram::PresentationOffer>,
+    /// Active Telegram presentation transport thread (#467).
+    tg_presentation_leg: Option<JoinHandle<()>>,
     /// Our user id in a Telegram group voice chat.
     tg_user_id: Option<String>,
+    /// True while carrying a Telegram group call (used to allow headless test camera/share without hardware).
+    tg_group_active: bool,
 }
 
 impl Call {
@@ -100,7 +106,8 @@ impl Call {
                     picture::choose_quality(quality);
                     picture::choose_cursor(show_cursor);
                 }
-                if on && (self.voice.is_some() || self.tiny.is_some()) {
+                let headless_tg = self.tg_group_active && out::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some();
+                if on && (self.voice.is_some() || self.tiny.is_some()) && !headless_tg {
                     if let Err(words) = picture::probe_screen() {
                         return MediaResponse::Refused { detail: words };
                     }
@@ -114,7 +121,8 @@ impl Call {
                 if on {
                     self.controls.set_camera_preview(false);
                 }
-                if on && (self.voice.is_some() || self.tiny.is_some()) {
+                let headless_tg = self.tg_group_active && out::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some();
+                if on && (self.voice.is_some() || self.tiny.is_some()) && !headless_tg {
                     if let Err(words) = picture::probe_camera() {
                         return MediaResponse::Refused { detail: words };
                     }
@@ -425,7 +433,10 @@ impl Call {
                     out::exit(0);
                 });
                 match spawned {
-                    Ok(voice) => self.voice = Some(voice),
+                    Ok(voice) => {
+                        self.voice = Some(voice);
+                        self.tg_group_active = true;
+                    }
                     Err(err) => {
                         tracing::warn!("mediad: the telegram group call thread did not start: {err}");
                         return MediaResponse::Refused { detail: ENGINE.to_owned() };
@@ -435,6 +446,111 @@ impl Call {
             }
             MediaRequest::TelegramGroupSources { sources } => {
                 self.controls.set_tg_sources(sources);
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramGroupPresentationOffer => {
+                return match telegram::PresentationOffer::new() {
+                    Ok(offer) => {
+                        let params = offer.params_json().to_owned();
+                        let ssrc = offer.ssrc();
+                        self.tg_presentation_offer = Some(offer);
+                        MediaResponse::TelegramGroupPresentationJoin { params, ssrc }
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: telegram presentation offer failed: {err}");
+                        MediaResponse::Refused { detail: ENGINE.to_owned() }
+                    }
+                };
+            }
+            MediaRequest::TelegramGroupPresentationAnswer { params } => {
+                let Some(offer) = self.tg_presentation_offer.take() else {
+                    return MediaResponse::Refused {
+                        detail: "No Telegram presentation offer is waiting for an answer.".to_owned(),
+                    };
+                };
+                self.controls.set_tg_presentation_stop(true);
+                if let Some(prev) = self.tg_presentation_leg.take() {
+                    let _ = prev.join();
+                }
+                self.controls.set_tg_presentation_stop(false);
+                let link = match offer.accept(&params) {
+                    Ok(link) => link,
+                    Err(err) => {
+                        tracing::warn!("mediad: telegram presentation answer refused: {err}");
+                        return MediaResponse::Refused {
+                            detail: "Telegram sent a screen-share transport this tinyclient couldn't use.".to_owned(),
+                        };
+                    }
+                };
+                let controls = self.controls.clone();
+                let spawned = out::spawn(std::thread::Builder::new().name("tg-present".to_owned()), move || {
+                    telegram::run_presentation(link, controls);
+                });
+                match spawned {
+                    Ok(handle) => self.tg_presentation_leg = Some(handle),
+                    Err(err) => {
+                        tracing::warn!("mediad: telegram presentation thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramGroupPresentationLeave => {
+                self.tg_presentation_offer = None;
+                self.controls.set_tg_presentation_stop(true);
+                self.controls.set_share(false);
+                self.video.share_encode = false;
+                if let Some(leg) = self.tg_presentation_leg.take() {
+                    let _ = leg.join();
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramGroupVideoSources { sources } => {
+                self.controls.set_tg_video_sources(sources);
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramRtmpStart { channel_id } => {
+                if self.voice.is_some() {
+                    return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
+                }
+                self.controls.muted.store(true, Ordering::Relaxed);
+                self.controls.set_tg_rtmp_state(protocol::RtmpStreamState::Waiting);
+                self.video = Video::default();
+                let controls = self.controls.clone();
+                let spawned = out::spawn(std::thread::Builder::new().name("tg-rtmp".to_owned()), move || {
+                    out::or_fail(CallFailure::Engine, ENGINE_STOPPED, || {
+                        telegram::run_rtmp_viewer(channel_id, controls)
+                    });
+                    tracing::warn!("mediad: telegram rtmp viewer over, exiting");
+                    out::exit(0);
+                });
+                match spawned {
+                    Ok(voice) => {
+                        self.voice = Some(voice);
+                        self.tg_group_active = true;
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: the telegram rtmp viewer thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramRtmpSegment { time_ms, scale, video_channel, video_quality, data } => {
+                use base64::Engine as _;
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&data) {
+                    self.controls.push_tg_rtmp_segment(telegram::RtmpSegmentInput {
+                        time_ms,
+                        scale,
+                        video_channel,
+                        video_quality,
+                        bytes,
+                    });
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramRtmpState { state } => {
+                self.controls.set_tg_rtmp_state(state);
                 return MediaResponse::Done;
             }
             MediaRequest::Devices { input, output, camera } => {

@@ -266,6 +266,63 @@ pub struct Participant {
     /// True when this participant joined as a channel or group rather than a user account.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_channel: bool,
+    /// Server-reported per-participant volume in percent (0..=200), mapped from Telegram's 1..=20000 scale (#468).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u16>,
+    /// True while their camera video track is paused (`groupCallParticipantVideo.paused`) (#467).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video_paused: bool,
+    /// True while their screen-share presentation is paused (`groupCallParticipantVideo.paused`) (#467).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub presentation_paused: bool,
+}
+
+/// Converts Telegram's `groupCallParticipant.volume` (`1..=20000`, where `10000` = 100%)
+/// to tinyclient's gain percentage (`0..=200`) (#468).
+pub fn telegram_volume_to_percent(volume: i32) -> u16 {
+    let clamped = volume.clamp(0, 20_000) as u32;
+    ((clamped + 50) / 100).min(u32::from(GAIN_MAX)) as u16
+}
+
+/// Converts tinyclient's gain percentage (`0..=200`) to Telegram's `volume` scale (`1..=20000`) (#468).
+pub fn percent_to_telegram_volume(percent: u16) -> i32 {
+    (i32::from(percent.min(GAIN_MAX)) * 100).clamp(1, 20_000)
+}
+
+/// Recording mode for Telegram admin `phone.toggleGroupCallRecord` (#463).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupCallRecordMode {
+    Audio,
+    PortraitVideo,
+    LandscapeVideo,
+}
+
+/// Playback status of a Telegram channel RTMP live stream (#454).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RtmpStreamState {
+    Waiting,
+    Live,
+    Paused,
+    Ended,
+}
+
+/// Server URL and stream key returned by `phone.getGroupCallStreamRtmpUrl` (#454).
+/// The stream key is redacted from `Debug` output so it is never written to logs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupCallRtmpUrl {
+    pub url: String,
+    pub key: String,
+}
+
+impl std::fmt::Debug for GroupCallRtmpUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupCallRtmpUrl")
+            .field("url", &self.url)
+            .field("key", &"[redacted]")
+            .finish()
+    }
 }
 
 /// One eligible identity returned by `phone.getGroupCallJoinAs` (#460).
@@ -483,6 +540,67 @@ pub struct Call {
     /// Peer id we joined this Telegram group call as (`u<id>` / `c<id>` / `g<id>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joined_as: Option<String>,
+    /// Unix seconds when server-side recording started (`groupCall.record_start_date`) (#463).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_start_date: Option<i64>,
+    /// True when video is also being recorded (`groupCall.record_video_active`) (#463).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub record_video_active: bool,
+    /// Telegram `groupCall.can_start_video`: whether we may start camera/screen video (#467).
+    #[serde(default = "video_allowed_default", skip_serializing_if = "is_true")]
+    pub can_start_video: bool,
+    /// Active video/presentation streams currently unmuted (`groupCall.unmuted_video_count`) (#467).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unmuted_video_count: u32,
+    /// Maximum simultaneous video/presentation streams allowed (`groupCall.unmuted_video_limit`) (#467).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unmuted_video_limit: u32,
+    /// True when this Telegram call is an RTMP live stream (`groupCall.rtmp_stream`) (#454).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rtmp_stream: bool,
+    /// Playback status of a joined Telegram RTMP live stream (#454).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtmp_state: Option<RtmpStreamState>,
+    /// Currently selected RTMP stream quality tier (0 = Low, 1 = Medium, 2 = High) (#454).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtmp_quality: Option<u8>,
+    /// Available RTMP stream quality tiers reported for this stream (#454).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rtmp_qualities: Vec<u8>,
+}
+
+impl Call {
+    /// Returns a clear user-facing reason when starting camera or screen share is blocked by the
+    /// server's video limit or live-stream mode (#467, #454). Pass `already_sending = true` when
+    /// toggling off an already active local track (stopping is always allowed).
+    pub fn video_limit_reason(&self, already_sending: bool) -> Option<String> {
+        if already_sending {
+            return None;
+        }
+        if self.conversation.network != crate::Network::Telegram {
+            return None;
+        }
+        if self.rtmp_stream {
+            return Some("Viewers can't turn on camera or share screen in a live stream.".to_owned());
+        }
+        if !self.can_start_video {
+            return Some(if self.unmuted_video_limit > 0 {
+                format!(
+                    "Video limit reached ({} of {} active video streams).",
+                    self.unmuted_video_count, self.unmuted_video_limit
+                )
+            } else {
+                "Video isn't available in this video chat right now.".to_owned()
+            });
+        }
+        if self.unmuted_video_limit > 0 && self.unmuted_video_count >= self.unmuted_video_limit {
+            return Some(format!(
+                "Video limit reached ({} of {} active video streams).",
+                self.unmuted_video_count, self.unmuted_video_limit
+            ));
+        }
+        None
+    }
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -805,6 +923,18 @@ pub struct TelegramGroupSource {
     pub user_id: String,
 }
 
+/// Maps a remote Telegram group call camera or screen-share endpoint & SSRC group to its owner (#467).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramGroupVideoSource {
+    pub user_id: String,
+    pub kind: PictureKind,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssrcs: Vec<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub paused: bool,
+}
+
 /// chatd to mediad, over mediad's stdin. Closing stdin ends the call. Each request gets exactly
 /// one reply (`Streams`, `Done` or `Refused`), in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -908,6 +1038,29 @@ pub enum MediaRequest {
     TelegramGroupAnswer { params: String },
     /// Current SSRC -> participant id mapping for a Telegram group video chat.
     TelegramGroupSources { sources: Vec<TelegramGroupSource> },
+    /// Build a presentation (screen share) WebRTC offer for `phone.joinGroupCallPresentation` (#467).
+    /// Answered `TelegramGroupPresentationJoin`.
+    TelegramGroupPresentationOffer,
+    /// Server transport JSON from `updateGroupCallConnection(presentation=true)` (#467).
+    TelegramGroupPresentationAnswer { params: String },
+    /// Tear down the local Telegram presentation transport (`phone.leaveGroupCallPresentation`) (#467).
+    TelegramGroupPresentationLeave,
+    /// Remote camera & presentation video endpoints/SSRCs for a Telegram group video chat (#467).
+    TelegramGroupVideoSources { sources: Vec<TelegramGroupVideoSource> },
+    /// Start receive-only RTMP live stream playback in mediad (no microphone) (#454).
+    TelegramRtmpStart { channel_id: String },
+    /// Deliver one fetched `inputGroupCallStream` segment (base64 payload) to mediad (#454).
+    TelegramRtmpSegment {
+        time_ms: i64,
+        scale: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_channel: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_quality: Option<u8>,
+        data: String,
+    },
+    /// Report RTMP stream state change (Live, Paused, Ended, Waiting) to mediad (#454).
+    TelegramRtmpState { state: RtmpStreamState },
 
     // What the shell and the room decide about the sound, for mediad to apply. Each is answered
     // `Done`, and each holds until sent again.
@@ -1247,6 +1400,8 @@ pub enum Cue {
     Disconnected,
     /// Someone started sharing their screen in this call (S7, with joins and leaves).
     ShareStarted,
+    /// Server-side recording started while joined to a video chat (#463).
+    RecordingStarted,
     /// "Play test sound": the join cue, whatever the switches say.
     Test,
 }
@@ -1263,6 +1418,8 @@ pub enum MediaResponse {
     Offer { sdp: String },
     /// The join JSON and local audio SSRC for a Telegram group video chat, in answer to `TelegramGroupOffer`.
     TelegramGroupJoin { params: String, ssrc: u32 },
+    /// The presentation join JSON and video SSRC in answer to `TelegramGroupPresentationOffer` (#467).
+    TelegramGroupPresentationJoin { params: String, ssrc: u32 },
     /// The connection as it is now, in answer to `Stats`.
     Stats(CallStats),
     /// This mediad cannot do what was asked.
@@ -1360,6 +1517,7 @@ impl MediaResponse {
             MediaResponse::Done => "Done",
             MediaResponse::Offer { .. } => "Offer",
             MediaResponse::TelegramGroupJoin { .. } => "TelegramGroupJoin",
+            MediaResponse::TelegramGroupPresentationJoin { .. } => "TelegramGroupPresentationJoin",
             MediaResponse::Stats(_) => "Stats",
             MediaResponse::Refused { .. } => "Refused",
             MediaResponse::LogsSaved { .. } => "LogsSaved",
@@ -1392,6 +1550,7 @@ impl MediaResponse {
                 | MediaResponse::Done
                 | MediaResponse::Offer { .. }
                 | MediaResponse::TelegramGroupJoin { .. }
+                | MediaResponse::TelegramGroupPresentationJoin { .. }
                 | MediaResponse::Stats(_)
                 | MediaResponse::Refused { .. }
                 | MediaResponse::LogsSaved { .. }
@@ -1618,6 +1777,7 @@ mod tests {
             scheduled_at: Some(1_800_000_000),
             subscribed: true,
             live: false,
+            ..crate::Occupants::default()
         };
         assert!(sched.active());
         assert!(sched.is_scheduled());
@@ -1670,5 +1830,97 @@ mod tests {
             serde_json::from_str::<GroupCallInviteResult>(&serde_json::to_string(&invited).unwrap()).unwrap(),
             invited
         );
+    }
+
+    #[test]
+    fn wave16b2_recording_volume_video_limit_and_rtmp_types_round_trip() {
+        // Telegram volume scale 1..=20000 <-> 0..=200%.
+        assert_eq!(telegram_volume_to_percent(5_000), 50);
+        assert_eq!(telegram_volume_to_percent(10_000), 100);
+        assert_eq!(telegram_volume_to_percent(20_000), 200);
+        assert_eq!(telegram_volume_to_percent(0), 0);
+        assert_eq!(percent_to_telegram_volume(50), 5_000);
+        assert_eq!(percent_to_telegram_volume(100), 10_000);
+        assert_eq!(percent_to_telegram_volume(200), 20_000);
+        assert_eq!(percent_to_telegram_volume(0), 1);
+
+        // Stream key is redacted from Debug output so it is never logged.
+        let rtmp = GroupCallRtmpUrl {
+            url: "rtmps://dc2-1.rtmp.t.me/s/".into(),
+            key: "super-secret-stream-key-999".into(),
+        };
+        let dbg = format!("{rtmp:?}");
+        assert!(dbg.contains("rtmps://dc2-1.rtmp.t.me/s/"));
+        assert!(!dbg.contains("super-secret-stream-key-999"));
+        assert_eq!(serde_json::from_str::<GroupCallRtmpUrl>(&serde_json::to_string(&rtmp).unwrap()).unwrap(), rtmp);
+
+        // Recording & RTMP fields on Occupants and Participant round-trip cleanly.
+        let occ = crate::Occupants {
+            live: true,
+            total: 42,
+            record_start_date: Some(1_700_000_123),
+            record_video_active: true,
+            rtmp_stream: true,
+            ..crate::Occupants::default()
+        };
+        assert_eq!(serde_json::from_str::<crate::Occupants>(&serde_json::to_string(&occ).unwrap()).unwrap(), occ);
+
+        let p = Participant {
+            id: "c9001".into(),
+            name: "Field Notes".into(),
+            volume: Some(50),
+            camera: true,
+            video_paused: true,
+            sharing: true,
+            presentation_paused: false,
+            ..Participant::default()
+        };
+        assert_eq!(serde_json::from_str::<Participant>(&serde_json::to_string(&p).unwrap()).unwrap(), p);
+
+        // Call::video_limit_reason enforces can_start_video, unmuted_video_limit, and rtmp_stream.
+        let mut call: Call = serde_json::from_str(
+            r#"{"conversation":{"network":"telegram","account":"a","id":"g8001"},"state":"joined","participants":[],"muted":true,"deafened":false,"joined":10,"engine_linked":true,"video":[]}"#,
+        )
+        .unwrap();
+        assert!(call.can_start_video);
+        assert!(call.video_limit_reason(false).is_none());
+        call.unmuted_video_limit = 5;
+        call.unmuted_video_count = 5;
+        assert!(call.video_limit_reason(false).unwrap().contains("5 of 5"));
+        assert!(call.video_limit_reason(true).is_none(), "stopping own video is always allowed");
+        call.unmuted_video_count = 2;
+        call.can_start_video = false;
+        assert!(call.video_limit_reason(false).is_some());
+        call.can_start_video = true;
+        call.rtmp_stream = true;
+        assert!(call.video_limit_reason(false).unwrap().contains("live stream"));
+
+        // MediaRequest / MediaResponse additions round-trip and is_reply works.
+        let pres_join = MediaResponse::TelegramGroupPresentationJoin { params: r#"{"ufrag":"p"}"#.into(), ssrc: 77 };
+        assert!(pres_join.is_reply());
+        assert_eq!(pres_join.name(), "TelegramGroupPresentationJoin");
+        let vsrc = MediaRequest::TelegramGroupVideoSources {
+            sources: vec![TelegramGroupVideoSource {
+                user_id: "u7002".into(),
+                kind: PictureKind::Camera,
+                endpoint: "unified_1".into(),
+                ssrcs: vec![2001, 2002],
+                paused: false,
+            }],
+        };
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&vsrc).unwrap()).unwrap(), vsrc);
+        let seg = MediaRequest::TelegramRtmpSegment {
+            time_ms: 1_700_000_000_000,
+            scale: 0,
+            video_channel: Some(1),
+            video_quality: Some(2),
+            data: "AAAA".into(),
+        };
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&seg).unwrap()).unwrap(), seg);
+        assert_eq!(
+            serde_json::from_str::<Cue>(&serde_json::to_string(&Cue::RecordingStarted).unwrap()).unwrap(),
+            Cue::RecordingStarted
+        );
+        assert!(crate::call_pictures(crate::Network::Telegram));
     }
 }

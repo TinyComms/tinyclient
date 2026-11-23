@@ -473,9 +473,9 @@ pub enum CallSupport {
     Restricted,
 }
 
-/// Camera and screen share run in this client on a Tiny or Discord call.
+/// Camera and screen share run in this client on a Tiny, Discord, or Telegram call.
 pub fn call_pictures(network: Network) -> bool {
-    matches!(network, Network::Tiny | Network::Discord)
+    matches!(network, Network::Tiny | Network::Discord | Network::Telegram)
 }
 
 /// How a conversation kind is called, as the adapter that builds its row decides.
@@ -569,6 +569,15 @@ pub struct Occupants {
     /// True when a group video chat is live even if `total == 0` (e.g. just started).
     #[serde(default, skip_serializing_if = "is_false")]
     pub live: bool,
+    /// Unix seconds when server-side recording started (`groupCall.record_start_date`) (#463).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_start_date: Option<i64>,
+    /// True when video is also being recorded (`groupCall.record_video_active`) (#463).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub record_video_active: bool,
+    /// True when this Telegram broadcast is an RTMP live stream (`groupCall.rtmp_stream`) (#454).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rtmp_stream: bool,
 }
 
 impl Occupants {
@@ -3393,6 +3402,30 @@ pub enum Request {
         #[serde(default)]
         remove: bool,
     },
+    /// Starts or stops server-side recording of a Telegram video chat (`phone.toggleGroupCallRecord`,
+    /// requires `manage_call`) (#463).
+    GroupCallRecord {
+        conversation: Key,
+        start: bool,
+        #[serde(default)]
+        video: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_portrait: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Queries or revokes the RTMP server URL and stream key (`phone.getGroupCallStreamRtmpUrl`,
+    /// requires `manage_call`) (#454).
+    GroupCallRtmpUrl {
+        conversation: Key,
+        #[serde(default)]
+        revoke: bool,
+    },
+    /// Switches the requested quality tier (0 = Low, 1 = Medium, 2 = High) on a watched RTMP live stream (#454).
+    GroupCallRtmpQuality {
+        conversation: Key,
+        quality: u8,
+    },
     Media(MediaRequest),
     /// A voice message or audio file: play, pause, seek, speed, stop. Answers `Ok`; the rest is
     /// `Change::Playback`.
@@ -4781,6 +4814,14 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "is_false")]
         speaker: bool,
     },
+    /// Answers `GroupCallRecord` (#463).
+    GroupCallRecord {
+        recording: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+    },
+    /// Answers `GroupCallRtmpUrl` (#454).
+    GroupCallRtmpUrl(GroupCallRtmpUrl),
     Privacy {
         key: PrivacyKey,
         policy: PrivacyPolicy,

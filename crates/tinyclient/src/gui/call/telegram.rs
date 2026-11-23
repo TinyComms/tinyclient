@@ -7,18 +7,19 @@ use super::bare_call;
 use crate::client::ask;
 use crate::gui::components::{
     button, glyph, menu_item, menu_item_danger, menu_label, menu_separator, modal_body,
-    modal_buttons, scrim, Avatar, ButtonKind,
+    modal_buttons, scrim, tip, Avatar, ButtonKind,
 };
 use crate::gui::input::TextInput;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{
     div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, Entity, MouseButton,
-    SharedString, Window,
+    SharedString, Stateful, Window,
 };
 use protocol::{
-    Call, CallState, ConversationKind, GroupCallInviteResult, GroupCallJoinAs, GroupCallJoinPeer,
-    Key, Network, Participant, Request, Response,
+    AudioProcessing, Call, CallState, ConversationKind, GroupCallInviteResult, GroupCallJoinAs,
+    GroupCallJoinPeer, GroupCallRecordMode, Key, MediaRequest, Network, NoiseMode, Participant,
+    Request, Response, RtmpStreamState,
 };
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -89,6 +90,23 @@ pub(super) enum TelegramModal {
         conversation: Key,
         chat_title: String,
         invite_hash: Option<String>,
+    },
+    /// Admin start-recording dialog (`#463`): optional title and mode (audio only / portrait / landscape).
+    RecordStart {
+        conversation: Key,
+        title_input: Entity<TextInput>,
+        mode: GroupCallRecordMode,
+    },
+    /// Admin RTMP stream key sheet (`#454`): Server URL & masked stream key with Copy, Show/Hide,
+    /// Revoke key, and Start live stream once an encoder is feeding.
+    RtmpKeySheet {
+        conversation: Key,
+        title: Option<String>,
+        url: String,
+        key: String,
+        key_revealed: bool,
+        started: bool,
+        busy: bool,
     },
 }
 
@@ -175,7 +193,8 @@ pub(crate) fn can_end_call_for_everyone(call: &Call, manage_call: bool) -> bool 
         && matches!(call.state, CallState::Joined | CallState::Connecting | CallState::Reconnecting)
 }
 
-/// Admin moderation menu actions for one Telegram participant (`#464`). Empty without `manage_call`.
+/// Admin moderation menu actions for one Telegram participant (`#464`, `#468`). Empty without `manage_call`.
+/// Explicitly named `"Mute for everyone"` so an admin wanting local `"Mute for me"` never confuses the two.
 pub(crate) fn telegram_admin_participant_actions(
     call: &Call,
     participant: &Participant,
@@ -188,10 +207,89 @@ pub(crate) fn telegram_admin_participant_actions(
     if participant.suppressed {
         actions.push("Allow to speak");
     } else {
-        actions.push("Mute");
+        actions.push("Mute for everyone");
     }
     actions.push("Remove from group");
     actions
+}
+
+/// Formats the prominent recording indicator tooltip (`#463`), e.g. `"Recording audio & video since 14:30"`.
+pub(crate) fn recording_tooltip(record_start_date: i64, record_video_active: bool) -> String {
+    let what = if record_video_active {
+        "Recording audio & video"
+    } else {
+        "Recording audio"
+    };
+    let secs = record_start_date.max(0);
+    let mins = (secs / 60) % 60;
+    let hours = (secs / 3600) % 24;
+    format!("{what} since {hours:02}:{mins:02} UTC")
+}
+
+/// Prominent red recording dot + `"REC"` badge with tooltip (`#463`), shown in the call header,
+/// dock, and live bar so recording is impossible to miss.
+pub(in crate::gui) fn recording_badge(
+    id: &'static str,
+    record_start_date: i64,
+    record_video_active: bool,
+) -> Stateful<Div> {
+    let label = recording_tooltip(record_start_date, record_video_active);
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(20.))
+        .px(px(6.))
+        .rounded_full()
+        .bg(theme::danger_soft())
+        .border_1()
+        .border_color(theme::danger())
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .aria_label(label.clone())
+        .tooltip(tip(label, None))
+        .child(div().size(px(7.)).rounded_full().bg(theme::danger()))
+        .child(
+            div()
+                .type_micro()
+                .font_weight(theme::SEMIBOLD)
+                .text_color(theme::danger())
+                .child("REC"),
+        )
+}
+
+/// Effective per-call noise suppression state (`#468`): uses per-call override if set, otherwise
+/// defaults to Settings › Voice.
+pub(crate) fn telegram_noise_suppression_enabled(call_override: Option<bool>, settings_default: bool) -> bool {
+    call_override.unwrap_or(settings_default)
+}
+
+/// Masks an RTMP stream key by default (`#454`) so screen shares / screenshots never expose it.
+pub(crate) fn mask_stream_key(key: &str) -> String {
+    if key.is_empty() {
+        String::new()
+    } else {
+        "••••••••••••••••".to_owned()
+    }
+}
+
+/// Label for one RTMP live stream quality tier (`#454`).
+pub(crate) fn rtmp_quality_label(q: u8) -> &'static str {
+    match q {
+        0 => "Low",
+        1 => "Medium",
+        _ => "High",
+    }
+}
+
+/// Banner copy for non-live RTMP stream states (`#454`).
+pub(crate) fn rtmp_state_banner(state: RtmpStreamState) -> Option<&'static str> {
+    match state {
+        RtmpStreamState::Waiting => Some("Waiting for live stream to start…"),
+        RtmpStreamState::Paused => Some("Live stream is paused"),
+        RtmpStreamState::Ended => Some("Live stream has ended"),
+        RtmpStreamState::Live => None,
+    }
 }
 
 /// Display title for the call header (`#466`): includes `call.title` when set.
@@ -537,14 +635,171 @@ impl Shell {
         cx.notify();
     }
 
-    /// Popover menu for Telegram group video chat controls (`#460`, `#459`, `#466`, `#464`).
+    pub(super) fn telegram_open_record_start(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        self.call_menu_close(cx);
+        let title_input = cx.new(|cx| TextInput::new("Recording title (optional)", cx));
+        self.call_state.telegram_modal = Some(TelegramModal::RecordStart {
+            conversation,
+            title_input,
+            mode: GroupCallRecordMode::Audio,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn telegram_stop_record(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        self.call_menu_close(cx);
+        let req = Request::GroupCallRecord {
+            conversation,
+            start: false,
+            video: false,
+            video_portrait: None,
+            title: None,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(Response::GroupCallRecord { notice, .. }) => {
+                    let msg = notice.unwrap_or_else(|| {
+                        "Recording stopped. The file will arrive in your Saved Messages.".to_owned()
+                    });
+                    this.toast(Some(("icons/check.svg", theme::positive())), msg, cx);
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                }
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn telegram_open_rtmp_key(
+        &mut self,
+        conversation: Key,
+        title: Option<String>,
+        started: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.call_menu_close(cx);
+        let req = Request::GroupCallRtmpUrl { conversation: conversation.clone(), revoke: false };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(Response::GroupCallRtmpUrl(rtmp)) => {
+                    this.call_state.telegram_modal = Some(TelegramModal::RtmpKeySheet {
+                        conversation,
+                        title,
+                        url: rtmp.url,
+                        key: rtmp.key,
+                        key_revealed: false,
+                        started,
+                        busy: false,
+                    });
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                }
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn telegram_toggle_noise_suppression(&mut self, cx: &mut Context<Self>) {
+        let base = crate::gui::app::prefs::values().processing();
+        let cur = telegram_noise_suppression_enabled(
+            self.call_state.telegram_noise_suppression,
+            base.noise_suppression(),
+        );
+        let next = !cur;
+        self.call_state.telegram_noise_suppression = Some(next);
+        let next_noise = if next {
+            if base.noise == NoiseMode::Off {
+                NoiseMode::Enhanced
+            } else {
+                base.noise
+            }
+        } else {
+            NoiseMode::Off
+        };
+        let proc = AudioProcessing { noise: next_noise, ..base };
+        self.call_ask(Request::Media(MediaRequest::Processing(proc)), cx);
+        cx.notify();
+    }
+
+    pub(super) fn telegram_set_rtmp_quality(&mut self, conversation: Key, quality: u8, cx: &mut Context<Self>) {
+        self.call_menu_close(cx);
+        self.call_ask(Request::GroupCallRtmpQuality { conversation, quality }, cx);
+    }
+
+    /// Popover menu for Telegram group video chat controls (`#460`, `#459`, `#466`, `#464`, `#463`, `#468`, `#454`).
     pub(super) fn telegram_call_menu(&self, call: &Call, cx: &mut Context<Self>) -> Div {
         let manage = self.telegram_can_manage_call(&call.conversation);
         let conv = call.conversation.clone();
+        let ns_on = telegram_noise_suppression_enabled(
+            self.call_state.telegram_noise_suppression,
+            crate::gui::app::prefs::values().processing().noise_suppression(),
+        );
         let mut items = div()
             .flex()
             .flex_col()
-            .child(menu_label("Video chat"))
+            .child(menu_label(if call.rtmp_stream { "Live stream" } else { "Video chat" }))
+            .child(menu_separator().mx(px(8.)));
+        if !call.rtmp_stream {
+            items = items.child(
+                menu_item(
+                    "tg-call-noise-suppression",
+                    Some("icons/sparkles.svg"),
+                    if ns_on { "Noise suppression: On" } else { "Noise suppression: Off" },
+                    None,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.telegram_toggle_noise_suppression(cx);
+                })),
+            );
+        } else {
+            let cur_q = call.rtmp_quality.unwrap_or(1);
+            items = items.child(menu_label("Stream quality"));
+            for q in [2u8, 1, 0] {
+                let label = if q == cur_q {
+                    format!("{} (selected)", rtmp_quality_label(q))
+                } else {
+                    rtmp_quality_label(q).to_owned()
+                };
+                items = items.child(
+                    menu_item(
+                        SharedString::from(format!("tg-rtmp-quality-{q}")),
+                        Some(if q == cur_q { "icons/check.svg" } else { "icons/sliders-horizontal.svg" }),
+                        label,
+                        None,
+                    )
+                    .on_click(cx.listener({
+                        let conv = conv.clone();
+                        move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.telegram_set_rtmp_quality(conv.clone(), q, cx);
+                        }
+                    })),
+                );
+            }
+            if manage {
+                items = items.child(menu_separator().mx(px(8.))).child(
+                    menu_item("tg-call-stream-key", Some("icons/key.svg"), "Stream key…", None).on_click(
+                        cx.listener({
+                            let conv = conv.clone();
+                            let title = (!call.title.is_empty()).then(|| call.title.clone());
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.telegram_open_rtmp_key(conv.clone(), title.clone(), true, cx);
+                            }
+                        }),
+                    ),
+                );
+            }
+        }
+        items = items
             .child(menu_separator().mx(px(8.)))
             .child(
                 menu_item("tg-call-invite", Some("icons/user-plus.svg"), "Invite people…", None).on_click(
@@ -603,7 +858,33 @@ impl Shell {
             ),
         );
         if manage {
-            items = items.child(menu_separator().mx(px(8.))).child(
+            items = items.child(menu_separator().mx(px(8.)));
+            if !call.rtmp_stream {
+                if call.record_start_date.is_some() {
+                    items = items.child(
+                        menu_item_danger("tg-call-stop-record", Some("icons/circle-stop.svg"), "Stop recording")
+                            .on_click(cx.listener({
+                                let conv = conv.clone();
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.telegram_stop_record(conv.clone(), cx);
+                                }
+                            })),
+                    );
+                } else {
+                    items = items.child(
+                        menu_item("tg-call-start-record", Some("icons/circle-dot.svg"), "Start recording…", None)
+                            .on_click(cx.listener({
+                                let conv = conv.clone();
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.telegram_open_record_start(conv.clone(), cx);
+                                }
+                            })),
+                    );
+                }
+            }
+            items = items.child(
                 menu_item("tg-call-rename", Some("icons/pencil.svg"), "Rename video chat…", None).on_click(
                     cx.listener({
                         let conv = conv.clone();
@@ -615,7 +896,7 @@ impl Shell {
                     }),
                 ),
             );
-            if call.can_change_join_muted {
+            if call.can_change_join_muted && !call.rtmp_stream {
                 let next_jm = !call.join_muted;
                 let label = if call.join_muted {
                     "New participants are muted: On"
@@ -850,15 +1131,25 @@ impl Shell {
                                     .on_click(cx.listener(|this, _, _, cx| this.telegram_modal_close(cx))),
                             )
                             .child(
-                                button("tg-start-confirm", ButtonKind::Primary, "Start").on_click(cx.listener(
+                                button(
+                                    "tg-start-confirm",
+                                    ButtonKind::Primary,
+                                    if rtmp { "Stream key…" } else { "Start" },
+                                )
+                                .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         let title = input_ref.read(cx).text().trim().to_owned();
                                         let title = (!title.is_empty()).then_some(title);
+                                        if rtmp {
+                                            this.telegram_modal_close(cx);
+                                            this.telegram_open_rtmp_key(conv.clone(), title, false, cx);
+                                            return;
+                                        }
                                         let req = Request::GroupCallCreate {
                                             conversation: conv.clone(),
                                             title,
-                                            rtmp_stream: rtmp,
-                                            join: !rtmp,
+                                            rtmp_stream: false,
+                                            join: true,
                                         };
                                         this.telegram_modal_close(cx);
                                         let orig = conv.clone();
@@ -1162,6 +1453,283 @@ impl Shell {
                             ),
                     )
             }
+            TelegramModal::RecordStart { conversation, title_input, mode } => {
+                let conv = conversation.clone();
+                let input_ref = title_input.clone();
+                let cur_mode = *mode;
+                let modes = [
+                    (GroupCallRecordMode::Audio, "Audio only"),
+                    (GroupCallRecordMode::PortraitVideo, "Portrait video"),
+                    (GroupCallRecordMode::LandscapeVideo, "Landscape video"),
+                ];
+                let mut opts = div().mt(px(10.)).flex().flex_col().gap(px(4.));
+                for (m, label) in modes {
+                    let active = cur_mode == m;
+                    opts = opts.child(
+                        div()
+                            .id(SharedString::from(format!("tg-rec-mode-{label}")))
+                            .h(px(34.))
+                            .px(px(10.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(if active { theme::accent_soft() } else { theme::raised() })
+                            .border_1()
+                            .border_color(if active { theme::accent() } else { theme::hairline() })
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(TelegramModal::RecordStart { mode, .. }) =
+                                    this.call_state.telegram_modal.as_mut()
+                                {
+                                    *mode = m;
+                                    cx.notify();
+                                }
+                            }))
+                            .child(div().type_ui().text_color(theme::text()).child(label)),
+                    );
+                }
+                div()
+                    .child(div().type_title().child("Start recording"))
+                    .child(modal_body(
+                        "Telegram records on its servers and sends the file to your Saved Messages when you stop. Everyone in the video chat will see a recording indicator.",
+                    ))
+                    .child(
+                        div()
+                            .mt(px(12.))
+                            .px(px(10.))
+                            .py(px(6.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::raised())
+                            .border_1()
+                            .border_color(theme::border())
+                            .child(title_input.clone()),
+                    )
+                    .child(opts)
+                    .child(
+                        modal_buttons()
+                            .child(
+                                button("tg-rec-cancel", ButtonKind::Secondary, "Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| this.telegram_modal_close(cx))),
+                            )
+                            .child(
+                                button("tg-rec-start", ButtonKind::Danger, "Start recording").on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        let title = input_ref.read(cx).text().trim().to_owned();
+                                        let title = (!title.is_empty()).then_some(title);
+                                        let (video, video_portrait) = match cur_mode {
+                                            GroupCallRecordMode::Audio => (false, None),
+                                            GroupCallRecordMode::PortraitVideo => (true, Some(true)),
+                                            GroupCallRecordMode::LandscapeVideo => (true, Some(false)),
+                                        };
+                                        let req = Request::GroupCallRecord {
+                                            conversation: conv.clone(),
+                                            start: true,
+                                            video,
+                                            video_portrait,
+                                            title,
+                                        };
+                                        this.telegram_modal_close(cx);
+                                        cx.spawn(async move |this, cx| {
+                                            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+                                            let _ = this.update(cx, |this, cx| {
+                                                if let Ok(Response::Error { detail, .. }) = answer {
+                                                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                                                }
+                                            });
+                                        })
+                                        .detach();
+                                    },
+                                )),
+                            ),
+                    )
+            }
+            TelegramModal::RtmpKeySheet {
+                conversation,
+                title,
+                url,
+                key,
+                key_revealed,
+                started,
+                busy,
+            } => {
+                let conv = conversation.clone();
+                let title_opt = title.clone();
+                let url_copy = url.clone();
+                let key_copy = key.clone();
+                let display_key = if *key_revealed { key.clone() } else { mask_stream_key(key) };
+                let is_started = *started;
+                let is_busy = *busy;
+                div()
+                    .child(div().type_title().child("RTMP stream credentials"))
+                    .child(modal_body(
+                        "Paste this server URL and stream key into OBS or another RTMP encoder. Keep your stream key private.",
+                    ))
+                    .child(
+                        div()
+                            .mt(px(12.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(div().type_micro().text_color(theme::text_soft()).child("Server URL"))
+                            .child(
+                                div()
+                                    .px(px(10.))
+                                    .py(px(8.))
+                                    .rounded(px(theme::R_CONTROL))
+                                    .bg(theme::raised())
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(div().flex_1().min_w_0().truncate().type_small().child(url.clone()))
+                                    .child(
+                                        button("tg-rtmp-copy-url", ButtonKind::Secondary, "Copy").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(url_copy.clone()));
+                                                this.toast(Some(("icons/check.svg", theme::positive())), "Server URL copied", cx);
+                                            }),
+                                        ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(10.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(div().type_micro().text_color(theme::text_soft()).child("Stream key"))
+                            .child(
+                                div()
+                                    .px(px(10.))
+                                    .py(px(8.))
+                                    .rounded(px(theme::R_CONTROL))
+                                    .bg(theme::raised())
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(div().flex_1().min_w_0().truncate().type_small().child(display_key))
+                                    .child(
+                                        button(
+                                            "tg-rtmp-reveal",
+                                            ButtonKind::Secondary,
+                                            if *key_revealed { "Hide" } else { "Show" },
+                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(TelegramModal::RtmpKeySheet { key_revealed, .. }) =
+                                                this.call_state.telegram_modal.as_mut()
+                                            {
+                                                *key_revealed = !*key_revealed;
+                                                cx.notify();
+                                            }
+                                        })),
+                                    )
+                                    .child(
+                                        button("tg-rtmp-copy-key", ButtonKind::Secondary, "Copy").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(key_copy.clone()));
+                                                this.toast(Some(("icons/check.svg", theme::positive())), "Stream key copied", cx);
+                                            }),
+                                        ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        modal_buttons()
+                            .child(
+                                button("tg-rtmp-revoke", ButtonKind::Danger, if is_busy { "Revoking…" } else { "Revoke key" })
+                                    .on_click(cx.listener({
+                                        let conv = conv.clone();
+                                        move |this, _, _, cx| {
+                                            if is_busy {
+                                                return;
+                                            }
+                                            if let Some(TelegramModal::RtmpKeySheet { busy, .. }) =
+                                                this.call_state.telegram_modal.as_mut()
+                                            {
+                                                *busy = true;
+                                                cx.notify();
+                                            }
+                                            let req = Request::GroupCallRtmpUrl {
+                                                conversation: conv.clone(),
+                                                revoke: true,
+                                            };
+                                            cx.spawn(async move |this, cx| {
+                                                let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+                                                let _ = this.update(cx, |this, cx| match answer {
+                                                    Ok(Response::GroupCallRtmpUrl(rtmp)) => {
+                                                        if let Some(TelegramModal::RtmpKeySheet { url, key, busy, .. }) =
+                                                            this.call_state.telegram_modal.as_mut()
+                                                        {
+                                                            *url = rtmp.url;
+                                                            *key = rtmp.key;
+                                                            *busy = false;
+                                                        }
+                                                        this.toast(
+                                                            Some(("icons/check.svg", theme::positive())),
+                                                            "Stream key revoked and replaced",
+                                                            cx,
+                                                        );
+                                                        cx.notify();
+                                                    }
+                                                    Ok(Response::Error { detail, .. }) => {
+                                                        if let Some(TelegramModal::RtmpKeySheet { busy, .. }) =
+                                                            this.call_state.telegram_modal.as_mut()
+                                                        {
+                                                            *busy = false;
+                                                        }
+                                                        this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                                                        cx.notify();
+                                                    }
+                                                    _ => {}
+                                                });
+                                            })
+                                            .detach();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                button("tg-rtmp-close", ButtonKind::Secondary, "Close")
+                                    .on_click(cx.listener(|this, _, _, cx| this.telegram_modal_close(cx))),
+                            )
+                            .when(!is_started, |row| {
+                                row.child(
+                                    button("tg-rtmp-start", ButtonKind::Primary, "Start live stream").on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            let req = Request::GroupCallCreate {
+                                                conversation: conv.clone(),
+                                                title: title_opt.clone(),
+                                                rtmp_stream: true,
+                                                join: true,
+                                            };
+                                            this.telegram_modal_close(cx);
+                                            let orig = conv.clone();
+                                            cx.spawn(async move |this, cx| {
+                                                let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+                                                let _ = this.update(cx, |this, cx| match answer {
+                                                    Ok(Response::GroupCallStarted { conversation }) => {
+                                                        if conversation != orig {
+                                                            this.open_now(conversation, "", cx);
+                                                        }
+                                                    }
+                                                    Ok(Response::Error { detail, .. }) => {
+                                                        this.call_state.error = Some(detail);
+                                                        cx.notify();
+                                                    }
+                                                    _ => {}
+                                                });
+                                            })
+                                            .detach();
+                                        }),
+                                    ),
+                                )
+                            }),
+                    )
+            }
         };
 
         let box_panel = div()
@@ -1320,7 +1888,46 @@ mod tests {
         );
         assert_eq!(
             telegram_admin_participant_actions(&call, &speaker_p, true),
-            vec!["Mute", "Remove from group"]
+            vec!["Mute for everyone", "Remove from group"]
         );
+    }
+
+    #[test]
+    fn wave16b2_recording_badge_noise_suppression_video_limit_and_masked_rtmp_key() {
+        // Recording tooltip clearly indicates audio vs audio+video and start time (#463).
+        assert_eq!(recording_tooltip(14 * 3600 + 30 * 60, false), "Recording audio since 14:30 UTC");
+        assert_eq!(recording_tooltip(14 * 3600 + 30 * 60, true), "Recording audio & video since 14:30 UTC");
+
+        // Admin moderation action is explicitly "Mute for everyone", never ambiguous with "Mute for me" (#468).
+        let mut call = tg_call();
+        let speaker = Participant { id: "u7002".into(), name: "Odalys".into(), suppressed: false, ..Default::default() };
+        let admin_actions = telegram_admin_participant_actions(&call, &speaker, true);
+        assert!(admin_actions.contains(&"Mute for everyone"));
+        assert!(!admin_actions.contains(&"Mute for me"));
+
+        // Per-call noise suppression defaults to Settings > Voice and overrides cleanly (#468).
+        assert!(telegram_noise_suppression_enabled(None, true));
+        assert!(!telegram_noise_suppression_enabled(None, false));
+        assert!(!telegram_noise_suppression_enabled(Some(false), true));
+        assert!(telegram_noise_suppression_enabled(Some(true), false));
+
+        // Video limit disables starting camera/share with a clear reason (#467).
+        call.unmuted_video_limit = 4;
+        call.unmuted_video_count = 4;
+        assert!(call.video_limit_reason(false).unwrap().contains("4 of 4"));
+        assert!(call.video_limit_reason(true).is_none());
+
+        // RTMP stream key is always masked by default and banners describe non-live states (#454).
+        let masked = mask_stream_key("tg-secret-stream-key-123");
+        assert!(!masked.contains("tg-secret"));
+        assert!(!masked.is_empty());
+        assert_eq!(mask_stream_key(""), "");
+        assert_eq!(rtmp_quality_label(0), "Low");
+        assert_eq!(rtmp_quality_label(1), "Medium");
+        assert_eq!(rtmp_quality_label(2), "High");
+        assert!(rtmp_state_banner(RtmpStreamState::Waiting).is_some());
+        assert!(rtmp_state_banner(RtmpStreamState::Paused).is_some());
+        assert!(rtmp_state_banner(RtmpStreamState::Ended).is_some());
+        assert!(rtmp_state_banner(RtmpStreamState::Live).is_none());
     }
 }

@@ -122,6 +122,14 @@ pub struct Controls {
     tg_signals: Mutex<std::collections::VecDeque<Vec<u8>>>,
     /// Updated Telegram group voice chat SSRC -> participant mapping.
     tg_sources: Mutex<Option<Vec<protocol::TelegramGroupSource>>>,
+    /// Updated Telegram group video & presentation endpoint/SSRC mapping (#467).
+    tg_video_sources: Mutex<Option<Vec<protocol::TelegramGroupVideoSource>>>,
+    /// Pending Telegram presentation transport stop flag (#467).
+    tg_presentation_stop: AtomicBool,
+    /// Queued RTMP live stream segments (time_ms, scale, video_channel, video_quality, raw bytes) (#454).
+    tg_rtmp_segments: Mutex<std::collections::VecDeque<crate::telegram::RtmpSegmentInput>>,
+    /// Latest RTMP stream state (#454).
+    tg_rtmp_state: Mutex<Option<protocol::RtmpStreamState>>,
 }
 
 impl Controls {
@@ -278,6 +286,7 @@ impl Controls {
         let wanted = match cue {
             Cue::Test => true,
             Cue::Joined | Cue::Left | Cue::ShareStarted => tuning.joins && !self.deafened.load(Ordering::Relaxed),
+            Cue::RecordingStarted => !self.deafened.load(Ordering::Relaxed),
             // Our own room changed: as a join, but heard while deafened, since it is ours.
             Cue::Moved => tuning.joins,
             Cue::Muted | Cue::Unmuted | Cue::Deafened | Cue::Undeafened => tuning.mine,
@@ -407,6 +416,42 @@ impl Controls {
 
     pub fn take_tg_sources(&self) -> Option<Vec<protocol::TelegramGroupSource>> {
         self.tg_sources.lock().unwrap().take()
+    }
+
+    pub fn set_tg_video_sources(&self, sources: Vec<protocol::TelegramGroupVideoSource>) {
+        *self.tg_video_sources.lock().unwrap() = Some(sources);
+    }
+
+    pub fn take_tg_video_sources(&self) -> Option<Vec<protocol::TelegramGroupVideoSource>> {
+        self.tg_video_sources.lock().unwrap().take()
+    }
+
+    pub fn set_tg_presentation_stop(&self, stop: bool) {
+        self.tg_presentation_stop.store(stop, Ordering::Relaxed);
+    }
+
+    pub fn tg_presentation_stopped(&self) -> bool {
+        self.tg_presentation_stop.load(Ordering::Relaxed)
+    }
+
+    pub fn push_tg_rtmp_segment(&self, seg: crate::telegram::RtmpSegmentInput) {
+        let mut q = self.tg_rtmp_segments.lock().unwrap();
+        if q.len() >= 64 {
+            q.pop_front();
+        }
+        q.push_back(seg);
+    }
+
+    pub fn take_tg_rtmp_segments(&self) -> Vec<crate::telegram::RtmpSegmentInput> {
+        self.tg_rtmp_segments.lock().unwrap().drain(..).collect()
+    }
+
+    pub fn set_tg_rtmp_state(&self, state: protocol::RtmpStreamState) {
+        *self.tg_rtmp_state.lock().unwrap() = Some(state);
+    }
+
+    pub fn tg_rtmp_state(&self) -> Option<protocol::RtmpStreamState> {
+        *self.tg_rtmp_state.lock().unwrap()
     }
 }
 

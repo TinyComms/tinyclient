@@ -7461,3 +7461,308 @@ fn group_call_listener_raise_hand_allow_speak_admin_mute_remove_and_join_muted()
     assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
     world.until("call ended", || current_call(&world).is_none().then_some(()));
 }
+
+#[test]
+fn wave16b2_recording_volume_camera_share_limits_and_rtmp_streams() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[
+            ("TINYCLIENT_TELEGRAM_CHECK_MS", "2500"),
+            ("TINYCLIENT_TELEGRAM_GAIN_DEBOUNCE_MS", "60"),
+            ("TINYCLIENT_TELEGRAM_RTMP_POLL_MS", "60"),
+            ("TINYCLIENT_MEDIAD_AUDIO", "null"),
+            ("TINYCLIENT_TELEGRAM_ADMIN", "1"),
+        ],
+    );
+    world.connected();
+    let account = key("g8001").account();
+
+    // ---------------------------------------------------------------------
+    // #463: Recording indicator via updateGroupCall + admin start/stop
+    // ---------------------------------------------------------------------
+    world.steer("group-call-live");
+    world.until("live group call banner appears", || {
+        world
+            .conversation("g8001")?
+            .occupants
+            .filter(|o| o.live && o.record_start_date.is_none())
+    });
+
+    // Recording starts before joining -> live bar immediately reflects record_start_date & video active.
+    world.steer("group-call-record-start");
+    let rec_occ = world.until("live bar shows recording indicator", || {
+        world
+            .conversation("g8001")?
+            .occupants
+            .filter(|o| o.record_start_date.is_some() && o.record_video_active)
+    });
+    assert!(rec_occ.record_start_date.is_some());
+
+    // Joining an already-recording chat immediately surfaces record_start_date on Call before unmuting.
+    assert_eq!(
+        world.ask(Request::GroupCallJoin {
+            conversation: key("g8001"),
+            join_as: None,
+            invite_hash: None,
+            save_default: false,
+        }),
+        Response::Ok
+    );
+    let call = world.until("joined already-recording chat shows recording dot while muted", || {
+        current_call(&world).filter(|c| {
+            c.state == protocol::CallState::Joined
+                && c.muted
+                && c.record_start_date.is_some()
+                && c.record_video_active
+        })
+    });
+    assert!(call.record_start_date.is_some());
+
+    // Admin stops recording -> phone.toggleGroupCallRecord(start=false) + Saved Messages notice.
+    let stop_resp = world.ask(Request::GroupCallRecord {
+        conversation: key("g8001"),
+        start: false,
+        video: false,
+        video_portrait: None,
+        title: None,
+    });
+    match stop_resp {
+        Response::GroupCallRecord { recording, notice } => {
+            assert!(!recording);
+            assert!(notice.as_deref().unwrap_or("").contains("Saved Messages"));
+        }
+        other => panic!("expected GroupCallRecord stop response, got {other:?}"),
+    }
+    world.until("recording cleared on Call", || {
+        current_call(&world).filter(|c| c.record_start_date.is_none() && !c.record_video_active)
+    });
+    assert!(calls_log_contains(&world, "ToggleGroupCallRecord"));
+
+    // Admin starts recording with title & portrait video -> sends expected flags.
+    let start_resp = world.ask(Request::GroupCallRecord {
+        conversation: key("g8001"),
+        start: true,
+        video: true,
+        video_portrait: Some(true),
+        title: Some("Summit debrief".into()),
+    });
+    assert!(matches!(start_resp, Response::GroupCallRecord { recording: true, .. }));
+    world.until("recording active again on Call", || {
+        current_call(&world).filter(|c| c.record_start_date.is_some() && c.record_video_active)
+    });
+    assert!(calls_log_contains(
+        &world,
+        "start=true video=true portrait=Some(true) title=Some(\"Summit debrief\")"
+    ));
+
+    // ---------------------------------------------------------------------
+    // #468: Per-person volume (5000 -> 50%), debounced slider sync, separate Mute for me
+    // ---------------------------------------------------------------------
+    world.steer("group-call-volume-5000");
+    world.until("participant volume 5000 mapped to 50%", || {
+        let c = current_call(&world)?;
+        c.participants
+            .iter()
+            .find(|p| p.id == "u7002")
+            .filter(|p| p.volume == Some(50))
+            .map(|_| ())
+    });
+
+    // Rapid slider drags coalesce into a single debounced editGroupCallParticipant with final volume.
+    for pct in [60u16, 80, 120, 140] {
+        assert_eq!(
+            world.ask(Request::CallGain {
+                account: account.clone(),
+                user_id: "u7002".into(),
+                percent: pct,
+                muted: false,
+            }),
+            Response::Ok
+        );
+    }
+    world.until("debounced volume=14000 sent to Telegram", || {
+        calls_log_contains(&world, "target=u7002 muted=None volume=Some(14000)").then_some(())
+    });
+    // Intermediate values were coalesced away.
+    assert!(!calls_log_contains(&world, "volume=Some(6000)"));
+
+    // CRITICAL (#468): Admin clicking "Mute for me" (CallGain muted=true) MUST NOT send muted=Some(true)
+    // to Telegram (which would mute Odalys for everyone).
+    assert_eq!(
+        world.ask(Request::CallGain {
+            account: account.clone(),
+            user_id: "u7002".into(),
+            percent: 140,
+            muted: true,
+        }),
+        Response::Ok
+    );
+    world.until("admin local mute sends volume=Some(1) with muted=None, never muting for everyone", || {
+        calls_log_contains(&world, "target=u7002 muted=None volume=Some(1)").then_some(())
+    });
+    assert!(
+        !calls_log_contains(&world, "target=u7002 muted=Some(true)"),
+        "admin local mute must never send server mute-for-everyone"
+    );
+
+    // ---------------------------------------------------------------------
+    // #467: Camera, screen share presentation, remote multi-video, & video limit
+    // ---------------------------------------------------------------------
+    // Remote camera (Odalys) and screen share presentation (Tobin) arrive.
+    world.steer("group-call-remote-videos");
+    world.until("remote camera and presentation streams tracked on participants", || {
+        let c = current_call(&world)?;
+        let odalys = c.participants.iter().find(|p| p.id == "u7002")?;
+        let tobin = c.participants.iter().find(|p| p.id == "u7003")?;
+        (odalys.camera && !odalys.video_paused && tobin.sharing && !tobin.presentation_paused).then_some(())
+    });
+
+    // Turn local camera on -> sends video_stopped=Some(false).
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::Camera { on: true })),
+        Response::Status { .. }
+    ));
+    world.until("camera editGroupCallParticipant sent", || {
+        calls_log_contains(&world, "video_stopped=Some(false)").then_some(())
+    });
+
+    // Start screen share -> phone.joinGroupCallPresentation + presentation_paused=Some(false).
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::ShareSend {
+            on: true,
+            screen: None,
+            quality: None,
+            show_cursor: None,
+        })),
+        Response::Status { .. }
+    ));
+    world.until("JoinGroupCallPresentation sent", || {
+        calls_log_contains(&world, "JoinGroupCallPresentation").then_some(())
+    });
+
+    // Stop screen share -> phone.leaveGroupCallPresentation.
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::ShareSend {
+            on: false,
+            screen: None,
+            quality: None,
+            show_cursor: None,
+        })),
+        Response::Status { .. }
+    ));
+    world.until("LeaveGroupCallPresentation sent", || {
+        calls_log_contains(&world, "LeaveGroupCallPresentation").then_some(())
+    });
+
+    // Turn camera off before testing video limit.
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::Camera { on: false })),
+        Response::Status { .. }
+    ));
+
+    // Server signals unmuted_video_limit reached (can_start_video=false, 4 of 4) -> Camera & ShareSend refused.
+    world.steer("group-call-video-limit");
+    world.until("video limit reflected on Call", || {
+        current_call(&world).filter(|c| !c.can_start_video && c.unmuted_video_limit == 4 && c.unmuted_video_count == 4)
+    });
+    match world.ask(Request::Media(protocol::MediaRequest::Camera { on: true })) {
+        Response::Error { detail, .. } => assert!(detail.contains("4 of 4"), "unexpected reason: {detail}"),
+        other => panic!("expected Camera refused at video limit, got {other:?}"),
+    }
+    match world.ask(Request::Media(protocol::MediaRequest::ShareSend {
+        on: true,
+        screen: None,
+        quality: None,
+        show_cursor: None,
+    })) {
+        Response::Error { detail, .. } => assert!(detail.contains("4 of 4"), "unexpected reason: {detail}"),
+        other => panic!("expected ShareSend refused at video limit, got {other:?}"),
+    }
+
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("group call ended before RTMP test", || current_call(&world).is_none().then_some(()));
+
+    // ---------------------------------------------------------------------
+    // #454: Channel RTMP live stream — key fetch/revoke (never logged), live bar, watch, quality, pause
+    // ---------------------------------------------------------------------
+    let rtmp1 = match world.ask(Request::GroupCallRtmpUrl {
+        conversation: key("c9001"),
+        revoke: false,
+    }) {
+        Response::GroupCallRtmpUrl(info) => info,
+        other => panic!("expected GroupCallRtmpUrl, got {other:?}"),
+    };
+    assert!(rtmp1.url.starts_with("rtmps://"));
+    assert!(!rtmp1.key.is_empty());
+    assert!(
+        !calls_log_contains(&world, &rtmp1.key),
+        "RTMP stream key must NEVER appear in logs"
+    );
+
+    let rtmp2 = match world.ask(Request::GroupCallRtmpUrl {
+        conversation: key("c9001"),
+        revoke: true,
+    }) {
+        Response::GroupCallRtmpUrl(info) => info,
+        other => panic!("expected revoked GroupCallRtmpUrl, got {other:?}"),
+    };
+    assert_ne!(rtmp1.key, rtmp2.key);
+    assert!(calls_log_contains(&world, "GetGroupCallStreamRtmpUrl c9001 revoke=true"));
+    assert!(
+        !calls_log_contains(&world, &rtmp2.key),
+        "revoked RTMP stream key must NEVER appear in logs"
+    );
+
+    // Channel goes live with rtmp_stream=true and 42 viewers.
+    world.steer("group-call-rtmp-live");
+    let rtmp_occ = world.until("channel live bar shows RTMP live stream with viewer count", || {
+        world
+            .conversation("c9001")?
+            .occupants
+            .filter(|o| o.live && o.rtmp_stream && o.total == 42)
+    });
+    assert!(rtmp_occ.rtmp_stream && rtmp_occ.total == 42);
+
+    // Join as viewer -> suppressed (cannot speak), fetches GetGroupCallStreamChannels + inputGroupCallStream segment.
+    assert_eq!(
+        world.ask(Request::GroupCallJoin {
+            conversation: key("c9001"),
+            join_as: None,
+            invite_hash: None,
+            save_default: false,
+        }),
+        Response::Ok
+    );
+    let rtmp_call = world.until("watching RTMP stream as suppressed viewer with Live state", || {
+        current_call(&world).filter(|c| {
+            c.state == protocol::CallState::Joined
+                && c.rtmp_stream
+                && c.suppressed
+                && c.rtmp_state == Some(protocol::RtmpStreamState::Live)
+        })
+    });
+    assert_eq!(rtmp_call.rtmp_quality, Some(1));
+    assert!(calls_log_contains(&world, "GetGroupCallStreamChannels"));
+    assert!(calls_log_contains(&world, "GetFile stream"));
+
+    // Switch quality to High (2) -> fetches segment with q=Some(2).
+    assert_eq!(
+        world.ask(Request::GroupCallRtmpQuality { conversation: key("c9001"), quality: 2 }),
+        Response::Ok
+    );
+    world.until("RTMP quality switched to High and fetched with q=Some(2)", || {
+        (current_call(&world).is_some_and(|c| c.rtmp_quality == Some(2))
+            && calls_log_contains(&world, "q=Some(2)"))
+            .then_some(())
+    });
+
+    // Stream pauses -> TIME_TOO_BIG transitions Call.rtmp_state to Paused.
+    world.steer("group-call-rtmp-pause");
+    world.until("RTMP stream transitions to Paused state", || {
+        current_call(&world).filter(|c| c.rtmp_state == Some(protocol::RtmpStreamState::Paused))
+    });
+
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("RTMP viewer ended cleanly", || current_call(&world).is_none().then_some(()));
+}

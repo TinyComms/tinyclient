@@ -865,7 +865,10 @@ fn offline(ctx: &Context, command: Command) {
         | Command::GroupCallDiscard { reply, .. }
         | Command::GroupCallSettings { reply, .. }
         | Command::GroupCallRaiseHand { reply, .. }
-        | Command::GroupCallModerate { reply, .. } => drop(reply.send(Err(down()))),
+        | Command::GroupCallModerate { reply, .. }
+        | Command::GroupCallRtmpQuality { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GroupCallRecord { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GroupCallRtmpUrl { reply, .. } => drop(reply.send(Err(down()))),
         Command::GroupCallJoinAs { reply, .. } => drop(reply.send(Err(down()))),
         Command::GroupCallCreate { reply, .. }
         | Command::GroupCallExportInvite { reply, .. } => drop(reply.send(Err(down()))),
@@ -1440,6 +1443,26 @@ fn serve(account: &Arc<Account>, command: Command) {
                 group_call::moderate(account, &conversation_id, &participant_id, muted, remove).map_err(refused),
             );
         }
+        Command::GroupCallRecord { conversation_id, start, video, video_portrait, title, reply } => {
+            let _ = reply.send(
+                group_call::toggle_record(account, &conversation_id, start, video, video_portrait, title)
+                    .map_err(refused),
+            );
+        }
+        Command::GroupCallParticipantGain { conversation_id, participant_id, percent, muted } => {
+            group_call::queue_participant_gain(account, &conversation_id, &participant_id, percent, muted);
+        }
+        Command::GroupCallRtmpUrl { conversation_id, revoke, reply } => {
+            let _ = reply.send(group_call::rtmp_url(account, &conversation_id, revoke).map_err(refused));
+        }
+        Command::GroupCallRtmpQuality { conversation_id, quality, reply } => {
+            let _ = reply.send(group_call::set_rtmp_quality(account, &conversation_id, quality).map_err(refused));
+        }
+        Command::CallPicture(picture) => match picture {
+            crate::adapters::Picture::Camera(on) => group_call::on_camera(account, on),
+            crate::adapters::Picture::Share(on) => group_call::on_share(account, on),
+            crate::adapters::Picture::Watch(_) => {}
+        },
         Command::TelegramCallSignal { conversation_id, data } => {
             call::send_signal(account, &conversation_id, &data);
         }

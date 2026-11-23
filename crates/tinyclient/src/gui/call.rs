@@ -383,6 +383,7 @@ pub struct State {
     watch_again: Option<(Vec<protocol::WatchSource>, Instant)>,
     /// Always-on-top pop-out window showing the call's video (`#267`). While `Some`, the main
     /// stage renders a placeholder so the decoded `RenderImage` is never drawn twice.
+    pub(super) telegram_noise_suppression: Option<bool>,
     pub(in crate::gui) popout: Option<gpui::WindowHandle<popout::CallPopout>>,
     /// Remembered `(x, y, width, height)` for the call pop-out window, persisted in `shell.prefs`.
     pub(in crate::gui) popout_frame: Option<(f32, f32, f32, f32)>,
@@ -472,7 +473,10 @@ fn desired_watch_sources(
     budget_small: usize,
 ) -> Vec<protocol::WatchSource> {
     use protocol::{PictureKind, WatchSize, WatchSource};
-    if call.state != CallState::Joined || call.deafened || call.conversation.network != Network::Tiny {
+    if call.state != CallState::Joined
+        || call.deafened
+        || !matches!(call.conversation.network, Network::Tiny | Network::Telegram)
+    {
         return Vec::new();
     }
     let mut out: Vec<WatchSource> = Vec::new();
@@ -714,6 +718,15 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         can_change_join_muted: false,
         participants_count: 0,
         joined_as: None,
+        record_start_date: None,
+        record_video_active: false,
+        can_start_video: true,
+        unmuted_video_count: 0,
+        unmuted_video_limit: 0,
+        rtmp_stream: false,
+        rtmp_state: None,
+        rtmp_quality: None,
+        rtmp_qualities: Vec::new(),
     }
 }
 
@@ -1015,6 +1028,7 @@ impl Shell {
                 state.muted_talk = health::MutedTalk::default();
                 state.muted_talk_task = None;
                 state.metering = None;
+                state.telegram_noise_suppression = None;
                 state.cued = None;
                 state.auto_watch = None;
                 state.discord_speaker = None;
@@ -1628,7 +1642,7 @@ impl Shell {
                     let conv = call.conversation.clone();
                     let pid = user_id.to_owned();
                     let pname = name.to_owned();
-                    items = items.child(menu_separator().mx(px(8.))).child(menu_label("Moderation"));
+                    items = items.child(menu_separator().mx(px(8.))).child(menu_label("Moderation (for everyone)"));
                     if participant.suppressed {
                         items = items.child(
                             menu_item(
@@ -1651,7 +1665,7 @@ impl Shell {
                             menu_item(
                                 SharedString::from(format!("tg-call-mute-{user_id}")),
                                 Some("icons/mic-off.svg"),
-                                "Mute",
+                                "Mute for everyone",
                                 None,
                             )
                             .on_click(cx.listener({

@@ -6474,7 +6474,22 @@ impl Chat {
                 if let Err(err) = self.hub.set_setting(&scope, &key, value) {
                     return internal(err);
                 }
-                self.hub.calls.gain(&self.hub, &account, user_id, percent, muted);
+                self.hub.calls.gain(&self.hub, &account, user_id.clone(), percent, muted);
+                if account.network == Network::Telegram {
+                    if let (Some(call), true) = self.hub.calls.describe() {
+                        if call.conversation.account() == account {
+                            self.command(
+                                &account,
+                                Command::GroupCallParticipantGain {
+                                    conversation_id: call.conversation.id,
+                                    participant_id: user_id,
+                                    percent,
+                                    muted,
+                                },
+                            );
+                        }
+                    }
+                }
                 Response::Ok
             }
             // Only ever from the person's own click: nothing else turns a blocked call to clear.
@@ -6803,6 +6818,42 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::GroupCallRecord { conversation, start, video, video_portrait, title } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallRecord {
+                    conversation_id,
+                    start,
+                    video,
+                    video_portrait,
+                    title,
+                    reply,
+                }) {
+                    Ok((recording, notice)) => Response::GroupCallRecord { recording, notice },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallRtmpUrl { conversation, revoke } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallRtmpUrl {
+                    conversation_id,
+                    revoke,
+                    reply,
+                }) {
+                    Ok(rtmp) => Response::GroupCallRtmpUrl(rtmp),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallRtmpQuality { conversation, quality } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallRtmpQuality {
+                    conversation_id,
+                    quality,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Play(request) => {
                 let viewed = match &request {
                     protocol::PlayRequest::Start { conversation, message, .. } if !message.is_empty() => {
@@ -6866,6 +6917,30 @@ impl Chat {
                     MediaRequest::ShareWatch { source } => Some(Picture::Watch(source.clone())),
                     _ => None,
                 };
+                // Enforce Telegram group video limits (`can_start_video`, `unmuted_video_limit`, RTMP viewer) (#467, #454).
+                if let (Some(call), true) = self.hub.calls.describe() {
+                    if call.conversation.network == Network::Telegram {
+                        match &request {
+                            MediaRequest::Camera { on: true } => {
+                                let already = call.video.iter().any(|v| {
+                                    v.direction == protocol::Direction::Encode && v.content == protocol::Content::Camera
+                                });
+                                if let Some(reason) = call.video_limit_reason(already) {
+                                    return error(ErrorCode::Refused, reason);
+                                }
+                            }
+                            MediaRequest::ShareSend { on: true, .. } => {
+                                let already = call.video.iter().any(|v| {
+                                    v.direction == protocol::Direction::Encode && v.content == protocol::Content::Share
+                                });
+                                if let Some(reason) = call.video_limit_reason(already) {
+                                    return error(ErrorCode::Refused, reason);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let asked = match request {
                     // Joining is the adapter's to ask for, with what the network handed out.
                     MediaRequest::Join(_) | MediaRequest::Rejoin(_) => {
@@ -6874,11 +6949,11 @@ impl Chat {
                     MediaRequest::Meter { on } => self.hub.calls.meter(&self.hub, on),
                     request => self.hub.calls.request(&self.hub, &request).map(drop),
                 };
-                // A refusal never tells Discord we are sending. Other networks ignore the command.
+                // A refusal never tells Discord or Telegram we are sending. Other networks ignore the command.
                 if asked.is_ok() {
                     if let (Some(call), true) = self.hub.calls.describe() {
                         if let Some(picture) = picture {
-                            if call.conversation.network == Network::Discord {
+                            if matches!(call.conversation.network, Network::Discord | Network::Telegram) {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
                             }
                         }

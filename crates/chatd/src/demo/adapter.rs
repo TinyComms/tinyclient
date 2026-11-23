@@ -1493,6 +1493,7 @@ impl Demo {
             | Command::WantedSpan { .. }
             | Command::TelegramCallSignal { .. }
             | Command::TelegramCallSpeaking { .. }
+            | Command::GroupCallParticipantGain { .. }
             | Command::Played { .. }
             | Command::Stop => {}
             Command::GroupCallSchedule { reply, .. }
@@ -1504,7 +1505,14 @@ impl Demo {
             | Command::GroupCallDiscard { reply, .. }
             | Command::GroupCallSettings { reply, .. }
             | Command::GroupCallRaiseHand { reply, .. }
-            | Command::GroupCallModerate { reply, .. } => {
+            | Command::GroupCallModerate { reply, .. }
+            | Command::GroupCallRtmpQuality { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::GroupCallRecord { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::GroupCallRtmpUrl { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
             Command::GroupCallJoinAs { reply, .. } => {
