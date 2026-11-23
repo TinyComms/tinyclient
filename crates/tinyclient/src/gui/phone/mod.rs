@@ -251,6 +251,7 @@ impl Shell {
         }
         // Minimised, it is a bar under the status bar, and every screen starts under that bar.
         let bar = self.call_phone_bar(snapshot, cx);
+        let live_loc_bar = self.live_location_bar(cx);
         tokens::take_top(bar.is_some());
         let right = self.layout_state.right.is_some() && !self.pane_tucked();
         // Server Settings, when a page of it is open (Encryption, from a conversation's strip).
@@ -275,6 +276,7 @@ impl Shell {
             .bg(theme::canvas())
             .text_color(theme::text())
             .children(bar)
+            .children(live_loc_bar)
             .child(div().flex_1().min_h_0().pl(px(left)).pr(px(right)).bg(theme::sidebar()).child(screen))
             .children(self.switcher(window, cx))
             .children(self.create_channel_modal(cx))

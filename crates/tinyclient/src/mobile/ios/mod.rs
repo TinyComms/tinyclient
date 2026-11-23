@@ -20,6 +20,7 @@ mod approval;
 mod cover;
 mod camera;
 mod codec;
+mod location;
 mod unified;
 mod pixels;
 mod screen;
@@ -43,6 +44,7 @@ pub(super) fn register() {
     mediad::platform::register(phone.clone());
     protocol::web_sign_in::register(phone.clone());
     protocol::device_approval::register(Arc::new(approval::IosApproval));
+    protocol::location::register(Arc::new(location::IosLocation));
     audio::register_hooks();
     camera::register_hooks();
     selftest::maybe_start(phone);
