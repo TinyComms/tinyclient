@@ -3792,8 +3792,28 @@ impl Chat {
         }
     }
 
+    /// A browser store that has never signed in, so a second Discord account does not reuse the
+    /// first account's cookies.
+    fn fresh_discord_store() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        format!("discord-fresh-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// True when a Discord account is already connected or stored, so the next sign-in must not
+    /// reuse that account's browser profile.
+    fn discord_open(&self) -> bool {
+        if lock(&self.adapters).keys().any(|key| key.network == Network::Discord) {
+            return true;
+        }
+        match session::read(Network::Discord) {
+            session::Stored::Found(session) => adapters::accounts(Network::Discord, &session).is_ok(),
+            _ => false,
+        }
+    }
+
     /// Shows the network's sign-in and waits for the user to finish it.
-    fn sign_in(&self, network: Network, at: Option<(i32, i32)>, resume: Option<String>) -> Response {
+    fn sign_in(&self, network: Network, at: Option<(i32, i32)>, resume: Option<String>, kind: Option<String>) -> Response {
         if !adapters::supported(network) {
             return error(
                 ErrorCode::Unsupported,
@@ -3820,21 +3840,47 @@ impl Chat {
         if let Some(account) = resume {
             return self.resume_sign_in(network, at, &account);
         }
+        let personal = network == Network::Teams && kind.as_deref() == Some("personal");
+        let label = if personal { "teams-personal".to_owned() } else { network.label().to_lowercase() };
+        let fresh = network == Network::Discord && self.discord_open();
+        let store = if fresh { Self::fresh_discord_store() } else { label.clone() };
         let session = match web {
-            Some(web) => match login::web::sign_in(&*web, &network.label().to_lowercase(), None) {
+            Some(web) => match login::web::sign_in_in(&*web, &label, None, &store) {
                 Ok(session) => session,
                 Err(code) => return sign_in_ended(network, Some(code)),
             },
-            None => match self.sign_in_helper(network, at, None) {
+            None => match self.sign_in_helper(network, &label, at, None, fresh) {
                 Ok(session) => session,
                 Err(answer) => return *answer,
             },
         };
-        // The new session replaces every adapter of the network: an expired account comes back,
-        // and the accounts that were fine reconnect once.
+        // Discord and Teams add the account that just signed in and leave the others connected.
+        // Slack's helper returns every workspace, so that session still replaces the network.
+        let additive = matches!(network, Network::Discord | Network::Teams);
+        let fresh_ids = if additive {
+            match adapters::accounts(network, &session) {
+                Ok(found) => found.into_iter().map(|signed| signed.account).collect(),
+                Err(why) => return error(ErrorCode::SignIn, why),
+            }
+        } else {
+            Vec::new()
+        };
+        let session = match merged(network, &session) {
+            Ok(session) => session,
+            Err(why) => return error(ErrorCode::SignIn, why),
+        };
         let started = session::save(network, &session).and_then(|()| {
-            lock(&self.adapters).retain(|account, _| account.network != network);
-            self.connect(network, &session)
+            if additive {
+                for id in &fresh_ids {
+                    let key = AccountKey { network, account: id.clone() };
+                    lock(&self.adapters).remove(&key);
+                    self.start_accounts(network, &session, Some(id))?;
+                }
+                Ok(())
+            } else {
+                lock(&self.adapters).retain(|account, _| account.network != network);
+                self.connect(network, &session)
+            }
         });
         match started {
             Ok(()) => self.status(),
@@ -3868,7 +3914,7 @@ impl Chat {
                 Ok(session) => session,
                 Err(code) => return self.resume_ended(account, sign_in_ended(network, Some(code))),
             },
-            None => match self.sign_in_helper(network, at, Some(&url)) {
+            None => match self.sign_in_helper(network, "slack", at, Some(&url), false) {
                 Ok(session) => session,
                 Err(answer) => return self.resume_ended(account, *answer),
             },
@@ -3901,11 +3947,14 @@ impl Chat {
 
     /// The desktop's sign-in: the helper window (`tinyclient-login`), and the session it prints.
     /// `start` opens that Slack address instead of the usual sign-in page.
-    fn sign_in_helper(&self, network: Network, at: Option<(i32, i32)>, start: Option<&str>) -> Result<String, Refused> {
+    fn sign_in_helper(&self, network: Network, label: &str, at: Option<(i32, i32)>, start: Option<&str>, fresh: bool) -> Result<String, Refused> {
         let helper = login_path().and_then(|path| {
             let mut helper = std::process::Command::new(path);
             protocol::log_policy::share_session(&mut helper);
-            protocol::launch::no_console(&mut helper).arg(network.label().to_lowercase());
+            protocol::launch::no_console(&mut helper).arg(label);
+            if fresh {
+                helper.arg("--fresh");
+            }
             if let Some(start) = start {
                 helper.args(["--start", start]);
             }
@@ -5860,6 +5909,18 @@ impl Chat {
             }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::CallHistory { account, missed, before, limit } => self.call_history(account, missed, before, limit),
+            Request::Voicemails { account, before } => match self.ask(&account, |reply| Command::Voicemails { before, reply }) {
+                Ok((entries, next)) => Response::Voicemails { entries, next },
+                Err(refused) => *refused,
+            },
+            Request::VoicemailAudio { account, id, attachment } => match self.ask(&account, |reply| Command::VoicemailAudio { id, attachment, reply }) {
+                Ok(file) => Response::Media { files: vec![file] },
+                Err(refused) => *refused,
+            },
+            Request::ChangeVoicemail { account, id, action } => match self.ask(&account, |reply| Command::ChangeVoicemail { id, action, reply }) {
+                Ok(()) => Response::Ok,
+                Err(refused) => *refused,
+            },
             Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
@@ -6247,7 +6308,7 @@ impl Chat {
                 }
             }
 
-            Request::SignIn { network, at, resume } => self.sign_in(network, at, resume),
+            Request::SignIn { network, at, resume, kind } => self.sign_in(network, at, resume, kind),
             Request::SignInBegin { network } => self.sign_in_step(network, None),
             Request::SignInAnswer { network, input } => self.sign_in_step(network, Some(input)),
             Request::SignInCancel { network } => {
@@ -7352,6 +7413,31 @@ impl Chat {
             }),
             Request::TranslateMessages { conversation, message_ids, to } => self.translate(conversation, message_ids, to),
             Request::Meetings { account } => self.meetings(account),
+            Request::MeetingInvitees { conversation } => match self.ask(&conversation.account(), |reply| Command::MeetingInvitees {
+                conversation_id: conversation.id, reply,
+            }) {
+                Ok(emails) => Response::MeetingInvitees { emails },
+                Err(refused) => *refused,
+            },
+            Request::CreateMeeting { conversation, draft } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateMeeting { conversation_id: conversation.id, draft, reply }) {
+                    Ok((mut event, posted)) => {
+                        clip_meeting(&mut event);
+                        Response::MeetingCreated { event, posted }
+                    }
+                    Err(refused) => *refused,
+                }
+            },
+            Request::MeetingTranscript { conversation, message_id } => match self.ask(&conversation.account(), |reply| Command::MeetingTranscript {
+                conversation_id: conversation.id, message_id, reply,
+            }) {
+                Ok(text) => Response::MeetingTranscript { text },
+                Err(refused) => *refused,
+            },
             Request::MeetingRsvp { account, id, response, propose } => self.meeting_rsvp(account, id, response, propose),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
@@ -7420,8 +7506,6 @@ fn discovery_snowflake(id: &str) -> bool {
     (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Tiny keeps every server in the one item. A second sign-in is folded in before anything is
-/// saved, so it does not replace the server already there. Other networks still replace.
 /// Keeps a meeting row inside the sizes the shell draws, and drops a join target that is not
 /// `https://` or `http://`.
 fn clip_meeting(event: &mut protocol::MeetingEvent) {
@@ -7444,16 +7528,27 @@ fn clip_meeting(event: &mut protocol::MeetingEvent) {
     }
 }
 
+/// Tiny, Discord, and Teams keep every account in the one item. A second sign-in is folded in
+/// before anything is saved, so it does not replace an account already there. Other networks
+/// still replace.
 fn merged(network: Network, session: &str) -> Result<String, String> {
-    if network != Network::Tiny || !session::enabled() {
+    let fold = match network {
+        Network::Tiny => adapters::tiny::combine as fn(&str, &str) -> Result<String, String>,
+        Network::Discord => adapters::discord::combine,
+        Network::Teams => adapters::teams::combine,
+        _ => return Ok(session.to_owned()),
+    };
+    // A scratch directory has no keychain item to fold into. The session just signed in is the
+    // whole session, which is what a test hands over.
+    if !session::enabled() {
         return Ok(session.to_owned());
     }
-    match session::read(Network::Tiny) {
+    match session::read(network) {
         session::Stored::Absent => Ok(session.to_owned()),
         session::Stored::Unreadable(why) => {
             Err(format!("The session could not be read from {}: {why}", session::STORE))
         }
-        session::Stored::Found(existing) => adapters::tiny::combine(&existing, session),
+        session::Stored::Found(existing) => fold(&existing, session),
     }
 }
 

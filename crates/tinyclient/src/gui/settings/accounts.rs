@@ -183,6 +183,30 @@ impl SettingsWindow {
                     group = group.child(self.active_sessions_rows(account, ix, cx));
                 }
             }
+            if network == Network::Discord && !mine.is_empty() {
+                let action = touch(button(("add-discord", network as usize), ButtonKind::Secondary, "Add another"))
+                    .on_click(cx.listener(|this, _, _, cx| this.sign_in(Network::Discord, cx)))
+                    .into_any_element();
+                group = group.child(rule()).child(account_row(
+                    network,
+                    "Add another Discord account".into(),
+                    "Sign in to another account".into(),
+                    None,
+                    action,
+                ));
+            }
+            if network == Network::Teams {
+                let action = touch(button(("teams-personal", network as usize), ButtonKind::Secondary, "Sign in"))
+                    .on_click(cx.listener(|this, _, _, cx| this.sign_in_personal(cx)))
+                    .into_any_element();
+                group = group.child(rule()).child(account_row(
+                    network,
+                    "Personal Microsoft account".into(),
+                    "Teams free, teams.live.com".into(),
+                    None,
+                    action,
+                ));
+            }
             if network == Network::Teams && !mine.is_empty() {
                 group = group.child(self.teams_sessions_row(cx));
             }
@@ -206,6 +230,11 @@ impl SettingsWindow {
 
     fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
+        cx.notify();
+    }
+
+    fn sign_in_personal(&mut self, cx: &mut Context<Self>) {
+        let _ = self.shell.update(cx, |shell, cx| shell.sign_in_personal(cx));
         cx.notify();
     }
 

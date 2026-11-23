@@ -897,7 +897,7 @@ fn the_sign_in_window_is_told_where_to_open_and_how_it_ended_is_told_apart() {
 
     let ended = |code: u8, at| {
         std::fs::write(helper.join("code"), code.to_string()).unwrap();
-        match chatd.ask(Request::SignIn { network: Network::Slack, at, resume: None }) {
+        match chatd.ask(Request::SignIn { network: Network::Slack, at, resume: None, kind: None }) {
             Response::Error { code, detail } => (code, detail, std::fs::read_to_string(helper.join("args")).unwrap()),
             other => panic!("signed in: {other:?}"),
         }

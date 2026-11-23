@@ -1,0 +1,12 @@
+{
+  "id": "accounts-wave13",
+  "title": "Two Discord accounts stay isolated, and a personal Microsoft account uses Teams free",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "This driver starts desktop chatd. A phone driver is a later pass.",
+    "ios": "This driver starts desktop chatd. A phone driver is a later pass."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

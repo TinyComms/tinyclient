@@ -116,7 +116,21 @@ impl WebDelegate {
     }
 }
 
-pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>) {
+/// A version-4 UUID for one `--fresh` sign-in. The default store id stays fixed.
+fn fresh_uuid() -> String {
+    let mut bytes = [0u8; 16];
+    if let Ok(mut source) = std::fs::File::open("/dev/urandom") {
+        let _ = std::io::Read::read_exact(&mut source, &mut bytes);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    )
+}
+
+pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>, fresh: bool, personal: bool) {
     let mtm = MainThreadMarker::new().expect("main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -154,11 +168,16 @@ pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>) {
         window.setFrameOrigin(NSPoint::new(x, y));
     }
 
-    let store_id = NSUUID::initWithUUIDString(
-        NSUUID::alloc(),
-        &NSString::from_str("c0a1e5b2-7d44-4f18-9a6e-3b8d1f0c6e27"),
-    )
-    .expect("uuid");
+    // The shared store is one fixed id. `--fresh` is a new empty store. A personal Microsoft
+    // account keeps its own store, so it does not share cookies with a work sign-in.
+    let uuid = if fresh {
+        fresh_uuid()
+    } else if personal {
+        "a13c0e7e-5b21-4d0a-9f66-2c4e8a1b7d90"
+    } else {
+        "c0a1e5b2-7d44-4f18-9a6e-3b8d1f0c6e27"
+    };
+    let store_id = NSUUID::initWithUUIDString(NSUUID::alloc(), &NSString::from_str(uuid)).expect("uuid");
     let store = unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&store_id, mtm) };
     let config = unsafe { WKWebViewConfiguration::new(mtm) };
     unsafe { config.setWebsiteDataStore(&store) };

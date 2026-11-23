@@ -788,6 +788,25 @@ pub struct MeetingEvent {
     pub conversation: String,
 }
 
+/// A confirmed request to create a meeting and share it in a conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingDraft {
+    pub title: String,
+    /// Stable across retries of the same creation request.
+    pub request_id: String,
+    /// Absent for an instant meeting.
+    pub schedule: Option<MeetingSchedule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingSchedule {
+    pub start: i64,
+    pub end: i64,
+    pub attendees: Vec<String>,
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub weekly: bool,
+}
+
 /// Kind of a channel bookmark.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

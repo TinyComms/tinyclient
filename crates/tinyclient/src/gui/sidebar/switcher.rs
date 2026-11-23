@@ -171,6 +171,15 @@ fn kind_word(c: &Conversation) -> &'static str {
     }
 }
 
+/// The account name on a Discord row when more than one Discord account is signed in.
+pub fn discord_context(base: &str, name: &str, several: bool) -> String {
+    if several && !name.is_empty() {
+        if base.is_empty() { name.to_owned() } else { format!("{name} · {base}") }
+    } else {
+        base.to_owned()
+    }
+}
+
 /// Where a conversation is, for the row's second column: its place for a channel, its kind for
 /// a DM, group or meeting, after the workspace on Slack and Teams.
 pub fn context(c: &Conversation) -> String {
@@ -757,6 +766,7 @@ impl Shell {
         } else if let Some(number_hit) = text_number_hit(&query, accounts) {
             fresh.insert(0, number_hit);
         }
+        tag_discord(&mut fresh, accounts);
         if keep {
             switcher.hits = settle(&switcher.hits, switcher.selected, fresh);
             switcher.selected = switcher.selected.min(switcher.hits.len().saturating_sub(1));
@@ -1472,6 +1482,24 @@ fn command_morning(now: i64) -> i64 {
     now - now.rem_euclid(60) + until * 60
 }
 
+/// Names the Discord account on a row when two of them are signed in.
+fn tag_discord(hits: &mut [Hit], accounts: &[AccountStatus]) {
+    let discord: Vec<&AccountStatus> = accounts.iter().filter(|account| account.key.network == Network::Discord && account.link != Link::SignedOut).collect();
+    if discord.len() < 2 {
+        return;
+    }
+    for hit in hits {
+        let Target::Conversation(conversation) = &hit.target else {
+            continue;
+        };
+        if conversation.key.network != Network::Discord {
+            continue;
+        }
+        let name = discord.iter().find(|account| account.key == conversation.key.account()).map(|account| account.name.as_str()).unwrap_or("");
+        hit.context = discord_context(&hit.context, name, true);
+    }
+}
+
 fn name_is_empty(input: &Entity<TextInput>, cx: &gpui::App) -> bool {
     narrowed(input.read(cx).text().trim()).1.trim_start_matches(['#', '@']).is_empty()
 }
@@ -1488,6 +1516,32 @@ impl super::State {
 mod tests {
     use super::*;
     use protocol::{AccountKey, Presence};
+
+    #[test]
+    fn two_discord_accounts_are_named_on_the_switcher_row() {
+        assert_eq!(discord_context("Direct message", "Work", true), "Work · Direct message");
+        assert_eq!(discord_context("", "Work", true), "Work");
+        assert_eq!(discord_context("Direct message", "Work", false), "Direct message");
+        let key = Key { network: Network::Discord, account: "1000".into(), id: "3001".into() };
+        let mut hits = vec![Hit {
+            title: "Mara".into(),
+            context: "Direct message".into(),
+            matched: Vec::new(),
+            target: Target::Conversation(Rc::new(Conversation::new(key, ConversationKind::Direct, "Mara".to_owned()))),
+            section: None,
+            trailing: None,
+        }];
+        let mut work = account(Network::Discord, Link::Connected);
+        work.key.account = "1000".into();
+        work.name = "Work".into();
+        let mut home = account(Network::Discord, Link::Connected);
+        home.key.account = "2000".into();
+        home.name = "Home".into();
+        tag_discord(&mut hits, &[work.clone()]);
+        assert_eq!(hits[0].context, "Direct message");
+        tag_discord(&mut hits, &[work, home]);
+        assert_eq!(hits[0].context, "Work · Direct message");
+    }
 
     fn account(network: Network, link: Link) -> AccountStatus {
         AccountStatus {

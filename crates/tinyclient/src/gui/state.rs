@@ -249,6 +249,7 @@ pub struct Shell {
     pub(super) composer_state: composer::State,
     #[allow(dead_code)]
     pub(super) call_state: call::State,
+    pub(super) meeting_form: Option<super::meetings::Form>,
     /// The voice message or audio file playing, across conversations.
     pub(super) playing_state: super::playing::State,
     /// The Tiny server on show.
@@ -345,6 +346,7 @@ impl Shell {
             people_state: people::State::default(),
             composer_state: composer::State::default(),
             call_state: call::State::default(),
+            meeting_form: None,
             playing_state: super::playing::State::default(),
             tiny_state: super::tiny::State::new(cx),
             discord_settings: super::discord_settings::State::default(),
@@ -1174,15 +1176,20 @@ impl Shell {
 
     /// Opens the network's sign-in window. chatd answers when the user has finished with it.
     pub(super) fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
-        self.begin_sign_in(network, None, cx);
+        self.begin_sign_in(network, None, None, cx);
+    }
+
+    /// A personal Microsoft account (Teams free), not a work or school account.
+    pub(super) fn sign_in_personal(&mut self, cx: &mut Context<Self>) {
+        self.begin_sign_in(Network::Teams, None, Some("personal".to_owned()), cx);
     }
 
     /// Continues Slack SSO or two-factor for one workspace. The others stay connected.
     pub(super) fn continue_slack(&mut self, account: String, cx: &mut Context<Self>) {
-        self.begin_sign_in(Network::Slack, Some(account), cx);
+        self.begin_sign_in(Network::Slack, Some(account), None, cx);
     }
 
-    fn begin_sign_in(&mut self, network: Network, resume: Option<String>, cx: &mut Context<Self>) {
+    fn begin_sign_in(&mut self, network: Network, resume: Option<String>, kind: Option<String>, cx: &mut Context<Self>) {
         if super::signin::open(network, cx) { return; }
         if self.signing_in.is_some() {
             return;
@@ -1190,7 +1197,7 @@ impl Shell {
         self.signing_in = Some(network);
         self.sign_in_failed = None;
         cx.notify();
-        let request = Request::SignIn { at: self.window_at.get(), network, resume };
+        let request = Request::SignIn { at: self.window_at.get(), network, resume, kind };
         self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
             this.signing_in = None;
             this.sign_in_failed = match answer {

@@ -15,7 +15,7 @@
 //! Nothing here acts for the user unasked. A friend request is answered, a presence set, a
 //! message edited, deleted or reacted to only by the command the shell's request became.
 
-mod discord;
+pub(crate) mod discord;
 pub mod parity;
 
 /// `TINYCLIENT_PROVE=discord-nitro-length`. Nitro's 4,000-character limit, shared by every send path.
@@ -1577,6 +1577,9 @@ pub enum Command {
         limit: u32,
         reply: Reply<CallHistoryPage>,
     },
+    Voicemails { before: Option<String>, reply: Reply<(Vec<protocol::Voicemail>, Option<String>)> },
+    VoicemailAudio { id: String, attachment: String, reply: Reply<MediaFile> },
+    ChangeVoicemail { id: String, action: protocol::VoicemailAction, reply: Reply<()> },
     /// Delete one or more call log entries by message id (`revoke` for both sides).
     DeleteCallEntries {
         message_ids: Vec<String>,
@@ -1826,6 +1829,9 @@ pub enum Command {
     /// Today's meetings, soonest first. A calendar the account cannot read answers with what
     /// the chat list already remembered.
     Meetings { reply: Reply<Vec<protocol::MeetingEvent>> },
+    MeetingTranscript { conversation_id: String, message_id: String, reply: Reply<String> },
+    MeetingInvitees { conversation_id: String, reply: Reply<Vec<String>> },
+    CreateMeeting { conversation_id: String, draft: protocol::MeetingDraft, reply: Reply<(protocol::MeetingEvent, bool)> },
     /// Accept, decline, or tentatively accept one meeting. `propose` is a new start.
     MeetingRsvp {
         id: String,
@@ -2195,6 +2201,9 @@ impl Command {
             Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Voicemails { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::VoicemailAudio { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChangeVoicemail { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2266,6 +2275,9 @@ impl Command {
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingInvitees { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateMeeting { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
@@ -3928,6 +3940,39 @@ pub fn start(account: AccountKey, session: &str, hub: Arc<Hub>) -> Result<Adapte
         return Err(why);
     }
     Ok(Adapter { commands, stop })
+}
+
+/// `TINYCLIENT_PROVE=accounts-wave13`. Two Discord accounts stay apart, and a personal Teams
+/// account uses the consumer host.
+pub fn prove_accounts_wave13() -> Result<(), String> {
+    let first = r#"{"token":"MTAwMA.Gabcde.signature"}"#;
+    let second = r#"{"token":"MjAwMA.Gabcde.signature"}"#;
+    let both = discord::combine(first, second)?;
+    let ids: Vec<String> = discord::accounts(&both)?.into_iter().map(|signed| signed.account).collect();
+    if ids != ["1000", "2000"] {
+        return Err(format!("discord accounts {ids:?}"));
+    }
+    let left = discord::without(&both, "1000").ok_or("signing out dropped the other Discord account")?;
+    let kept = discord::accounts(&left)?;
+    if kept.len() != 1 || kept[0].account != "2000" {
+        return Err("signing out dropped the other Discord account".to_owned());
+    }
+    let personal = teams::cloud::TeamsCloud::parse("personal");
+    let hosts = personal.endpoints();
+    if personal.as_str() != "personal" || hosts.teams != "https://teams.live.com" || hosts.presence != "https://presence.teams.live.com" {
+        return Err("personal Teams hosts".to_owned());
+    }
+    if hosts.ours.iter().any(|host| *host == "teams.microsoft.com") {
+        return Err("a personal account allow-list includes work Teams".to_owned());
+    }
+    if teams::consumer_authz(hosts.teams) != "https://teams.live.com/api/auth/v1.0/authz/consumer" {
+        return Err("consumer authz".to_owned());
+    }
+    let scope = teams::personal_scope();
+    if !scope.starts_with("https://mtsvc.fl.teams.microsoft.com/teams.mt.readwrite ") {
+        return Err(format!("personal scope {scope}"));
+    }
+    Ok(())
 }
 
 /// The lab's teams-markdown driver. See `teams::prove_teams_markdown`.

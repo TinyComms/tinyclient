@@ -25,9 +25,9 @@
 //! - Conditional access: purple-teams #78 (AADSTS53003) was worked around for the device-code
 //!   flow by sending a browser User-Agent; it is still open. A tenant that requires a managed
 //!   device blocks this whatever is sent.
-//! - Personal accounts are not built: another client id (`8ec6bc83-…`), `consumers`, another
-//!   authz, chat host, push host and registrar, with an unresolved rate-limit bug in the only
-//!   client that does it.
+//! - A personal Microsoft account is a second sign-in: client id `8ec6bc83-69c8-4392-8f08-b3c986009232`,
+//!   authority `consumers`, scope `https://mtsvc.fl.teams.microsoft.com/teams.mt.readwrite`, and
+//!   `POST https://teams.live.com/api/auth/v1.0/authz/consumer`. Entra guest access stays elsewhere.
 //!
 //! Tokens
 //! - `POST https://teams.microsoft.com/api/authsvc/v1.0/authz`, empty body, bearer token for
@@ -108,6 +108,9 @@ pub fn prove_teams_markdown() -> Result<(), String> {
     html::prove_markdown()
 }
 mod info;
+mod call_log;
+mod meeting_media;
+mod meeting_create;
 mod links;
 pub(crate) mod message;
 
@@ -233,6 +236,30 @@ use std::time::{Duration, Instant};
 
 /// Teams' own desktop client, the one registration third-party clients sign in as.
 const CLIENT: &str = "1fec8e78-bce4-4aaf-ab1b-5451cc387264";
+/// The client a personal Microsoft account signs in as (Teams free).
+const PERSONAL_CLIENT: &str = "8ec6bc83-69c8-4392-8f08-b3c986009232";
+/// The one scope a personal account's spaces token is asked for. Work accounts use `/.default`.
+const PERSONAL_SCOPE: &str = "https://mtsvc.fl.teams.microsoft.com/teams.mt.readwrite openid profile offline_access";
+
+/// The scope string minted for one audience. Personal spaces is the consumer read-write scope.
+/// Every other audience stays `{audience}/.default`.
+fn spaces_scope(cloud: TeamsCloud, scope: Audience, audience: &str) -> String {
+    if cloud == TeamsCloud::Personal && scope == Audience::Spaces {
+        PERSONAL_SCOPE.to_owned()
+    } else {
+        format!("{audience}/.default openid profile offline_access")
+    }
+}
+
+/// The consumer spaces scope, for the accounts-wave13 prove hook.
+pub(crate) fn personal_scope() -> &'static str {
+    PERSONAL_SCOPE
+}
+
+/// Where a personal account asks for its skype token.
+pub(crate) fn consumer_authz(api: &str) -> String {
+    format!("{}/api/auth/v1.0/authz/consumer", api.trim_end_matches('/'))
+}
 const TEAMS: &str = cloud::WORLDWIDE.teams;
 /// Microsoft Graph default (worldwide), kept for `prove_shared_file`.
 const GRAPH: &str = cloud::WORLDWIDE.graph;
@@ -284,9 +311,12 @@ struct Session {
     /// The user's own name, as Teams shows it beside what they send.
     #[serde(default)]
     user: String,
-    /// Microsoft 365 cloud (`worldwide`, `gcc_high`, `dod`, `china`).
+    /// Microsoft 365 cloud (`worldwide`, `gcc_high`, `dod`, `china`, `personal`).
     #[serde(default)]
     cloud: String,
+    /// A personal Microsoft account. The consumer host and client id follow from this.
+    #[serde(default)]
+    personal: bool,
 }
 
 /// Why a call failed. Deliberately not `Display`: it becomes a [`Failure`] or words for the
@@ -456,6 +486,8 @@ struct State {
     catalog_meta: HashMap<String, (u32, u32, String)>,
     /// Meeting chats and calendar events remembered this run, by id.
     meetings: HashMap<String, protocol::MeetingEvent>,
+    voicemail_next: Option<String>,
+    transcript_token: Option<(String, Token)>,
 }
 
 /// What a call presents.
@@ -527,12 +559,18 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
         let cloud = Some(text(&tenant["cloud"]))
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| text(&parsed["cloud"]));
-        let session = json!({
+        let own_client = text(&tenant["client_id"]);
+        let client = if own_client.is_empty() { text(&parsed["client_id"]) } else { own_client };
+        let personal = tenant["personal"].as_bool().unwrap_or(false) || cloud == "personal";
+        let mut session = json!({
             "tenant": id, "name": name, "refresh_token": refresh,
-            "client_id": text(&parsed["client_id"]), "user_agent": text(&parsed["user_agent"]),
+            "client_id": client, "user_agent": text(&parsed["user_agent"]),
             "oid": text(&parsed["oid"]), "user": text(&parsed["name"]),
             "cloud": cloud,
         });
+        if personal {
+            session["personal"] = json!(true);
+        }
         found.push(Signed {
             account: id,
             name,
@@ -543,6 +581,64 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
         return Err("the Teams session has no tenant".to_owned());
     }
     Ok(found)
+}
+
+/// Writes a session's top-level cloud onto each tenant that does not name one, so a later
+/// personal sign-in cannot relabel a work tenant.
+fn stamp(session: &mut Value) {
+    let cloud = session["cloud"].as_str().unwrap_or("").to_owned();
+    let personal = session["personal"].as_bool().unwrap_or(false) || cloud == "personal";
+    let Some(list) = session["tenants"].as_array_mut() else {
+        return;
+    };
+    for tenant in list {
+        if !cloud.is_empty() && tenant["cloud"].as_str().unwrap_or("").is_empty() {
+            tenant["cloud"] = json!(cloud);
+        }
+        if personal && tenant["personal"].as_bool() != Some(false) && tenant["cloud"].as_str() == Some("personal") {
+            tenant["personal"] = json!(true);
+        }
+    }
+}
+
+/// A finished sign-in joins the tenants already stored. The same tenant replaces its own
+/// refresh token. An empty refresh token is not a tenant. A work client id already stored is
+/// left as it is; a personal tenant carries its own client id.
+pub fn combine(existing: &str, fresh: &str) -> Result<String, String> {
+    let mut base: Value = serde_json::from_str(existing).map_err(|err| err.to_string())?;
+    let mut incoming: Value = serde_json::from_str(fresh).map_err(|err| err.to_string())?;
+    stamp(&mut base);
+    stamp(&mut incoming);
+    if let Some(agent) = incoming["user_agent"].as_str().filter(|agent| !agent.is_empty()) {
+        base["user_agent"] = json!(agent);
+    }
+    for key in ["oid", "name", "upn"] {
+        if base[key].as_str().unwrap_or("").is_empty() {
+            if let Some(value) = incoming[key].as_str().filter(|value| !value.is_empty()) {
+                base[key] = json!(value);
+            }
+        }
+    }
+    if base["client_id"].as_str().unwrap_or("").is_empty() {
+        if let Some(value) = incoming["client_id"].as_str().filter(|value| !value.is_empty()) {
+            base["client_id"] = json!(value);
+        }
+    }
+    let mut kept = tenants(&base).to_vec();
+    for tenant in tenants(&incoming) {
+        let id = tenant["id"].as_str().unwrap_or("");
+        let refresh = tenant["refresh_token"].as_str().unwrap_or("");
+        if id.is_empty() || refresh.is_empty() {
+            continue;
+        }
+        kept.retain(|one| one["id"].as_str() != Some(id));
+        kept.push(tenant.clone());
+    }
+    if kept.is_empty() {
+        return Err("the Teams session has no tenant".to_owned());
+    }
+    base["tenants"] = Value::Array(kept);
+    Ok(base.to_string())
 }
 
 /// The session without one tenant, or `None` when it was the last.
@@ -569,8 +665,12 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     if session.user_agent.is_empty() {
         session.user_agent = browser().to_owned();
     }
+    if session.personal || session.cloud == "personal" {
+        session.personal = true;
+        session.cloud = "personal".to_owned();
+    }
     if session.client_id.is_empty() {
-        session.client_id = CLIENT.to_owned();
+        session.client_id = if session.personal { PERSONAL_CLIENT } else { CLIENT }.to_owned();
     }
     let cloud = TeamsCloud::parse(&session.cloud);
     let ep = cloud.endpoints();
@@ -813,7 +913,7 @@ impl Teams {
         let refresh = self.state().refresh.clone();
         let url = format!("{}/{}/oauth2/v2.0/token", self.login, escaped(&self.session.tenant));
         let audience = self.cloud.endpoints().audience(scope);
-        let scopes = format!("{audience}/.default openid profile offline_access");
+        let scopes = spaces_scope(self.cloud, scope, audience);
         let form = [
             ("client_id", self.session.client_id.as_str()),
             ("grant_type", "refresh_token"),
@@ -879,7 +979,11 @@ impl Teams {
         if let Some(held) = held() {
             return Ok(held);
         }
-        let url = format!("{}/api/authsvc/v1.0/authz", self.api);
+        let url = if self.cloud == TeamsCloud::Personal {
+            consumer_authz(&self.api)
+        } else {
+            format!("{}/api/authsvc/v1.0/authz", self.api)
+        };
         let mut refused = None;
         for _ in 0..2 {
             let bearer = self.token(Audience::Spaces)?;
@@ -926,7 +1030,13 @@ impl Teams {
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
-                Some(&self.session.oid).filter(|oid| !oid.is_empty()).map(|oid| format!("8:orgid:{oid}"))
+                Some(&self.session.oid).filter(|oid| !oid.is_empty()).map(|oid| {
+                    if self.cloud == TeamsCloud::Personal {
+                        format!("8:live:{oid}")
+                    } else {
+                        format!("8:orgid:{oid}")
+                    }
+                })
             });
             let mut state = self.state();
             state.skype = Some(Token {
@@ -1291,8 +1401,29 @@ impl Teams {
             Command::Translate { conversation_id, message_id, to, reply } => {
                 let _ = reply.send(self.translate(&conversation_id, &message_id, &to).map_err(refuse));
             }
+            Command::CallHistory { missed, before, limit, reply } => {
+                let _ = reply.send(self.call_history(missed, before.as_deref(), limit).map_err(refuse));
+            }
+            Command::Voicemails { before, reply } => {
+                let _ = reply.send(self.voicemails(before.as_deref()).map_err(refuse));
+            }
+            Command::VoicemailAudio { id, attachment, reply } => {
+                let _ = reply.send(self.voicemail_audio(&id, &attachment).map_err(refuse));
+            }
+            Command::ChangeVoicemail { id, action, reply } => {
+                let _ = reply.send(self.change_voicemail(&id, action).map_err(refuse));
+            }
             Command::Meetings { reply } => {
                 let _ = reply.send(self.meetings().map_err(refuse));
+            }
+            Command::MeetingTranscript { conversation_id, message_id, reply } => {
+                let _ = reply.send(self.meeting_transcript(&conversation_id, &message_id).map_err(refuse));
+            }
+            Command::MeetingInvitees { conversation_id, reply } => {
+                let _ = reply.send(self.meeting_invitees(&conversation_id).map_err(refuse));
+            }
+            Command::CreateMeeting { conversation_id, draft, reply } => {
+                let _ = reply.send(self.create_meeting(&conversation_id, &draft).map_err(refuse));
             }
             Command::MeetingRsvp { id, response, propose, reply } => {
                 let _ = reply.send(self.meeting_rsvp(&id, response, propose).map_err(refuse));
@@ -1425,6 +1556,25 @@ mod tests {
         let guest: Session = serde_json::from_str(&found[1].session).unwrap();
         assert_eq!((guest.tenant.as_str(), guest.refresh_token.as_str()), ("22222222-bbbb", "rt-guest"));
         assert_eq!((guest.client_id.as_str(), guest.user_agent.as_str(), guest.oid.as_str()), (CLIENT, "Safari/1", "me-oid"));
+        assert!(!guest.personal);
+
+        let personal = json!({
+            "client_id": PERSONAL_CLIENT, "personal": true, "cloud": "personal",
+            "oid": "live-oid", "name": "Pat Live",
+            "tenants": [{"id": "9188040d-6c67-4c5b-b112-36a304b66dad", "name": "Personal", "refresh_token": "rt-personal", "client_id": PERSONAL_CLIENT, "personal": true, "cloud": "personal"}],
+        }).to_string();
+        let joined = combine(&session(), &personal).unwrap();
+        let both = accounts(&joined).unwrap();
+        assert_eq!(both.len(), 3);
+        let live: Session = serde_json::from_str(&both[2].session).unwrap();
+        assert!(live.personal);
+        assert_eq!(live.client_id, PERSONAL_CLIENT);
+        assert_eq!(live.cloud, "personal");
+        let home: Session = serde_json::from_str(&both[0].session).unwrap();
+        assert!(!home.personal);
+        assert_eq!(home.client_id, CLIENT);
+        assert_eq!(spaces_scope(TeamsCloud::Personal, Audience::Spaces, "https://mtsvc.fl.teams.microsoft.com"), PERSONAL_SCOPE);
+        assert_eq!(consumer_authz("https://teams.live.com"), "https://teams.live.com/api/auth/v1.0/authz/consumer");
 
         let left = without(&session(), "11111111-aaaa").unwrap();
         let ids: Vec<String> = accounts(&left).unwrap().into_iter().map(|signed| signed.account).collect();

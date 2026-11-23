@@ -1560,7 +1560,10 @@ impl Slack {
         if let Some(mut stored) = self.ctx.stored_message(channel, ts)? {
             // The event counts the replies; how many of them are unread it does not say.
             let unread = stored.thread.as_ref().map_or(0, |summary| summary.unread);
-            stored.thread = mapped.thread.map(|summary| ThreadSummary { unread, ..summary });
+            let summary = mapped.thread.map(|summary| ThreadSummary { unread, ..summary });
+            if summary.is_some() || stored.call.is_none() {
+                stored.thread = summary;
+            }
             self.thread_known(channel, ts)?;
             self.ctx.history(channel, &[stored])?;
         }
@@ -1586,7 +1589,7 @@ impl Slack {
             message.client_id = stored.client_id;
             // An answer to `chat.update` carries the text and not what hangs off the message.
             if inner["reply_count"].is_null() {
-                message.thread = stored.thread;
+                message.thread = stored.thread.or(message.thread);
             }
             if inner["reactions"].is_null() && !message.deleted {
                 message.reactions = stored.reactions;
@@ -1784,8 +1787,12 @@ impl Slack {
             if let Some(first) = entries.iter().find(|entry| entry["ts"] == root) {
                 // The channel's copy of the first message carries the count.
                 if let Some(mut stored) = self.ctx.stored_message(channel, root)? {
-                    stored.thread = messages.iter().find(|message| message.id == root).and_then(|m| m.thread.clone());
-                    self.ctx.history(channel, &[stored])?;
+                    let summary = messages.iter().find(|message| message.id == root).and_then(|m| m.thread.clone());
+                    // Slack can omit the room fields when reading replies, even for an empty huddle thread.
+                    if summary.is_some() || stored.call.is_none() {
+                        stored.thread = summary;
+                        self.ctx.history(channel, &[stored])?;
+                    }
                 }
                 if first["subscribed"] == true {
                     self.state().followed_threads.insert(thread.clone());

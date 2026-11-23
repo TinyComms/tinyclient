@@ -802,18 +802,132 @@ fn user_of(token: &str) -> Option<String> {
     (!id.is_empty() && id.len() <= 20 && id.bytes().all(|byte| byte.is_ascii_digit())).then_some(id)
 }
 
-/// One account per sign-in, named by the user's id when the token shows it.
-pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
-    let parsed: Session = serde_json::from_str(session).map_err(|err| err.to_string())?;
-    Ok(vec![Signed {
-        account: user_of(&parsed.token).unwrap_or_else(|| "main".to_owned()),
-        name: "Discord".to_owned(),
-        session: session.to_owned(),
-    }])
+fn unreadable() -> String {
+    "the Discord session is unreadable".to_owned()
 }
 
-pub fn without(_session: &str, _account: &str) -> Option<String> {
-    None
+/// One token inside the keychain item. A session from before several accounts were kept is the
+/// one object `{"token","user_agent"}`. Several are `accounts`.
+struct Row {
+    token: String,
+    id: String,
+    name: String,
+}
+
+fn account_id(token: &str, id: &str) -> String {
+    if let Some(user) = user_of(token) {
+        return user;
+    }
+    let id = id.trim();
+    let plain = !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if plain { id.to_owned() } else { "main".to_owned() }
+}
+
+fn stored_text(value: &Value, key: &str) -> String {
+    value.get(key).and_then(Value::as_str).unwrap_or("").to_owned()
+}
+
+/// `(user_agent, rows)`. One account stays the legacy object; an empty token is not an account.
+fn rows(session: &str) -> Result<(String, Vec<Row>), String> {
+    let parsed: Value = serde_json::from_str(session).map_err(|_| unreadable())?;
+    let agent = stored_text(&parsed, "user_agent");
+    if let Some(list) = parsed.get("accounts").and_then(Value::as_array).filter(|list| !list.is_empty()) {
+        let mut found = Vec::new();
+        for entry in list {
+            let token = stored_text(entry, "token");
+            if token.is_empty() {
+                continue;
+            }
+            found.push(Row { id: account_id(&token, &stored_text(entry, "id")), token, name: stored_text(entry, "name") });
+        }
+        if found.is_empty() {
+            return Err(unreadable());
+        }
+        return Ok((agent, found));
+    }
+    let token = stored_text(&parsed, "token");
+    if token.is_empty() {
+        return Err(unreadable());
+    }
+    Ok((agent, vec![Row { id: account_id(&token, ""), token, name: String::new() }]))
+}
+
+/// What `start` is given: one token, so each account is its own adapter.
+fn one_session(agent: &str, token: &str) -> String {
+    if agent.is_empty() {
+        json!({"token": token}).to_string()
+    } else {
+        json!({"token": token, "user_agent": agent}).to_string()
+    }
+}
+
+/// One account is the legacy object. Several are a list. Nothing left is `None`.
+fn pack(agent: &str, rows: &[Row]) -> Option<String> {
+    match rows {
+        [] => None,
+        [one] => Some(one_session(agent, &one.token)),
+        many => {
+            let accounts: Vec<Value> = many
+                .iter()
+                .map(|row| {
+                    let mut entry = json!({"token": row.token, "id": row.id});
+                    if !row.name.is_empty() {
+                        entry["name"] = Value::String(row.name.clone());
+                    }
+                    entry
+                })
+                .collect();
+            let mut stored = json!({"accounts": accounts});
+            if !agent.is_empty() {
+                stored["user_agent"] = Value::String(agent.to_owned());
+            }
+            Some(stored.to_string())
+        }
+    }
+}
+
+/// One account per token, named by the user's id when the token shows it.
+pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
+    let (agent, rows) = rows(session)?;
+    let mut found = Vec::new();
+    for row in rows {
+        if found.iter().any(|signed: &Signed| signed.account == row.id) {
+            continue;
+        }
+        let name = if row.name.is_empty() { "Discord".to_owned() } else { row.name };
+        found.push(Signed { account: row.id, name, session: one_session(&agent, &row.token) });
+    }
+    if found.is_empty() {
+        return Err(unreadable());
+    }
+    Ok(found)
+}
+
+/// The session with one account taken out. `None` only when that was the last one. An account
+/// that is not in it leaves the original string untouched.
+pub fn without(session: &str, account: &str) -> Option<String> {
+    let (agent, mut rows) = rows(session).ok()?;
+    let before = rows.len();
+    rows.retain(|row| row.id != account);
+    if rows.len() == before {
+        return Some(session.to_owned());
+    }
+    pack(&agent, &rows)
+}
+
+/// A finished sign-in joins the accounts already stored. The same user replaces their own token.
+pub fn combine(existing: &str, fresh: &str) -> Result<String, String> {
+    let (old_agent, mut kept) = rows(existing)?;
+    let (new_agent, fresh_rows) = rows(fresh)?;
+    let agent = if new_agent.is_empty() { old_agent } else { new_agent };
+    for row in fresh_rows {
+        kept.retain(|one| one.id != row.id);
+        kept.push(row);
+    }
+    pack(&agent, &kept).ok_or_else(unreadable)
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -3810,7 +3924,14 @@ impl Discord {
         }
         match command {
             // `serve_commands` keeps these two for itself.
-            Command::Backfill(id) | Command::Warm(id) => self.backfill(&id),
+            Command::Backfill(id) => self.backfill(&id),
+            Command::Warm(id) => {
+                self.backfill(&id);
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                unsafe {
+                    libc::malloc_trim(0);
+                }
+            }
             Command::History { conversation_id, before } => {
                 if let Ok(Some(conversation)) = self.ctx.known(&conversation_id) {
                     self.fetch(&conversation, Stretch::Before(&before));
@@ -5014,8 +5135,38 @@ mod tests {
         // "MTAwMA" is base64 for "1000".
         let found = accounts(r#"{"token":"MTAwMA.Gabcde.signature"}"#).unwrap();
         assert_eq!(found[0].account, "1000");
+        let started: Session = serde_json::from_str(&found[0].session).unwrap();
+        assert_eq!(started.token, "MTAwMA.Gabcde.signature");
         // A token that does not start with an id still signs in.
         assert_eq!(accounts(r#"{"token":"opaque"}"#).unwrap()[0].account, "main");
+    }
+
+    #[test]
+    fn two_accounts_stay_apart_and_signing_one_out_keeps_the_other() {
+        // "MjAwMA" is base64 for "2000".
+        let first = r#"{"token":"MTAwMA.Gabcde.signature","user_agent":"Safari/26.0"}"#;
+        let second = r#"{"token":"MjAwMA.Gabcde.signature","user_agent":"Safari/26.0"}"#;
+        let both = combine(first, second).unwrap();
+        let found = accounts(&both).unwrap();
+        assert_eq!(found.iter().map(|signed| signed.account.as_str()).collect::<Vec<_>>(), ["1000", "2000"]);
+        assert!(found.iter().all(|signed| serde_json::from_str::<Session>(&signed.session).is_ok()));
+        assert_ne!(found[0].session, found[1].session);
+        // The same person replaces their token and does not become a third account.
+        let again = combine(&both, r#"{"token":"MTAwMA.replaced.signature"}"#).unwrap();
+        let ids: Vec<String> = accounts(&again).unwrap().into_iter().map(|signed| signed.account).collect();
+        assert_eq!(ids, ["2000", "1000"]);
+        assert!(accounts(&again).unwrap().iter().any(|signed| signed.session.contains("replaced")));
+        // Signing out of one leaves the other as the single-token session start already reads.
+        let left = without(&both, "1000").unwrap();
+        let kept = accounts(&left).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].account, "2000");
+        assert!(kept[0].session.contains("MjAwMA"));
+        assert!(!kept[0].session.contains("accounts"));
+        assert_eq!(without(&left, "2000"), None);
+        // An account that is not stored is left untouched.
+        assert_eq!(without(&both, "nope").as_deref(), Some(both.as_str()));
+        assert!(accounts("not json").is_err());
     }
 
     #[test]

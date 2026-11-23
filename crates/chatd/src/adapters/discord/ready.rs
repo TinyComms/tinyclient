@@ -1372,6 +1372,10 @@ impl Discord {
         self.ctx.media(&files)?;
         self.ctx.people(&people)?;
         self.ctx.relations(&relations)?;
+        drop(known);
+        drop(files);
+        drop(people);
+        drop(relations);
         let now = now();
         let mut unread_directs = Vec::new();
         for (row, last) in &rows {
@@ -1395,6 +1399,7 @@ impl Discord {
                 unread_directs.push((updated, row.id.clone()));
             }
         }
+        drop(rows);
 
         // Servers: what is kept of each, then its tree.
         let mut icons = Vec::new();
@@ -1429,6 +1434,9 @@ impl Discord {
                 state.guilds.insert(guild.id.clone(), info);
             }
         }
+        drop(read);
+        drop(settings);
+        drop(icons);
         self.spaces()?;
         {
             let mut state = self.state.lock().unwrap();
