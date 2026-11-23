@@ -307,6 +307,13 @@ impl Source {
     }
 }
 
+/// The filter a share's sound captures, the same window or display as the picture.
+pub(crate) fn share_filter(id: Option<&str>) -> Result<Retained<SCContentFilter>, String> {
+    let content = content(false)?;
+    let source = Source::parse(id)?;
+    Ok(source.target(&content)?.0)
+}
+
 fn window_size(window: &SCWindow) -> (u32, u32) {
     let size = unsafe { window.frame() }.size;
     (size.width.ceil() as u32, size.height.ceil() as u32)

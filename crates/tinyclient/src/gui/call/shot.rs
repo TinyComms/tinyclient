@@ -140,6 +140,7 @@ pub(super) fn security(members: &[String]) -> Option<CallSecurity> {
         unsupported: Vec::new(),
         server_lacks: mode == SecurityMode::Transport,
         required: false,
+        ..CallSecurity::default()
     })
 }
 
@@ -323,6 +324,9 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         ringing: Vec::new(),
         moved_from: matches!(name.as_str(), "moving" | "moved_notice").then(|| key("direct")),
         move_notice: (name == "moved_notice").then(|| "Bea added Cy. The call moved to Campfire.".to_owned()),
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
         hand_raised: false,
         reaction: None,
     })
@@ -481,6 +485,9 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
         hand_raised: false,
         reaction: None,
     }
@@ -509,6 +516,7 @@ fn sealed(call: &mut Call) {
         unsupported: Vec::new(),
         server_lacks: false,
         required: false,
+        ..CallSecurity::default()
     });
 }
 

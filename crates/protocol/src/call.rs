@@ -269,6 +269,9 @@ pub struct Participant {
     /// Being rung for this call and not yet joined (Discord DM / group DM calls, Signal group calls).
     #[serde(default, skip_serializing_if = "is_false")]
     pub ringing: bool,
+    /// A short preview of their live stream, as a local file. Empty until one was fetched.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
     /// Raised hand in a group call (e.g., Signal group calls).
     #[serde(default, skip_serializing_if = "is_false")]
     pub hand_raised: bool,
@@ -429,6 +432,16 @@ pub struct Call {
     /// One sentence about that move, or why it came back. The shell shows it once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub move_notice: Option<String>,
+    /// People watching our own share, named from the ids the network sent. Not inferred from
+    /// who is merely in the voice channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewers: Vec<Participant>,
+    /// The stream we are watching has stopped sending. The tile says so.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream_paused: bool,
+    /// A Go Live leg's own MLS group. It does not replace [`Call::security`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_security: Option<CallSecurity>,
     /// Whether our own hand is raised in the active group call.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hand_raised: bool,
@@ -484,6 +497,12 @@ pub struct CallSecurity {
     /// Only with [`SecurityMode::Transport`]: the server itself has no end-to-end encryption.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub server_lacks: bool,
+    /// This report is the Go Live leg, not the voice call. chatd keeps it on [`Call::stream_security`].
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub stream: bool,
+    /// Our DAVE identity public key (hex). Empty on a Tiny call. chatd publishes it once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity: String,
     /// This call is never carried on unencrypted: the person chose so, the server is an Incognito
     /// host, or the room only takes end-to-end encrypted calls. A [`SecurityMode::Blocked`] call
     /// then offers no way on but leaving.
@@ -591,7 +610,8 @@ pub struct VoiceJoin {
     pub dave: Dave,
     pub muted: bool,
     pub deafened: bool,
-    /// A Go Live connection, not the call's own voice. Its loop sends pictures and no audio.
+    /// A Go Live connection, not the call's own voice. Its loop sends the screen, and that
+    /// screen's sound when the share asked for it.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub stream: bool,
     /// This Go Live connection only receives. It sends no picture of its own.
@@ -741,6 +761,14 @@ pub enum MediaRequest {
         /// the capture can.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         show_cursor: Option<bool>,
+        /// The sound of the shared screen or window, on the Go Live audio SSRC. `None` is off,
+        /// which is what an older shell asked for, and what a phone sends: it has no loopback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sound: Option<bool>,
+        /// Send Discord a small preview of the share, outside the encrypted stream. `None` is
+        /// off: an older shell, or a phone, which has no switch for it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<bool>,
     },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
@@ -1368,15 +1396,25 @@ mod tests {
     #[test]
     fn a_share_without_a_screen_is_the_frame_an_older_build_sends() {
         let older: MediaRequest = serde_json::from_str(r#"{"media":"share_send","on":true}"#).unwrap();
-        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None });
+        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: None });
         assert_eq!(serde_json::to_string(&older).unwrap(), r#"{"media":"share_send","on":true}"#);
         // The pointer is on when nothing is said, so an older shell gets it like everyone.
-        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false) };
+        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false), sound: None, preview: None };
         let json = serde_json::to_string(&chosen).unwrap();
         assert!(json.contains(r#""quality":"balanced""#) && json.contains(r#""show_cursor":false"#));
+        assert!(!json.contains("sound"), "{json}");
+        assert!(!json.contains("preview"), "{json}");
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), chosen);
-        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true) };
+        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true), sound: None, preview: None };
         assert_eq!(serde_json::to_string(&shown).unwrap(), r#"{"media":"share_send","on":true,"show_cursor":true}"#);
+        let heard = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: Some(true), preview: None };
+        let json = serde_json::to_string(&heard).unwrap();
+        assert_eq!(json, r#"{"media":"share_send","on":true,"sound":true}"#);
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), heard);
+        let previewed = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: Some(true) };
+        let json = serde_json::to_string(&previewed).unwrap();
+        assert_eq!(json, r#"{"media":"share_send","on":true,"preview":true}"#);
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), previewed);
     }
 
     #[test]

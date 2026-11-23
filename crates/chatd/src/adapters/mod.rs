@@ -49,6 +49,12 @@ pub fn prove_discord_forward_report() -> Result<(), String> {
 pub fn prove_discord_voice_move() -> Result<(), String> {
     discord::prove_voice_move()
 }
+
+/// `TINYCLIENT_PROVE=discord-wave15-share`. A preview is a jpeg, a named viewer is kept, and
+/// the identity post is the public key.
+pub fn prove_discord_wave15_share() -> Result<(), String> {
+    discord::prove_wave15_share()
+}
 mod recovery;
 pub mod net;
 mod script;
@@ -375,8 +381,8 @@ impl From<Vec<MessageHit>> for SearchPage {
 pub enum Picture {
     /// Our camera, on or off.
     Camera(bool),
-    /// Our screen, on or off.
-    Share(bool),
+    /// Our screen, on or off. `preview` sends Discord a small picture outside the encrypted stream.
+    Share { on: bool, preview: bool },
     /// Whose share to watch. `None` stops watching.
     Watch(Option<String>),
 }
@@ -3498,6 +3504,28 @@ impl Context {
     /// One sentence about a move into a group call, or why that move came back.
     pub fn set_move_notice(&self, conversation_id: &str, notice: Option<String>) {
         self.hub.calls.set_move_notice(&self.hub, &self.key(conversation_id), notice);
+    }
+
+    /// People watching our own share.
+    pub fn set_viewers(&self, conversation_id: &str, viewers: Vec<Participant>) {
+        self.hub.calls.set_viewers(&self.hub, &self.key(conversation_id), viewers);
+    }
+
+    /// The stream we are watching stopped sending, or started again.
+    pub fn set_stream_paused(&self, conversation_id: &str, paused: bool) {
+        self.hub.calls.set_stream_paused(&self.hub, &self.key(conversation_id), paused);
+    }
+
+    /// The jpeg mediad painted of our share, when one is on disk. Empty otherwise.
+    pub fn share_frame(&self) -> Option<String> {
+        let (call, _) = self.hub.calls.describe();
+        let call = call?;
+        if call.conversation.account() != self.account {
+            return None;
+        }
+        let path = call.share_view.as_ref()?.path.clone();
+        let lower = path.to_ascii_lowercase();
+        (lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".png")).then_some(path)
     }
 
     /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).

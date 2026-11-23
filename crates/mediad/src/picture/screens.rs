@@ -24,6 +24,11 @@ pub fn choose_screen(id: Option<String>) {
 }
 
 pub(super) fn chosen() -> Option<String> {
+    chosen_screen()
+}
+
+/// The screen or window the share is capturing, for the loopback that follows it.
+pub fn chosen_screen() -> Option<String> {
     CHOSEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
 }
 
