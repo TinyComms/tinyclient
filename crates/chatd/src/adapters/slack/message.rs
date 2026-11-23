@@ -4,7 +4,7 @@ use super::emoji;
 use super::text::{emoji_end, Custom, Names, Rich};
 use super::{fnv, seconds, thread_id, Slack};
 use protocol::{
-    Attachment, Card, ConfirmDialog, ControlKind, ControlOption, ControlStyle, Forwarded,
+    Attachment, CallNote, CallOutcome, Card, ConfirmDialog, ControlKind, ControlOption, ControlStyle, Forwarded,
     MediaFile, MediaKind, Message, MessageControl, MessageKind, Preview, Reaction, Sender, Span,
     Style, ThreadSummary, Transcript, CARD_FIELDS, CONTROL_OPTIONS_LIMIT, MESSAGE_CONTROLS_LIMIT,
     THREAD_FACES, WAVEFORM_LIMIT,
@@ -689,16 +689,54 @@ pub(super) fn prove_custom_emoji() -> Result<(), String> {
     Ok(())
 }
 
-/// A huddle's one line. Slack keeps the same message and marks the room ended.
-fn huddle(room: &Value) -> String {
-    let (start, end) = (room["date_start"].as_i64().unwrap_or(0), room["date_end"].as_i64().unwrap_or(0));
-    if room["has_ended"] == true || end > 0 {
-        match (end - start) / 60 {
-            minutes if start > 0 && minutes > 0 => format!("A huddle happened · {minutes} min"),
-            _ => "A huddle happened".to_owned(),
-        }
+/// Slack updates the same room message when the huddle ends. The active list may then
+/// be empty, so the history is what tells us who joined.
+fn huddle_note(room: &Value) -> CallNote {
+    let start = room["date_start"].as_i64().filter(|&at| at > 0);
+    let end = room["date_end"].as_i64().filter(|&at| at > 0);
+    let outcome = if room["is_dm_call"] == true && room["was_missed"] == true {
+        CallOutcome::Missed
+    } else if room["has_ended"] == true || end.is_some() {
+        CallOutcome::Ended
     } else {
-        "A huddle started".to_owned()
+        CallOutcome::Live
+    };
+    let active = room["participants"].as_array();
+    let history = room["participant_history"].as_array();
+    let (primary, rest) = match outcome {
+        CallOutcome::Live => (active.or(history), None),
+        _ => (history, active),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let participants = primary.into_iter().chain(rest).flatten()
+        .filter_map(huddle_user_id)
+        .filter(|id| seen.insert(*id))
+        .map(str::to_owned)
+        .collect();
+    let seconds = end.zip(start).and_then(|(end, start)| u32::try_from(end - start).ok()).filter(|&span| span > 0);
+    CallNote {
+        outcome,
+        caller_id: huddle_user_id(&room["created_by"]).unwrap_or_default().to_owned(),
+        seconds,
+        participants,
+        video: false,
+        call_id: None,
+    }
+}
+
+fn huddle_user_id(person: &Value) -> Option<&str> {
+    person.as_str().or_else(|| first(&[&person["user_id"], &person["id"]])).filter(|id| !id.is_empty())
+}
+
+/// The fallback for inbox previews and clients that only read a message's text.
+fn huddle_line(note: &CallNote) -> String {
+    match note.outcome {
+        CallOutcome::Missed => "Missed huddle".to_owned(),
+        CallOutcome::Live => "A huddle started".to_owned(),
+        _ => match note.seconds.map(|span| span / 60).unwrap_or(0) {
+            0 => "A huddle happened".to_owned(),
+            minutes => format!("A huddle happened · {minutes} min"),
+        },
     }
 }
 
@@ -839,7 +877,7 @@ pub(super) fn prove_call_cards() -> Result<(), String> {
     if line != "A call happened · 25 min" {
         return Err(format!("an old call said {line}"));
     }
-    if huddle(&room) != "A huddle happened · 25 min" {
+    if huddle_line(&huddle_note(&room)) != "A huddle happened · 25 min" {
         return Err("a huddle was renamed".to_owned());
     }
     Ok(())
@@ -1964,9 +2002,25 @@ impl Slack {
 
         let mut rich = Rich::new(self);
         let system = subtype.is_some_and(|subtype| SYSTEM.contains(&subtype));
-        if event["room"].is_object() {
-            // `sh_room_created` is an old Slack call. A huddle uses the same room object.
-            rich.text = if subtype == Some("sh_room_created") { legacy_call(&event["room"]) } else { huddle(&event["room"]) };
+        let room = &event["room"];
+        // Slack's old calls have a room object too. Only huddles get its summary card.
+        let huddle = (room.is_object() && subtype != Some("sh_room_created")
+            && (subtype == Some("huddle_thread") || room["call_family"] == "huddle"))
+            .then(|| huddle_note(room));
+        if let Some(note) = &huddle {
+            let people = std::iter::once(&note.caller_id)
+                .chain(note.participants.iter().take(THREAD_FACES))
+                .filter(|id| !id.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            self.users(&people);
+            rich.text = huddle_line(note);
+        } else if room.is_object() {
+            rich.text = if subtype == Some("sh_room_created") {
+                legacy_call(room)
+            } else {
+                huddle_line(&huddle_note(room))
+            };
         } else if !event["blocks"].as_array().is_some_and(|blocks| rich.blocks(blocks)) {
             rich.mrkdwn(event["text"].as_str().unwrap_or(""));
         }
@@ -2146,6 +2200,7 @@ impl Slack {
         message.previews = previews;
         message.reactions = reactions;
         message.thread = summary;
+        message.call = huddle;
         message.card = framed;
         message.cards = extra_cards;
         message.controls = controls;
