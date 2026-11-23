@@ -3475,11 +3475,6 @@ impl Context {
         self.hub.calls.any_active()
     }
 
-    /// Sets explicit call security (e.g. Telegram 1:1 confirmed emoji after `phone.confirmCall`).
-    pub fn call_security(&self, conversation_id: &str, security: Option<protocol::CallSecurity>) {
-        self.hub.calls.set_security(&self.hub, &self.key(conversation_id), security);
-    }
-
     /// Hands a confirmed Telegram 1:1 voice call to mediad.
     pub fn telegram_call(&self, conversation_id: &str, join: protocol::TelegramCallJoin) {
         self.hub.calls.telegram_call(&self.hub, &self.key(conversation_id), join);

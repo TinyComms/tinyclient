@@ -1067,20 +1067,6 @@ impl Calls {
         }
     }
 
-    /// Sets explicit call security (e.g. Telegram 1:1 verified emoji after `phone.confirmCall`).
-    pub fn set_security(&self, hub: &Hub, conversation: &Key, security: Option<protocol::CallSecurity>) {
-        let mut changed = false;
-        let known = self.update(hub, conversation, |live| {
-            if live.call.security != security {
-                live.call.security = security.clone();
-                changed = true;
-            }
-        });
-        if known && changed {
-            self.tell(hub);
-        }
-    }
-
     fn offer(&self, conversation: &Key, sdp: String) {
         if let Some(told) = &*crate::hub::lock(&self.offer) {
             told(conversation, sdp);
