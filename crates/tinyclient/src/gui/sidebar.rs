@@ -2113,11 +2113,12 @@ impl Shell {
         // An empty voice channel rests at a muted row's weight, and a stage with nobody on
         // stage reads as one (`02` §4).
         let empty_voice = empty_voice_row(c.kind, stage, selected, inside.is_some(), live.is_some());
-        let title_color = if empty_voice { theme::text_faint() } else { tone.title };
+        let faint = if selected { theme::text_soft() } else { theme::text_faint() };
+        let title_color = if empty_voice { faint } else { tone.title };
         let leading = match c.kind {
             ConversationKind::Direct | ConversationKind::Group => self.conversation_avatar(c, 20., surface, cx).into_any_element(),
             kind => {
-                let icon_color = if c.muted || empty_voice { theme::text_faint() } else { theme::text_soft() };
+                let icon_color = if c.muted || empty_voice { faint } else { theme::text_soft() };
                 let icon = if c.key.network == Network::Teams && kind == ConversationKind::Channel && !c.private { None } else { Some(kind_glyph(kind, c.private, c.call)) };
                 div().size(px(20.)).flex_none().flex().items_center().justify_center().children(icon.map(|icon| glyph(icon, if kind == ConversationKind::Thread { 14. } else { 16. }, icon_color))).into_any_element()
             }
@@ -2135,7 +2136,7 @@ impl Shell {
         } else {
             inside.and_then(|row| voice_count(row.total, if c.call == CallSupport::Native { c.limit } else { 0 }))
         };
-        let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
+        let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., faint));
         let (picked, menu_row) = (c.clone(), c.clone());
         let ours = self
             .snapshot
@@ -2166,8 +2167,8 @@ impl Shell {
             .child(div().flex_1())
             .children(show_join.then(|| self.join_pill(c, cx)))
             .children(draft)
-            .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph(count_icon, 12., theme::text_faint())).child(div().type_micro().text_color(if soft { theme::text_soft() } else { theme::text_faint() }).child(count))))
-            .children(live.map(|line| div().flex_none().type_micro().text_color(theme::text_faint()).child(line)))
+            .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph(count_icon, 12., faint)).child(div().type_micro().text_color(if soft { theme::text_soft() } else { faint }).child(count))))
+            .children(live.map(|line| div().flex_none().type_micro().text_color(faint).child(line)))
             .children(row_badge(c))
             .when(show_join, |row| row.group(hover_group));
         let height = if voice_status.is_some() { theme::ROW_MID } else { theme::ROW_ONE };

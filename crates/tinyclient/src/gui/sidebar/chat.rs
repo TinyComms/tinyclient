@@ -203,6 +203,10 @@ impl Shell {
     }
 
     pub(in crate::gui) fn conversation_avatar(&self, c: &Conversation, size: f32, surface: Rgba, cx: &mut Context<Self>) -> Div {
+        self.conversation_avatar_with_ring(c, size, surface, &presence::Ring::on(surface), cx)
+    }
+
+    pub(super) fn conversation_avatar_with_ring(&self, c: &Conversation, size: f32, surface: Rgba, ring: &presence::Ring, cx: &mut Context<Self>) -> Div {
         let picture = self.conversation_face(c, cx);
         match c.special {
             // My own notes: Telegram's Saved Messages is its bookmark; Teams' Notes and Slack's
@@ -225,7 +229,7 @@ impl Shell {
                 if c.bot || c.special != Special::None {
                     return avatar;
                 }
-                avatar.children(self.presence_dot(c).and_then(|shape| presence::dot(shape, size, &presence::Ring::on(surface))))
+                avatar.children(self.presence_dot(c).and_then(|shape| presence::dot(shape, size, ring)))
             }
             // One look per group at every size: its picture, else two of its people when its
             // title names them, else its two letters (`components::pair`).
@@ -272,14 +276,16 @@ impl Shell {
         let previews = crate::gui::app::prefs::choices().previews;
         if self.send_failed_in(&c.key) {
             let hidden = self.age_gated(c);
+            let has_preview = previews && !hidden && !c.preview.trim().is_empty();
             return line
                 .child(glyph("icons/circle-alert.svg", 12., theme::danger()))
                 .child(div().flex_none().text_color(theme::danger()).child("Not sent"))
-                .when(previews && !hidden, |line| line.child(div().min_w_0().truncate().text_color(theme::text_faint()).child(format!("· {}", one_line(&c.preview)))));
+                .when(has_preview, |line| line.child(div().min_w_0().truncate().text_color(theme::text_faint()).child(format!("· {}", one_line(&c.preview)))));
         }
         let typing = self.slots.typing.and_then(|typing| typing(self, &c.key));
         if let Some(words) = typing {
-            return line.child(div().min_w_0().truncate().text_color(theme::accent_text()).child(one_line(&words).into_owned()));
+            let typing_color = if c.muted { color } else { theme::accent_text() };
+            return line.child(div().min_w_0().truncate().text_color(typing_color).child(one_line(&words).into_owned()));
         }
         if !previews {
             return line;
@@ -377,12 +383,28 @@ impl Shell {
             _ => c.title.clone(),
         };
         // The Space gives way first and goes when fewer than six letters of it would show (C11).
-        let room = self.sidebar_state.width.get() - 2. * theme::INSET - 16. - 32. - 10. - 12.
+        let avatar_size = theme::row_avatar();
+        let mark_w = if name_mark(c).is_some() { 56. } else { 0. };
+        let pin_w = if look.pin && c.pin.is_some() { 18. } else { 0. };
+        let room = self.sidebar_state.width.get() - 2. * theme::INSET - 16. - avatar_size - 10. - 12.
             - if look.mark { 20. } else { 0. }
+            - pin_w
+            - mark_w
             - stamp.len() as f32 * 6.5
             - title.chars().count().min(24) as f32 * 7.6;
         // Six letters and the ellipsis, or nothing.
         let context = context.filter(|_| room > 6. * 7. + 14.);
+        let has_context = context.is_some();
+        let title_el = div()
+            .min_w_0()
+            .when(has_context, |t| t.max_w(px(180.)))
+            .truncate()
+            .type_ui()
+            .font_weight(tone.weight)
+            .text_color(tone.title)
+            .child(one_line(&title).into_owned());
+        let stamp_id = gpui::SharedString::from(format!("{id}-stamp-{}/{}/{}", c.key.network.label(), c.key.account, c.key.id));
+        let stamp_tip = crate::gui::time::tooltip(c.updated);
         let line_one = div()
             .h(theme::line(18.))
             .flex_none()
@@ -392,26 +414,39 @@ impl Shell {
             .gap(px(6.))
             .children(look.mark.then(|| mark(c.key.network, 14., faint)))
             .children((look.pin && c.pin.is_some()).then(|| glyph("icons/pin.svg", 12., faint)))
-            .child(
-                div()
-                    .min_w_0()
-                    .max_w(px(180.))
-                    .truncate()
-                    .type_ui()
-                    .font_weight(tone.weight)
-                    .text_color(tone.title)
-                    .child(one_line(&title).into_owned()),
-            )
-            .children(name_mark(c))
             .map(|line| match context {
-                Some(context) => line.child(div().flex_1().min_w_0().truncate().type_ui().text_color(faint).child(one_line(&context).into_owned())),
-                None => line.child(div().flex_1()),
+                Some(context) => line
+                    .child(title_el)
+                    .children(name_mark(c))
+                    .child(div().flex_1().min_w_0().truncate().type_ui().text_color(faint).child(one_line(&context).into_owned())),
+                None => line.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(title_el)
+                        .children(name_mark(c)),
+                ),
             })
-            .when(!stamp.is_empty(), |line| line.child(div().flex_none().type_micro().text_color(faint).child(stamp)));
+            .when(!stamp.is_empty(), |line| {
+                line.child(
+                    div()
+                        .id(stamp_id)
+                        .flex_none()
+                        .type_micro()
+                        .text_color(faint)
+                        .when(!crate::gui::phone::active(), |s| s.tooltip(crate::gui::components::tip(stamp_tip, None)))
+                        .child(stamp),
+                )
+            });
         let badge = row_badge(c);
+        let ring = presence::Ring::row(theme::sidebar(), selected, "list-row");
         let content = div()
             .gap(px(10.))
-            .child(self.conversation_avatar(c, theme::row_avatar(), surface, cx))
+            .child(self.conversation_avatar_with_ring(c, avatar_size, surface, &ring, cx))
             .child(
                 div()
                     .flex_1()

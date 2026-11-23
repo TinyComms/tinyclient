@@ -321,7 +321,7 @@ pub(super) fn draw<F>(list: &List, pick: F) -> AnyElement
 where
     F: Fn(usize, &mut Window, &mut App) + Clone + 'static,
 {
-    let mut panel = menu().w(px(360.)).p(px(4.)).flex().flex_col().gap(px(2.));
+    let mut panel = menu().w_full().max_w(px(360.)).flex().flex_col().gap(px(2.));
     match &list.mode {
         Mode::Commands(commands) => {
             for (ix, cmd) in commands.iter().enumerate() {
@@ -359,7 +359,7 @@ where
                     .rounded(px(theme::R_CONTROL))
                     .cursor_pointer()
                     .when(selected, |d| d.bg(theme::selected()))
-                    .hover(|s| s.bg(theme::hover()))
+                    .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
                     .flex()
                     .flex_col()
                     .gap(px(2.))
@@ -401,7 +401,7 @@ where
                         .rounded(px(theme::R_CONTROL))
                         .cursor_pointer()
                         .when(selected, |d| d.bg(theme::selected()))
-                        .hover(|s| s.bg(theme::hover()))
+                        .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
                         .type_small()
                         .text_color(theme::text())
                         .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {

@@ -101,7 +101,7 @@ fn sound_row(row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
 }
 
 /// Disappearing-messages timer control in the info pane (separate from local `keep_days`).
-fn disappearing_row(
+pub(in crate::gui) fn disappearing_row(
     pane: &InfoPane,
     row: &Conversation,
     info: Option<&protocol::ConversationInfo>,

@@ -1021,15 +1021,20 @@ impl Pane {
             .items_center()
             .occlude();
         // Only reactions the conversation takes, and none at all where it takes none.
-        let quick = emoji::quick(self.rules(), &message.reactions, 3);
+        let quick = if can.react { emoji::quick(self.rules(), &message.reactions, 3) } else { Vec::new() };
         for (slot, quick) in quick.iter().enumerate() {
             let (id, react) = (message.id.clone(), quick.clone());
-            bar = bar.child(tool(("quick", slot), glyph_of(quick)).on_click(cx.listener(move |this, _, _, cx| {
-                this.react_toggle(&id, &react, cx);
-            })));
+            let tip_words = format!("React with {}", emoji::display(&react));
+            bar = bar.child(
+                tool(("quick", slot), glyph_of(quick))
+                    .when(!phone, |t| t.tooltip(tip(tip_words, None)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.react_toggle(&id, &react, cx);
+                    })),
+            );
         }
-        let adds = self.adds(message);
-        if !quick.is_empty() || adds {
+        let adds = can.react && self.adds(message);
+        if !quick.is_empty() {
             bar = bar.child(div().w(px(1.)).h(px(16.)).mx(px(3.)).bg(theme::hairline()));
         }
         if adds {
@@ -4045,9 +4050,10 @@ impl Pane {
             .px(px(12.))
             .py(px(8.))
             .rounded(px(theme::R_CARD))
-            .bg(theme::raised())
+            .bg(theme::overlay())
             .border_1()
             .border_color(super::tokens::border_strong())
+            .shadow(theme::shadow_popover())
             .flex()
             .items_center()
             .gap(px(8.))

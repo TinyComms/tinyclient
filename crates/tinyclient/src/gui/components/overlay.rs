@@ -26,6 +26,7 @@ impl Render for Tip {
             .border_color(theme::border())
             .shadow(theme::shadow_tooltip())
             .flex()
+            .items_baseline()
             .gap(px(8.))
             .font_family(theme::FONT)
             .type_small()
@@ -105,6 +106,7 @@ fn menu_row(
     color: Rgba,
     icon_color: Rgba,
     highlight: Rgba,
+    enabled: bool,
 ) -> Stateful<Div> {
     // On a phone every menu is a sheet: 48 pt rows, a 20 pt glyph and 16 pt words, as the
     // message sheet has them, lit while pressed rather than under a pointer.
@@ -120,8 +122,8 @@ fn menu_row(
         .id(id)
         .role(gpui::Role::MenuItem)
         .aria_label(label.clone())
-        .tab_index(0)
-        .group("menu-item")
+        .when(enabled, |row| row.tab_index(0).group("menu-item"))
+        .when(!enabled, |row| row.aria_disabled(true).tab_stop(false))
         .flex_none()
         .h(px(if phone { (crate::gui::phone::tokens::scaled(22.) + 26.).max(48.) } else { theme::row_height(theme::ROW_ONE) }))
         .px(px(if phone { 12. } else { 8. }))
@@ -129,11 +131,19 @@ fn menu_row(
         .flex()
         .items_center()
         .gap(px(if phone { 14. } else { 8. }))
-        .cursor_pointer()
+        .when(enabled, |row| row.cursor_pointer())
+        .when(!enabled, |row| row.cursor_default())
         .text_color(color)
-        .when(phone, |row| row.text_size(px(words)).line_height(px(crate::gui::phone::tokens::scaled(22.))).active(move |style| style.bg(highlight)))
-        .when(!phone, |row| row.hover(move |style| style.bg(highlight)))
-        .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
+        .when(phone, |row| {
+            row.text_size(px(words))
+                .line_height(px(crate::gui::phone::tokens::scaled(22.)))
+                .when(enabled, |row| row.active(move |style| style.bg(highlight)))
+        })
+        .when(!phone && enabled, |row| {
+            row.hover(move |style| style.bg(highlight))
+                .active(|style| style.bg(theme::pressed()))
+        })
+        .when(enabled, |row| row.focus_visible(|style| style.shadow(theme::focus_ring_inset())))
         .children(lead)
         .child(div().flex_1().min_w_0().truncate().child(label))
         // A phone has no keyboard: its menus name no keys.
@@ -141,8 +151,8 @@ fn menu_row(
             div()
                 .flex_none()
                 .type_small()
-                .text_color(theme::text_faint())
-                .group_hover("menu-item", |style| style.text_color(theme::text_soft()))
+                .text_color(if enabled { theme::text_faint() } else { theme::text_disabled() })
+                .when(enabled, |s| s.group_hover("menu-item", |style| style.text_color(theme::text_soft())))
                 .child(crate::gui::shortcuts::label(keys))
         }))
 }
@@ -167,8 +177,7 @@ pub fn menu_item_disabled(
     label: impl Into<SharedString>,
     shortcut: Option<&'static str>,
 ) -> Stateful<Div> {
-    menu_row(id, icon, label, shortcut, theme::text_disabled(), theme::text_disabled(), gpui::rgba(0))
-        .cursor_default().aria_disabled(true).tab_stop(false)
+    menu_row(id, icon, label, shortcut, theme::text_disabled(), theme::text_disabled(), gpui::rgba(0), false)
 }
 
 /// The highlight is `selected`, never accent.
@@ -178,7 +187,7 @@ pub fn menu_item(
     label: impl Into<SharedString>,
     shortcut: Option<&'static str>,
 ) -> Stateful<Div> {
-    menu_row(id, icon, label, shortcut, theme::text(), theme::text_soft(), theme::selected())
+    menu_row(id, icon, label, shortcut, theme::text(), theme::text_soft(), theme::selected(), true)
 }
 
 pub fn menu_item_danger(
@@ -186,7 +195,7 @@ pub fn menu_item_danger(
     icon: Option<&'static str>,
     label: impl Into<SharedString>,
 ) -> Stateful<Div> {
-    menu_row(id, icon, label, None, theme::danger(), theme::danger(), theme::danger_soft())
+    menu_row(id, icon, label, None, theme::danger(), theme::danger(), theme::danger_soft(), true)
 }
 
 /// An item that opens a submenu beside it: its label, then a chevron. `open` keeps it lit
@@ -197,9 +206,33 @@ pub fn menu_item_more(
     label: impl Into<SharedString>,
     open: bool,
 ) -> Stateful<Div> {
-    menu_row(id, icon, label, None, theme::text(), theme::text_soft(), theme::selected())
+    let chevron = if open {
+        glyph("icons/chevron-right.svg", 14., theme::text_soft()).into_any_element()
+    } else {
+        div()
+            .relative()
+            .size(px(14.))
+            .flex_none()
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .group_hover("menu-item", |s| s.opacity(0.))
+                    .child(glyph("icons/chevron-right.svg", 14., theme::text_faint())),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(0.)
+                    .group_hover("menu-item", |s| s.opacity(1.))
+                    .child(glyph("icons/chevron-right.svg", 14., theme::text_soft())),
+            )
+            .into_any_element()
+    };
+    menu_row(id, icon, label, None, theme::text(), theme::text_soft(), theme::selected(), true)
         .when(open, |row| row.bg(theme::selected()))
-        .child(glyph("icons/chevron-right.svg", 14., theme::text_faint()))
+        .child(chevron)
 }
 
 /// A slider's track and knob, `width` wide, filled to `at` (0 to 1). `mark` draws a tick
@@ -223,6 +256,8 @@ pub fn slider(at: f32, width: f32, mark: Option<f32>) -> Div {
                 .size(px(16.))
                 .rounded_full()
                 .bg(gpui::rgb(0xf4f4f6))
+                .border_1()
+                .border_color(theme::border_strong())
                 .shadow(theme::shadow_tooltip()),
         )
 }
