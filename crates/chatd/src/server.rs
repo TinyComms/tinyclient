@@ -4681,6 +4681,137 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Stories { account, peer_id } => {
+                match self.ask(&account, |reply| Command::Stories { peer_id, reply }) {
+                    Ok((rings, stories)) => Response::Stories { rings, stories },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ReadStory { account, peer_id, story_id } => {
+                match self.ask(&account, |reply| Command::ReadStory { peer_id, story_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ReactStory { account, peer_id, story_id, emoji } => {
+                match self.ask(&account, |reply| Command::ReactStory { peer_id, story_id, emoji, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ReplyStory { account, peer_id, story_id, client_id, text } => {
+                if text.trim().is_empty() {
+                    return error(ErrorCode::Refused, "Reply text cannot be empty.");
+                }
+                match self.ask(&account, |reply| Command::ReplyStory {
+                    peer_id,
+                    story_id,
+                    client_id,
+                    text,
+                    reply,
+                }) {
+                    Ok((conversation_id, message)) => Response::StoryReplied {
+                        conversation: Key::new(&account, conversation_id),
+                        message: Box::new(message),
+                    },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SendLocation { conversation, client_id, point, reply_to } => {
+                if !point.is_valid() {
+                    return error(ErrorCode::Refused, "Location coordinates are out of range.");
+                }
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::SendLocation {
+                    conversation_id: conversation.id,
+                    client_id,
+                    point,
+                    reply_to,
+                    reply,
+                }) {
+                    Ok(_) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StartLiveLocation { conversation, client_id, point, period_secs, proximity_alert_radius, reply_to } => {
+                if !point.is_valid() {
+                    return error(ErrorCode::Refused, "Location coordinates are out of range.");
+                }
+                if !protocol::valid_live_period(period_secs) {
+                    return error(ErrorCode::Refused, "Invalid live location duration.");
+                }
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::StartLiveLocation {
+                    conversation_id: conversation.id,
+                    client_id,
+                    point,
+                    period_secs,
+                    proximity_alert_radius,
+                    reply_to,
+                    reply,
+                }) {
+                    Ok(share) => Response::LiveLocation { share },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UpdateLiveLocation { conversation, message_id, point, proximity_alert_radius } => {
+                if !point.is_valid() {
+                    return error(ErrorCode::Refused, "Location coordinates are out of range.");
+                }
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::UpdateLiveLocation {
+                    conversation_id: conversation.id,
+                    message_id,
+                    point,
+                    proximity_alert_radius,
+                    reply,
+                }) {
+                    Ok(share) => Response::LiveLocation { share },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StopLiveLocation { conversation, message_id } => {
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::StopLiveLocation {
+                    conversation_id: conversation.id,
+                    message_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StopAllLiveLocations { account } => {
+                if let Some(acct) = account {
+                    match self.ask(&acct, |reply| Command::StopAllLiveLocations { reply }) {
+                        Ok(()) => Response::Ok,
+                        Err(refused) => *refused,
+                    }
+                } else {
+                    let accounts = self.hub.store().accounts().unwrap_or_default();
+                    for row in accounts {
+                        let _ = self.ask(&row.key, |reply| Command::StopAllLiveLocations { reply });
+                    }
+                    Response::Ok
+                }
+            }
+            Request::ActiveLiveLocations { account } => {
+                if let Some(acct) = account {
+                    match self.ask(&acct, |reply| Command::ActiveLiveLocations { reply }) {
+                        Ok(shares) => Response::LiveLocations { shares },
+                        Err(refused) => *refused,
+                    }
+                } else {
+                    let mut all = Vec::new();
+                    let accounts = self.hub.store().accounts().unwrap_or_default();
+                    for row in accounts {
+                        if let Ok(shares) = self.ask(&row.key, |reply| Command::ActiveLiveLocations { reply }) {
+                            all.extend(shares);
+                        }
+                    }
+                    Response::LiveLocations { shares: all }
+                }
+            }
             Request::Translate { conversation, message_id, to } => {
                 let encryption = self
                     .hub
@@ -7026,6 +7157,7 @@ impl Chat {
                     MediaRequest::Camera { on } => Some(Picture::Camera(*on)),
                     MediaRequest::ShareSend { on, preview, .. } => Some(Picture::Share { on: *on, preview: *preview == Some(true) }),
                     MediaRequest::ShareWatch { source } => Some(Picture::Watch(source.clone())),
+                    MediaRequest::Watch { sources } => Some(Picture::WatchList(sources.clone())),
                     _ => None,
                 };
                 // Enforce Telegram group video limits (`can_start_video`, `unmuted_video_limit`, RTMP viewer) (#467, #454).
@@ -7978,9 +8110,10 @@ pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
             }
         };
         let chat = chat.clone();
-        // Authentication requests can exceed 256 KiB in debug builds as the request/status
-        // contract grows. Leave headroom so sign-in returns a reply instead of aborting chatd.
-        let spawned = std::thread::Builder::new().name("connection".into()).stack_size(1024 * 1024).spawn(move || {
+        // Authentication requests can exceed 1 MiB in debug builds as the request/status
+        // contract and scripted wire grow. Leave headroom so sign-in returns a reply instead of aborting chatd.
+        let stack = if cfg!(debug_assertions) { 4 * 1024 * 1024 } else { 1024 * 1024 };
+        let spawned = std::thread::Builder::new().name("connection".into()).stack_size(stack).spawn(move || {
             if let Err(err) = serve_connection(&chat, stream) {
                 tracing::warn!("chatd: connection: {err}");
             }

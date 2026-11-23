@@ -388,8 +388,8 @@ pub struct Voice {
     told: HashMap<String, Option<String>>,
     /// The screen we are sending, once we asked Discord for it.
     share: Option<StreamSlot>,
-    /// The share we are watching.
-    watch: Option<StreamSlot>,
+    /// The Go Live shares we are watching simultaneously, keyed by `stream_key`.
+    watches: HashMap<String, StreamSlot>,
     /// A stream preview fetched while this call is up: when, and the file if one landed.
     /// Not filled at sign-in. Asked once, then left alone for [`PREVIEW_FOR`].
     previews: HashMap<String, (Instant, String)>,
@@ -781,8 +781,11 @@ impl Discord {
         self.ctx.voice(&join.0, join.1);
         self.tell_bitrate();
         // A stream's events can arrive before this session id does.
-        self.flush_stream(false);
-        self.flush_stream(true);
+        self.flush_stream(StreamTarget::Share);
+        let watch_keys: Vec<String> = self.state.lock().unwrap().voice.watches.keys().cloned().collect();
+        for key in watch_keys {
+            self.flush_stream(StreamTarget::Watch(key));
+        }
     }
 
     pub(super) fn voice_state(&self, voice: VoiceState) {
@@ -986,7 +989,7 @@ impl Discord {
             let was = if ours { state.voice.call.take() } else { None };
             let share_key = ours.then(|| state.voice.share.take()).flatten().map(|slot| slot.key).filter(|key| !key.is_empty());
             if ours {
-                state.voice.watch.take();
+                state.voice.watches.clear();
             }
             (was, share_key, state.voice.ringing.remove(conversation_id))
         };
@@ -1437,39 +1440,82 @@ impl Discord {
                     self.tell(19, json!({ "stream_key": key }));
                 }
                 if let Some(conversation) = conversation {
-                    self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: false });
+                    self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: false, stream_owner: None });
                     self.ctx.set_viewers(&conversation, Vec::new());
                 }
             }
             Picture::Watch(Some(user)) => {
                 let _gate = self.stream_gate.lock().unwrap();
-                let (key, replaced) = {
+                let key = {
                     let mut state = self.state.lock().unwrap();
                     let Some(call) = state.voice.call.as_ref() else {
                         return;
                     };
                     let key = stream_key(call.guild.as_deref(), &call.conversation, &user);
-                    let replaced = state.voice.watch.as_ref()
-                        .filter(|slot| slot.key != key)
-                        .map(|_| call.conversation.clone());
-                    state.voice.watch = Some(StreamSlot::open(key.clone(), false));
-                    (key, replaced)
+                    state.voice.watches.entry(key.clone()).or_insert_with(|| StreamSlot::open(key.clone(), false));
+                    key
                 };
-                if let Some(conversation) = replaced {
-                    self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: true });
-                }
                 self.tell(20, json!({ "stream_key": key }));
             }
             Picture::Watch(None) => {
                 let _gate = self.stream_gate.lock().unwrap();
                 let conversation = {
                     let mut state = self.state.lock().unwrap();
-                    state.voice.watch.take();
+                    state.voice.watches.clear();
                     state.voice.call.as_ref().map(|call| call.conversation.clone())
                 };
                 if let Some(conversation) = conversation {
-                    self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: true });
+                    self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: true, stream_owner: None });
                     self.ctx.set_stream_paused(&conversation, false);
+                }
+            }
+            Picture::WatchList(sources) => {
+                let _gate = self.stream_gate.lock().unwrap();
+                let (conversation, added, removed, any_paused) = {
+                    let mut state = self.state.lock().unwrap();
+                    let Some(call) = state.voice.call.as_ref() else {
+                        return;
+                    };
+                    let conversation = call.conversation.clone();
+                    let guild = call.guild.clone();
+                    let desired: HashSet<String> = sources
+                        .iter()
+                        .filter(|s| s.kind == protocol::PictureKind::Share)
+                        .map(|s| stream_key(guild.as_deref(), &conversation, &s.user_id))
+                        .collect();
+                    let mut added = Vec::new();
+                    for key in &desired {
+                        if !state.voice.watches.contains_key(key) {
+                            state.voice.watches.insert(key.clone(), StreamSlot::open(key.clone(), false));
+                            added.push(key.clone());
+                        }
+                    }
+                    let removed_keys: Vec<String> = state
+                        .voice
+                        .watches
+                        .keys()
+                        .filter(|key| !desired.contains(*key))
+                        .cloned()
+                        .collect();
+                    let mut removed = Vec::new();
+                    for key in removed_keys {
+                        state.voice.watches.remove(&key);
+                        if let Some((_, owner)) = key.rsplit_once(':') {
+                            removed.push(owner.to_owned());
+                        }
+                    }
+                    let any_paused = state.voice.watches.values().any(|slot| slot.paused);
+                    (conversation, added, removed, any_paused)
+                };
+                for owner in removed {
+                    self.ctx.tell_media(
+                        &conversation,
+                        MediaRequest::StreamStop { watch: true, stream_owner: Some(owner) },
+                    );
+                }
+                self.ctx.set_stream_paused(&conversation, any_paused);
+                for key in added {
+                    self.tell(20, json!({ "stream_key": key }));
                 }
             }
         }
@@ -1497,14 +1543,13 @@ impl Discord {
                         slot.preview_at = Some(Instant::now());
                         upload = Some(slot.key.clone());
                     }
-                    StreamNext::Flush(false)
+                    StreamNext::Flush(StreamTarget::Share)
                 } else {
                     StreamNext::Quiet
                 }
-            } else if state.voice.watch.as_ref().is_some_and(|slot| slot.key == made.stream_key) {
-                let slot = state.voice.watch.as_mut().expect("the watch was just found");
+            } else if let Some(slot) = state.voice.watches.get_mut(&made.stream_key) {
                 note_stream(slot, &made);
-                StreamNext::Flush(true)
+                StreamNext::Flush(StreamTarget::Watch(made.stream_key))
             } else {
                 StreamNext::Quiet
             };
@@ -1518,7 +1563,7 @@ impl Discord {
     }
 
     /// Discord's `viewer_ids` and `paused` for a stream. Viewers of ours go on the call. A
-    /// pause is for the stream we are watching, not guessed from who is in the channel.
+    /// pause is tracked per watched stream and surfaces while any watched stream is paused.
     pub(super) fn stream_updated(&self, data: &str) -> Result<(), Failure> {
         let update: StreamUpdate = serde_json::from_str(data)?;
         let told = {
@@ -1536,11 +1581,11 @@ impl Discord {
                 }
                 let viewers = update.viewer_ids.iter().map(|id| named_viewer(id, &state)).collect();
                 Some((conversation, Some(viewers), None))
-            } else if state.voice.watch.as_ref().is_some_and(|slot| slot.key == update.stream_key) {
-                let slot = state.voice.watch.as_mut().expect("the watch was just found");
+            } else if let Some(slot) = state.voice.watches.get_mut(&update.stream_key) {
                 slot.viewer_ids = update.viewer_ids.clone();
                 slot.paused = update.paused;
-                Some((conversation, None, Some(update.paused)))
+                let any_paused = state.voice.watches.values().any(|s| s.paused);
+                Some((conversation, None, Some(any_paused)))
             } else {
                 None
             }
@@ -1561,17 +1606,21 @@ impl Discord {
         let next = {
             let mut state = self.state.lock().unwrap();
             let me = state.me.clone();
-            let watch = if state.voice.share.as_ref().is_some_and(|slot| slot.key == update.stream_key || (slot.key.is_empty() && owned_by(&update.stream_key, &me))) {
-                Some(false)
-            } else if state.voice.watch.as_ref().is_some_and(|slot| slot.key == update.stream_key) {
-                Some(true)
+            let target = if state.voice.share.as_ref().is_some_and(|slot| slot.key == update.stream_key || (slot.key.is_empty() && owned_by(&update.stream_key, &me))) {
+                Some(StreamTarget::Share)
+            } else if state.voice.watches.contains_key(&update.stream_key) {
+                Some(StreamTarget::Watch(update.stream_key.clone()))
             } else {
                 None
             };
-            let Some(watch) = watch else {
+            let Some(target) = target else {
                 return Ok(());
             };
-            let slot = if watch { state.voice.watch.as_mut() } else { state.voice.share.as_mut() }.expect("the slot was just found");
+            let slot = match &target {
+                StreamTarget::Share => state.voice.share.as_mut(),
+                StreamTarget::Watch(key) => state.voice.watches.get_mut(key),
+            }
+            .expect("the slot was just found");
             if slot.key.is_empty() {
                 slot.key = update.stream_key;
             }
@@ -1582,12 +1631,12 @@ impl Discord {
                         slot.told = false;
                     }
                     slot.endpoint = Some(endpoint);
-                    StreamNext::Flush(watch)
+                    StreamNext::Flush(target)
                 }
                 None => {
                     slot.endpoint = None;
                     slot.told = false;
-                    StreamNext::Pause(watch)
+                    StreamNext::Pause(target)
                 }
             }
         };
@@ -1605,10 +1654,9 @@ impl Discord {
             let me = state.me.clone();
             if state.voice.share.as_ref().is_some_and(|slot| slot.key == gone.stream_key || (slot.key.is_empty() && owned_by(&gone.stream_key, &me))) {
                 state.voice.share = None;
-                StreamNext::Stop(false)
-            } else if state.voice.watch.as_ref().is_some_and(|slot| slot.key == gone.stream_key) {
-                state.voice.watch = None;
-                StreamNext::Stop(true)
+                StreamNext::Stop(StreamTarget::Share)
+            } else if state.voice.watches.remove(&gone.stream_key).is_some() {
+                StreamNext::Stop(StreamTarget::Watch(gone.stream_key))
             } else {
                 StreamNext::Quiet
             }
@@ -1621,16 +1669,16 @@ impl Discord {
         match next {
             StreamNext::Quiet => {}
             StreamNext::Delete(key) => self.tell(19, json!({ "stream_key": key })),
-            StreamNext::Flush(watch) => self.flush_stream(watch),
-            StreamNext::Pause(watch) => self.stop_leg(watch, false),
-            StreamNext::Stop(watch) => self.stop_leg(watch, true),
+            StreamNext::Flush(target) => self.flush_stream(target),
+            StreamNext::Pause(target) => self.stop_leg(target, false),
+            StreamNext::Stop(target) => self.stop_leg(target, true),
         }
     }
 
     /// Gives mediad the stream session once Discord has named the server, the channel, the
     /// token and the endpoint, and the voice call has a session id. The MLS group is the RTC
     /// server id minus one.
-    fn flush_stream(&self, watch: bool) {
+    fn flush_stream(&self, target: StreamTarget) {
         let _gate = self.stream_gate.lock().unwrap();
         let ready = {
             let mut state = self.state.lock().unwrap();
@@ -1643,7 +1691,11 @@ impl Discord {
             };
             let conversation = call.conversation.clone();
             let (muted, deafened) = (call.muted, call.deafened);
-            let slot = if watch { state.voice.watch.as_mut() } else { state.voice.share.as_mut() };
+            let watch = matches!(target, StreamTarget::Watch(_));
+            let slot = match &target {
+                StreamTarget::Share => state.voice.share.as_mut(),
+                StreamTarget::Watch(key) => state.voice.watches.get_mut(key),
+            };
             let Some(slot) = slot else {
                 return;
             };
@@ -1690,27 +1742,39 @@ impl Discord {
         }
     }
 
-    /// Stops the mediad leg. `forget` also turns the button off: the stream is gone, not merely
-    /// between servers.
-    fn stop_leg(&self, watch: bool, forget: bool) {
+    /// Stops one mediad stream leg. `forget` also clears the state for that stream without
+    /// disrupting any other watched streams.
+    fn stop_leg(&self, target: StreamTarget, forget: bool) {
         let _gate = self.stream_gate.lock().unwrap();
-        let conversation = {
+        let (conversation, remaining_watches, any_paused) = {
             let state = self.state.lock().unwrap();
-            state.voice.call.as_ref().map(|call| call.conversation.clone())
+            (
+                state.voice.call.as_ref().map(|call| call.conversation.clone()),
+                state.voice.watches.len(),
+                state.voice.watches.values().any(|slot| slot.paused),
+            )
         };
         let Some(conversation) = conversation else {
             return;
         };
-        self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch });
+        let (watch, stream_owner) = match &target {
+            StreamTarget::Share => (false, None),
+            StreamTarget::Watch(key) => (true, key.rsplit_once(':').map(|(_, owner)| owner.to_owned())),
+        };
+        self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch, stream_owner });
         if forget {
-            let request = if watch {
-                self.ctx.set_stream_paused(&conversation, false);
-                MediaRequest::ShareWatch { source: None }
+            if watch {
+                self.ctx.set_stream_paused(&conversation, any_paused);
+                if remaining_watches == 0 {
+                    self.ctx.tell_media(&conversation, MediaRequest::ShareWatch { source: None });
+                }
             } else {
                 self.ctx.set_viewers(&conversation, Vec::new());
-                MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None, preview: None }
-            };
-            self.ctx.tell_media(&conversation, request);
+                self.ctx.tell_media(
+                    &conversation,
+                    MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None, preview: None },
+                );
+            }
         }
     }
 
@@ -1828,6 +1892,30 @@ pub(super) fn prove_wave15_share() -> Result<(), String> {
     Ok(())
 }
 
+/// `TINYCLIENT_PROVE=discord-wave15a3`. Verifies that multiple watched Go Live streams can be
+/// held simultaneously in `Voice::watches` and that removing one preserves the other.
+pub(super) fn prove_wave15a3() -> Result<(), String> {
+    let mut voice = Voice::default();
+    let k1 = stream_key(Some("4000"), "4201", "2001");
+    let k2 = stream_key(Some("4000"), "4201", "2002");
+    voice.watches.insert(k1.clone(), StreamSlot::open(k1.clone(), false));
+    voice.watches.insert(k2.clone(), StreamSlot::open(k2.clone(), false));
+    if voice.watches.len() != 2 {
+        return Err("watches map must hold two concurrent Go Live streams".to_owned());
+    }
+    voice.watches.remove(&k1);
+    if voice.watches.len() != 1 || !voice.watches.contains_key(&k2) {
+        return Err("unwatching one stream must preserve the other".to_owned());
+    }
+    let stop = protocol::MediaRequest::StreamStop { watch: true, stream_owner: Some("2001".to_owned()) };
+    let json = serde_json::to_string(&stop).map_err(|e| e.to_string())?;
+    let back: protocol::MediaRequest = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    if back != stop {
+        return Err("per-owner StreamStop did not round-trip".to_owned());
+    }
+    Ok(())
+}
+
 fn hex_bytes(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -1835,13 +1923,18 @@ fn hex_bytes(text: &str) -> Option<Vec<u8>> {
     (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok()).collect()
 }
 
+enum StreamTarget {
+    Share,
+    Watch(String),
+}
+
 enum StreamNext {
     Quiet,
-    Flush(bool),
+    Flush(StreamTarget),
     /// The server went away. Disconnect and wait for the next endpoint.
-    Pause(bool),
+    Pause(StreamTarget),
     /// The stream ended. Disconnect, and turn the control off.
-    Stop(bool),
+    Stop(StreamTarget),
     Delete(String),
 }
 

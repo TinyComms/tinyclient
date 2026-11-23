@@ -22,6 +22,7 @@
 
 pub mod alert;
 pub mod audio;
+pub mod av1;
 pub mod broadcast;
 pub mod cue;
 pub mod dave;
@@ -32,6 +33,8 @@ pub mod framing;
 pub mod gateway;
 #[cfg(test)]
 mod harness;
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod ffmpeg_codec;
 pub mod h264;
 pub mod hear;
 pub mod inproc;
@@ -40,6 +43,10 @@ pub mod media;
 /// The machine's own H.264 hardware encoder, ahead of the OpenH264 download. Windows only.
 #[cfg(windows)]
 mod mf_encoder;
+#[cfg(windows)]
+mod mf_decoder;
+#[cfg(target_os = "macos")]
+mod vt_codec;
 pub mod ogg;
 pub mod opus;
 pub mod pace;
@@ -69,6 +76,7 @@ pub mod telegram_e2ee;
 pub mod tiny;
 pub mod video;
 pub mod video_stats;
+pub mod vp8;
 
 /// Samples a second, on the wire and in every buffer between the codec and the devices.
 pub const RATE: u32 = 48_000;

@@ -126,15 +126,25 @@ impl CameraProfile {
             CameraQuality::DataSaver => CameraProfile { max: CAMERA_HIGH, fps: 15, bps: CAMERA_DATA_SAVER_BPS },
         }
     }
+
+    /// The companion low simulcast layer for this profile: 360p@15 beneath a 720p@30 top layer,
+    /// or 180p@15 beneath a 360p@15 top layer.
+    pub const fn low_layer(&self) -> CameraProfile {
+        if self.max.0 > CAMERA_HIGH.0 {
+            CameraProfile { max: CAMERA_HIGH, fps: 15, bps: CAMERA_DATA_SAVER_BPS }
+        } else {
+            CameraProfile { max: CAMERA_LOW, fps: 15, bps: CAMERA_LOW_BPS }
+        }
+    }
 }
 
 /// Whether this machine has a hardware H.264 encoder available for HD camera encoding.
 pub fn has_hardware_encoder() -> bool {
-    #[cfg(all(windows, not(any(target_os = "android", target_os = "ios"))))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        crate::mf_encoder::available().is_ok()
+        desktop::hardware_encoder_available()
     }
-    #[cfg(not(all(windows, not(any(target_os = "android", target_os = "ios")))))]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         false
     }

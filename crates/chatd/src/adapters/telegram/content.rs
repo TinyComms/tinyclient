@@ -75,6 +75,9 @@ pub struct Mapped {
     /// Every Telegram message id folded into this row, including [`Mapped::id`]. Empty when
     /// the row is one message.
     pub members: Vec<i32>,
+    /// A forwarded/shared story whose `StoryItem` was not embedded inline and should be hydrated
+    /// via `stories.getStoriesByID` (never `stories.readStories`).
+    pub pending_story: Option<(Who, i32)>,
 }
 
 /// Byte offsets for UTF-16 offsets: entry `n` is where the `n`th UTF-16 unit of `text` starts.
@@ -1006,6 +1009,57 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>, peer: W
     Some(attachment)
 }
 
+/// Extracts media from a Telegram `StoryItem::media` into `(kind, attachment, media_file, thumb,
+/// duration_ms)`, registering download `Want`s without ever marking the story read.
+pub(super) fn story_media(
+    media: &MessageMedia,
+    wants: &mut Vec<Want>,
+    peer: Who,
+    megagroup: bool,
+    rules: DownloadRules,
+) -> (
+    protocol::StoryMediaKind,
+    Option<Attachment>,
+    Option<MediaFile>,
+    Option<MediaFile>,
+    Option<u32>,
+) {
+    match media {
+        MessageMedia::Photo(pic) => {
+            if let Some(tl::enums::Photo::Photo(p)) = &pic.photo {
+                if let Some(mut att) = photo(p, pic.spoiler, wants, peer, megagroup, rules) {
+                    att.name = "Story".to_owned();
+                    let file = att.file.clone();
+                    let thumb = att.thumb.clone();
+                    return (protocol::StoryMediaKind::Photo, Some(att), Some(file), thumb, None);
+                }
+            }
+            (protocol::StoryMediaKind::Photo, None, None, None, None)
+        }
+        MessageMedia::Document(doc) => {
+            if let Some(tl::enums::Document::Document(d)) = &doc.document {
+                let mut att = document(doc, d, wants, peer, megagroup, rules);
+                if att.name.is_empty() {
+                    att.name = "Story".to_owned();
+                }
+                let kind = if att.file.kind == MediaKind::Video || att.mime.starts_with("video/") {
+                    protocol::StoryMediaKind::Video
+                } else if att.file.kind == MediaKind::Image || att.mime.starts_with("image/") {
+                    protocol::StoryMediaKind::Photo
+                } else {
+                    protocol::StoryMediaKind::Unsupported
+                };
+                let duration_ms = (att.duration > 0).then_some(att.duration.saturating_mul(1_000));
+                let file = att.file.clone();
+                let thumb = att.thumb.clone();
+                return (kind, Some(att), Some(file), thumb, duration_ms);
+            }
+            (protocol::StoryMediaKind::Unsupported, None, None, None, None)
+        }
+        _ => (protocol::StoryMediaKind::Unsupported, None, None, None, None),
+    }
+}
+
 /// The picture a link card shows. A photo's row-sized still, or a video's thumbnail. The full
 /// picture stays with Telegram until someone opens it, and a card does not open it.
 fn preview_image(page: &tl::types::WebPage, wants: &mut Vec<Want>) -> Option<MediaFile> {
@@ -1532,8 +1586,11 @@ fn place_fields(lat: f64, long: f64, accuracy: Option<i32>) -> Vec<(String, Stri
     fields
 }
 
-/// Still shared when the share's end is ahead of now. This layer has no stopped flag.
+/// Still shared when the share is indefinite (`LIVE_LOCATION_INDEFINITE`) or its end is ahead of now.
 fn still_sharing(date: i32, period: i32) -> bool {
+    if period == protocol::LIVE_LOCATION_INDEFINITE as i32 {
+        return true;
+    }
     if period <= 0 {
         return false;
     }
@@ -1578,7 +1635,9 @@ fn location_card(media: &MessageMedia, date: i32) -> Option<Card> {
             if let Some(heading) = live.heading {
                 card.fields.push(("Heading".to_owned(), format!("{heading}°")));
             }
-            if live.period > 0 {
+            if live.period == protocol::LIVE_LOCATION_INDEFINITE as i32 {
+                card.fields.push(("Shared for".to_owned(), "Until turned off".to_owned()));
+            } else if live.period > 0 {
                 card.fields.push(("Shared for".to_owned(), kept_for(live.period)));
             }
             let status = if still_sharing(date, live.period) { "Still sharing" } else { "Stopped" };
@@ -2938,6 +2997,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 wants: Vec::new(),
                 group: None,
                 members: Vec::new(),
+                pending_story: None,
             })
         }
         tl::enums::Message::Message(raw) => {
@@ -3014,6 +3074,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 }
             }
             let mut wants = Vec::new();
+            let mut pending_story: Option<(Who, i32)> = None;
             let rules = dir.download;
             let megagroup = dir.get(peer).is_some_and(|known| known.megagroup);
             match &raw.media {
@@ -3087,6 +3148,67 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                     message.controls.extend(controls);
                     message.attachments.extend(picture);
                 }
+                Some(MessageMedia::Story(shared)) => {
+                    let story_peer = Who::of(&shared.peer);
+                    let author_name = dir.name(story_peer);
+                    let peer_key = protocol::Key {
+                        network: protocol::Network::Telegram,
+                        account: String::new(),
+                        id: story_peer.text(),
+                    };
+                    match &shared.story {
+                        Some(tl::enums::StoryItem::Item(item)) => {
+                            let (media_kind, attachment, media, thumb, _) =
+                                story_media(&item.media, &mut wants, story_peer, false, rules);
+                            if let Some(att) = attachment {
+                                message.attachments.push(att);
+                            }
+                            let caption = item.caption.clone().unwrap_or_default();
+                            let caption_spans = spans(&caption, item.entities.as_deref().unwrap_or(&[]));
+                            message.story = Some(Box::new(protocol::SharedStory {
+                                peer: peer_key,
+                                story_id: shared.id.to_string(),
+                                author_name,
+                                caption,
+                                caption_spans,
+                                media_kind,
+                                media,
+                                thumb,
+                                expired: false,
+                                via_mention: shared.via_mention,
+                            }));
+                        }
+                        Some(tl::enums::StoryItem::Deleted(_)) => {
+                            message.story = Some(Box::new(protocol::SharedStory {
+                                peer: peer_key,
+                                story_id: shared.id.to_string(),
+                                author_name,
+                                caption: String::new(),
+                                caption_spans: Vec::new(),
+                                media_kind: protocol::StoryMediaKind::Unsupported,
+                                media: None,
+                                thumb: None,
+                                expired: true,
+                                via_mention: shared.via_mention,
+                            }));
+                        }
+                        None | Some(tl::enums::StoryItem::Skipped(_)) => {
+                            pending_story = Some((story_peer, shared.id));
+                            message.story = Some(Box::new(protocol::SharedStory {
+                                peer: peer_key,
+                                story_id: shared.id.to_string(),
+                                author_name,
+                                caption: String::new(),
+                                caption_spans: Vec::new(),
+                                media_kind: protocol::StoryMediaKind::Unsupported,
+                                media: None,
+                                thumb: None,
+                                expired: false,
+                                via_mention: shared.via_mention,
+                            }));
+                        }
+                    }
+                }
                 Some(media) => {
                     if let Some(label) = unsupported(media) {
                         // The caption follows the label; its styles no longer line up, so they go.
@@ -3135,6 +3257,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 wants,
                 group: raw.grouped_id.filter(|id| *id != 0),
                 members: Vec::new(),
+                pending_story,
             })
         }
     }

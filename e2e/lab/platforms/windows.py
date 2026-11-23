@@ -72,7 +72,7 @@ def run(ctx):
     rid = "%s-%s" % (sha, ctx.label)
     started = time.time()
     sabotage = os.environ.get("E2E_SABOTAGE") == "1"
-    headless = ctx.scenario["id"] == "tiny-video-received"
+    headless = ctx.scenario["id"] in ("tiny-video-received", "gpu-codecs-wave18")
     driver_timeout = BUILD_TIMEOUT if headless else DRIVER_TIMEOUT
     os.makedirs(ctx.out_dir, exist_ok=True)
     notes = []

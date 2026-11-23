@@ -1562,7 +1562,7 @@ impl Call {
             tracing::info!(user_id = %user, kind = ?kind, ms_since_watch = ms, "first keyframe received");
         }
         self.controls.video_stats.lock().unwrap().received_slot(data.data.len(), slot_idx == 0, now);
-        let frame = Received { key, contiguous: data.contiguous, data: data.data, user, kind };
+        let frame = Received { codec: crate::video::VideoCodec::H264, key, contiguous: data.contiguous, data: data.data, user, kind };
         if !self.video.picture_slot(slot_idx, frame) {
             self.ask_keyframe_mid(data.mid);
         }
@@ -2359,7 +2359,7 @@ mod tests {
         let received = wire.pictures.len();
         let mut images = Vec::new();
         for data in wire.pictures {
-            screen.decode(&data.data, Some(Tag { user: "proof".into(), kind: protocol::PictureKind::Share, small: false })).expect("every received frame decodes");
+            screen.decode(crate::video::VideoCodec::H264, &data.data, Some(Tag { user: "proof".into(), kind: protocol::PictureKind::Share, small: false })).expect("every received frame decodes");
             images.extend(screen.painted());
         }
         let deadline = Instant::now() + Duration::from_secs(5);

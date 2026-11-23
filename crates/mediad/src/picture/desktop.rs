@@ -1,11 +1,15 @@
-//! The desktop's pictures: a share or camera encoded first by the machine's own hardware
-//! through Media Foundation (`mf_encoder`, Windows), else by OpenH264 (Cisco's binary,
-//! fetched at run time), which decodes whatever arrives either way. nokhwa's camera (Media
-//! Foundation, AVFoundation, V4L2), and the screen through GDI, Core Graphics, the X11
-//! root, or the Linux desktop portal. Moved here from `picture.rs`, which keeps what phones share.
+//! Desktop capture and H.264. Hardware codecs are tried first, with Cisco's
+//! runtime-loaded OpenH264 as the fallback.
 
 use super::*;
-use crate::rt;
+use crate::{h264, rt, video::Track};
+use crate::platform::VideoFrame;
+#[cfg(any(target_os = "macos", all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+use crate::platform::EncoderConfig as PlatformEncoderConfig;
+#[cfg(target_os = "macos")]
+use crate::platform::H264Encoder;
+#[cfg(any(target_os = "macos", all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+use crate::platform::H264Decoder;
 #[cfg(windows)]
 use crate::mf_encoder;
 use openh264::decoder::{Decoder, DecoderConfig};
@@ -49,16 +53,12 @@ struct Coded {
     width: u32,
     height: u32,
     /// What the track asked at open: what a mid-share failover sets the software encoder
-    /// up with. Windows only: the failover is.
-    #[cfg(windows)]
+    /// up with.
     bps: u32,
-    #[cfg(windows)]
     fps: f32,
-    #[cfg(windows)]
     screen: bool,
     /// The software encoder on its way after the hardware failed mid-share: loaded and
     /// opened on a thread of its own, and only looked for here.
-    #[cfg(windows)]
     takeover: Option<Takeover>,
 }
 
@@ -66,14 +66,11 @@ struct Coded {
 /// worker's whole job: the binary's file, the download when it is not on the disk yet,
 /// the wait for it, and the encoder's open. The capture thread only looks at the channel,
 /// which never waits, so no frame touches the disk or the network for the swap.
-#[cfg(windows)]
 struct Takeover(Receiver<Result<Backend, String>>);
 
 /// How long the takeover's worker waits for the download before it gives the track up.
-#[cfg(windows)]
 const TAKEOVER_WAIT: Duration = Duration::from_secs(30);
 
-#[cfg(windows)]
 impl Takeover {
     /// Starts the worker and returns at once. `open` runs there, again while its answer is
     /// [`CODEC_LATER`], and never on the thread that asked.
@@ -115,12 +112,56 @@ enum Backend {
     /// download and hardly any CPU.
     #[cfg(windows)]
     MediaFoundation(mf_encoder::Encoder),
+    #[cfg(target_os = "macos")]
+    VideoToolbox(crate::vt_codec::Encoder),
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    Ffmpeg(crate::ffmpeg_codec::Encoder),
     /// The downloaded Cisco binary. It sets up on its first frame, and takes no options
     /// before that.
     OpenH264 { encoder: Encoder, begun: bool, bps: u32, fps: f32 },
+    OpeningOpenH264 { bps: u32, fps: f32, screen: bool },
 }
 
 impl Backend {
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(windows)]
+            Self::MediaFoundation(_) => "Media Foundation",
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(_) => "VideoToolbox",
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            Self::Ffmpeg(encoder) => encoder.name(),
+            Self::OpenH264 { .. } | Self::OpeningOpenH264 { .. } => "OpenH264",
+        }
+    }
+
+    fn hardware(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Self, String> {
+        if software_only() {
+            return Err("Hardware H.264 is disabled for this lab run.".into());
+        }
+        #[cfg(windows)]
+        {
+            let available = mf_encoder::available();
+            if mf_encoder::choose(&available) != mf_encoder::Choice::MediaFoundation {
+                return Err(available.unwrap_err());
+            }
+            mf_encoder::Encoder::open(width, height, bps, fps, screen).map(Self::MediaFoundation)
+        }
+        #[cfg(any(target_os = "macos", all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        {
+            let config = PlatformEncoderConfig { width, height, bitrate_bps: bps, fps: fps.round().max(1.) as u32, screen };
+            #[cfg(target_os = "macos")]
+            return crate::vt_codec::Encoder::new(config).map(Self::VideoToolbox);
+            #[cfg(target_os = "linux")]
+            return crate::ffmpeg_codec::Encoder::open(config).map(Self::Ffmpeg);
+        }
+        #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))))]
+        {
+            let _ = (width, height, bps, fps, screen);
+            Err("No hardware H.264 encoder for this desktop.".into())
+        }
+    }
+
     /// The OpenH264 fallback, opened the way it always was: `bps` is also the most this
     /// encoder ever spends: [`Backend::encode`] only tunes under it, and so is `fps`. A
     /// share's encoder is level 5.1, which holds 1440p at 60, and spreads its work over
@@ -156,8 +197,23 @@ impl Backend {
     /// encoder it holds.
     fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
         match self {
+            Self::OpeningOpenH264 { bps, fps, screen } => {
+                *self = Self::open_h264(*bps, *fps, *screen)?;
+                self.encode(planes, ask)
+            }
             #[cfg(windows)]
             Backend::MediaFoundation(encoder) => encoder.encode(planes, ask),
+            #[cfg(target_os = "macos")]
+            Backend::VideoToolbox(encoder) => {
+                encoder.tune(ask.bps, ask.fps.round() as u32)?;
+                let bytes = encoder.encode(&super::convert::nv12(planes), ask.key)?;
+                Ok(Encoded { key: h264::is_key(&bytes), bytes })
+            }
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            Backend::Ffmpeg(encoder) => {
+                let bytes = encoder.encode(&super::convert::nv12(planes), ask.key, ask.bps, ask.fps.round() as u32)?;
+                Ok(Encoded { key: h264::is_key(&bytes), bytes })
+            }
             Backend::OpenH264 { encoder, begun, bps, fps } => {
                 if *begun {
                     if ask.bps != *bps && ask.bps > 0 {
@@ -195,46 +251,15 @@ impl Backend {
 }
 
 impl Coded {
-    /// `bps` is also the most this encoder ever spends: a tune only goes under it, and so
-    /// is `fps`. A share's encoder is level 5.1, which holds 1440p at 60. The machine's own
-    /// hardware takes the job first when Windows lists an encoder for it ([`mf_encoder`]);
-    /// OpenH264, downloaded at run time, takes every other machine and every refusal, with
-    /// the words it has always had.
     fn open(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Coded, String> {
-        Ok(Coded::with(Self::backend(width, height, bps, fps, screen)?, width, height, bps, fps, screen))
+        let backend = settle(Backend::hardware(width, height, bps, fps, screen), || Ok(Backend::OpeningOpenH264 { bps, fps, screen }))?;
+        Ok(Coded::with(backend, width, height, bps, fps, screen))
     }
 
-    #[cfg(windows)]
     fn with(backend: Backend, width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Coded {
         Coded { backend, width, height, bps, fps, screen, takeover: None }
     }
 
-    #[cfg(not(windows))]
-    fn with(backend: Backend, width: u32, height: u32, _bps: u32, _fps: f32, _screen: bool) -> Coded {
-        Coded { backend, width, height }
-    }
-
-    /// The machine's own hardware when Windows lists one, else OpenH264. The one place a
-    /// refusal of the hardware becomes the software encoder.
-    #[cfg(windows)]
-    fn backend(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
-        if mf_encoder::choose(&mf_encoder::available()) == mf_encoder::Choice::MediaFoundation {
-            return settle(mf_encoder::Encoder::open(width, height, bps, fps, screen), || Backend::open_h264(bps, fps, screen));
-        }
-        Backend::open_h264(bps, fps, screen)
-    }
-
-    #[cfg(not(windows))]
-    fn backend(width: u32, height: u32, bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
-        Backend::open_h264(bps, fps, screen)
-    }
-
-    #[cfg(not(windows))]
-    fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
-        self.backend.encode(planes, ask)
-    }
-
-    #[cfg(windows)]
     fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
         let (bps, fps, screen) = (self.bps, self.fps, self.screen);
         self.encode_or(planes, ask, move || Backend::open_h264(bps, fps, screen))
@@ -248,18 +273,18 @@ impl Coded {
     /// arrives is skipped without asking the failed hardware again. The frame that finds
     /// the encoder swaps it in and is forced to a keyframe. A software encoder that cannot
     /// come fails the track in its own words, as it does when a share starts.
-    #[cfg(windows)]
     fn encode_or(&mut self, planes: &Planes, ask: &Ask, software: impl FnMut() -> Result<Backend, String> + Send + 'static) -> Result<Encoded, String> {
         if self.takeover.is_none() {
-            if !matches!(self.backend, Backend::MediaFoundation(_)) {
+            if matches!(self.backend, Backend::OpenH264 { .. } | Backend::OpeningOpenH264 { .. }) {
                 return self.backend.encode(planes, ask);
             }
             match self.backend.encode(planes, ask) {
                 Ok(encoded) => return Ok(encoded),
                 Err(why) => {
                     // Said once: the frames after this one find the takeover, not the hardware.
-                    tracing::warn!("mediad: the Media Foundation encoder failed mid-share ({why}); OpenH264 takes over with a keyframe.");
+                    tracing::warn!(backend = self.backend.name(), %why, "hardware encoder failed; OpenH264 takes over with a keyframe");
                     self.takeover = Some(Takeover::begin(software)?);
+                    self.backend = Backend::OpeningOpenH264 { bps: self.bps, fps: self.fps, screen: self.screen };
                 }
             }
         }
@@ -285,38 +310,38 @@ impl Coded {
 /// the log. The one place an open of the hardware becomes the fallback, whatever the
 /// refusal was: no encoder, a refused type, or a driver that would put a profile other
 /// than the baseline on the wire.
-#[cfg(windows)]
-fn settle(first: Result<mf_encoder::Encoder, String>, software: impl FnOnce() -> Result<Backend, String>) -> Result<Backend, String> {
+fn settle(first: Result<Backend, String>, software: impl FnOnce() -> Result<Backend, String>) -> Result<Backend, String> {
     match first {
-        Ok(encoder) => Ok(Backend::MediaFoundation(encoder)),
+        Ok(encoder) => Ok(encoder),
         Err(why) => {
-            tracing::warn!("mediad: the Media Foundation encoder could not be set up ({why}); OpenH264 takes over.");
+            tracing::debug!(%why, "hardware encoder could not be set up; using OpenH264");
             software()
         }
     }
 }
 
-/// Whether the OpenH264 binary is wanted before this track's first frame: on Windows the
-/// machine's own hardware may take the job, and then no download is needed. A decode still
-/// wants the binary whatever the send side chose, so `warm` runs on regardless.
-fn needs_openh264() -> bool {
-    #[cfg(windows)]
-    {
-        match mf_encoder::available() {
-            Ok(()) => false,
-            Err(why) => {
-                // The answer is the machine's and does not change; the frames keep asking
-                // while a slot is empty, and the words are said on the first ask only.
-                static SAID: OnceLock<()> = OnceLock::new();
-                if SAID.set(()).is_ok() {
-                    tracing::debug!("mediad: no Media Foundation encoder ({why}); OpenH264 stays the codec.");
-                }
-                true
-            }
-        }
+fn software_only() -> bool {
+    crate::out::var_os("TINYCLIENT_DIR").is_some()
+        && crate::out::var("TINYCLIENT_MEDIAD_VIDEO_CODEC").as_deref() == Some("software")
+}
+
+pub(super) fn hardware_encoder_available() -> bool {
+    if software_only() {
+        return false;
     }
+    #[cfg(windows)]
+    { mf_encoder::available().is_ok() }
     #[cfg(not(windows))]
-    true
+    {
+        // Try the actual HD camera configuration. Do it off the call tick the first time
+        // a capture worker starts. Until then Auto can start at its software-safe profile.
+        static PROBE: OnceLock<Option<std::thread::JoinHandle<()>>> = OnceLock::new();
+        static AVAILABLE: AtomicBool = AtomicBool::new(false);
+        PROBE.get_or_init(|| std::thread::Builder::new().name("mediad-h264-probe".into()).spawn(|| {
+            AVAILABLE.store(Backend::hardware(CAMERA_HD.0, CAMERA_HD.1, CAMERA_HD_BPS, CAMERA_HD_FPS as f32, false).is_ok(), Ordering::Release);
+        }).ok());
+        AVAILABLE.load(Ordering::Acquire)
+    }
 }
 
 /// The encoder for one track at this size: the one it has, or a new one, which starts with a
@@ -355,15 +380,15 @@ struct Selfie {
 impl Selfie {
     /// Paints this grab, unless the last was painted less than [`super::SELF_VIEW_EVERY`] ago.
     fn shoot(&mut self, grabbed: &Rgba) {
-        self.shoot_mirrored(grabbed, false);
+        self.shoot_mirrored(grabbed, false, Instant::now());
     }
 
     /// Paints this grab, optionally mirrored horizontally (for the local camera self-view only).
-    fn shoot_mirrored(&mut self, grabbed: &Rgba, mirror: bool) {
-        if self.at.is_some_and(|at| at.elapsed() < super::SELF_VIEW_EVERY) {
+    fn shoot_mirrored(&mut self, grabbed: &Rgba, mirror: bool, now: Instant) {
+        if self.at.is_some_and(|at| now.saturating_duration_since(at) < super::SELF_VIEW_EVERY) {
             return;
         }
-        self.at = Some(Instant::now());
+        self.at = Some(now);
         let (width, height) = fit(grabbed.width, grabbed.height, super::SELF_VIEW.0, super::SELF_VIEW.1);
         let mut rgb = super::screens::shrink(grabbed, width, height);
         if mirror {
@@ -448,10 +473,6 @@ impl Cost {
 impl Outgoing {
     /// One share frame, or why the screen could not be read.
     pub fn share(&mut self, ask: Ask) -> Result<Encoded, String> {
-        // A capture is wasted until the codec loads, and the hardware needs no load at all.
-        if self.share.is_none() && needs_openh264() {
-            load_api()?;
-        }
         let quality = super::share_quality();
         let began = Instant::now();
         let grabbed = capture_screen()?;
@@ -480,16 +501,13 @@ impl Outgoing {
     /// The camera's two layers, high then low, or why the camera could not be read. A layer with
     /// no `Ask` is stopped: nothing is spent on it and it comes back empty.
     pub fn camera(&mut self, high: Option<Ask>, low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
-        if (high.is_some() || low.is_some()) && (self.high.is_none() || self.low.is_none()) && needs_openh264() {
-            load_api()?;
-        }
         let began = Instant::now();
         let mut grabbed = self.camera.frame()?;
         self.camera_cost.note(began.elapsed(), (grabbed.width, grabbed.height));
         if super::camera_blur() {
             super::apply_background_blur(&mut grabbed);
         }
-        self.selfie.shoot_mirrored(&grabbed, super::camera_mirror());
+        self.selfie.shoot_mirrored(&grabbed, super::camera_mirror(), Instant::now());
         let profile = super::camera_profile();
         let layer = |slot: &mut Option<Coded>, ask: Option<Ask>, most: (u32, u32), nominal: u32, fps: f32| match ask {
             Some(ask) => {
@@ -499,12 +517,24 @@ impl Outgoing {
             }
             None => Ok(Encoded::default()),
         };
+        let low_profile = profile.low_layer();
         let high = layer(&mut self.high, high, profile.max, profile.bps, profile.fps as f32)?;
-        let low = layer(&mut self.low, low, CAMERA_LOW, CAMERA_LOW_BPS, FULL_FPS)?;
+        let low = layer(&mut self.low, low, low_profile.max, low_profile.bps, low_profile.fps as f32)?;
         Ok((high, low))
     }
 
+    pub(crate) fn backend_name(&self, track: Track) -> Option<&'static str> {
+        let slot = match track {
+            Track::Share => &self.share,
+            Track::High => &self.high,
+            Track::Low => &self.low,
+        };
+        slot.as_ref().map(|coded| coded.backend.name())
+    }
+
     pub fn close_camera(&mut self) {
+        self.high = None;
+        self.low = None;
         self.camera.close();
         self.selfie.forget();
     }
@@ -522,10 +552,73 @@ impl Outgoing {
     }
 }
 
-/// The one decoder a call holds, and the painters that write what it decodes for the window.
+enum HardwareDecoder {
+    #[cfg(test)]
+    Refuses,
+    #[cfg(windows)]
+    MediaFoundation(crate::mf_decoder::Decoder),
+    #[cfg(target_os = "macos")]
+    VideoToolbox(crate::vt_codec::Decoder),
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    Ffmpeg(crate::ffmpeg_codec::Decoder),
+}
+
+impl HardwareDecoder {
+    fn open() -> Result<Self, String> {
+        if software_only() {
+            return Err("Hardware H.264 is disabled for this lab run.".into());
+        }
+        #[cfg(windows)]
+        return crate::mf_decoder::Decoder::open().map(Self::MediaFoundation);
+        #[cfg(target_os = "macos")]
+        return crate::vt_codec::Decoder::new().map(Self::VideoToolbox);
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        return crate::ffmpeg_codec::Decoder::open().map(Self::Ffmpeg);
+        #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))))]
+        Err("No hardware H.264 decoder for this desktop.".into())
+    }
+
+    fn name(&self) -> &'static str {
+        match *self {
+            #[cfg(test)]
+            Self::Refuses => "test hardware decoder",
+            #[cfg(windows)]
+            Self::MediaFoundation(_) => "Media Foundation (D3D11)",
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(_) => "VideoToolbox",
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            Self::Ffmpeg(ref decoder) => decoder.name(),
+        }
+    }
+
+    fn decode(&mut self, annex_b: &[u8]) -> Result<Option<VideoFrame>, String> {
+        match *self {
+            #[cfg(test)]
+            Self::Refuses => Err("test device stopped responding".into()),
+            #[cfg(windows)]
+            Self::MediaFoundation(ref mut decoder) => decoder.decode(annex_b),
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(ref mut decoder) => decoder.decode(annex_b),
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            Self::Ffmpeg(ref mut decoder) => decoder.decode(annex_b),
+        }
+    }
+}
+
+/// The decoder and painters for one receive worker. Once hardware fails, it is retired
+/// for that worker, even across stream resets. Software starts with a fresh IDR.
 #[derive(Default)]
 pub struct Incoming {
     decoder: Option<Decoder>,
+    hardware: Option<HardwareDecoder>,
+    vp8: Option<crate::vp8::Vp8Decoder>,
+    av1: Option<crate::av1::Av1Decoder>,
+    software_only: bool,
+    waiting_for_key: bool,
+    pending: u8,
+    sps: Vec<u8>,
+    pps: Vec<u8>,
+    last_backend: Option<&'static str>,
     painters: Painters,
 }
 
@@ -533,39 +626,153 @@ impl Incoming {
     /// Drops a decoder whose sender changed, so the next frame starts from a keyframe.
     pub fn reset(&mut self) {
         self.decoder = None;
+        self.hardware = None;
+        self.vp8 = None;
+        self.av1 = None;
+        self.waiting_for_key = true;
+        self.pending = 0;
+        self.sps.clear();
+        self.pps.clear();
+        self.last_backend = None;
     }
 
-    /// Decodes one received Annex B frame, and has it painted for `paint` if given. Every frame
-    /// goes through the decoder, painted or not: the next one is built on it. `Err` means it did
-    /// not decode. What was painted comes back from [`Incoming::painted`].
+    pub(crate) fn backend_name(&self) -> Option<&'static str> {
+        self.last_backend
+    }
+
+    /// Decode every access unit (`H264`, `Vp8`, or `Av1`) so the decoder's reference frames stay
+    /// current. Convert to RGB only when a painter is due.
     #[allow(clippy::result_unit_err)]
-    pub fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+    pub fn decode(&mut self, codec: crate::video::VideoCodec, data: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+        self.last_backend = None;
+        match codec {
+            crate::video::VideoCodec::H264 => self.decode_h264(data, paint),
+            crate::video::VideoCodec::Vp8 => {
+                let decoder = self.vp8.get_or_insert_with(crate::vp8::Vp8Decoder::new);
+                let Some(planes) = decoder.decode(data)? else {
+                    return Ok(());
+                };
+                self.last_backend = Some("VP8");
+                if let Some(tag) = paint {
+                    let (w, h) = (planes.width as u32, planes.height as u32);
+                    self.paint(rgb(&planes), w, h, tag);
+                }
+                Ok(())
+            }
+            crate::video::VideoCodec::Av1 => {
+                if self.av1.is_none() {
+                    self.av1 = crate::av1::Av1Decoder::new().ok();
+                }
+                let decoder = self.av1.as_mut().ok_or(())?;
+                let Some(planes) = decoder.decode(data)? else {
+                    return Ok(());
+                };
+                self.last_backend = Some("AV1");
+                if let Some(tag) = paint {
+                    let (w, h) = (planes.width as u32, planes.height as u32);
+                    self.paint(rgb(&planes), w, h, tag);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(clippy::result_unit_err)]
+    fn decode_h264(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+        let (mut idr, mut has_sps, mut has_pps) = (false, false, false);
+        for unit in h264::split(annex_b) {
+            match unit[0] & 31 {
+                5 => idr = true,
+                7 => {
+                    has_sps = true;
+                    self.sps = unit.to_vec();
+                }
+                8 => {
+                    has_pps = true;
+                    self.pps = unit.to_vec();
+                }
+                _ => {}
+            }
+        }
+
+        if self.hardware.is_none() && self.decoder.is_none() && !self.software_only {
+            match HardwareDecoder::open() {
+                Ok(hardware) => self.hardware = Some(hardware),
+                Err(why) => {
+                    tracing::debug!(%why, "hardware decoder could not be set up; using OpenH264");
+                    self.software_only = true;
+                }
+            }
+            self.waiting_for_key = true;
+        }
+        let mut headers = Vec::new();
+        if idr && !(has_sps && has_pps) && !self.sps.is_empty() && !self.pps.is_empty() {
+            for set in [&self.sps, &self.pps] {
+                headers.extend_from_slice(&[0, 0, 0, 1]);
+                headers.extend_from_slice(set);
+            }
+            headers.extend_from_slice(annex_b);
+        }
+        let access_unit = if headers.is_empty() { annex_b } else { &headers };
+        if let Some(hardware) = &mut self.hardware {
+            if self.waiting_for_key && !idr {
+                return Ok(());
+            }
+            self.waiting_for_key = false;
+            let result = match hardware.decode(access_unit) {
+                Ok(Some(frame)) => {
+                    self.pending = 0;
+                    self.last_backend = Some(hardware.name());
+                    if let Some(tag) = paint {
+                        let (w, h) = (frame.width, frame.height);
+                        let planes = super::convert::planes(&frame, w, h);
+                        self.paint(rgb(&planes), w, h, tag);
+                    }
+                    return Ok(());
+                }
+                Ok(None) if self.pending < 32 => {
+                    self.pending += 1;
+                    return Ok(());
+                }
+                Ok(None) => "no frames produced after 32 access units".into(),
+                Err(why) => why,
+            };
+            tracing::warn!(backend = hardware.name(), why = %result, "hardware decoder failed; switching to OpenH264");
+            self.hardware = None;
+            self.software_only = true;
+            self.waiting_for_key = true;
+        }
+        if self.waiting_for_key && !idr {
+            return Err(()); // Request a keyframe through the existing receive worker.
+        }
         if self.decoder.is_none() {
             let api = load_api().map_err(|_| ())?;
             self.decoder = Decoder::with_api_config(api, DecoderConfig::new()).ok();
         }
         let decoder = self.decoder.as_mut().ok_or(())?;
-        let Some(decoded) = decoder.decode(annex_b).map_err(|_| ())? else {
-            return Ok(());
+        let Some(decoded) = decoder.decode(access_unit).map_err(|_| ())? else {
+            return if self.waiting_for_key { Err(()) } else { Ok(()) };
         };
-        let Some(tag) = paint else {
-            return Ok(());
-        };
-        let (width, height) = decoded.dimensions();
-        if width == 0 || height == 0 {
-            return Ok(());
+        self.waiting_for_key = false;
+        self.last_backend = Some("OpenH264");
+        if let Some(tag) = paint {
+            let (w, h) = decoded.dimensions();
+            if w > 0 && h > 0 {
+                let mut colors = vec![0u8; w * h * 3];
+                decoded.write_rgb8(&mut colors);
+                self.paint(colors, w as u32, h as u32, tag);
+            }
         }
-        let mut colors = vec![0u8; width * height * 3];
-        // This honours the decoder's strides, which are wider than the picture.
-        decoded.write_rgb8(&mut colors);
-        let (mut w, mut h) = (width as u32, height as u32);
+        Ok(())
+    }
+
+    fn paint(&mut self, mut colors: Vec<u8>, mut w: u32, mut h: u32, tag: Tag) {
         if tag.small && (w > SMALL_TILE.0 || h > SMALL_TILE.1) {
             let (tw, th) = fit(w, h, SMALL_TILE.0, SMALL_TILE.1);
             colors = scale_rgb(&colors, w, h, tw, th);
             (w, h) = (tw, th);
         }
         self.painters.paint(colors, w, h, tag);
-        Ok(())
     }
 
     /// The pictures painted since this was last asked.
@@ -846,7 +1053,7 @@ pub fn cameras(folder: Option<&Path>) -> Vec<CameraSource> {
     }
 }
 
-/// The camera `index`, at 720p at its fastest if it has 720p (more than the 640×360 that is
+/// The camera `index`, at 720p at its fastest if it has 720p (more than the 640Ã—360 that is
 /// sent, and far less to decode than 4K), else at whatever it runs fastest at. The format is
 /// nokhwa's to pick from those two asks: a format set by hand (`Exact`) on Windows came out as
 /// black frames, and the frame rate Media Foundation reports back is a range minimum, not the
@@ -1016,7 +1223,7 @@ fn capture_screen_linux(id: Option<&str>, live: bool) -> Result<Rgba, String> {
 }
 
 /// What the call is told when Cisco's host could not be reached. A VPN or a firewall that
-/// quietly drops the host is the usual reason, and that is said, so "Connecting…" is not
+/// quietly drops the host is the usual reason, and that is said, so "Connectingâ€¦" is not
 /// read as a slow network.
 const DOWNLOAD_FAILED: &str = "OpenH264 could not be downloaded. A VPN or firewall may be blocking ciscobinary.openh264.org. The call stays a voice call. Turn share or camera on again to retry.";
 /// What the call is told when the download arrived but the disk would not take it.
@@ -1270,7 +1477,6 @@ mod tests {
     /// encoder's own answer is what the track gets: the hardware's words are said in the
     /// log, and what comes back from the fallback is passed on whole, a refusal included.
     /// The hardware opening is the one-line arm above it.
-    #[cfg(windows)]
     #[test]
     fn a_refused_hardware_encoder_settles_on_the_software_one() {
         let refused = Err("the hardware encoder encodes H.264 profile 100, not the baseline the SFU takes.".to_owned());
@@ -1278,6 +1484,63 @@ mod tests {
             panic!("the software answer is the track's");
         };
         assert!(why.contains("OpenH264"), "{why}");
+    }
+
+    #[test]
+    fn a_failed_hardware_decoder_is_retired_and_waits_for_an_idr() {
+        let mut incoming = Incoming { hardware: Some(HardwareDecoder::Refuses), ..Incoming::default() };
+        let delta = [0, 0, 0, 1, 0x41, 0xae];
+        assert_eq!(incoming.decode(crate::video::VideoCodec::H264, &delta, None), Err(()));
+        assert!(incoming.hardware.is_none());
+        assert!(incoming.software_only);
+        assert!(incoming.waiting_for_key);
+        assert_eq!(incoming.backend_name(), None);
+        incoming.reset();
+        assert_eq!(incoming.decode(crate::video::VideoCodec::H264, &delta, None), Err(()));
+        assert!(incoming.hardware.is_none());
+        assert!(incoming.decoder.is_none());
+    }
+
+    #[test]
+    #[ignore = "native smoke test requires both H.264 GPU codecs"]
+    fn desktop_hardware_round_trip_emits_prompt_idrs() {
+        let (width, height, bps, fps) = (320, 192, 800_000, 30.);
+        let mut encoder = Backend::hardware(width, height, bps, fps, false).expect("hardware encoder");
+        let mut decoder = HardwareDecoder::open().expect("hardware decoder");
+        let mut painted = 0;
+        let mut keyframes = 0;
+        let mut requested = None;
+        for n in 0..60 {
+            let planes = Planes {
+                width: width as usize,
+                height: height as usize,
+                y: vec![40 + n as u8; (width * height) as usize],
+                u: vec![128; (width * height / 4) as usize],
+                v: vec![128; (width * height / 4) as usize],
+            };
+            let key = n == 0 || n == 30;
+            if key {
+                requested = Some(n);
+            }
+            let ask = Ask { key, bps, fps, at: Duration::from_millis(n * 33) };
+            let encoded = encoder.encode(&planes, &ask).expect("encode with hardware");
+            if encoded.bytes.is_empty() {
+                continue;
+            }
+            if h264::split(&encoded.bytes).iter().any(|unit| unit[0] & 31 == 5) {
+                if let Some(since) = requested.take() {
+                    assert!(n - since <= 8, "keyframe was late");
+                    keyframes += 1;
+                }
+            }
+            if let Some(frame) = decoder.decode(&encoded.bytes).expect("decode with hardware") {
+                assert_eq!((frame.width, frame.height), (width, height));
+                assert!(frame.is_whole());
+                painted += 1;
+            }
+        }
+        assert_eq!(keyframes, 2);
+        assert!(painted > 30, "only {painted} frames decoded");
     }
 
     /// The hardware failing mid-share hands the load of OpenH264 to a worker: the frame
@@ -1347,18 +1610,18 @@ mod tests {
     #[test]
     fn a_self_view_is_shrunk_to_the_corner_size_painted_at_a_steady_rate_and_let_go() {
         let mut outgoing = Outgoing::default();
-        outgoing.screen_selfie.shoot(&screen());
+        let now = Instant::now();
+        outgoing.screen_selfie.shoot_mirrored(&screen(), false, now);
         let first = outgoing.share_view().expect("the first grab is painted at once");
         assert_eq!((first.width, first.height), super::super::SELF_VIEW);
         assert!(first.path.exists());
         assert!(outgoing.share_view().is_none(), "taken once");
         assert!(outgoing.self_view().is_none(), "the camera's slot is a different one");
 
-        outgoing.screen_selfie.shoot(&screen());
+        outgoing.screen_selfie.shoot_mirrored(&screen(), false, now);
         assert!(outgoing.share_view().is_none(), "a grab inside the interval is not painted");
 
-        outgoing.screen_selfie.at = None;
-        outgoing.screen_selfie.shoot(&screen());
+        outgoing.screen_selfie.shoot_mirrored(&screen(), false, now + SELF_VIEW_EVERY);
         let next = outgoing.share_view().unwrap();
         assert_ne!(next.generation, first.generation);
         assert!(!first.path.exists(), "the file before it is gone");
@@ -1466,7 +1729,7 @@ mod tests {
             }
             if !encoded.bytes.is_empty() {
                 let tag = (n == 0).then(|| Tag { user: "ada".into(), kind: protocol::PictureKind::Share, small: false });
-                incoming.decode(&encoded.bytes, tag).expect("every frame decodes");
+                incoming.decode(crate::video::VideoCodec::H264, &encoded.bytes, tag).expect("every frame decodes");
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut painted = incoming.painted();
                 while n == 0 && painted.is_empty() && std::time::Instant::now() < deadline {

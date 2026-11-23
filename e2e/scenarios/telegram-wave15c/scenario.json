@@ -1,0 +1,12 @@
+{
+  "id": "telegram-wave15c",
+  "title": "Telegram stories (view, react, reply, forwarded card) and live location sharing",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same Telegram adapter, protocol, and location bridge code runs on Android.",
+    "ios": "The phone proof build does not run desktop chatd. The same Telegram adapter, protocol, and location bridge code runs on iOS."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

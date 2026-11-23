@@ -195,6 +195,7 @@ fn real_video_peer() {
                     };
                     preview.is_some() && call.video.iter().any(|stream| stream.content == content && stream.direction == protocol::Direction::Encode)
                 }));
+                prove_codec_stats(&running, &label, true);
                 wait_for(&format!("{label}: viewer proved motion"), || flagged(&out, &format!("{label}-moving")));
                 running.hub.calls.request(&running.hub, &send(false)).unwrap();
             } else {
@@ -215,6 +216,7 @@ fn real_video_peer() {
                     }), Ok(()));
                 }
                 prove_moving_picture(&label, picture);
+                prove_codec_stats(&running, &label, false);
                 assert!(call().unwrap().video.iter().any(|stream| stream.direction == protocol::Direction::Decode && stream.source == other_id),
                     "{label}: viewer's decode session is missing");
                 flag(&out, &format!("{label}-moving"));
@@ -241,6 +243,45 @@ fn real_video_peer() {
         } else if owner {
             end(&running, &id);
         }
+    }
+}
+
+/// The codec lab checks the stats returned through the real call daemon while the
+/// track is running. Ordinary runs of the picture probe keep their existing contract.
+fn prove_codec_stats(running: &Running, label: &str, sending: bool) {
+    let Ok(mode) = std::env::var("TINY_GPU_CODECS_PROOF") else { return };
+    let direction = if sending { "encoder" } else { "decoder" };
+    let expect = if mode == "software" {
+        Some("OpenH264".to_owned())
+    } else {
+        std::env::var(if sending { "TINY_GPU_EXPECT_ENCODER" } else { "TINY_GPU_EXPECT_DECODER" }).ok()
+    };
+    let allowed: &[&str] = if cfg!(windows) {
+        if sending { &["Media Foundation"] } else { &["Media Foundation (D3D11)"] }
+    } else if cfg!(target_os = "macos") {
+        &["VideoToolbox"]
+    } else if sending {
+        &["VA-API", "NVENC"]
+    } else {
+        &["VA-API", "NVDEC"]
+    };
+    let mut names = Vec::new();
+    wait_for_within(&format!("{label}: {mode} {direction} backend in call stats"), Duration::from_secs(8), || {
+        let Ok(protocol::MediaResponse::Stats(stats)) = running.hub.calls.request(&running.hub, &MediaRequest::Stats) else {
+            return false;
+        };
+        let Some(video) = stats.video else { return false };
+        names = if sending { video.encoder_backends } else { video.decoder_backends };
+        match &expect {
+            Some(expected) if mode == "software" => names == [expected.as_str()],
+            Some(expected) => names.contains(expected),
+            None => !names.is_empty() && names.iter().all(|name| name == "OpenH264" || allowed.contains(&name.as_str())),
+        }
+    });
+    println!("gpu-codecs-proof: {mode} {label} {direction}: {}", names.join(", "));
+    if let Some(evidence) = std::env::var_os("TINY_VIDEO_EVIDENCE") {
+        std::fs::write(PathBuf::from(evidence).join(format!("{label}-{direction}.txt")), names.join(", "))
+            .expect("save the backend from CallStats");
     }
 }
 

@@ -426,6 +426,7 @@ impl KeyGate {
 
 /// Encoders and their capture. `Outgoing`, or a stand-in for a test.
 pub trait Source {
+    fn encoder_backend(&self, _track: Track) -> Option<&'static str> { None }
     fn share(&mut self, ask: Ask) -> Result<Encoded, String>;
     /// High then low. A layer with no `Ask` is stopped, and comes back empty.
     fn camera(&mut self, high: Option<Ask>, low: Option<Ask>)
@@ -444,6 +445,11 @@ pub trait Source {
 }
 
 impl Source for Outgoing {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn encoder_backend(&self, track: Track) -> Option<&'static str> {
+        self.backend_name(track)
+    }
+
     fn self_view(&mut self) -> Option<Painted> {
         Outgoing::self_view(self)
     }
@@ -560,6 +566,9 @@ impl<S: Source> Capture<S> {
             self.gate(track).ask();
             return true;
         };
+        if let Some(name) = self.source.encoder_backend(track) {
+            self.controls.video_stats.lock().unwrap().encoded_with(name);
+        }
         if coded.key {
             tracing::debug!(?track, wanted_key, bytes = coded.bytes.len(), "keyframe handed to the tick");
         }
@@ -732,9 +741,19 @@ fn capture<S: Source>(mut work: Capture<S>, orders: &Orders) {
     }
 }
 
+/// Video bitstream codec carried in a received frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Vp8,
+    Av1,
+}
+
 /// One received frame, not yet opened.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Received {
+    pub codec: VideoCodec,
     pub data: Arc<[u8]>,
     pub key: bool,
     pub contiguous: bool,
@@ -842,10 +861,11 @@ enum Take {
 
 /// The decoder and what it paints. `Incoming`, or a stand-in for a test.
 pub trait Screen {
+    fn decoder_backend(&self) -> Option<&'static str> { None }
     /// Decodes one frame, always, and has it painted for `paint` if given. `Err` when it did
     /// not decode. What was painted comes back from [`Screen::painted`], later.
     #[allow(clippy::result_unit_err)]
-    fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()>;
+    fn decode(&mut self, codec: VideoCodec, data: &[u8], paint: Option<Tag>) -> Result<(), ()>;
     /// The pictures painted since this was last asked.
     fn painted(&mut self) -> Vec<(Tag, Painted)>;
     fn reset(&mut self);
@@ -854,8 +874,13 @@ pub trait Screen {
 }
 
 impl Screen for Incoming {
-    fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
-        Incoming::decode(self, annex_b, paint)
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn decoder_backend(&self) -> Option<&'static str> {
+        self.backend_name()
+    }
+
+    fn decode(&mut self, codec: VideoCodec, data: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+        Incoming::decode(self, codec, data, paint)
     }
 
     fn painted(&mut self) -> Vec<(Tag, Painted)> {
@@ -966,7 +991,10 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
             .then(|| Tag { user: frame.user.clone(), kind: frame.kind, small: self.small });
         let painting = paint.is_some();
         let began = Instant::now();
-        let decoded = self.screen.decode(&opened, paint);
+        let decoded = self.screen.decode(frame.codec, &opened, paint);
+        if let Some(name) = self.screen.decoder_backend() {
+            self.controls.video_stats.lock().unwrap().decoded_with(name);
+        }
         self.cost.note(began, Instant::now(), painting && decoded.is_ok());
         match decoded {
             Ok(()) => {
@@ -1996,7 +2024,7 @@ mod tests {
     }
 
     impl Screen for Glass {
-        fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+        fn decode(&mut self, _codec: VideoCodec, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
             self.decoded.lock().unwrap().push((annex_b[0], paint.is_some()));
             if self.fails.contains(&annex_b[0]) {
                 return Err(());
@@ -2023,6 +2051,7 @@ mod tests {
 
     fn frame(name: u8, key: bool) -> Received {
         Received {
+            codec: VideoCodec::H264,
             data: vec![name].into(),
             key,
             contiguous: true,

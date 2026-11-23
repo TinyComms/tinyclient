@@ -2223,6 +2223,7 @@ impl Render for Shell {
             return root
                 .children(self.telegram_call_modal(window, cx))
                 .children(self.meeting_layer(cx))
+                .children(self.story_viewer_layer(window, cx))
                 .children(self.toast_layer(width, cx))
                 .children(super::settings::phone_page(window, cx))
                 .children(self.streamer_mark(window, cx));
@@ -2337,9 +2338,15 @@ impl Render for Shell {
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.meeting_layer(cx))
+            .children(self.story_viewer_layer(window, cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))
             .children(self.streamer_mark(window, cx));
+        let desktop = if let Some(live_bar) = self.live_location_bar(cx) {
+            desktop.child(div().absolute().top_0().left(px(RAIL_WIDTH)).right_0().child(live_bar))
+        } else {
+            desktop
+        };
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let desktop = desktop.children(self.phone_share_layer(window, cx));
         desktop

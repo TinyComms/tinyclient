@@ -1,0 +1,12 @@
+{
+  "id": "discord-wave15a3",
+  "title": "Discord video codecs (VP8, AV1 decode), camera simulcast, per-SSRC sink wants, and multi-stream watch",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same checks run in the libraries the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same checks run in the libraries the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}

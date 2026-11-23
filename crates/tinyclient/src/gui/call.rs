@@ -372,6 +372,8 @@ pub struct State {
     pub(super) share_prompt: Option<String>,
     /// Last multi-stream watch list the server accepted for this call.
     pub(in crate::gui) watched: Vec<protocol::WatchSource>,
+    /// Discord Go Live sharer user IDs the user explicitly toggled Watch on (multi-stream).
+    pub(in crate::gui) discord_watched_shares: Vec<String>,
     /// The list in flight. It is not applied until chatd says ok.
     watch_pending: Option<Vec<protocol::WatchSource>>,
     /// Bumped when the call changes, so a late answer cannot apply.
@@ -525,6 +527,81 @@ fn desired_watch_sources(
         push(&mut out, &p.id, PictureKind::Camera, WatchSize::Small);
         small += 1;
     }
+    out
+}
+
+/// Derives the desired multi-stream watch list for a joined Discord call: every explicitly
+/// watched Go Live share plus every active remote camera (focused tile `Large` -> op 15 quality
+/// 100; remaining visible tiles `Small` -> op 15 quality 50, up to `budget_small`).
+fn desired_discord_watch_sources(
+    call: &Call,
+    focus: Option<&stage::Focus>,
+    watched_shares: &[String],
+    budget_small: usize,
+) -> Vec<protocol::WatchSource> {
+    use protocol::{PictureKind, WatchSize, WatchSource};
+    if call.state != CallState::Joined || call.deafened || call.conversation.network != Network::Discord {
+        return Vec::new();
+    }
+    let mut out: Vec<WatchSource> = Vec::new();
+    let mut small = 0usize;
+    let push = |out: &mut Vec<WatchSource>, small: &mut usize, user_id: &str, kind: PictureKind, size: WatchSize| {
+        if out.iter().any(|s| s.user_id == user_id && s.kind == kind) {
+            return;
+        }
+        if size == WatchSize::Small {
+            if *small >= budget_small {
+                return;
+            }
+            *small += 1;
+        }
+        out.push(WatchSource { user_id: user_id.to_owned(), kind, size });
+    };
+    let is_watched_share = |uid: &str| {
+        watched_shares.iter().any(|id| id == uid)
+            && call.participants.iter().any(|p| !p.ringing && p.id == uid && p.sharing)
+    };
+
+    // 1. Focused tile claims the Large slot.
+    match focus {
+        Some(stage::Focus::Stream(uid)) => {
+            if is_watched_share(uid) {
+                push(&mut out, &mut small, uid, PictureKind::Share, WatchSize::Large);
+            } else if call.participants.iter().any(|p| !p.ringing && p.id == *uid && p.camera) {
+                push(&mut out, &mut small, uid, PictureKind::Camera, WatchSize::Large);
+            }
+        }
+        Some(stage::Focus::Person(uid)) => {
+            if call.participants.iter().any(|p| !p.ringing && p.id == *uid && p.camera) {
+                push(&mut out, &mut small, uid, PictureKind::Camera, WatchSize::Large);
+            }
+        }
+        None => {}
+    }
+
+    // 2. Every explicitly watched Go Live share (independent toggles: multiple streams stay open).
+    for uid in watched_shares {
+        if !is_watched_share(uid) {
+            continue;
+        }
+        let size = if out.iter().all(|s| s.size != WatchSize::Large) {
+            WatchSize::Large
+        } else {
+            WatchSize::Small
+        };
+        push(&mut out, &mut small, uid, PictureKind::Share, size);
+    }
+
+    // 3. Every active remote camera stays visible alongside watched shares.
+    for p in call.participants.iter().filter(|p| !p.ringing && p.camera) {
+        let size = if out.is_empty() && call.participants.iter().filter(|q| !q.ringing && q.camera).count() == 1 {
+            WatchSize::Large
+        } else {
+            WatchSize::Small
+        };
+        push(&mut out, &mut small, &p.id, PictureKind::Camera, size);
+    }
+
     out
 }
 
@@ -2189,7 +2266,8 @@ impl Shell {
     }
 
     /// Ask mediad to watch `user_id`'s stream and schedule 3 s / 10 s redraws so the tile never
-    /// stays on "Connecting…" silently. On Tiny the subscription is `call.watch`, not ShareWatch.
+    /// stays on "Connecting…" silently. Tiny and Discord both subscribe through multi-stream
+    /// `MediaRequest::Watch`.
     pub(in crate::gui) fn call_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
         self.call_state.share_prompt = None;
         self.call_state.watch_asked = Some((user_id.clone(), Instant::now()));
@@ -2199,15 +2277,26 @@ impl Shell {
             cx.background_executor().timer(Duration::from_secs(7)).await;
             let _ = this.update(cx, |_, cx| cx.notify());
         }));
-        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
-            return;
+        if let Some(call) = self.call_now() {
+            if call.conversation.network == Network::Tiny {
+                return;
+            }
+            if call.conversation.network == Network::Discord {
+                if call.participants.iter().any(|p| p.id == user_id && p.sharing)
+                    && !self.call_state.discord_watched_shares.contains(&user_id)
+                {
+                    self.call_state.discord_watched_shares.push(user_id);
+                }
+                self.call_sync_watch_now(cx);
+                return;
+            }
         }
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(user_id) }), cx);
     }
 
-    /// One-click watch from a picture box or a phone tile. Tiny subscribes with `call.watch`.
+    /// One-click watch from a picture box or a phone tile. Tiny and Discord subscribe via `Watch`.
     pub(in crate::gui) fn call_watch_user(&mut self, user_id: String, cx: &mut Context<Self>) {
-        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+        if self.call_now().is_some_and(|call| matches!(call.conversation.network, Network::Tiny | Network::Discord)) {
             self.call_state.focus = Some(stage::Focus::Stream(user_id.clone()));
             self.call_watch(user_id, cx);
             self.call_sync_watch_now(cx);
@@ -2216,11 +2305,13 @@ impl Shell {
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(user_id) }), cx);
     }
 
-    /// Stop the picture-box or phone watch. On Tiny that is a focus change and `call.watch`.
+    /// Stop the picture-box or phone watch. On Tiny and Discord that updates focus and `Watch`.
     pub(in crate::gui) fn call_stop_watch_user(&mut self, cx: &mut Context<Self>) {
-        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
-            if matches!(self.call_state.focus, Some(stage::Focus::Stream(_))) {
-                self.call_state.focus = None;
+        if self.call_now().is_some_and(|call| matches!(call.conversation.network, Network::Tiny | Network::Discord)) {
+            if let Some(stage::Focus::Stream(uid)) = self.call_state.focus.take() {
+                self.call_state.discord_watched_shares.retain(|id| id != &uid);
+            } else {
+                self.call_state.discord_watched_shares.clear();
             }
             self.call_unwatch(cx);
             self.call_sync_watch_now(cx);
@@ -2296,7 +2387,7 @@ impl Shell {
 
     /// Reset the decoder and ask for a fresh keyframe for `user_id`.
     pub(in crate::gui) fn call_retry_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
-        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+        if self.call_now().is_some_and(|call| matches!(call.conversation.network, Network::Tiny | Network::Discord)) {
             self.call_state.watched.clear();
             self.call_state.watch_pending = None;
             self.call_state.watch_again = None;
@@ -2314,8 +2405,15 @@ impl Shell {
     pub(in crate::gui) fn call_unwatch(&mut self, cx: &mut Context<Self>) {
         self.call_state.watch_asked = None;
         self.call_state.watch_timer = None;
-        if self.call_now().is_some_and(|call| share_watch_superseded(call.conversation.network, self.call_state.watch_sent)) {
-            return;
+        if let Some(call) = self.call_now() {
+            if share_watch_superseded(call.conversation.network, self.call_state.watch_sent) {
+                return;
+            }
+            if call.conversation.network == Network::Discord {
+                self.call_state.discord_watched_shares.clear();
+                self.call_sync_watch_now(cx);
+                return;
+            }
         }
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
     }
@@ -2349,21 +2447,34 @@ impl Shell {
     fn call_reset_watch(&mut self) {
         let state = &mut self.call_state;
         state.watched.clear();
+        state.discord_watched_shares.clear();
         state.watch_pending = None;
         state.watch_again = None;
         state.watch_sent = false;
         state.watch_epoch = state.watch_epoch.wrapping_add(1);
     }
 
-    /// Synchronizes multi-stream `MediaRequest::Watch` when the joined Tiny call's visible
-    /// cameras or focused stream change. The list counts only after chatd says ok. A refusal
-    /// is shown and asked again, but not on every picture frame.
+    /// Synchronizes multi-stream `MediaRequest::Watch` when the joined Tiny or Discord call's
+    /// visible cameras, watched Go Live streams, or focused tile change. The list counts only
+    /// after chatd says ok. A refusal is shown and asked again, but not on every picture frame.
     pub(in crate::gui) fn call_sync_watch(&mut self, call: &Call, cx: &mut Context<Self>) {
-        if call.conversation.network != Network::Tiny {
+        if !matches!(call.conversation.network, Network::Tiny | Network::Discord) {
             return;
         }
         let budget_small = if super::phone::active() { 2 } else { 4 };
-        let next = desired_watch_sources(call, self.call_state.focus.as_ref(), budget_small);
+        let next = if call.conversation.network == Network::Discord {
+            self.call_state
+                .discord_watched_shares
+                .retain(|uid| call.participants.iter().any(|p| !p.ringing && p.id == *uid && p.sharing));
+            desired_discord_watch_sources(
+                call,
+                self.call_state.focus.as_ref(),
+                &self.call_state.discord_watched_shares,
+                budget_small,
+            )
+        } else {
+            desired_watch_sources(call, self.call_state.focus.as_ref(), budget_small)
+        };
         if self.call_state.watch_pending.as_ref() == Some(&next) || self.call_state.watched == next {
             return;
         }
@@ -2837,8 +2948,8 @@ impl Shell {
         let call = self.call_shown(snapshot).filter(|c| in_call(c))?;
         let subject = Subject::of(self, snapshot, &call);
         let focused = match &self.call_state.focus {
-            Some(stage::Focus::Stream(id)) => Some(id.as_str()),
-            _ => None,
+            Some(stage::Focus::Stream(id)) | Some(stage::Focus::Person(id)) => Some(id.as_str()),
+            None => None,
         };
         let owner = popout::preferred_frame_owner(&call, focused);
         let remote_frame = owner.as_ref().and_then(|(id, share)| {
@@ -3944,5 +4055,35 @@ mod tests {
         // Deafened -> nothing watched.
         call.deafened = true;
         assert!(desired_watch_sources(&call, Some(&stage::Focus::Stream("ada".into())), 4).is_empty());
+    }
+
+    #[test]
+    fn discord_watch_sources_tracks_multiple_go_live_streams_and_all_cameras_independently() {
+        let discord_key = Key { network: Network::Discord, account: "1".into(), id: "900".into() };
+        let mut call = bare_call(discord_key, CallState::Joined, false, false);
+        call.participants = vec![
+            protocol::Participant { id: "ada".into(), name: "Ada".into(), sharing: true, camera: true, ..Default::default() },
+            protocol::Participant { id: "bea".into(), name: "Bea".into(), sharing: true, camera: false, ..Default::default() },
+            protocol::Participant { id: "cy".into(), name: "Cy".into(), sharing: false, camera: true, ..Default::default() },
+        ];
+        // Watching both Ada's and Bea's Go Live shares, with Ada focused: Ada Share=Large,
+        // Bea Share=Small, plus both active cameras (Ada, Cy) at Small!
+        let watched = vec!["ada".to_owned(), "bea".to_owned()];
+        let sources = desired_discord_watch_sources(&call, Some(&stage::Focus::Stream("ada".into())), &watched, 4);
+        assert_eq!(
+            sources,
+            vec![
+                protocol::WatchSource { user_id: "ada".into(), kind: protocol::PictureKind::Share, size: protocol::WatchSize::Large },
+                protocol::WatchSource { user_id: "bea".into(), kind: protocol::PictureKind::Share, size: protocol::WatchSize::Small },
+                protocol::WatchSource { user_id: "ada".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Small },
+                protocol::WatchSource { user_id: "cy".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Small },
+            ]
+        );
+        // Unwatching Ada's share keeps Bea's share and all cameras active.
+        let after = desired_discord_watch_sources(&call, None, &["bea".to_owned()], 4);
+        assert!(after.iter().any(|s| s.user_id == "bea" && s.kind == protocol::PictureKind::Share && s.size == protocol::WatchSize::Large));
+        assert!(after.iter().any(|s| s.user_id == "ada" && s.kind == protocol::PictureKind::Camera));
+        assert!(after.iter().any(|s| s.user_id == "cy" && s.kind == protocol::PictureKind::Camera));
+        assert!(!after.iter().any(|s| s.user_id == "ada" && s.kind == protocol::PictureKind::Share));
     }
 }

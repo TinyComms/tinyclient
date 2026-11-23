@@ -891,14 +891,21 @@ impl PeopleList {
             _ => around_line(person, &status, in_call, several || matches!(person.key.network, Network::Teams)),
         };
         let (profile, shell) = (person.key.clone(), self.shell.clone());
+        let has_story = self.hub.story_ring(&person.key).is_some();
         let avatar = div()
             .flex_none()
             .when(blocked, |avatar| avatar.opacity(0.45))
             .child(person_avatar(&self.hub, person, 32., &ring, in_call, cx))
-            // The avatar opens the profile; the rest of the row is Message.
+            // A ringed avatar opens the person's story viewer; otherwise opens the profile.
             .on_mouse_down(MouseButton::Left, move |event, _, cx| {
                 cx.stop_propagation();
-                let _ = shell.update(cx, |shell, cx| shell.open_profile(profile.clone(), event.position, cx));
+                let _ = shell.update(cx, |shell, cx| {
+                    if has_story {
+                        shell.open_story_viewer(profile.clone(), None, cx);
+                    } else {
+                        shell.open_profile(profile.clone(), event.position, cx);
+                    }
+                });
             });
         let title = div()
             .h(px(18.))

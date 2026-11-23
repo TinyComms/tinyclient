@@ -1140,8 +1140,14 @@ pub enum MediaRequest {
     /// A Go Live connection beside the voice call. Answered `Done`. The leg returns on its
     /// own and does not end the process.
     Stream(VoiceJoin),
-    /// Stop one Go Live leg. `watch` is the receive-only connection. Answered `Done`.
-    StreamStop { watch: bool },
+    /// Stop one Go Live leg. `watch` is the receive-only connection. When `stream_owner` is
+    /// `Some`, only that user's watched stream leg is stopped; `None` stops all watch legs (or
+    /// the outgoing share leg when `watch` is false). Answered `Done`.
+    StreamStop {
+        watch: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_owner: Option<String>,
+    },
     /// The device menu opened or closed. While on, `Levels` are wanted and `DeviceList` is sent
     /// once at once and again whenever the system's devices change.
     Meter { on: bool },
@@ -1513,6 +1519,11 @@ pub struct CallStats {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoStats {
+    /// Distinct encoders and decoders that produced video in the sampled interval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encoder_backends: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoder_backends: Vec<String>,
     /// A remote video slot is selected and being watched.
     pub receive_expected: bool,
     /// Time this receive slot has been watched, so startup is not called a stall.
@@ -1766,6 +1777,15 @@ impl MediaResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_stop_supports_per_owner_and_legacy_all_watch_legs() {
+        let legacy: MediaRequest = serde_json::from_str(r#"{"media":"stream_stop","watch":true}"#).unwrap();
+        assert_eq!(legacy, MediaRequest::StreamStop { watch: true, stream_owner: None });
+        let one = MediaRequest::StreamStop { watch: true, stream_owner: Some("2002".into()) };
+        let round: MediaRequest = serde_json::from_str(&serde_json::to_string(&one).unwrap()).unwrap();
+        assert_eq!(round, one);
+    }
 
     #[test]
     fn a_watched_go_live_leg_can_name_its_owner_without_changing_older_joins() {
@@ -2214,4 +2234,18 @@ mod tests {
         assert!(wire.contains(r#""hand_raised":true"#) && wire.contains(r#""reaction":"👏""#), "{wire}");
         assert_eq!(serde_json::from_str::<Participant>(&wire).unwrap(), p);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn video_codec_backends_are_optional_on_the_wire() {
+    let stats = VideoStats::default();
+    let old = serde_json::to_value(&stats).unwrap();
+    assert!(old.get("encoder_backends").is_none());
+    let mut new = old.clone();
+    new["encoder_backends"] = serde_json::json!(["VideoToolbox", "OpenH264"]);
+    new["decoder_backends"] = serde_json::json!(["VideoToolbox"]);
+    let round_trip = serde_json::to_value(serde_json::from_value::<VideoStats>(new.clone()).unwrap()).unwrap();
+    assert_eq!(round_trip, new);
+    assert_eq!(serde_json::from_value::<VideoStats>(old).unwrap(), stats);
 }

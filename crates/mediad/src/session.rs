@@ -95,7 +95,7 @@ pub struct Controls {
     watch: AtomicBool,
     /// Stops a Go Live leg without hanging up the voice call. The voice loop does not read these.
     share_leg_stop: AtomicBool,
-    watch_leg_stop: AtomicBool,
+    watch_leg_stops: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Whose camera to paint, when the shell named one.
     speaker: Mutex<Option<String>>,
     /// An answer to the renegotiation offer, or an empty SDP when the server refused it.
@@ -104,7 +104,7 @@ pub struct Controls {
     picture_slots: Mutex<Option<Vec<TinyPicture>>>,
     /// Multi-stream watch list accepted by the decode budget.
     watch_sources: Mutex<Vec<protocol::WatchSource>>,
-    pub(crate) watched_audio: Mutex<Option<discord_video::WatchAudio>>,
+    pub(crate) watched_audio: Mutex<HashMap<String, discord_video::WatchAudio>>,
     /// A Tiny server call's end-to-end encryption (`e2ee`), shared by chatd's requests and the
     /// call's loop.
     pub(crate) tiny_e2ee: Mutex<crate::e2ee::E2ee>,
@@ -233,26 +233,54 @@ impl Controls {
         self.speaker.lock().unwrap().clone()
     }
 
-    /// Asks a Go Live leg to return. The voice call stays up.
-    pub fn stop_leg(&self, watch: bool) {
-        self.leg_flag(watch).store(true, Ordering::Relaxed);
-        if watch {
-            self.watched_audio.lock().unwrap().take();
+    /// Asks a Go Live leg to return. The voice call stays up. When `watch` is true and
+    /// `stream_owner` is `Some`, only that stream's leg is stopped; `None` stops all watch legs.
+    pub fn stop_leg(&self, watch: bool, stream_owner: Option<&str>) {
+        if !watch {
+            self.share_leg_stop.store(true, Ordering::Relaxed);
+            return;
+        }
+        if let Some(owner) = stream_owner {
+            if let Some(flag) = self.watch_leg_stops.lock().unwrap().get(owner) {
+                flag.store(true, Ordering::Relaxed);
+            }
+            self.watched_audio.lock().unwrap().remove(owner);
+        } else {
+            for flag in self.watch_leg_stops.lock().unwrap().values() {
+                flag.store(true, Ordering::Relaxed);
+            }
+            self.watched_audio.lock().unwrap().clear();
         }
     }
 
     /// A new leg is about to start, so the stop from the one it replaces is cleared.
-    pub fn clear_leg(&self, watch: bool) {
-        self.leg_flag(watch).store(false, Ordering::Relaxed);
+    pub fn clear_leg(&self, watch: bool, stream_owner: Option<&str>) {
+        if !watch {
+            self.share_leg_stop.store(false, Ordering::Relaxed);
+            return;
+        }
+        let mut stops = self.watch_leg_stops.lock().unwrap();
+        if let Some(owner) = stream_owner {
+            stops.insert(owner.to_owned(), Arc::new(AtomicBool::new(false)));
+        } else {
+            stops.clear();
+        }
     }
 
     /// The leg should return: chatd hung up, or this leg was stopped.
-    pub fn leg_done(&self, watch: bool) -> bool {
-        self.hangup.load(Ordering::Relaxed) || self.leg_flag(watch).load(Ordering::Relaxed)
-    }
-
-    fn leg_flag(&self, watch: bool) -> &AtomicBool {
-        if watch { &self.watch_leg_stop } else { &self.share_leg_stop }
+    pub fn leg_done(&self, watch: bool, stream_owner: Option<&str>) -> bool {
+        if self.hangup.load(Ordering::Relaxed) {
+            return true;
+        }
+        if !watch {
+            return self.share_leg_stop.load(Ordering::Relaxed);
+        }
+        let key = stream_owner.unwrap_or("");
+        self.watch_leg_stops
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     /// The answer to the last renegotiation, taken once by the call's loop.
@@ -327,7 +355,7 @@ impl Controls {
     pub fn set_audio(&self, muted: bool, deafened: bool) {
         let was = (self.muted.swap(muted, Ordering::Relaxed), self.deafened.swap(deafened, Ordering::Relaxed));
         if deafened {
-            self.watched_audio.lock().unwrap().take();
+            self.watched_audio.lock().unwrap().clear();
         }
         if let Some(cue) = mine(was, (muted, deafened)) {
             self.cue(cue);
@@ -569,12 +597,20 @@ enum Running {
     Stream { stop: Arc<AtomicBool>, thread: JoinHandle<()> },
 }
 
+/// The video SSRCs Ready assigned us: primary (`rid` `"100"`) and optional low camera simulcast
+/// layer (`rid` `"50"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Assigned {
+    high: (u32, u32),
+    low: Option<(u32, u32)>,
+}
+
 /// What `Ready` gave us, held until the session description completes it.
 struct Transport {
     socket: UdpSocket,
     ssrc: u32,
-    /// The video SSRC and its retransmission, when Ready named a stream.
-    video: Option<(u32, u32)>,
+    /// The video SSRCs and their retransmissions, when Ready named stream(s).
+    video: Option<Assigned>,
 }
 
 struct Call {
@@ -590,13 +626,15 @@ struct Call {
     connected: BTreeSet<u64>,
     media: Option<Running>,
     /// The video SSRCs Ready gave us, once the session description has taken the transport.
-    assigned: Option<(u32, u32)>,
+    assigned: Option<Assigned>,
     /// Video SSRCs of other people, filled from opcode 12 and read by the media thread.
     videos: Arc<Mutex<HashMap<u32, Remote>>>,
     /// Set after opcode 12 goes out. The media thread sends picture packets only while it is set.
     announced: Arc<AtomicBool>,
     /// The share quality the last opcode 12 named. A later pick sends opcode 12 again.
     told: Option<crate::picture::Quality>,
+    /// The last op 15 media sink wants body sent on this connection.
+    last_sink_wants: Option<Value>,
     /// The devices, kept open between one voice server and the next.
     audio: Option<Audio>,
     reports: Reports<FromMedia>,
@@ -652,7 +690,7 @@ impl Call {
     /// does not hang up the voice call.
     fn stopping(&self) -> bool {
         if self.join.stream {
-            self.controls.leg_done(self.join.watch)
+            self.controls.leg_done(self.join.watch, self.join.stream_owner.as_deref())
         } else {
             self.controls.hangup.load(Ordering::Relaxed)
         }
@@ -678,6 +716,7 @@ impl Call {
         self.videos.lock().unwrap().clear();
         self.assigned = None;
         self.announced.store(false, Ordering::Relaxed);
+        self.last_sink_wants = None;
         let me = self.join.user_id.parse().ok();
         self.connected = me.into_iter().collect();
         // Reports from the loop that just stopped are about the old connection.
@@ -734,7 +773,7 @@ impl Call {
         socket
             .send(gateway::SELECT_PROTOCOL, json!({ "protocol": "udp", "data": data, "codecs": codecs }))
             .map_err(dropped)?;
-        self.transport = Some(Transport { socket: udp, ssrc, video: assigned_stream(d) });
+        self.transport = Some(Transport { socket: udp, ssrc, video: assigned_streams(d) });
         Ok(())
     }
 
@@ -796,7 +835,8 @@ impl Call {
             audio,
             stop: stop.clone(),
             microphone_unasked: self.microphone_unasked,
-            pipe: transport.video.map(|(ssrc, rtx)| discord_video::Pipe::new(seal, ssrc, rtx)),
+            pipe: transport.video.map(|a| discord_video::Pipe::with_rid(seal.clone(), a.high.0, a.high.1, "100")),
+            low_pipe: transport.video.and_then(|a| a.low).map(|(ssrc, rtx)| discord_video::Pipe::with_rid(seal, ssrc, rtx, "50")),
             videos: self.videos.clone(),
             announced: self.announced.clone(),
         };
@@ -810,12 +850,14 @@ impl Call {
             })?;
         self.media = Some(Running::Voice { stop, thread });
 
-        // Announces our SSRC. Speaking itself is told when it starts. The sink wants follow,
-        // so a camera already in the channel is forwarded; the fake server matches speaking
-        // by opcode and is not bothered by the extra frame.
+        // Announces our SSRC. Speaking itself is told when it starts. The initial sink wants
+        // follow so remote cameras already in the channel are advertised; per-SSRC wants replace
+        // this as soon as op 12 names each remote video SSRC.
         let quiet = json!({ "speaking": 0, "delay": 0, "ssrc": self.ssrc });
         socket.send(gateway::SPEAKING, quiet).map_err(dropped)?;
-        socket.send(gateway::SINK, json!({ "any": 100 })).map_err(dropped)?;
+        let initial_wants = json!({ "any": 100 });
+        socket.send(gateway::SINK, initial_wants.clone()).map_err(dropped)?;
+        self.last_sink_wants = Some(initial_wants);
         self.joined = true;
         self.deadline = None;
         out::send(&MediaResponse::Connected { ssrc: self.ssrc, dave_version: version });
@@ -881,7 +923,7 @@ impl Call {
                     self.users.lock().unwrap().retain(|_, user| *user != user_id);
                     self.videos.lock().unwrap().retain(|_, remote| remote.user_id != user_id);
                     if self.join.watch && self.join.stream_owner.as_deref() == Some(&user_id) {
-                        self.controls.watched_audio.lock().unwrap().take();
+                        self.controls.watched_audio.lock().unwrap().remove(&user_id);
                     } else if !self.join.stream {
                         out::send(&MediaResponse::Gone { user_id });
                     }
@@ -993,6 +1035,9 @@ impl Call {
             if let Err(end) = self.tell_share_again(socket) {
                 return end;
             }
+            if let Err(end) = self.tell_sink_wants(socket) {
+                return end;
+            }
             let now = Instant::now();
             if let Some(interval) = self.heartbeat {
                 if now >= self.next_beat {
@@ -1099,7 +1144,7 @@ impl Call {
         // The picture takes the cipher. The sound, on a sending leg, uses the same key on the
         // audio SSRC Ready assigned. A watcher only receives.
         let audio = (!self.join.watch).then(|| rtp::Sender::new(seal.clone(), transport.ssrc, 0, 0));
-        let pipe = transport.video.map(|(ssrc, rtx)| discord_video::Pipe::new(seal, ssrc, rtx));
+        let pipe = transport.video.map(|a| discord_video::Pipe::with_rid(seal, a.high.0, a.high.1, "100"));
         let stop = Arc::new(AtomicBool::new(false));
         let leg = discord_video::Leg {
             socket: transport.socket,
@@ -1123,15 +1168,18 @@ impl Call {
         })?;
         self.media = Some(Running::Stream { stop, thread });
         // Viewers and the sender both say what they want. Sound speaks for itself, as flag 2.
-        socket.send(gateway::SINK, json!({ "any": 100 })).map_err(dropped)?;
+        let initial_wants = json!({ "any": 100 });
+        socket.send(gateway::SINK, initial_wants.clone()).map_err(dropped)?;
+        self.last_sink_wants = Some(initial_wants);
         self.joined = true;
         self.deadline = None;
         self.dave_report();
         Ok(())
     }
 
-    /// Opcode 12 named someone else's video SSRCs. Ours are ignored; the media thread routes
-    /// by this map and must not open a packet we sent.
+    /// Opcode 12 named someone else's video SSRCs (including multiple simulcast streams/layers
+    /// per user). Ours are ignored; the media thread routes by this map and must not open a
+    /// packet we sent.
     fn note_video(&mut self, d: &Value) {
         let Some(user_id) = text(&d["user_id"]) else {
             return;
@@ -1141,19 +1189,67 @@ impl Call {
         }
         let mut videos = self.videos.lock().unwrap();
         videos.retain(|_, remote| remote.user_id != user_id);
-        let Some(streams) = d["streams"].as_array() else {
+        if let Some(streams) = d["streams"].as_array() {
+            for stream in streams {
+                let Some(ssrc) = number(&stream["ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0) else {
+                    continue;
+                };
+                let rtx = number(&stream["rtx_ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0);
+                let rid = stream["rid"].as_str().unwrap_or("100").to_owned();
+                let quality = number(&stream["quality"]).unwrap_or(100) as u32;
+                let active = stream["active"].as_bool().unwrap_or(true);
+                videos.insert(
+                    ssrc,
+                    Remote { user_id: user_id.clone(), repair_of: None, rid: rid.clone(), quality, active },
+                );
+                if let Some(rtx) = rtx {
+                    videos.insert(
+                        rtx,
+                        Remote { user_id: user_id.clone(), repair_of: Some(ssrc), rid, quality, active },
+                    );
+                }
+            }
             return;
-        };
-        for stream in streams {
-            let Some(ssrc) = number(&stream["ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0) else {
-                continue;
-            };
-            let rtx = number(&stream["rtx_ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0);
-            videos.insert(ssrc, Remote { user_id: user_id.clone(), repair_of: None });
+        }
+        if let Some(ssrc) = number(&d["video_ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0) {
+            let rtx = number(&d["rtx_ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0);
+            videos.insert(
+                ssrc,
+                Remote { user_id: user_id.clone(), repair_of: None, rid: "100".to_owned(), quality: 100, active: true },
+            );
             if let Some(rtx) = rtx {
-                videos.insert(rtx, Remote { user_id: user_id.clone(), repair_of: Some(ssrc) });
+                videos.insert(
+                    rtx,
+                    Remote { user_id: user_id.clone(), repair_of: Some(ssrc), rid: "100".to_owned(), quality: 100, active: true },
+                );
             }
         }
+    }
+
+    /// Sends per-SSRC op 15 (`MEDIA_SINK_WANTS`) whenever the known remote SSRCs or desired tile
+    /// sizes/focus change, scaling quality per SSRC instead of leaving only `{"any": 100}`.
+    fn tell_sink_wants(&mut self, socket: &mut Socket) -> Result<(), End> {
+        if !self.joined || (self.join.stream && !self.join.watch) {
+            return Ok(());
+        }
+        let videos = self.videos.lock().unwrap().clone();
+        let watch_sources = self.controls.watch_sources();
+        let speaker = self.controls.speaker();
+        let Some(next) = media_sink_wants(
+            &videos,
+            &watch_sources,
+            speaker.as_deref(),
+            self.join.watch,
+            self.join.stream_owner.as_deref(),
+        ) else {
+            return Ok(());
+        };
+        if self.last_sink_wants.as_ref() == Some(&next) {
+            return Ok(());
+        }
+        socket.send(gateway::SINK, next.clone()).map_err(dropped)?;
+        self.last_sink_wants = Some(next);
+        Ok(())
     }
 
     /// The capture thread asked for a picture, or to stop. The announcement goes out before
@@ -1210,33 +1306,110 @@ impl Call {
     }
 }
 
+/// Builds per-SSRC op 15 (`MEDIA_SINK_WANTS`) scaled by tile size and focus:
+/// - Focused / `WatchSize::Large` stream -> quality `100`
+/// - Grid / `WatchSize::Small` tile -> quality `50`
+/// Returns `None` while no active remote video SSRCs are known yet (so initial `{"any": 100}` stands).
+fn media_sink_wants(
+    videos: &HashMap<u32, Remote>,
+    watch_sources: &[protocol::WatchSource],
+    speaker: Option<&str>,
+    watch_leg: bool,
+    stream_owner: Option<&str>,
+) -> Option<Value> {
+    // Group active primary (non-RTX) SSRCs by remote user, selecting each user's highest-quality
+    // announced primary SSRC as the key Discord's SFU matches against.
+    let mut primary_by_user: std::collections::BTreeMap<&str, (u32, u32)> = std::collections::BTreeMap::new();
+    for (&ssrc, remote) in videos {
+        if remote.repair_of.is_some() || !remote.active {
+            continue;
+        }
+        if watch_leg && stream_owner.is_some_and(|owner| owner != remote.user_id) {
+            continue;
+        }
+        primary_by_user
+            .entry(remote.user_id.as_str())
+            .and_modify(|cur| {
+                if remote.quality > cur.1 || (remote.quality == cur.1 && ssrc < cur.0) {
+                    *cur = (ssrc, remote.quality);
+                }
+            })
+            .or_insert((ssrc, remote.quality));
+    }
+    if primary_by_user.is_empty() {
+        return None;
+    }
+    let kind = if watch_leg { protocol::PictureKind::Share } else { protocol::PictureKind::Camera };
+    let has_explicit = watch_sources.iter().any(|s| s.kind == kind);
+    let many_cameras = !watch_leg && primary_by_user.len() > 1;
+    let mut map = serde_json::Map::new();
+    for (user_id, (ssrc, _)) in primary_by_user {
+        let quality: u32 = if let Some(entry) = watch_sources.iter().find(|s| s.user_id == user_id && s.kind == kind) {
+            match entry.size {
+                protocol::WatchSize::Large => 100,
+                protocol::WatchSize::Small => 50,
+            }
+        } else if watch_leg {
+            100
+        } else if has_explicit {
+            // Other visible cameras not explicitly focused still stay alive at small quality.
+            50
+        } else if speaker == Some(user_id) || !many_cameras {
+            100
+        } else {
+            50
+        };
+        map.insert(ssrc.to_string(), json!(quality));
+    }
+    Some(Value::Object(map))
+}
+
 /// Opcode 12 for one leg. A screen names the share that was picked; a camera uses the resolved
-/// [`CameraProfile`] (720p30 HD when hardware or HD is selected, 360p15 otherwise).
-/// Off, or never assigned, is a video SSRC of 0 and no streams.
-fn video_announcement(active: bool, audio_ssrc: u32, assigned: Option<(u32, u32)>, screen: bool, quality: crate::picture::Quality, camera: CameraProfile) -> Value {
-    let Some((ssrc, rtx)) = assigned.filter(|_| active) else {
+/// [`CameraProfile`] (up to 720p@30 HD when hardware or HD is selected, 360p@15 otherwise) plus
+/// a second low simulcast layer (`rid` `"50"`, 360p@15 beneath 720p or 180p@15 beneath 360p) when
+/// Ready assigned a second SSRC pair. Off, or never assigned, is a video SSRC of 0 and no streams.
+fn video_announcement(active: bool, audio_ssrc: u32, assigned: Option<Assigned>, screen: bool, quality: crate::picture::Quality, camera: CameraProfile) -> Value {
+    let Some(assigned) = assigned.filter(|_| active) else {
         return json!({ "audio_ssrc": audio_ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": [] });
     };
+    let (ssrc, rtx) = assigned.high;
     let (width, height, fps, bitrate) = if screen {
         (quality.max.0, quality.max.1, quality.fps, quality.bps)
     } else {
         (camera.max.0, camera.max.1, camera.fps, camera.bps)
     };
+    let mut streams = vec![json!({
+        "type": "video",
+        "rid": "100",
+        "ssrc": ssrc,
+        "rtx_ssrc": rtx,
+        "active": true,
+        "quality": 100,
+        "max_bitrate": bitrate,
+        "max_framerate": fps,
+        "max_resolution": { "type": "fixed", "width": width, "height": height },
+    })];
+    if !screen {
+        if let Some((low_ssrc, low_rtx)) = assigned.low {
+            let low = camera.low_layer();
+            streams.push(json!({
+                "type": "video",
+                "rid": "50",
+                "ssrc": low_ssrc,
+                "rtx_ssrc": low_rtx,
+                "active": true,
+                "quality": 50,
+                "max_bitrate": low.bps,
+                "max_framerate": low.fps,
+                "max_resolution": { "type": "fixed", "width": low.max.0, "height": low.max.1 },
+            }));
+        }
+    }
     json!({
         "audio_ssrc": audio_ssrc,
         "video_ssrc": ssrc,
         "rtx_ssrc": rtx,
-        "streams": [{
-            "type": "video",
-            "rid": "100",
-            "ssrc": ssrc,
-            "rtx_ssrc": rtx,
-            "active": true,
-            "quality": 100,
-            "max_bitrate": bitrate,
-            "max_framerate": fps,
-            "max_resolution": { "type": "fixed", "width": width, "height": height },
-        }],
+        "streams": streams,
     })
 }
 
@@ -1245,8 +1418,9 @@ fn video_announcement(active: bool, audio_ssrc: u32, assigned: Option<(u32, u32)
 pub fn prove_discord_share_quality() -> Result<(), String> {
     let std_cam = CameraProfile::resolve(protocol::CameraQuality::Standard, false);
     let hd_cam = CameraProfile::resolve(protocol::CameraQuality::Hd, true);
+    let one = Some(Assigned { high: (7, 8), low: None });
     let size = |quality: protocol::ShareQuality| {
-        let body = video_announcement(true, 1, Some((7, 8)), true, crate::picture::Quality::of(quality), std_cam);
+        let body = video_announcement(true, 1, one, true, crate::picture::Quality::of(quality), std_cam);
         (
             body["streams"][0]["max_resolution"]["width"].as_u64().unwrap_or(0),
             body["streams"][0]["max_resolution"]["height"].as_u64().unwrap_or(0),
@@ -1263,13 +1437,68 @@ pub fn prove_discord_share_quality() -> Result<(), String> {
     if size(protocol::ShareQuality::Best) != (2560, 1440, 60, 8_000_000) {
         return Err("best is 1440p at 60".into());
     }
-    let camera = video_announcement(true, 1, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best), std_cam);
+    let camera = video_announcement(true, 1, one, false, crate::picture::Quality::of(protocol::ShareQuality::Best), std_cam);
     if camera["streams"][0]["max_resolution"]["width"] != 640 || camera["streams"][0]["max_framerate"] != 15 {
         return Err("standard camera is 640 by 360 at 15".into());
     }
-    let camera_hd = video_announcement(true, 1, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best), hd_cam);
+    let camera_hd = video_announcement(true, 1, one, false, crate::picture::Quality::of(protocol::ShareQuality::Best), hd_cam);
     if camera_hd["streams"][0]["max_resolution"]["width"] != 1280 || camera_hd["streams"][0]["max_framerate"] != 30 {
         return Err("hd camera is 1280 by 720 at 30".into());
+    }
+    Ok(())
+}
+
+/// The lab's discord-wave15a3 driver: verifies codec negotiation (H.264 encode+decode, VP8/AV1
+/// decode), simulcast camera op 12 with high+low layers, per-SSRC op 15 sink wants, and real
+/// AV1 RTP depacketize + decode.
+pub fn prove_discord_wave15a3() -> Result<(), String> {
+    let offered = codecs(true);
+    let names: Vec<&str> = offered.as_array().ok_or("codecs not array")?.iter().filter_map(|c| c["name"].as_str()).collect();
+    if names != ["opus", "H264", "VP8", "AV1"] {
+        return Err(format!("unexpected codec list: {names:?}"));
+    }
+    if offered[1]["encode"] != true || offered[2]["encode"] != false || offered[2]["decode"] != true || offered[3]["encode"] != false || offered[3]["decode"] != true {
+        return Err("H264 must encode+decode and VP8/AV1 must be decode-only".into());
+    }
+    let hd_cam = CameraProfile::resolve(protocol::CameraQuality::Hd, true);
+    let sim = video_announcement(true, 1, Some(Assigned { high: (100, 101), low: Some((200, 201)) }), false, crate::picture::Quality::of(protocol::ShareQuality::Balanced), hd_cam);
+    if sim["streams"].as_array().map(Vec::len) != Some(2)
+        || sim["streams"][0]["rid"] != "100"
+        || sim["streams"][0]["max_resolution"]["height"] != 720
+        || sim["streams"][1]["rid"] != "50"
+        || sim["streams"][1]["max_resolution"]["height"] != 360
+    {
+        return Err(format!("camera simulcast op 12 mismatch: {sim}"));
+    }
+    let mut videos = HashMap::new();
+    videos.insert(5001, Remote { user_id: "2001".into(), repair_of: None, rid: "100".into(), quality: 100, active: true });
+    videos.insert(5002, Remote { user_id: "2002".into(), repair_of: None, rid: "100".into(), quality: 100, active: true });
+    let wants = media_sink_wants(
+        &videos,
+        &[
+            protocol::WatchSource { user_id: "2001".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Large },
+            protocol::WatchSource { user_id: "2002".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Small },
+        ],
+        None,
+        false,
+        None,
+    )
+    .ok_or("missing per-SSRC sink wants")?;
+    if wants["5001"] != 100 || wants["5002"] != 50 {
+        return Err(format!("per-SSRC op 15 mismatch: {wants}"));
+    }
+    // Verify AV1 RTP depacketizer + pure-Rust AV1 decoder on the embedded keyframe.
+    let pieces = crate::av1::packetize(crate::av1::SAMPLE_KEYFRAME_OBU, 16);
+    let mut asm = crate::av1::Assembler::default();
+    let mut frame = None;
+    for (i, p) in pieces.iter().enumerate() {
+        frame = asm.push(i as u16, 90_000, p.marker, &p.payload);
+    }
+    let frame = frame.ok_or("AV1 RTP assembler did not emit frame")?;
+    let mut dec = crate::av1::Av1Decoder::new().map_err(|()| "AV1 decoder init failed")?;
+    let planes = dec.decode(&frame).map_err(|()| "AV1 decode failed")?.ok_or("AV1 produced no picture")?;
+    if (planes.width, planes.height) != (64, 48) {
+        return Err(format!("unexpected AV1 decoded dimensions {}x{}", planes.width, planes.height));
     }
     Ok(())
 }
@@ -1307,7 +1536,8 @@ pub fn prove_discord_wave15_share() -> Result<(), String> {
     Ok(())
 }
 
-/// What we can send and receive. One H.264 layer. A watch leg does not encode.
+/// What we can send and receive: Opus audio, H.264 encode+decode, plus VP8 and AV1 decode-only.
+/// A watch leg does not encode.
 fn codecs(encode: bool) -> Value {
     json!([
         { "name": "opus", "type": "audio", "priority": 1000, "payload_type": rtp::PAYLOAD_TYPE },
@@ -1320,11 +1550,30 @@ fn codecs(encode: bool) -> Value {
             "encode": encode,
             "decode": true,
         },
+        {
+            "name": "VP8",
+            "type": "video",
+            "priority": 2000,
+            "payload_type": rtp::VP8,
+            "rtx_payload_type": rtp::VP8_RTX,
+            "encode": false,
+            "decode": true,
+        },
+        {
+            "name": "AV1",
+            "type": "video",
+            "priority": 3000,
+            "payload_type": rtp::AV1,
+            "rtx_payload_type": rtp::AV1_RTX,
+            "encode": false,
+            "decode": true,
+        },
     ])
 }
 
-/// The voice identify. A camera offers one video layer. Go Live offers a screen layer. A
-/// viewer offers video and no stream of its own. No channel id: that field is gateway v9.
+/// The voice identify. A camera offers two simulcast video layers (`rid` `"100"` high and `"50"`
+/// low). Go Live offers one screen layer. A viewer offers video and no stream of its own. No
+/// channel id: that field is gateway v9.
 fn identify(join: &VoiceJoin) -> Value {
     let mut d = json!({
         "server_id": join.server_id,
@@ -1335,20 +1584,35 @@ fn identify(join: &VoiceJoin) -> Value {
         "video": true,
     });
     if !join.watch {
-        let kind = if join.stream { "screen" } else { "video" };
-        d["streams"] = json!([{ "type": kind, "rid": "100", "quality": 100 }]);
+        if join.stream {
+            d["streams"] = json!([{ "type": "screen", "rid": "100", "quality": 100 }]);
+        } else {
+            d["streams"] = json!([
+                { "type": "video", "rid": "100", "quality": 100 },
+                { "type": "video", "rid": "50", "quality": 50 },
+            ]);
+        }
     }
     d
 }
 
-/// The SSRC Ready assigned to the layer we offered, and its retransmission. A missing
+/// The SSRCs Ready assigned to the layer(s) we offered, and their retransmissions. A missing
 /// retransmission is the next number. No stream, or a zero SSRC, means this call has no picture.
-fn assigned_stream(d: &Value) -> Option<(u32, u32)> {
+fn assigned_streams(d: &Value) -> Option<Assigned> {
     let streams = d["streams"].as_array()?;
+    let parse_pair = |stream: &Value| -> Option<(u32, u32)> {
+        let ssrc = number(&stream["ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0)?;
+        let rtx = number(&stream["rtx_ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0).unwrap_or(ssrc.saturating_add(1));
+        Some((ssrc, rtx))
+    };
     let chosen = streams.iter().find(|stream| stream["rid"].as_str() == Some("100")).or(streams.first())?;
-    let ssrc = number(&chosen["ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0)?;
-    let rtx = number(&chosen["rtx_ssrc"]).and_then(|n| u32::try_from(n).ok()).filter(|ssrc| *ssrc != 0).unwrap_or(ssrc.saturating_add(1));
-    Some((ssrc, rtx))
+    let high = parse_pair(chosen)?;
+    let low = streams
+        .iter()
+        .find(|stream| stream["rid"].as_str() == Some("50"))
+        .and_then(parse_pair)
+        .filter(|&(ssrc, _)| ssrc != high.0);
+    Some(Assigned { high, low })
 }
 
 /// Runs the call to its end. Returns when chatd hung up or the other side ended it; a failure
@@ -1414,6 +1678,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
         videos: Arc::default(),
         announced: Arc::new(AtomicBool::new(false)),
         told: None,
+        last_sink_wants: None,
         audio: None,
         reports,
         from_media,
@@ -1574,7 +1839,9 @@ mod tests {
     fn a_share_is_announced_at_the_quality_that_was_picked() {
         let std_cam = CameraProfile::resolve(protocol::CameraQuality::Standard, false);
         let hd_cam = CameraProfile::resolve(protocol::CameraQuality::Hd, true);
-        let announced = |quality: protocol::ShareQuality| video_announcement(true, 1111, Some((7, 8)), true, crate::picture::Quality::of(quality), std_cam);
+        let one = Some(Assigned { high: (7, 8), low: None });
+        let sim = Some(Assigned { high: (7, 8), low: Some((9, 10)) });
+        let announced = |quality: protocol::ShareQuality| video_announcement(true, 1111, one, true, crate::picture::Quality::of(quality), std_cam);
         let size = |body: &Value| {
             (
                 body["streams"][0]["max_resolution"]["width"].as_u64().unwrap(),
@@ -1586,29 +1853,40 @@ mod tests {
         assert_eq!(size(&announced(protocol::ShareQuality::Low)), (1280, 720, 15, 1_500_000));
         assert_eq!(size(&announced(protocol::ShareQuality::Balanced)), (1920, 1080, 30, 4_000_000));
         assert_eq!(size(&announced(protocol::ShareQuality::Best)), (2560, 1440, 60, 8_000_000));
-        let camera = video_announcement(true, 1111, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best), std_cam);
+        let camera = video_announcement(true, 1111, one, false, crate::picture::Quality::of(protocol::ShareQuality::Best), std_cam);
         assert_eq!(size(&camera), (640, 360, 15, 500_000), "standard camera is 360p at 15");
-        let camera_hd = video_announcement(true, 1111, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best), hd_cam);
+        let camera_hd = video_announcement(true, 1111, sim, false, crate::picture::Quality::of(protocol::ShareQuality::Best), hd_cam);
         assert_eq!(size(&camera_hd), (1280, 720, 30, 1_500_000), "hd camera announces 720p at 30");
-        let off = video_announcement(false, 1111, Some((7, 8)), true, crate::picture::Quality::of(protocol::ShareQuality::Best), std_cam);
+        assert_eq!(camera_hd["streams"].as_array().unwrap().len(), 2, "simulcast announces both high and low camera layers");
+        assert_eq!(camera_hd["streams"][1]["rid"], "50");
+        assert_eq!(camera_hd["streams"][1]["ssrc"], 9);
+        assert_eq!(camera_hd["streams"][1]["rtx_ssrc"], 10);
+        assert_eq!(camera_hd["streams"][1]["max_resolution"]["width"], 640);
+        assert_eq!(camera_hd["streams"][1]["max_resolution"]["height"], 360);
+        assert_eq!(camera_hd["streams"][1]["max_framerate"], 15);
+        let off = video_announcement(false, 1111, one, true, crate::picture::Quality::of(protocol::ShareQuality::Best), std_cam);
         assert_eq!(off["video_ssrc"], 0);
         assert!(off["streams"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn identify_offers_one_camera_layer_a_screen_on_go_live_and_nothing_to_send_when_watching() {
+    fn identify_offers_simulcast_camera_layers_a_screen_on_go_live_and_nothing_to_send_when_watching() {
         let voice = identify(&sample_join(false, false));
         assert_eq!(voice["video"], json!(true));
+        assert_eq!(voice["streams"].as_array().unwrap().len(), 2);
         assert_eq!(voice["streams"][0]["type"], "video");
         assert_eq!(voice["streams"][0]["rid"], "100");
         assert_eq!(voice["streams"][0]["quality"], 100);
+        assert_eq!(voice["streams"][1]["type"], "video");
+        assert_eq!(voice["streams"][1]["rid"], "50");
+        assert_eq!(voice["streams"][1]["quality"], 50);
         assert!(voice.get("channel_id").is_none());
         assert_eq!(identify(&sample_join(true, false))["streams"][0]["type"], "screen");
         assert!(identify(&sample_join(true, true)).get("streams").is_none());
     }
 
     #[test]
-    fn codecs_offer_opus_and_one_h264_layer_and_a_viewer_does_not_encode() {
+    fn codecs_offer_opus_h264_vp8_and_av1_and_a_viewer_does_not_encode() {
         let offered = codecs(true);
         assert_eq!(offered[0]["name"], "opus");
         assert_eq!(offered[0]["payload_type"], json!(rtp::PAYLOAD_TYPE));
@@ -1617,15 +1895,44 @@ mod tests {
         assert_eq!(offered[1]["rtx_payload_type"], json!(rtp::RTX));
         assert_eq!(offered[1]["encode"], true);
         assert_eq!(offered[1]["decode"], true);
+        assert_eq!(offered[2]["name"], "VP8");
+        assert_eq!(offered[2]["payload_type"], json!(rtp::VP8));
+        assert_eq!(offered[2]["rtx_payload_type"], json!(rtp::VP8_RTX));
+        assert_eq!(offered[2]["encode"], false);
+        assert_eq!(offered[2]["decode"], true);
+        assert_eq!(offered[3]["name"], "AV1");
+        assert_eq!(offered[3]["payload_type"], json!(rtp::AV1));
+        assert_eq!(offered[3]["rtx_payload_type"], json!(rtp::AV1_RTX));
+        assert_eq!(offered[3]["encode"], false);
+        assert_eq!(offered[3]["decode"], true);
         assert_eq!(codecs(false)[1]["encode"], false);
     }
 
     #[test]
-    fn ready_names_the_layer_we_send_and_a_missing_retransmission_is_the_next_ssrc() {
+    fn ready_names_high_and_low_simulcast_layers_and_default_rtx() {
         let ready = json!({ "streams": [{ "rid": "100", "ssrc": 7, "rtx_ssrc": 8 }] });
-        assert_eq!(assigned_stream(&ready), Some((7, 8)));
-        assert_eq!(assigned_stream(&json!({ "streams": [{ "rid": "50", "ssrc": 1 }, { "rid": "100", "ssrc": "4" }] })), Some((4, 5)));
-        assert_eq!(assigned_stream(&json!({})), None);
-        assert_eq!(assigned_stream(&json!({ "streams": [{ "ssrc": 0 }] })), None);
+        assert_eq!(assigned_streams(&ready), Some(Assigned { high: (7, 8), low: None }));
+        assert_eq!(
+            assigned_streams(&json!({ "streams": [{ "rid": "50", "ssrc": 1 }, { "rid": "100", "ssrc": "4" }] })),
+            Some(Assigned { high: (4, 5), low: Some((1, 2)) })
+        );
+        assert_eq!(assigned_streams(&json!({})), None);
+        assert_eq!(assigned_streams(&json!({ "streams": [{ "ssrc": 0 }] })), None);
+    }
+
+    #[test]
+    fn media_sink_wants_scales_per_ssrc_by_tile_size_and_focus() {
+        let mut videos = HashMap::new();
+        // User 2001 announces two simulcast layers; primary high SSRC 501 should be selected.
+        videos.insert(501, Remote { user_id: "2001".into(), repair_of: None, rid: "100".into(), quality: 100, active: true });
+        videos.insert(502, Remote { user_id: "2001".into(), repair_of: None, rid: "50".into(), quality: 50, active: true });
+        videos.insert(503, Remote { user_id: "2001".into(), repair_of: Some(501), rid: "100".into(), quality: 100, active: true });
+        videos.insert(601, Remote { user_id: "2002".into(), repair_of: None, rid: "100".into(), quality: 100, active: true });
+        let sources = vec![
+            protocol::WatchSource { user_id: "2001".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Large },
+            protocol::WatchSource { user_id: "2002".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Small },
+        ];
+        let wants = media_sink_wants(&videos, &sources, None, false, None).unwrap();
+        assert_eq!(wants, json!({ "501": 100, "601": 50 }));
     }
 }

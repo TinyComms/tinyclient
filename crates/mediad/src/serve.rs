@@ -25,13 +25,12 @@ const NOT_YET: &str = "The call isn't connected yet, so there's nothing to measu
 /// Once, when the server turns a call's end-to-end encryption off and the call is blocked.
 const BLOCKED_NOTICE: &str = "The server turned this call's encryption off. Nothing is sent or played. Open the call's security panel to leave or decide.";
 
-/// The video sessions of one call. Each field is one session, so a second share replaces the
-/// first instead of adding a tile.
+/// The video sessions of one call.
 #[derive(Default)]
 struct Video {
     share_encode: bool,
     camera_encode: bool,
-    share_decode: Option<String>,
+    share_decodes: Vec<String>,
     speaker_decode: Option<String>,
 }
 
@@ -50,7 +49,11 @@ impl Video {
         encode(self.share_encode, Content::Share)
             .into_iter()
             .chain(encode(self.camera_encode, Content::Camera))
-            .chain(decode(Content::Share, &self.share_decode))
+            .chain(self.share_decodes.iter().cloned().map(|source| VideoStream {
+                direction: Direction::Decode,
+                content: Content::Share,
+                source,
+            }))
             .chain(decode(Content::Speaker, &self.speaker_decode))
             .collect()
     }
@@ -62,9 +65,9 @@ struct Call {
     video: Video,
     controls: Arc<Controls>,
     voice: Option<JoinHandle<()>>,
-    /// Go Live: one connection that sends the screen, and one that only receives a share.
+    /// Go Live: one connection that sends the screen, and one per watched share keyed by stream owner.
     share_leg: Option<JoinHandle<()>>,
-    watch_leg: Option<JoinHandle<()>>,
+    watch_legs: std::collections::HashMap<String, JoinHandle<()>>,
     /// A Tiny server call's offer, out with the server and not yet answered.
     offer: Option<tiny::Offer>,
     /// Our user id on that server, and whether the call running is one.
@@ -88,13 +91,22 @@ struct Call {
 impl Call {
     /// The Go Live leg this request replaces has to be gone before the next one starts, or the
     /// stop flag meant for it would end the new one.
-    fn replace_leg(&mut self, watch: bool) {
-        self.controls.stop_leg(watch);
-        let running = if watch { self.watch_leg.take() } else { self.share_leg.take() };
-        if let Some(running) = running {
+    fn replace_leg(&mut self, watch: bool, stream_owner: Option<&str>) {
+        self.controls.stop_leg(watch, stream_owner);
+        if watch {
+            if let Some(owner) = stream_owner {
+                if let Some(running) = self.watch_legs.remove(owner) {
+                    let _ = running.join();
+                }
+            } else {
+                for (_, running) in self.watch_legs.drain() {
+                    let _ = running.join();
+                }
+            }
+        } else if let Some(running) = self.share_leg.take() {
             let _ = running.join();
         }
-        self.controls.clear_leg(watch);
+        self.controls.clear_leg(watch, stream_owner);
     }
 
     /// Every request gets exactly one reply.
@@ -157,7 +169,7 @@ impl Call {
                     Some(user_id) => tracing::info!(user_id = %user_id, "watch on"),
                     None => tracing::info!("watch off"),
                 }
-                self.video.share_decode = source.clone();
+                self.video.share_decodes = source.clone().into_iter().collect();
                 if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_watch(source.is_some());
                     self.controls.set_watch_sources(
@@ -176,7 +188,11 @@ impl Call {
                 let (max_large, max_small) = crate::video::default_budget();
                 let (accepted, refused) = crate::video::apply_watch_budget(&sources, max_large, max_small);
                 tracing::info!(accepted = accepted.len(), refused = refused.len(), "watch list");
-                self.video.share_decode = accepted.first().map(|s| s.user_id.clone());
+                self.video.share_decodes = accepted
+                    .iter()
+                    .filter(|s| s.kind == protocol::PictureKind::Share)
+                    .map(|s| s.user_id.clone())
+                    .collect();
                 if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_watch(!accepted.is_empty());
                     self.controls.set_watch_sources(accepted);
@@ -230,14 +246,15 @@ impl Call {
             // Beside the voice call. The thread returns; it does not exit the process.
             MediaRequest::Stream(join) => {
                 let watch = join.watch;
-                self.replace_leg(watch);
+                let owner_key = join.stream_owner.clone().unwrap_or_default();
+                self.replace_leg(watch, watch.then_some(owner_key.as_str()));
                 let controls = self.controls.clone();
                 let name = if watch { "watch" } else { "share" };
                 let spawned = out::spawn(std::thread::Builder::new().name(name.to_owned()), move || session::run(join, controls));
                 match spawned {
                     Ok(leg) => {
                         if watch {
-                            self.watch_leg = Some(leg);
+                            self.watch_legs.insert(owner_key, leg);
                         } else {
                             self.share_leg = Some(leg);
                         }
@@ -249,8 +266,8 @@ impl Call {
                 }
                 return MediaResponse::Done;
             }
-            MediaRequest::StreamStop { watch } => {
-                self.controls.stop_leg(watch);
+            MediaRequest::StreamStop { watch, stream_owner } => {
+                self.controls.stop_leg(watch, stream_owner.as_deref());
                 return MediaResponse::Done;
             }
             MediaRequest::Meter { on } => {

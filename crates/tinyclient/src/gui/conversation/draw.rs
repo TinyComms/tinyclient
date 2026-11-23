@@ -1496,6 +1496,7 @@ impl Pane {
                         )
                 }))
                 .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, window, cx)))
+                .children(message.story.as_deref().map(|story| self.shared_story_card(message, story, cx)))
                 .children(message.meeting_transcript.as_ref().map(|_| {
                     let id = message.id.clone();
                     let title = message.card.as_ref().map(|card| card.title.clone()).unwrap_or_else(|| "Meeting transcript".into());
@@ -3551,6 +3552,104 @@ impl Pane {
         out
     }
 
+    fn shared_story_card(&self, message: &Message, story: &protocol::SharedStory, cx: &mut Context<Self>) -> AnyElement {
+        let peer = story.peer.clone();
+        let story_id = story.story_id.clone();
+        let author = if story.author_name.is_empty() {
+            "Story".to_owned()
+        } else {
+            story.author_name.clone()
+        };
+        let badge = if story.expired {
+            "Story · Expired"
+        } else if story.via_mention {
+            "Story · Mention"
+        } else {
+            "Story"
+        };
+        let preview_path = story
+            .thumb
+            .as_ref()
+            .or(story.media.as_ref())
+            .and_then(|f| f.path.as_ref())
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                message
+                    .attachments
+                    .first()
+                    .and_then(|a| a.thumb.as_ref().or(Some(&a.file)))
+                    .and_then(|f| f.path.as_ref())
+                    .filter(|p| !p.is_empty())
+                    .map(std::path::PathBuf::from)
+            });
+        let clickable = !story.expired && !story.peer.id.is_empty();
+        div()
+            .id(SharedString::from(format!("shared-story-{}", message.id)))
+            .mt(px(4.))
+            .max_w(px(320.))
+            .p(px(10.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(tokens::card())
+            .border_1()
+            .border_color(theme::hairline())
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .when(clickable, |card| {
+                card.cursor_pointer()
+                    .hover(|s| s.border_color(theme::accent()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(PaneEvent::OpenStory {
+                            peer: peer.clone(),
+                            story_id: Some(story_id.clone()),
+                        });
+                    }))
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .px(px(6.))
+                            .py(px(1.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::accent_wash())
+                            .type_micro()
+                            .font_weight(theme::SEMIBOLD)
+                            .text_color(theme::accent_text())
+                            .child(badge),
+                    )
+                    .child(div().type_small().font_weight(theme::MEDIUM).truncate().child(author)),
+            )
+            .children(preview_path.map(|path| {
+                div()
+                    .w_full()
+                    .max_h(px(180.))
+                    .rounded(px(theme::R_CONTROL))
+                    .overflow_hidden()
+                    .child(gpui::img(path).w_full().max_h(px(180.)).object_fit(gpui::ObjectFit::Cover))
+            }))
+            .children((!story.caption.is_empty()).then(|| {
+                div()
+                    .type_ui()
+                    .text_color(theme::text_soft())
+                    .child(story.caption.clone())
+            }))
+            .children((!story.expired).then(|| {
+                div()
+                    .type_small()
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::accent())
+                    .child("Open story")
+            }))
+            .into_any_element()
+    }
+
     fn app_card(&mut self, message: &Message, ix: usize, card: &Card, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let bar = match media::card_tone(card.color) {
             media::Tone::Positive => theme::positive(),
@@ -3577,10 +3676,40 @@ impl Pane {
                 .and_then(|a| a.file.path.clone())
         }).flatten();
         let footer_el: Option<AnyElement> = if let Some(url) = maps_url {
+            let can_stop_live = message.outgoing
+                && card.title == "Live location"
+                && card.fields.iter().any(|(k, v)| k == "Status" && v == "Still sharing");
+            let stop_btn = can_stop_live.then(|| {
+                let conv = self.open.as_ref().map(|o| o.key.clone());
+                let msg_id = message.id.clone();
+                div()
+                    .id(SharedString::from(format!("card-stop-live-{}-{ix}", message.id)))
+                    .cursor_pointer()
+                    .px(px(8.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::danger_soft())
+                    .type_small()
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::danger())
+                    .child("Stop sharing")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(conversation) = conv.clone() {
+                            cx.emit(PaneEvent::StopLiveLocation {
+                                conversation,
+                                message_id: msg_id.clone(),
+                            });
+                        }
+                    }))
+            });
             Some(
                 div()
                     .mt(px(4.))
                     .flex()
+                    .items_center()
+                    .gap(px(10.))
                     .child(
                         div()
                             .id(SharedString::from(format!("card-maps-{}-{ix}", message.id)))
@@ -3595,6 +3724,7 @@ impl Pane {
                                 cx.open_url(&url);
                             }),
                     )
+                    .children(stop_btn)
                     .into_any_element(),
             )
         } else if card.footer == "Contact card" {

@@ -40,8 +40,8 @@ use crate::rtp::SILENCE;
 use crate::session::Controls;
 use crate::stats::Meter;
 use crate::video::{
-    Rates, Received, Received as VideoReceived, Track, Track as VideoTrack, Video, Video as VideoEngine, Wants,
-    Wants as VideoWants, Word, Word as VideoWord,
+    Rates, Received, Received as VideoReceived, Track, Track as VideoTrack, Video, Video as VideoEngine, VideoCodec,
+    Wants, Wants as VideoWants, Word, Word as VideoWord,
 };
 use crate::{out, rt, share_audio, telegram_e2ee, tiny, FRAME, FRAME_SAMPLES};
 use aes::Aes256;
@@ -661,6 +661,7 @@ pub fn run_direct(join: TelegramCallJoin, controls: Arc<Controls>) {
                             DIRECT_KIND_VIDEO_CAMERA => {
                                 if let Some((h264, is_key)) = cam_reasm.push(&payload) {
                                     let frame = Received {
+                                        codec: VideoCodec::H264,
                                         key: is_key,
                                         contiguous: true,
                                         data: Arc::from(h264),
@@ -679,6 +680,7 @@ pub fn run_direct(join: TelegramCallJoin, controls: Arc<Controls>) {
                             DIRECT_KIND_VIDEO_SHARE => {
                                 if let Some((h264, is_key)) = share_reasm.push(&payload) {
                                     let frame = Received {
+                                        codec: VideoCodec::H264,
                                         key: is_key,
                                         contiguous: true,
                                         data: Arc::from(h264),
@@ -1731,6 +1733,7 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
                                         let _ = video.picture_slot(
                                             vslot,
                                             VideoReceived {
+                                                codec: VideoCodec::H264,
                                                 data: Arc::<[u8]>::from(data.data),
                                                 key,
                                                 contiguous: data.contiguous,
@@ -2060,6 +2063,7 @@ pub fn run_rtmp_viewer(channel_id: String, controls: Arc<Controls>) {
                 let _ = video.picture_slot(
                     0,
                     VideoReceived {
+                        codec: VideoCodec::H264,
                         data: Arc::from(unit.into_boxed_slice()),
                         key,
                         contiguous: true,

@@ -26,6 +26,7 @@ mod info;
 pub mod ipc;
 pub mod launch;
 pub mod link;
+pub mod location;
 mod message;
 pub mod otp;
 mod play;
@@ -34,6 +35,7 @@ pub mod quarantine;
 mod react;
 pub mod settings;
 mod signin;
+pub mod story;
 pub mod streamer;
 pub mod telegram_call_emoji;
 mod tiny;
@@ -45,6 +47,7 @@ pub use discord_perms::*;
 pub use e2ee::*;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
+pub use location::*;
 pub use message::*;
 
 /// Maximum bytes fetched automatically for an inline text/code attachment preview (100 KB).
@@ -53,6 +56,7 @@ pub use play::*;
 pub use react::*;
 pub use record::*;
 pub use signin::*;
+pub use story::*;
 pub use telegram_call_emoji::*;
 pub use tiny::*;
 
@@ -4401,6 +4405,79 @@ pub enum Request {
         transcription_id: i64,
         good: bool,
     },
+    /// Fetch story rings across the account (`peer_id: None`) or one peer's active stories
+    /// (`peer_id: Some`). Never sends `stories.readStories` — reading is explicit via `ReadStory`.
+    Stories {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_id: Option<String>,
+    },
+    /// Mark a peer's stories read up to `story_id` (`stories.readStories`). Called ONLY when the
+    /// user explicitly opens or advances to that story in the viewer.
+    ReadStory {
+        account: AccountKey,
+        peer_id: String,
+        story_id: String,
+    },
+    /// React to a story (`stories.sendReaction`), or clear our reaction when `emoji` is `None`.
+    ReactStory {
+        account: AccountKey,
+        peer_id: String,
+        story_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+    },
+    /// Send a private reply to a peer's story (`inputReplyToStory`).
+    ReplyStory {
+        account: AccountKey,
+        peer_id: String,
+        story_id: String,
+        client_id: String,
+        text: String,
+    },
+    /// Send a one-time location point (`inputMediaGeoPoint`).
+    SendLocation {
+        conversation: Key,
+        client_id: String,
+        point: GeoPoint,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+    },
+    /// Start sharing a live location in `conversation` for `period_secs` (`inputMediaGeoLive`).
+    StartLiveLocation {
+        conversation: Key,
+        client_id: String,
+        point: GeoPoint,
+        period_secs: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proximity_alert_radius: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+    },
+    /// Update coordinates of an active live location share (`messages.editMessage` with
+    /// `inputMediaGeoLive`, rate-limited in the adapter).
+    UpdateLiveLocation {
+        conversation: Key,
+        message_id: String,
+        point: GeoPoint,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proximity_alert_radius: Option<u32>,
+    },
+    /// Stop one active live location share (`messages.editMessage` with `stopped: true`).
+    StopLiveLocation {
+        conversation: Key,
+        message_id: String,
+    },
+    /// Stop every active live location share on one account, or across all accounts when `None`.
+    StopAllLiveLocations {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+    },
+    /// List active live location shares (recovered across restarts/reconnects).
+    ActiveLiveLocations {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -4514,6 +4591,19 @@ pub enum Change {
         action_id: String,
         reason: String,
     },
+    /// Ephemeral. Active story rings for an account changed (new story, deleted story, or read).
+    Stories {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rings: Vec<PeerStoryRing>,
+    },
+    /// Ephemeral. Active live location shares for an account changed (started, updated, stopped,
+    /// expired, or recovered on reconnect).
+    LiveLocations {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shares: Vec<LiveLocationShare>,
+    },
 }
 
 impl Change {
@@ -4544,7 +4634,9 @@ impl Change {
             (Change::Spaces { account: a }, Change::Spaces { account: b })
             | (Change::Folders { account: a }, Change::Folders { account: b })
             | (Change::Searched { account: a, .. }, Change::Searched { account: b, .. })
-            | (Change::Tiny { account: a }, Change::Tiny { account: b }) => a == b,
+            | (Change::Tiny { account: a }, Change::Tiny { account: b })
+            | (Change::Stories { account: a, .. }, Change::Stories { account: b, .. })
+            | (Change::LiveLocations { account: a, .. }, Change::LiveLocations { account: b, .. }) => a == b,
             (Change::People { account: a, person: pa }, Change::People { account: b, person: pb }) => a == b && pa == pb,
             (Change::Media { account: a, file: x }, Change::Media { account: b, file: y }) => {
                 a == b && x.id == y.id
@@ -4584,6 +4676,8 @@ impl Change {
                 | Change::Open { .. }
                 | Change::InteractionModal { .. }
                 | Change::InteractionFailed { .. }
+                | Change::Stories { .. }
+                | Change::LiveLocations { .. }
         )
     }
 }
@@ -5371,6 +5465,27 @@ pub enum Response {
     /// Answers `Request::Transcribe`: the transcription state returned by the network.
     Transcription {
         transcription: Transcription,
+    },
+    /// Answers `Request::Stories`: active story rings and (when `peer_id` was given) stories.
+    Stories {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rings: Vec<PeerStoryRing>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stories: Vec<Story>,
+    },
+    /// Answers `Request::ReplyStory`: the private DM message sent in reply to the story.
+    StoryReplied {
+        conversation: Key,
+        message: Box<Message>,
+    },
+    /// Answers `Request::StartLiveLocation` or `Request::UpdateLiveLocation`.
+    LiveLocation {
+        share: LiveLocationShare,
+    },
+    /// Answers `Request::ActiveLiveLocations`.
+    LiveLocations {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shares: Vec<LiveLocationShare>,
     },
 }
 

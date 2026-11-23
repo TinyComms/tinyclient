@@ -964,7 +964,7 @@ pub(super) fn on_call_picture(account: &Account, picture: crate::adapters::Pictu
                     *video = true;
                 }
             }
-            crate::adapters::Picture::Watch(_) => {}
+            crate::adapters::Picture::Watch(_) | crate::adapters::Picture::WatchList(_) => {}
         }
     }
 }

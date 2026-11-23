@@ -58,7 +58,7 @@ OUT=$RUN/out
 mkdir -p "$OUT"
 export DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority
 export E2E_RUN_ID=$ID E2E_OUT=$OUT E2E_APP_DIR=$APP E2E_SRC_DIR=$SOURCE
-if [ "${6:-}" = tiny-video-received ]; then
+if [ "${6:-}" = tiny-video-received ] || [ "${6:-}" = gpu-codecs-wave18 ]; then
     export CARGO_TARGET_DIR
     CARGO_TARGET_DIR=$(dirname "$APP")
     timeout -k 5 "$LIMIT" bash "$RUN/scenario/drive.linux.sh" > "$OUT/driver.log" 2>&1
@@ -207,7 +207,7 @@ def run(ctx):
             return outcome(False, "could not copy the scenario to the host: " + r.stderr[-300:], binary_sha256=digest)
 
         # 4. the recorded run
-        headless = ctx.scenario["id"] == "tiny-video-received"
+        headless = ctx.scenario["id"] in ("tiny-video-received", "gpu-codecs-wave18")
         limit = int(host.get("build_timeout", 3600) if headless else host.get("driver_timeout", 300))
         env = "E2E_SABOTAGE=%s" % shlex.quote(os.environ.get("E2E_SABOTAGE", ""))
         log("recording and driving")

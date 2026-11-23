@@ -73,6 +73,7 @@ pub(super) fn stats() -> Option<protocol::CallStats> {
         video: std::env::var_os("TINYCLIENT_SHOT_VIDEO").map(|_| protocol::VideoStats {
             send_kbps: 440, receive_kbps: 2100, send_fps: 30, receive_fps: 60, rendered_fps: 58,
             receive_expected: true, watching_ms: 30_000, width: 1920, height: 1080, frame_age_ms: Some(16),
+            ..Default::default()
         }),
         link_measured: true,
         rtt_ms: if poor { 184 } else { 38 },

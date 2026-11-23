@@ -78,7 +78,9 @@ pub struct Setup {
     /// The system has not yet been asked about the microphone: watch for the answer.
     pub microphone_unasked: bool,
     /// The video SSRCs Ready assigned, when it assigned any. The camera sends on these.
+    /// The video SSRCs Ready assigned for our camera (`high` = `"100"`, optional `low` = `"50"`).
     pub pipe: Option<discord_video::Pipe>,
+    pub low_pipe: Option<discord_video::Pipe>,
     /// Video SSRCs the gateway has announced for other people.
     pub videos: Arc<Mutex<HashMap<u32, discord_video::Remote>>>,
     /// Set by the gateway thread after opcode 12 has gone out. The camera sends only while it is set.
@@ -1328,9 +1330,12 @@ impl Loop {
             }
         }
         drop(users);
-        if let Some(stream) = self.setup.controls.watched_audio.lock().unwrap().as_mut() {
-            if !deafened && !self.setup.controls.leg_done(true) {
-                stream.mix(&mut mix, &ear, ducked);
+        if !deafened {
+            let mut watched = self.setup.controls.watched_audio.lock().unwrap();
+            for (owner, stream) in watched.iter_mut() {
+                if !self.setup.controls.leg_done(true, Some(owner)) {
+                    stream.mix(&mut mix, &ear, ducked);
+                }
             }
         }
         mixdown(&mix, &self.setup.controls, &mut self.cue, &mut self.setup.audio, &mut self.processor, &mut self.limiter)
@@ -1354,7 +1359,11 @@ impl Loop {
         self.drops.unnamed += self.held.expire(Instant::now());
         self.setup.audio.log_glitches();
         self.meter.troubles = self.setup.audio.troubles();
-        let stats = self.meter.second(self.streams.values_mut().map(Stream::counts));
+        let mut stats = self.meter.second(self.streams.values_mut().map(Stream::counts));
+        let video = self.setup.controls.video_stats.lock().unwrap().sample(Instant::now());
+        if !video.encoder_backends.is_empty() || !video.decoder_backends.is_empty() {
+            stats.video = Some(video);
+        }
         self.setup.controls.publish_stats(stats);
         let users = self.setup.users.lock().unwrap();
         self.streams.retain(|ssrc, stream| {
@@ -1486,6 +1495,7 @@ mod discord_tests {
             stop: Arc::default(),
             microphone_unasked: false,
             pipe: None,
+            low_pipe: None,
             videos: videos.clone(),
             announced: announced.clone(),
         };
@@ -1652,12 +1662,13 @@ pub fn run(mut setup: Setup) -> Audio {
         return setup.audio;
     };
     let devices = Devices::start(setup.microphone_unasked);
-    let pictures = discord_video::Drive::new(
+    let pictures = discord_video::Drive::new_with_low(
         setup.controls.clone(),
         setup.user_id.clone(),
         setup.videos.clone(),
         setup.announced.clone(),
         setup.pipe.take(),
+        setup.low_pipe.take(),
         false,
         true,
     );
