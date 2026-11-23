@@ -60,6 +60,10 @@ struct Read {
     calls: Vec<protocol::CallLogEntry>,
     calls_next: Option<String>,
     calls_more: bool,
+    calls_error: String,
+    voicemail: Vec<protocol::Voicemail>,
+    voicemail_next: Option<String>,
+    voicemail_error: String,
     discover: Vec<protocol::DiscoveredGuild>,
     discover_total: u32,
     discover_error: String,
@@ -92,6 +96,15 @@ fn whole(network: Network, folder: Option<String>, shelf: Shelf) -> std::io::Res
 }
 
 impl Shell {
+    fn calls_account(&self) -> Option<protocol::AccountKey> {
+        let home = &self.sidebar_state.home;
+        let accounts = self.snapshot.as_ref()?.accounts.iter().filter(|a| {
+            Some(a.key.network) == home.network && a.link == protocol::Link::Connected
+        });
+        accounts.clone().find(|a| Some(&a.key) == home.calls_account.as_ref())
+            .or_else(|| accounts.into_iter().next()).map(|a| a.key.clone())
+    }
+
     /// Reads what the home on show draws. Asking is also what makes chatd bring it up to date.
     pub(in crate::gui) fn load_home(&mut self, cx: &mut Context<Self>) {
         let network = match &self.sidebar_state.mode {
@@ -131,11 +144,7 @@ impl Shell {
                 Drill::Discover => unreachable!("Discover is read on its own"),
             })
         };
-        let tg_account = self
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.accounts.iter().find(|a| a.key.network == Network::Telegram && a.link == protocol::Link::Connected))
-            .map(|a| a.key.clone());
+        let calls_account = self.calls_account();
         let teams_account = self
             .snapshot
             .as_ref()
@@ -167,13 +176,25 @@ impl Shell {
                     }
                 }
                 Some(DrillLoad::Calls) => {
-                    if let Some(account) = tg_account {
-                        if let Response::CallHistory { entries, next, more } =
-                            ask(&Request::CallHistory { account, missed: calls_missed, before: None, limit: 30 })?
-                        {
-                            read.calls = entries;
-                            read.calls_next = next;
-                            read.calls_more = more;
+                    if let Some(account) = calls_account {
+                        match ask(&Request::CallHistory { account: account.clone(), missed: calls_missed, before: None, limit: 30 })? {
+                            Response::CallHistory { entries, next, more } => {
+                                read.calls = entries;
+                                read.calls_next = next;
+                                read.calls_more = more;
+                            }
+                            Response::Error { detail, .. } => read.calls_error = detail,
+                            _ => read.calls_error = crate::client::OTHER_ANSWER.to_owned(),
+                        }
+                        if network == Network::Teams && !calls_missed {
+                            match ask(&Request::Voicemails { account, before: None })? {
+                                Response::Voicemails { entries, next } => {
+                                    read.voicemail = entries;
+                                    read.voicemail_next = next;
+                                }
+                                Response::Error { detail, .. } => read.voicemail_error = detail,
+                                _ => read.voicemail_error = crate::client::OTHER_ANSWER.to_owned(),
+                            }
                         }
                     }
                 }
@@ -261,6 +282,10 @@ impl Shell {
                 home.calls = read.calls;
                 home.calls_next = read.calls_next;
                 home.calls_more = read.calls_more;
+                home.calls_error = read.calls_error;
+                home.voicemail = read.voicemail;
+                home.voicemail_next = read.voicemail_next;
+                home.voicemail_error = read.voicemail_error;
             }
             if matches!(this.sidebar_state.drill, Some(Drill::Discover)) {
                 home.discover = read.discover;
@@ -413,8 +438,19 @@ impl Shell {
                 }
                 out
             }
-            (Mode::Network(_), Some(Drill::Calls)) => {
+            (Mode::Network(network), Some(Drill::Calls)) => {
                 let mut out = Vec::new();
+                let selected = self.calls_account();
+                if let Some(snapshot) = &self.snapshot {
+                    let accounts = snapshot.accounts.iter().filter(|a| a.key.network == *network && a.link == protocol::Link::Connected);
+                    if *network == Network::Teams && accounts.clone().count() > 1 {
+                        out.extend(accounts.map(|a| Item::Action {
+                            act: Act::CallsAccount(a.key.clone()),
+                            icon: if Some(&a.key) == selected.as_ref() { "icons/check.svg" } else { "icons/user.svg" },
+                            words: a.name.clone(), after: String::new(), dot: None,
+                        }));
+                    }
+                }
                 let filter_words = if state.home.calls_missed { "Showing missed · show all" } else { "Showing all · filter missed" };
                 out.push(Item::Action {
                     act: Act::CallsMissedToggle,
@@ -423,7 +459,16 @@ impl Shell {
                     after: String::new(),
                     dot: None,
                 });
-                out.extend(home::collapse_call_entries(&state.home.calls).into_iter().map(Item::Call));
+                if *network == Network::Teams {
+                    out.extend(state.home.calls.iter().cloned().map(|latest| Item::Call(home::CollapsedCall {
+                        latest, count: 1, message_ids: Vec::new(),
+                    })));
+                    if state.home.loaded && state.home.calls.is_empty() {
+                        out.push(Item::Header { label: "No recent calls", first: false });
+                    }
+                } else {
+                    out.extend(home::collapse_call_entries(&state.home.calls).into_iter().map(Item::Call));
+                }
                 if state.home.calls_more {
                     out.push(Item::Action {
                         act: Act::CallsMore,
@@ -432,6 +477,24 @@ impl Shell {
                         after: String::new(),
                         dot: None,
                     });
+                }
+                if !state.home.calls_error.is_empty() {
+                    out.push(Item::Status(state.home.calls_error.clone()));
+                }
+                if *network == Network::Teams && !state.home.calls_missed {
+                    out.push(Item::Header { label: "Voicemail", first: false });
+                    out.extend(state.home.voicemail.iter().cloned().map(Item::Voicemail));
+                    if !state.home.voicemail_error.is_empty() {
+                        out.push(Item::Status(state.home.voicemail_error.clone()));
+                    } else if state.home.loaded && state.home.voicemail.is_empty() {
+                        out.push(Item::Status("No voicemail".into()));
+                    }
+                    if state.home.voicemail_next.is_some() {
+                        out.push(Item::Action {
+                            act: Act::VoicemailMore, icon: "icons/chevron-down.svg",
+                            words: "Load more voicemail".into(), after: String::new(), dot: None,
+                        });
+                    }
                 }
                 out
             }
@@ -509,6 +572,7 @@ impl Shell {
         let Some(item) = self.sidebar_state.home_items.get(ix).cloned() else {
             return;
         };
+        let calls_account = self.calls_account();
         let home = &mut self.sidebar_state.home;
         match item {
             Item::Chat(c) | Item::Voice(c) | Item::Channel(c) => return self.pick_row(&c, cx),
@@ -528,6 +592,12 @@ impl Shell {
                 let key = group.latest.conversation.clone();
                 let msg_id = group.latest.message_id.clone();
                 let title = group.latest.name.clone();
+                if key.network == Network::Teams {
+                    if !key.id.is_empty() {
+                        self.select(key, &title, cx);
+                    }
+                    return;
+                }
                 let pane = self.pane(cx);
                 if self.open.as_ref() == Some(&key) {
                     pane.update(cx, |pane, cx| pane.jump_to(&msg_id, cx));
@@ -537,6 +607,13 @@ impl Shell {
                 }
                 return;
             }
+            Item::Voicemail(entry) => {
+                if let Some(account) = calls_account {
+                    self.play_voicemail(account, entry, cx);
+                }
+                return;
+            }
+            Item::Status(_) => return,
             Item::Meeting(event) => {
                 let account = home.upcoming_account.clone();
                 let conversation = event.conversation.clone();
@@ -566,6 +643,40 @@ impl Shell {
                 },
                 Act::Archive => return self.drill(Drill::Archive, cx),
                 Act::Calls => return self.drill(Drill::Calls, cx),
+                Act::CallsAccount(account) => {
+                    home.calls_account = Some(account);
+                    home.calls.clear();
+                    home.calls_next = None;
+                    home.calls_more = false;
+                    home.calls_error.clear();
+                    home.voicemail.clear();
+                    home.voicemail_next = None;
+                    home.voicemail_error.clear();
+                    home.loaded = false;
+                    self.rebuild_home(cx);
+                    self.load_home(cx);
+                    return;
+                }
+                Act::VoicemailMore => {
+                    if let (Some(account), Some(before)) = (calls_account, home.voicemail_next.take()) {
+                        let epoch = home.epoch;
+                        self.off_thread(cx, move || ask(&Request::Voicemails { account, before: Some(before.clone()) }), move |this, answer, cx| {
+                            let home = &mut this.sidebar_state.home;
+                            if home.epoch == epoch {
+                                match answer {
+                                    Ok(Response::Voicemails { entries, next }) => {
+                                        home.voicemail.extend(entries);
+                                        home.voicemail_next = next;
+                                    }
+                                    Ok(Response::Error { detail, .. }) => home.voicemail_error = detail,
+                                    _ => home.voicemail_error = crate::client::OTHER_ANSWER.to_owned(),
+                                }
+                                this.rebuild_home(cx);
+                            }
+                        });
+                    }
+                    return;
+                }
                 Act::CallsMissedToggle => {
                     home.calls_missed = !home.calls_missed;
                     home.calls.clear();
@@ -579,12 +690,7 @@ impl Shell {
                 Act::CallsMore => {
                     let before = home.calls_next.clone();
                     let missed = home.calls_missed;
-                    let account = self
-                        .snapshot
-                        .as_ref()
-                        .and_then(|s| s.accounts.iter().find(|a| a.key.network == Network::Telegram && a.link == protocol::Link::Connected))
-                        .map(|a| a.key.clone());
-                    if let Some(account) = account {
+                    if let Some(account) = calls_account {
                         let epoch = home.epoch;
                         self.off_thread(
                             cx,
@@ -655,6 +761,91 @@ impl Shell {
         self.rebuild_home(cx);
     }
 
+    fn play_voicemail(&mut self, account: protocol::AccountKey, entry: protocol::Voicemail, cx: &mut Context<Self>) {
+        let Some(attachment) = entry.audio else { return };
+        let id = entry.id;
+        let caller = entry.caller;
+        let request = Request::VoicemailAudio { account: account.clone(), id: id.clone(), attachment };
+        self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
+            let file = match answer {
+                Ok(Response::Media { files }) => files.into_iter().next(),
+                Ok(Response::Error { detail, .. }) => {
+                    this.toast(None, detail, cx);
+                    return;
+                }
+                _ => None,
+            };
+            let Some((file, path)) = file.and_then(|file| file.path.map(|path| (file.id, path))) else {
+                this.toast(None, "Voicemail audio could not be loaded.", cx);
+                return;
+            };
+            this.play(crate::gui::playing::Play {
+                conversation: Key::new(&account, "48:voicemail"),
+                account,
+                file,
+                path,
+                message: String::new(),
+                title: format!("Voicemail from {caller}"),
+                at: None,
+                round: false,
+                muted: false,
+                looped: false,
+            }, cx);
+        });
+    }
+
+    fn update_voicemail(&mut self, account: protocol::AccountKey, id: String, action: protocol::VoicemailAction, cx: &mut Context<Self>) {
+        let request = Request::ChangeVoicemail { account: account.clone(), id: id.clone(), action };
+        self.off_thread(cx, move || ask(&request), move |this, answer, cx| match answer {
+            Ok(Response::Ok) => {
+                if this.calls_account().as_ref() == Some(&account) {
+                    let entries = &mut this.sidebar_state.home.voicemail;
+                    match action {
+                        protocol::VoicemailAction::Delete => entries.retain(|entry| entry.id != id),
+                        protocol::VoicemailAction::MarkRead => {
+                            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                                entry.read = true;
+                            }
+                        }
+                    }
+                    this.rebuild_home(cx);
+                }
+            }
+            Ok(Response::Error { detail, .. }) => this.toast(None, detail, cx),
+            _ => this.toast(None, "Voicemail could not be updated.", cx),
+        });
+    }
+
+    fn voicemail_row(&mut self, ix: usize, entry: protocol::Voicemail, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let Some(account) = self.calls_account() else { return div().into_any_element() };
+        let stamp = crate::gui::time::stamp(now(), entry.time);
+        let status = if entry.read { stamp } else { format!("Unread · {stamp}") };
+        let transcript = entry.transcript.clone();
+        let mut controls = div().flex().items_center().gap(px(2.));
+        if entry.audio.is_some() {
+            let account = account.clone();
+            let entry = entry.clone();
+            controls = controls.child(icon_button(("voicemail-play", ix), "icons/play.svg", false).tooltip(tip("Play voicemail", None))
+                .on_click(cx.listener(move |this, _, _, cx| this.play_voicemail(account.clone(), entry.clone(), cx))));
+        }
+        if !entry.read {
+            let account = account.clone();
+            let id = entry.id.clone();
+            controls = controls.child(icon_button(("voicemail-read", ix), "icons/check.svg", false).tooltip(tip("Mark voicemail as read", None))
+                .on_click(cx.listener(move |this, _, _, cx| this.update_voicemail(account.clone(), id.clone(), protocol::VoicemailAction::MarkRead, cx))));
+        }
+        let id = entry.id.clone();
+        controls = controls.child(icon_button(("voicemail-delete", ix), "icons/trash-2.svg", false).tooltip(tip("Delete voicemail", None))
+            .on_click(cx.listener(move |this, _, _, cx| this.update_voicemail(account.clone(), id.clone(), protocol::VoicemailAction::Delete, cx))));
+        let body = div().min_w_0().flex_1().flex().flex_col()
+            .child(div().type_ui().text_color(theme::text()).truncate().child(entry.caller))
+            .child(div().type_small().text_color(theme::text_faint()).child(status))
+            .child(div().type_small().text_color(theme::text_soft()).whitespace_normal().line_clamp(2).child(transcript.clone()));
+        list_row(("home-voicemail", ix), theme::row_height(78.), false, focused, div().gap(px(4.)).child(body).child(controls))
+            .when(!transcript.is_empty(), |row| row.tooltip(tip(transcript, None)))
+            .into_any_element()
+    }
+
     fn home_item(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(item) = self.sidebar_state.home_items.get(ix).cloned() else {
             return div().into_any_element();
@@ -713,12 +904,16 @@ impl Shell {
                     (protocol::CallOutcome::Declined, _, _) => "Declined".to_owned(),
                     (protocol::CallOutcome::Cancelled, _, _) => "Cancelled".to_owned(),
                     (protocol::CallOutcome::Busy, _, _) => "Line busy".to_owned(),
+                    (protocol::CallOutcome::Voicemail, _, _) => "Voicemail".to_owned(),
                     (_, true, Some(s)) if s > 0 => format!("Outgoing · {}", format_call_log_duration(s)),
                     (_, false, Some(s)) if s > 0 => format!("Incoming · {}", format_call_log_duration(s)),
                     (_, true, _) => "Outgoing".to_owned(),
                     (_, false, _) => "Incoming".to_owned(),
                 };
                 let conv_key = entry.conversation.clone();
+                let subtitle = if entry.time > 0 {
+                    format!("{subtitle} · {}", crate::gui::time::stamp(now(), entry.time))
+                } else { subtitle };
                 let call_support = self
                     .sidebar_state
                     .home
@@ -726,7 +921,7 @@ impl Shell {
                     .iter()
                     .find(|c| c.key == conv_key)
                     .map_or(protocol::CallSupport::Handoff, |c| c.call);
-                let call_btn = (!matches!(call_support, protocol::CallSupport::None | protocol::CallSupport::Restricted)).then(|| {
+                let call_btn = (!conv_key.id.is_empty() && !matches!(call_support, protocol::CallSupport::None | protocol::CallSupport::Restricted)).then(|| {
                     let key = conv_key.clone();
                     let handoff = call_support == protocol::CallSupport::Handoff;
                     icon_button(("call-log-dial", ix), "icons/phone.svg", false).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).on_click(
@@ -741,7 +936,7 @@ impl Shell {
                 });
                 let del_ids = group.message_ids.clone();
                 let del_account = conv_key.account();
-                let del_btn = icon_button(("call-log-del", ix), "icons/trash-2.svg", false)
+                let del_btn = (conv_key.network == Network::Telegram).then(|| icon_button(("call-log-del", ix), "icons/trash-2.svg", false)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let ids = del_ids.clone();
@@ -749,7 +944,7 @@ impl Shell {
                         this.sidebar_state.home.calls.retain(|c| !ids.contains(&c.message_id));
                         this.rebuild_home(cx);
                         this.off_thread(cx, move || ask(&Request::DeleteCallEntries { account, message_ids: ids, revoke: false }), |_, _, _| {});
-                    }));
+                    })));
                 let fg = if missed { theme::danger() } else { theme::text() };
                 let content = div()
                     .gap(px(8.))
@@ -764,9 +959,11 @@ impl Shell {
                             .child(div().type_small().text_color(theme::text_faint()).truncate().child(subtitle)),
                     )
                     .children(call_btn)
-                    .child(del_btn);
+                    .children(del_btn);
                 click(list_row(("home-call", ix), theme::row_height(48.), false, focused, content), cx).into_any_element()
             }
+            Item::Status(words) => div().px(px(10.)).type_small().text_color(theme::text_soft()).truncate().child(words).into_any_element(),
+            Item::Voicemail(entry) => self.voicemail_row(ix, entry, focused, cx),
             Item::Meeting(event) => {
                 let line = crate::gui::time::meeting_display(&event, now());
                 let title = event.title.clone();

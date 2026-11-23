@@ -50,6 +50,24 @@ pub struct CallLogEntry {
     pub time: i64,
 }
 
+/// A voice message in the signed-in account's mailbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Voicemail {
+    pub id: String,
+    pub caller: String,
+    pub time: i64,
+    pub transcript: String,
+    pub read: bool,
+    pub audio: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoicemailAction {
+    MarkRead,
+    Delete,
+}
+
 /// The network asked for a quality rating after a call ended (Telegram `phoneCallDiscarded.need_rating`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallRatingPrompt {

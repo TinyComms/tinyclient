@@ -39,7 +39,7 @@ mod length;
 mod mention;
 mod niceties;
 mod rec;
-mod schedule;
+pub(in crate::gui) mod schedule;
 mod slash;
 // The picker is the composer's and the reactions'; it lives in `gui/picker`.
 #[path = "picker/mod.rs"]
@@ -178,7 +178,7 @@ fn staged(what: &str) -> bool {
 
 /// A name for a message that has not been sent yet: digits only and never repeated, because
 /// networks take it as their nonce.
-fn client_id() -> String {
+pub(super) fn client_id() -> String {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let micros = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     let next = |last: u64| micros.max(last + 1);

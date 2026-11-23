@@ -94,7 +94,7 @@ pub(super) struct Parsed {
     pub mentioned: bool,
 }
 
-enum Token<'a> {
+pub(super) enum Token<'a> {
     Text(&'a str),
     Open {
         name: String,
@@ -145,7 +145,7 @@ fn decode(text: &str, out: &mut String) {
     out.push_str(rest);
 }
 
-fn decoded(text: &str) -> String {
+pub(super) fn decoded(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     decode(text, &mut out);
     out
@@ -197,7 +197,7 @@ fn tag_end(text: &str) -> Option<usize> {
     None
 }
 
-fn next(rest: &str) -> Option<(Token<'_>, &str)> {
+pub(super) fn next(rest: &str) -> Option<(Token<'_>, &str)> {
     if rest.is_empty() {
         return None;
     }
@@ -328,7 +328,7 @@ const BLOCKS: &[&str] = &[
 /// Elements that never have an inside.
 const VOID: &[&str] = &["br", "img", "hr", "input", "meta", "link"];
 
-fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> &'a str {
+pub(super) fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> &'a str {
     attrs.iter().find(|(known, _)| known == name).map_or("", |(_, value)| value.as_str())
 }
 
