@@ -907,13 +907,19 @@ pub enum Event {
     /// `at` is when this receipt was sent, in milliseconds.
     Receipt { by: String, sent: Vec<u64>, read: bool, viewed: bool, at: u64 },
     Typing { peer: Peer, by: String, name: String, started: bool },
-    /// Someone is calling: an offer for the person (`by`) in a one-to-one conversation. A
-    /// group's ring update is a blob this library cannot open, so a group call stays with the
-    /// phone. `name` is the caller's as the user knows them, `sent` when the offer was sent.
-    Call { peer: Peer, by: String, name: String, video: bool, id: u64, sent: u64 },
+    /// Someone is calling: an offer for the person (`by`) in a one-to-one conversation.
+    /// `name` is the caller's as the user knows them, `sent` when the offer was sent.
+    /// `sdp` is decoded from `CallMessage.offer.opaque` when it carries a UTF-8 SDP offer.
+    Call { peer: Peer, by: String, name: String, video: bool, id: u64, sent: u64, sdp: String, opaque: Vec<u8> },
+    /// The remote peer answered our outgoing 1:1 call (`CallMessage.answer`).
+    CallAnswer { peer: Peer, by: String, id: u64, sdp: String, opaque: Vec<u8> },
+    /// Remote ICE candidates (`CallMessage.iceUpdate`) for an active or incoming 1:1 call.
+    CallIce { peer: Peer, by: String, id: u64, candidates: Vec<String> },
+    /// An opaque calling payload (`CallMessage.opaque`), used for RingRTC / group-call signalling.
+    CallOpaque { peer: Peer, by: String, data: Vec<u8>, urgent: bool },
     /// A call we heard of is over: its hangup, or the other side telling us it was busy.
-    /// `answered` says someone took it on another device; nobody did when it is false.
-    CallEnded { id: u64, answered: bool },
+    /// `answered` says someone took it on another device; `kind` names the Signal hangup reason.
+    CallEnded { id: u64, answered: bool, kind: HangupKind },
     /// A call synced from the user's phone (`SyncMessage.callEvent`).
     CallEvent {
         peer: Peer,
@@ -988,6 +994,66 @@ pub enum CallKind {
     Video,
     Group,
     AdHoc,
+}
+
+/// Signal `CallMessage.Hangup.Type` reasons.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HangupKind {
+    #[default]
+    Normal,
+    Accepted,
+    Declined,
+    Busy,
+    NeedPermission,
+}
+
+impl HangupKind {
+    pub fn word(self) -> &'static str {
+        match self {
+            HangupKind::Normal => "normal",
+            HangupKind::Accepted => "accepted",
+            HangupKind::Declined => "declined",
+            HangupKind::Busy => "busy",
+            HangupKind::NeedPermission => "need_permission",
+        }
+    }
+}
+
+/// One TURN relay server from Signal's `/v1/accounts/turn` endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnServer {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub password: String,
+}
+
+/// Signal 1:1 and group calling signals sent inside `ContentBody::CallMessage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallSignal {
+    Offer { id: u64, video: bool, sdp: String, opaque: Vec<u8> },
+    Answer { id: u64, sdp: String, opaque: Vec<u8> },
+    IceUpdate { id: u64, candidates: Vec<String> },
+    Busy { id: u64 },
+    Hangup { id: u64, kind: HangupKind, device_id: Option<u32> },
+    Opaque { data: Vec<u8>, urgent: bool },
+}
+
+/// Encodes an SDP string into Signal's `opaque` payload bytes when no raw opaque bytes are given.
+pub fn encode_sdp_opaque(sdp: &str, opaque: &[u8]) -> Vec<u8> {
+    if !opaque.is_empty() {
+        return opaque.to_vec();
+    }
+    sdp.as_bytes().to_vec()
+}
+
+/// Extracts a UTF-8 SDP document or ICE candidate line from Signal's `opaque` payload bytes.
+pub fn decode_sdp_opaque(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if text.starts_with("v=0") || text.starts_with("candidate:") || text.starts_with("a=candidate:") => {
+            text.to_owned()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Outcome of a synced `CallEvent`.
@@ -1156,6 +1222,8 @@ pub enum Body {
         file: Option<File>,
         allows_replies: bool,
     },
+    /// Send a Signal calling signal (`ContentBody::CallMessage`) over Signal's encrypted path.
+    Call(CallSignal),
 }
 
 /// Why something failed.
@@ -1354,6 +1422,10 @@ pub trait Wire: Send + Sync {
         _dest: &std::path::Path,
     ) -> Result<u64, Fault> {
         Err(Fault::Refused("No longer available".to_owned()))
+    }
+    /// Fetches TURN relay credentials from Signal's calling relay endpoint (`/v1/accounts/turn`).
+    fn turn_servers(&self) -> Result<Vec<TurnServer>, Fault> {
+        Ok(Vec::new())
     }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);

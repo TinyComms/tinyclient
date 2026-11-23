@@ -8,13 +8,14 @@
 use super::style::{self, Mark, Range};
 use super::vault::{self, Vault};
 use super::wire::{
-    call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
-    parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
-    CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, HistoryTransfer, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker,
-    MessageRequestAction, OwnCard, Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker,
-    StickerEntry, StickerPackInfo, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, StoryContext,
-    StoryDistributionList, StoryMessageData, StoryText, Text, TransferOutcome, TransferProgress, Wire,
+    call_link_room_id, decode_sdp_opaque, encode_sdp_opaque, format_call_link, format_group_invite_link,
+    gift_badge_label, parse_call_link, parse_group_invite_link, payment_label, view_once_label, Body, CallKind,
+    CallLink, CallLinkJoin, CallLogKind, CallOutcome, CallSignal, ChatFolder, Contact, CONTINUES, Event, Fault,
+    GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, HangupKind, HistoryTransfer,
+    IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard, Peer, PersonProfile,
+    Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo, StorageAccount,
+    StorageContact, StorageGroup, StorageSnapshot, StoryContext, StoryDistributionList, StoryMessageData, StoryText,
+    Text, TransferOutcome, TransferProgress, TurnServer, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -109,6 +110,7 @@ enum Ask {
         dest: std::path::PathBuf,
         answer: Sender<Result<u64, Fault>>,
     },
+    TurnServers { answer: Sender<Result<Vec<TurnServer>, Fault>> },
 }
 
 pub struct Real {
@@ -778,6 +780,10 @@ impl Wire for Real {
             dest: dest.to_path_buf(),
             answer,
         })
+    }
+
+    fn turn_servers(&self) -> Result<Vec<TurnServer>, Fault> {
+        self.ask(|answer| Ask::TurnServers { answer })
     }
 
     fn close(&self) {
@@ -1705,10 +1711,7 @@ impl Session {
         }));
     }
 
-    /// A call. The offer rings, and the hangup or busy with its id ends the ring. An offer of
-    /// our own (another of our devices announcing a call) is not a call to us. Nothing is sent
-    /// back: this client has no call control, so declining is not answering the wire, and the
-    /// caller's own no-answer deadline ends the call on their side.
+    /// Signal calling messages (`Offer`, `Answer`, `IceUpdate`, `Hangup`, `Busy`, `Opaque`).
     async fn call_message(&mut self, message: CallMessage, sender: String, sent: u64) {
         if let Some(offer) = message.offer {
             if sender == self.me {
@@ -1716,16 +1719,71 @@ impl Session {
             }
             let video = offer.r#type == Some(call_message::offer::Type::OfferVideoCall.into());
             let name = self.name_of(&sender).await;
-            self.tell(Event::Call { peer: Peer::Direct(sender.clone()), by: sender, name, video, id: offer.id.unwrap_or(0), sent });
+            let opaque = offer.opaque.unwrap_or_default();
+            let sdp = decode_sdp_opaque(&opaque);
+            self.tell(Event::Call {
+                peer: Peer::Direct(sender.clone()),
+                by: sender,
+                name,
+                video,
+                id: offer.id.unwrap_or(0),
+                sent,
+                sdp,
+                opaque,
+            });
+            return;
+        }
+        if let Some(answer) = message.answer {
+            let opaque = answer.opaque.unwrap_or_default();
+            let sdp = decode_sdp_opaque(&opaque);
+            self.tell(Event::CallAnswer {
+                peer: Peer::Direct(sender.clone()),
+                by: sender,
+                id: answer.id.unwrap_or(0),
+                sdp,
+                opaque,
+            });
+            return;
+        }
+        if !message.ice_update.is_empty() {
+            let id = message.ice_update.first().and_then(|u| u.id).unwrap_or(0);
+            let candidates: Vec<String> = message
+                .ice_update
+                .into_iter()
+                .filter_map(|u| {
+                    let s = decode_sdp_opaque(u.opaque.as_deref().unwrap_or(&[]));
+                    (!s.is_empty()).then_some(s)
+                })
+                .collect();
+            if !candidates.is_empty() {
+                self.tell(Event::CallIce { peer: Peer::Direct(sender.clone()), by: sender, id, candidates });
+            }
             return;
         }
         if let Some(hangup) = message.hangup {
-            let answered = hangup.r#type == Some(call_message::hangup::Type::HangupAccepted.into());
-            self.tell(Event::CallEnded { id: hangup.id.unwrap_or(0), answered });
+            let kind = match hangup.r#type.and_then(|v| call_message::hangup::Type::try_from(v).ok()) {
+                Some(call_message::hangup::Type::HangupAccepted) => HangupKind::Accepted,
+                Some(call_message::hangup::Type::HangupDeclined) => HangupKind::Declined,
+                Some(call_message::hangup::Type::HangupBusy) => HangupKind::Busy,
+                Some(call_message::hangup::Type::HangupNeedPermission) => HangupKind::NeedPermission,
+                _ => HangupKind::Normal,
+            };
+            let answered = kind == HangupKind::Accepted;
+            self.tell(Event::CallEnded { id: hangup.id.unwrap_or(0), answered, kind });
             return;
         }
         if let Some(busy) = message.busy {
-            self.tell(Event::CallEnded { id: busy.id.unwrap_or(0), answered: false });
+            self.tell(Event::CallEnded { id: busy.id.unwrap_or(0), answered: false, kind: HangupKind::Busy });
+            return;
+        }
+        if let Some(opaque) = message.opaque {
+            let urgent = opaque.urgency == Some(call_message::opaque::Urgency::HandleImmediately.into());
+            self.tell(Event::CallOpaque {
+                peer: Peer::Direct(sender.clone()),
+                by: sender,
+                data: opaque.data.unwrap_or_default(),
+                urgent,
+            });
         }
     }
 
@@ -2097,7 +2155,42 @@ impl Session {
             Ask::DownloadSticker { pack_id, pack_key, sticker_id, dest, answer } => {
                 let _ = answer.send(self.download_sticker(&pack_id, &pack_key, sticker_id, &dest).await);
             }
+            Ask::TurnServers { answer } => {
+                let _ = answer.send(self.turn_servers().await);
+            }
         }
+    }
+
+    async fn turn_servers(&mut self) -> Result<Vec<TurnServer>, Fault> {
+        let creds = self.manager.registration_data().service_credentials();
+        let auth = format!("{}:{}", creds.login(), creds.password.as_deref().unwrap_or(""));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let resp = client
+            .get("https://chat.signal.org/v1/accounts/turn")
+            .header("Authorization", format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth.as_bytes())))
+            .send()
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        if !resp.status().is_success() {
+            return Ok(Vec::new());
+        }
+        #[derive(serde::Deserialize)]
+        struct TurnResp {
+            #[serde(default)]
+            username: String,
+            #[serde(default)]
+            password: String,
+            #[serde(default)]
+            urls: Vec<String>,
+        }
+        let body: TurnResp = resp.json().await.map_err(|err| Fault::Net(err.to_string()))?;
+        if body.urls.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![TurnServer { urls: body.urls, username: body.username, password: body.password }])
     }
 
     async fn emit_sticker_packs(&mut self) {
@@ -3489,6 +3582,65 @@ impl Session {
                     }
                 }
                 return Ok(at);
+            }
+            Body::Call(signal) => {
+                let call_msg = match signal {
+                    CallSignal::Offer { id, video, sdp, opaque } => CallMessage {
+                        offer: Some(call_message::Offer {
+                            id: Some(id),
+                            r#type: Some(if video {
+                                call_message::offer::Type::OfferVideoCall.into()
+                            } else {
+                                call_message::offer::Type::OfferAudioCall.into()
+                            }),
+                            opaque: Some(encode_sdp_opaque(&sdp, &opaque)),
+                        }),
+                        ..Default::default()
+                    },
+                    CallSignal::Answer { id, sdp, opaque } => CallMessage {
+                        answer: Some(call_message::Answer {
+                            id: Some(id),
+                            opaque: Some(encode_sdp_opaque(&sdp, &opaque)),
+                        }),
+                        ..Default::default()
+                    },
+                    CallSignal::IceUpdate { id, candidates } => CallMessage {
+                        ice_update: candidates
+                            .into_iter()
+                            .map(|c| call_message::IceUpdate { id: Some(id), opaque: Some(c.into_bytes()) })
+                            .collect(),
+                        ..Default::default()
+                    },
+                    CallSignal::Busy { id } => CallMessage {
+                        busy: Some(call_message::Busy { id: Some(id) }),
+                        ..Default::default()
+                    },
+                    CallSignal::Hangup { id, kind, device_id } => {
+                        let ty = match kind {
+                            HangupKind::Normal => call_message::hangup::Type::HangupNormal,
+                            HangupKind::Accepted => call_message::hangup::Type::HangupAccepted,
+                            HangupKind::Declined => call_message::hangup::Type::HangupDeclined,
+                            HangupKind::Busy => call_message::hangup::Type::HangupBusy,
+                            HangupKind::NeedPermission => call_message::hangup::Type::HangupNeedPermission,
+                        };
+                        CallMessage {
+                            hangup: Some(call_message::Hangup { id: Some(id), r#type: Some(ty.into()), device_id }),
+                            ..Default::default()
+                        }
+                    }
+                    CallSignal::Opaque { data, urgent } => CallMessage {
+                        opaque: Some(call_message::Opaque {
+                            data: Some(data),
+                            urgency: Some(if urgent {
+                                call_message::opaque::Urgency::HandleImmediately.into()
+                            } else {
+                                call_message::opaque::Urgency::Droppable.into()
+                            }),
+                        }),
+                        ..Default::default()
+                    },
+                };
+                ContentBody::CallMessage(call_msg)
             }
         };
         self.deliver(to, content, at).await?;

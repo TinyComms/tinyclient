@@ -638,6 +638,58 @@ pub struct TinyPicture {
     pub kind: PictureKind,
 }
 
+/// One TURN relay server handed out by Signal's calling relay endpoint (`/v1/accounts/turn`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalRelay {
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password: String,
+}
+
+/// What mediad needs to build a WebRTC offer for a Signal 1:1 or group call (pure-Rust `str0m`
+/// Opus + H.264 over DTLS-SRTP).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalOffer {
+    pub user_id: String,
+    pub peer_id: String,
+    /// Host or IP used to choose the local route when direct candidates are allowed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
+    /// When true, gather only TURN relay candidates (no host IP exposed to the peer).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub relay_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<SignalRelay>,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub deafened: bool,
+}
+
+/// What mediad needs to accept an incoming Signal call offer and produce an SDP answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalAccept {
+    pub user_id: String,
+    pub peer_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    pub offer_sdp: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub relay_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<SignalRelay>,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub deafened: bool,
+}
+
 /// chatd to mediad, over mediad's stdin. Closing stdin ends the call. Each request gets exactly
 /// one reply (`Streams`, `Done` or `Refused`), in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -728,6 +780,14 @@ pub enum MediaRequest {
     /// off ([`SecurityMode::Blocked`]). Answered `Done`, or `Refused` in words when the call is
     /// not blocked or may not carry on unencrypted ([`CallSecurity::required`]).
     TinyTransport,
+    /// A Signal 1:1 or group call: build a pure-Rust `str0m` WebRTC SDP offer. Answered `Offer`.
+    SignalOffer(SignalOffer),
+    /// Accept an incoming Signal call SDP offer and start media. Answered `Answer`.
+    SignalAccept(SignalAccept),
+    /// Apply the remote peer's SDP answer to our pending Signal offer and start media. Answered `Done`.
+    SignalAnswer { sdp: String },
+    /// Feed a remote ICE candidate (`candidate:...`) into the active or pending Signal WebRTC session.
+    SignalIce { candidate: String },
 
     // What the shell and the room decide about the sound, for mediad to apply. Each is answered
     // `Done`, and each holds until sent again.
@@ -1079,8 +1139,10 @@ pub enum MediaResponse {
     Ready { engine_linked: bool },
     Streams { video: Vec<VideoStream> },
     Done,
-    /// The SDP offer for a Tiny server call, in answer to `TinyOffer`.
+    /// The SDP offer for a Tiny or Signal call, in answer to `TinyOffer` or `SignalOffer`.
     Offer { sdp: String },
+    /// The SDP answer for an incoming Signal call, in answer to `SignalAccept`.
+    Answer { sdp: String },
     /// The connection as it is now, in answer to `Stats`.
     Stats(CallStats),
     /// This mediad cannot do what was asked.
@@ -1165,6 +1227,8 @@ pub enum MediaResponse {
     Notice { detail: String },
     /// Sources dropped because the requested watch list exceeded this device's decode budget.
     WatchRefused { refused: Vec<(String, PictureKind)> },
+    /// A local ICE candidate gathered for an active Signal call, for chatd to send in `IceUpdate`.
+    SignalIce { candidate: String },
 }
 
 impl MediaResponse {
@@ -1175,6 +1239,7 @@ impl MediaResponse {
             MediaResponse::Streams { .. } => "Streams",
             MediaResponse::Done => "Done",
             MediaResponse::Offer { .. } => "Offer",
+            MediaResponse::Answer { .. } => "Answer",
             MediaResponse::Stats(_) => "Stats",
             MediaResponse::Refused { .. } => "Refused",
             MediaResponse::LogsSaved { .. } => "LogsSaved",
@@ -1195,6 +1260,7 @@ impl MediaResponse {
             MediaResponse::SelfView { .. } => "SelfView",
             MediaResponse::Notice { .. } => "Notice",
             MediaResponse::WatchRefused { .. } => "WatchRefused",
+            MediaResponse::SignalIce { .. } => "SignalIce",
         }
     }
 
@@ -1205,6 +1271,7 @@ impl MediaResponse {
             MediaResponse::Streams { .. }
                 | MediaResponse::Done
                 | MediaResponse::Offer { .. }
+                | MediaResponse::Answer { .. }
                 | MediaResponse::Stats(_)
                 | MediaResponse::Refused { .. }
                 | MediaResponse::LogsSaved { .. }
@@ -1367,5 +1434,55 @@ mod tests {
         for q in [CameraQuality::Auto, CameraQuality::Hd, CameraQuality::Standard, CameraQuality::DataSaver] {
             assert_eq!(CameraQuality::parse(q.word()), Some(q));
         }
+    }
+
+    #[test]
+    fn signal_call_media_frames_round_trip() {
+        let offer = MediaRequest::SignalOffer(SignalOffer {
+            user_id: "me-aci".into(),
+            peer_id: "grace-aci".into(),
+            host: "127.0.0.1".into(),
+            video: true,
+            relay_only: true,
+            relays: vec![SignalRelay {
+                urls: vec!["turn:turn1.whispersystems.org:443?transport=tcp".into()],
+                username: "u".into(),
+                password: "p".into(),
+            }],
+            muted: false,
+            deafened: false,
+        });
+        let json = serde_json::to_string(&offer).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), offer);
+
+        let accept = MediaRequest::SignalAccept(SignalAccept {
+            user_id: "me-aci".into(),
+            peer_id: "grace-aci".into(),
+            host: "127.0.0.1".into(),
+            offer_sdp: "v=0\r\n".into(),
+            video: true,
+            relay_only: false,
+            relays: Vec::new(),
+            muted: false,
+            deafened: false,
+        });
+        let json = serde_json::to_string(&accept).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), accept);
+
+        let ans_req = MediaRequest::SignalAnswer { sdp: "v=0\r\n".into() };
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&ans_req).unwrap()).unwrap(), ans_req);
+
+        let ice_req = MediaRequest::SignalIce { candidate: "candidate:1 1 UDP 2130706431 127.0.0.1 9 typ host".into() };
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&ice_req).unwrap()).unwrap(), ice_req);
+
+        let ans_resp = MediaResponse::Answer { sdp: "v=0\r\n".into() };
+        assert!(ans_resp.is_reply());
+        assert_eq!(ans_resp.name(), "Answer");
+        assert_eq!(serde_json::from_str::<MediaResponse>(&serde_json::to_string(&ans_resp).unwrap()).unwrap(), ans_resp);
+
+        let ice_resp = MediaResponse::SignalIce { candidate: "candidate:1 1 UDP 2130706431 127.0.0.1 9 typ host".into() };
+        assert!(!ice_resp.is_reply());
+        assert_eq!(ice_resp.name(), "SignalIce");
+        assert_eq!(serde_json::from_str::<MediaResponse>(&serde_json::to_string(&ice_resp).unwrap()).unwrap(), ice_resp);
     }
 }

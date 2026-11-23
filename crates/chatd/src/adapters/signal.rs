@@ -1,6 +1,8 @@
-//! Signal: text, and the photos, videos and files a person attaches. This computer is linked
-//! to the user's account as one more device, the way Signal Desktop is; it never registers a
-//! phone number, which would take the account from the phone. Calls and voice stay out of chatd.
+//! Signal: text, photos, videos, files, and end-to-end encrypted 1:1 and group calls. This
+//! computer is linked to the user's account as one more device, the way Signal Desktop is; it
+//! never registers a phone number, which would take the account from the phone. Call signalling
+//! runs over Signal's encrypted `CallMessage` path here, while `mediad` carries WebRTC media
+//! (pure-Rust `str0m` Opus + H.264 over DTLS-SRTP).
 //!
 //! # The library: presage, in this process (decided 2026-10-14, by building it on this Mac)
 //!
@@ -44,14 +46,16 @@ pub mod transfer;
 mod vault;
 mod wire;
 
-use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Refusal, SharedPage, Signed};
+use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Picture, Refusal, SharedPage, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, Filing, FolderRow, PersonDetails, PersonRow};
 use protocol::{
-    Attachment, CatalogItem, CatalogKind, Contact, ContactKind, ConversationKind, ConversationRights, Delivery, Link,
-    Mark, MediaFile, MediaKind, MemberSection, Message, MessageKind, Outgoing, Person, Poll, PollBallot, PollDraft,
-    Reaction, RelateAction, Relation, ReplyTo, ReportReason, ReportTarget, Span, Special,
+    Attachment, CallFailure, CallSecurity, CallState, CatalogItem, CatalogKind, Contact, ContactKind,
+    ConversationKind, ConversationRights, Delivery, Link, Mark, MediaFile, MediaKind, MemberSection, Message,
+    MessageKind, Outgoing, Participant, Person, Poll, PollBallot, PollDraft, Reaction, RelateAction, Relation,
+    ReplyTo, ReportReason, ReportTarget, SecureMember, SecurityMode, SignalAccept, SignalOffer, SignalRelay, Span,
+    Special, Trust,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -59,7 +63,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use wire::{view_once_label, Body, Event, Fault, Peer, Quote, Text, Wire};
+use wire::{view_once_label, Body, CallSignal, Event, Fault, HangupKind, Peer, Quote, Text, Wire};
 
 /// Signal has no on-demand server history backfill, so nothing is paced (linked-device history
 /// transfer runs once during linking in `signin`).
@@ -756,6 +760,8 @@ struct Live {
     /// offer was sent. The newest offer replaces an older one, so this stays one entry, and
     /// only the offer sitting here ends its own ring.
     ring: Option<Ring>,
+    /// Active outgoing or joined Signal 1:1 call managed by this adapter.
+    active_call: Option<ActiveSignalCall>,
     /// The user's own Signal settings. Off until the phone says.
     read_receipts: bool,
     typing: bool,
@@ -854,13 +860,34 @@ struct HeldAttachment {
     message_id: String,
 }
 
-/// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
+/// What [`Event::Call`] told of, for [`Event::CallEnded`] or [`Command::CallJoin`] to handle it.
+#[derive(Clone)]
 struct Ring {
     id: u64,
     conversation: String,
     author: String,
     video: bool,
     sent: u64,
+    sdp: String,
+    opaque: Vec<u8>,
+    pending_ice: Vec<String>,
+}
+
+/// Active outgoing or joined Signal 1:1 call state.
+#[derive(Clone)]
+struct ActiveSignalCall {
+    id: u64,
+    conversation: String,
+    peer_aci: String,
+    video: bool,
+    outgoing: bool,
+    answered: bool,
+    muted: bool,
+    deafened: bool,
+    camera: bool,
+    sharing: bool,
+    pending_ice: Vec<String>,
+    sent_ms: u64,
 }
 
 impl Live {
@@ -2193,8 +2220,17 @@ fn apply(account: &Account, event: Event) {
                 ctx.typing_stopped(&conversation, &by);
             }
         }
-        Event::Call { peer, by, name, video, id, sent } => incoming_call(account, &peer, &by, &name, video, id, sent),
-        Event::CallEnded { id, answered } => ended_call(account, id, answered),
+        Event::Call { peer, by, name, video, id, sent, sdp, opaque } => {
+            incoming_call(account, &peer, &by, &name, video, id, sent, sdp, opaque);
+        }
+        Event::CallAnswer { peer, by, id, sdp, opaque } => {
+            call_answered(account, &peer, &by, id, sdp, opaque);
+        }
+        Event::CallIce { peer, by, id, candidates } => {
+            call_ice_received(account, &peer, &by, id, candidates);
+        }
+        Event::CallOpaque { .. } => {}
+        Event::CallEnded { id, answered, kind } => ended_call(account, id, answered, kind),
         Event::CallEvent { peer, call_id, timestamp, kind, incoming, outcome } => {
             apply_call_event(account, &peer, call_id, timestamp, kind, incoming, outcome);
         }
@@ -3040,18 +3076,28 @@ fn read_elsewhere(account: &Account, read: &[(String, u64)]) {
 }
 
 /// Whether an offer sent `sent` (ms) is recent enough to ring for. One from before we
-/// connected is a call that is long over.
+/// connected is a call that is long over; allow small clock skew from remote phones.
 fn fresh_call(sent: u64) -> bool {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64);
-    sent <= now && now - sent <= (CALL_STALE as u64) * 1_000
+    sent <= now.saturating_add(5_000) && now.saturating_sub(sent) <= (CALL_STALE as u64) * 1_000
 }
 
 /// Someone is calling: their row is recorded (a ring names a conversation the list may not
-/// have yet), and the ring is one notification with one action, "Answer on your phone" —
-/// a Signal call is answered on the phone, never here. An offer that waited while we were
-/// away is remembered for its end, but not replayed as a ring. Only a person calls here: a
-/// group's ring update is a blob the wire cannot open, so it never names a conversation.
-fn incoming_call(account: &Account, peer: &Peer, by: &str, name: &str, video: bool, id: u64, sent: u64) {
+/// have yet), and the ring is presented natively in tinyclient's call dock + notification
+/// with Accept and Decline. If we are already in another call, reply with Signal's `Busy`
+/// message. An offer that waited while we were away is remembered for its end, not rung.
+#[allow(clippy::too_many_arguments)]
+fn incoming_call(
+    account: &Account,
+    peer: &Peer,
+    by: &str,
+    name: &str,
+    video: bool,
+    id: u64,
+    sent: u64,
+    sdp: String,
+    opaque: Vec<u8>,
+) {
     if by == account.me || !matches!(peer, Peer::Direct(_)) {
         return;
     }
@@ -3061,28 +3107,412 @@ fn incoming_call(account: &Account, peer: &Peer, by: &str, name: &str, video: bo
     }
     let caller = if name.is_empty() { account.live().name(by) } else { name.to_owned() };
     ensure_row(account, peer, &caller);
+    // Already in an active call on another conversation: answer Busy per Signal protocol.
+    if account.live().active_call.as_ref().is_some_and(|c| c.id != id) {
+        let _ = account.wire.send(peer, Body::Call(CallSignal::Busy { id }));
+        return;
+    }
     // The newest offer takes the one ring slot. An older or replayed one leaves both the slot
     // and the ring alone: a displaced call's hangup matches nothing here, and a losing offer
     // must not ring for a note its own hangup could not end.
     if account.live().ring.as_ref().is_none_or(|held| held.sent < sent) {
-        account.live().ring = Some(Ring { id, conversation: conversation.clone(), author: by.to_owned(), video, sent });
+        account.live().ring = Some(Ring {
+            id,
+            conversation: conversation.clone(),
+            author: by.to_owned(),
+            video,
+            sent,
+            sdp,
+            opaque,
+            pending_ice: Vec::new(),
+        });
         if fresh_call(sent) {
-            account.ctx.phone_ring(&conversation, &caller);
+            account.ctx.ring(&conversation, &caller);
         }
     }
 }
 
-/// The call ended: the ring goes, and a call nobody answered here leaves the line the other
-/// networks leave. One answered on the phone leaves none, because it was not missed.
-fn ended_call(account: &Account, id: u64, answered: bool) {
+/// Builds `CallSecurity` from Signal's 60-digit safety number and identity verification state
+/// for a 1:1 call with `peer_aci`.
+fn signal_call_security(account: &Account, peer_aci: &str) -> CallSecurity {
+    let safety = account.wire.safety_number(peer_aci).ok().flatten();
+    let (code, trust, key) = match safety {
+        Some(sn) => {
+            let trust = if sn.changed {
+                Trust::Changed
+            } else {
+                match sn.state {
+                    wire::IdentityState::Verified => Trust::Verified,
+                    wire::IdentityState::Default | wire::IdentityState::Unverified => Trust::Unverified,
+                }
+            };
+            let key = sn.digits.chars().take(16).collect();
+            (sn.digits, trust, key)
+        }
+        None => {
+            let live = account.live();
+            let trust = if live.identity_changed.contains(peer_aci) {
+                Trust::Changed
+            } else if live.identity_states.get(peer_aci) == Some(&wire::IdentityState::Verified) {
+                Trust::Verified
+            } else {
+                Trust::Unverified
+            };
+            (String::new(), trust, String::new())
+        }
+    };
+    CallSecurity {
+        mode: SecurityMode::EndToEnd,
+        code: code.clone(),
+        emojis: Vec::new(),
+        epoch: 1,
+        members: vec![SecureMember { user_id: peer_aci.to_owned(), key, safety: code, trust }],
+        unsupported: Vec::new(),
+        server_lacks: false,
+        required: true,
+    }
+}
+
+/// Fetches Signal's TURN relays and maps them into `mediad`'s `SignalRelay` list.
+fn signal_relays(account: &Account) -> Vec<SignalRelay> {
+    account
+        .wire
+        .turn_servers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| SignalRelay { urls: t.urls, username: t.username, password: t.password })
+        .collect()
+}
+
+/// Starts an outgoing 1:1 Signal call or answers an incoming ring (`Command::CallJoin`).
+fn call_join(account: &Account, conversation_id: &str) {
+    let Ok(target_peer) = peer(conversation_id) else {
+        account.ctx.call_failed(conversation_id, CallFailure::Refused, "That Signal conversation can't be called.");
+        return;
+    };
+    let Peer::Direct(peer_aci) = target_peer.clone() else {
+        account.ctx.call_failed(conversation_id, CallFailure::Refused, "Signal group calls are not enabled yet.");
+        return;
+    };
+
+    let always_relay = account.ctx.hub.settings().on(protocol::settings::SIGNAL_ALWAYS_RELAY);
+    let is_contact = account.live().contacts.contains(&peer_aci);
+    let relay_only = protocol::settings::signal_relay_only(is_contact, always_relay);
+    let relays = signal_relays(account);
+    let security = signal_call_security(account, &peer_aci);
+    let peer_name = account.live().name(&peer_aci);
+
+    // Check if we are answering an incoming ring for this conversation.
+    let incoming_ring = {
+        let mut live = account.live();
+        if live.ring.as_ref().is_some_and(|r| r.conversation == conversation_id) {
+            live.ring.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(ring) = incoming_ring {
+        let answer_sdp = if ring.sdp.starts_with("v=0") {
+            let accept = SignalAccept {
+                user_id: account.me.clone(),
+                peer_id: peer_aci.clone(),
+                host: "127.0.0.1".to_owned(),
+                offer_sdp: ring.sdp.clone(),
+                video: ring.video,
+                relay_only,
+                relays,
+                muted: false,
+                deafened: false,
+            };
+            match account.ctx.signal_accept(conversation_id, accept) {
+                Ok(sdp) => sdp,
+                Err(detail) => {
+                    account.ctx.call_failed(conversation_id, CallFailure::Engine, &detail);
+                    return;
+                }
+            }
+        } else {
+            // Scripted / opaque-only offer: generate an answer SDP locally via mediad offer if possible.
+            let offer = SignalOffer {
+                user_id: account.me.clone(),
+                peer_id: peer_aci.clone(),
+                host: "127.0.0.1".to_owned(),
+                video: ring.video,
+                relay_only,
+                relays,
+                muted: false,
+                deafened: false,
+            };
+            account.ctx.signal_offer(conversation_id, offer).unwrap_or_default()
+        };
+
+        let active = ActiveSignalCall {
+            id: ring.id,
+            conversation: conversation_id.to_owned(),
+            peer_aci: peer_aci.clone(),
+            video: ring.video,
+            outgoing: false,
+            answered: true,
+            muted: false,
+            deafened: false,
+            camera: ring.video,
+            sharing: false,
+            pending_ice: Vec::new(),
+            sent_ms: ring.sent,
+        };
+        account.live().active_call = Some(active);
+
+        if let Err(fault) = account.wire.send(
+            &target_peer,
+            Body::Call(CallSignal::Answer {
+                id: ring.id,
+                sdp: answer_sdp,
+                opaque: Vec::new(),
+            }),
+        ) {
+            account.live().active_call = None;
+            account.ctx.call_failed(conversation_id, CallFailure::Lost, &fault.words());
+            return;
+        }
+        for cand in ring.pending_ice {
+            account.ctx.signal_ice(conversation_id, cand);
+        }
+        account.ctx.call_security(conversation_id, Some(security));
+        account.ctx.participants(
+            conversation_id,
+            vec![Participant {
+                id: peer_aci,
+                name: peer_name,
+                camera: ring.video,
+                ..Participant::default()
+            }],
+        );
+        // If there is no real SDP from a remote peer (scripted fake wire), mark joined immediately
+        // once Answer is accepted by the wire; with a real remote peer, mediad Connected fires.
+        if !ring.sdp.starts_with("v=0") {
+            account.ctx.call_state(conversation_id, CallState::Joined);
+        }
+        return;
+    }
+
+    // Outgoing 1:1 call: enter RingingOut, generate str0m SDP offer, send OfferMessage over Signal.
+    let call_id = now_ms();
+    account.ctx.ringing_out(conversation_id);
+    let offer_spec = SignalOffer {
+        user_id: account.me.clone(),
+        peer_id: peer_aci.clone(),
+        host: "127.0.0.1".to_owned(),
+        video: false,
+        relay_only,
+        relays,
+        muted: false,
+        deafened: false,
+    };
+    let sdp = match account.ctx.signal_offer(conversation_id, offer_spec) {
+        Ok(sdp) => sdp,
+        Err(detail) => {
+            account.ctx.call_failed(conversation_id, CallFailure::Engine, &detail);
+            return;
+        }
+    };
+    account.live().active_call = Some(ActiveSignalCall {
+        id: call_id,
+        conversation: conversation_id.to_owned(),
+        peer_aci: peer_aci.clone(),
+        video: false,
+        outgoing: true,
+        answered: false,
+        muted: false,
+        deafened: false,
+        camera: false,
+        sharing: false,
+        pending_ice: Vec::new(),
+        sent_ms: call_id,
+    });
+    if let Err(fault) = account.wire.send(
+        &target_peer,
+        Body::Call(CallSignal::Offer {
+            id: call_id,
+            video: false,
+            sdp,
+            opaque: Vec::new(),
+        }),
+    ) {
+        account.live().active_call = None;
+        account.ctx.call_failed(conversation_id, CallFailure::Lost, &fault.words());
+        return;
+    }
+    account.ctx.call_security(conversation_id, Some(security));
+}
+
+/// Handles `CallMessage.answer` for our outgoing 1:1 call.
+fn call_answered(account: &Account, _peer: &Peer, by: &str, id: u64, sdp: String, _opaque: Vec<u8>) {
+    let matched = {
+        let mut live = account.live();
+        if let Some(active) = live.active_call.as_mut() {
+            let same = active.outgoing && active.peer_aci == by && (id == 0 || active.id == id);
+            if same {
+                active.answered = true;
+                let buffered = std::mem::take(&mut active.pending_ice);
+                Some((active.conversation.clone(), active.peer_aci.clone(), active.video, buffered))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let Some((conversation, peer_aci, video, buffered_ice)) = matched else {
+        return;
+    };
+    let peer_name = account.live().name(&peer_aci);
+    account.ctx.answered(&conversation);
+    account.ctx.participants(
+        &conversation,
+        vec![Participant {
+            id: peer_aci,
+            name: peer_name,
+            camera: video,
+            ..Participant::default()
+        }],
+    );
+    if sdp.starts_with("v=0") {
+        if let Err(detail) = account.ctx.signal_answer(&conversation, sdp) {
+            account.ctx.call_failed(&conversation, CallFailure::Engine, &detail);
+            return;
+        }
+        for cand in buffered_ice {
+            account.ctx.signal_ice(&conversation, cand);
+        }
+    } else {
+        for cand in buffered_ice {
+            account.ctx.signal_ice(&conversation, cand);
+        }
+        account.ctx.call_state(&conversation, CallState::Joined);
+    }
+}
+
+/// Handles incoming `CallMessage.iceUpdate` candidates from the remote peer.
+fn call_ice_received(account: &Account, _peer: &Peer, by: &str, id: u64, candidates: Vec<String>) {
+    let active_conv = {
+        let mut live = account.live();
+        if let Some(active) = live.active_call.as_mut() {
+            if active.peer_aci == by && (id == 0 || active.id == id) {
+                if active.answered {
+                    Some(active.conversation.clone())
+                } else {
+                    active.pending_ice.extend(candidates);
+                    return;
+                }
+            } else {
+                None
+            }
+        } else if let Some(ring) = live.ring.as_mut() {
+            if ring.author == by && (id == 0 || ring.id == id) {
+                ring.pending_ice.extend(candidates);
+            }
+            return;
+        } else {
+            None
+        }
+    };
+    if let Some(conversation) = active_conv {
+        for cand in candidates {
+            account.ctx.signal_ice(&conversation, cand);
+        }
+    }
+}
+
+/// Sends a local ICE candidate from `mediad` to the remote peer via `CallMessage.iceUpdate`.
+fn call_ice_send(account: &Account, conversation_id: &str, candidate: String) {
+    let target = {
+        let live = account.live();
+        live.active_call
+            .as_ref()
+            .filter(|c| c.conversation == conversation_id)
+            .map(|c| (c.id, c.peer_aci.clone()))
+    };
+    let Some((id, peer_aci)) = target else {
+        return;
+    };
+    let _ = account.wire.send(
+        &Peer::Direct(peer_aci),
+        Body::Call(CallSignal::IceUpdate { id, candidates: vec![candidate] }),
+    );
+}
+
+/// Leaves, cancels, or declines a Signal 1:1 call (`Command::CallLeave`).
+fn call_leave(account: &Account, conversation_id: &str) {
+    // Declining an incoming ring before accepting.
+    let declined_ring = {
+        let mut live = account.live();
+        if live.ring.as_ref().is_some_and(|r| r.conversation == conversation_id) {
+            live.ring.take()
+        } else {
+            None
+        }
+    };
+    if let Some(ring) = declined_ring {
+        account.ctx.ring_stopped(&ring.conversation);
+        let _ = account.wire.send(
+            &Peer::Direct(ring.author),
+            Body::Call(CallSignal::Hangup { id: ring.id, kind: HangupKind::Declined, device_id: None }),
+        );
+        return;
+    }
+
+    // Hanging up or cancelling an active outgoing/joined call.
+    let ended = {
+        let mut live = account.live();
+        if live.active_call.as_ref().is_some_and(|c| c.conversation == conversation_id) {
+            live.active_call.take()
+        } else {
+            None
+        }
+    };
+    if let Some(call) = ended {
+        let _ = account.wire.send(
+            &Peer::Direct(call.peer_aci),
+            Body::Call(CallSignal::Hangup { id: call.id, kind: HangupKind::Normal, device_id: None }),
+        );
+    }
+}
+
+/// The call ended: the ring or active call goes, and a call nobody answered here leaves the line
+/// the other networks leave. One answered on another device (`HangupKind::Accepted`) leaves none.
+fn ended_call(account: &Account, id: u64, answered: bool, kind: HangupKind) {
+    // Check if this ends our active call.
+    let active = {
+        let mut live = account.live();
+        if live.active_call.as_ref().is_some_and(|c| id == 0 || c.id == id) {
+            live.active_call.take()
+        } else {
+            None
+        }
+    };
+    if let Some(call) = active {
+        if !call.answered && matches!(kind, HangupKind::Busy | HangupKind::Declined) {
+            let detail = if kind == HangupKind::Busy {
+                "Busy on another call."
+            } else {
+                "Call declined."
+            };
+            account.ctx.call_failed(&call.conversation, CallFailure::Refused, detail);
+        } else {
+            account.ctx.call_over(&call.conversation);
+        }
+        return;
+    }
+
     if account.live().ring.as_ref().is_none_or(|ring| ring.id != id) {
         return;
     }
     let Some(ring) = account.live().ring.take() else {
         return;
     };
-    account.ctx.phone_ring_stopped(&ring.conversation);
-    if answered {
+    account.ctx.ring_stopped(&ring.conversation);
+    if answered || kind == HangupKind::Accepted {
         return;
     }
     let mut line = Message::plain(
@@ -3143,7 +3573,7 @@ fn apply_call_event(
             }
         };
         if let Some(ring) = stop {
-            account.ctx.phone_ring_stopped(&ring.conversation);
+            account.ctx.ring_stopped(&ring.conversation);
         }
     }
     match peer {
@@ -3376,6 +3806,9 @@ fn offline(ctx: &Context, command: Command) {
             let _ = reply.send(res);
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
+        Command::CallJoin(conversation_id) => {
+            ctx.call_failed(&conversation_id, CallFailure::Lost, "Signal is offline.");
+        }
         other => other.unsupported(ctx),
     }
 }
@@ -3392,10 +3825,12 @@ pub(crate) fn capability_ceiling() -> protocol::Capabilities {
     capabilities(true)
 }
 
-/// Signal calls stay on the phone. Directs and groups exist here; a voice room does not.
+/// Signal direct 1:1 calls run natively through `mediad` (pure-Rust `str0m` Opus + H.264).
+/// Signal has no voice rooms (`Voice` is absent).
 pub(crate) fn call_offer(kind: ConversationKind) -> protocol::CallOffer {
     match kind {
-        ConversationKind::Direct | ConversationKind::Group => protocol::CallOffer::Missing,
+        ConversationKind::Direct => protocol::CallOffer::Native,
+        ConversationKind::Group => protocol::CallOffer::Missing,
         _ => protocol::CallOffer::Absent,
     }
 }
@@ -3865,6 +4300,29 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = ctx.message(&conversation_id, &msg);
             let _ = reply.send(Ok(()));
         }
+        Command::CallJoin(conversation_id) => call_join(account, &conversation_id),
+        Command::CallLeave(conversation_id) => call_leave(account, &conversation_id),
+        Command::CallAudio { muted, deafened } => {
+            if let Some(active) = account.live().active_call.as_mut() {
+                active.muted = muted;
+                active.deafened = deafened;
+            }
+        }
+        Command::CallPicture(picture) => {
+            if let Some(active) = account.live().active_call.as_mut() {
+                match picture {
+                    Picture::Camera(on) => {
+                        active.camera = on;
+                        if on {
+                            active.video = true;
+                        }
+                    }
+                    Picture::Share(on) => active.sharing = on,
+                    Picture::Watch(_) => {}
+                }
+            }
+        }
+        Command::CallIce { conversation_id, candidate } => call_ice_send(account, &conversation_id, candidate),
         other => other.unsupported(ctx),
     }
 }

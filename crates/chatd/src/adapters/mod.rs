@@ -1851,6 +1851,8 @@ pub enum Command {
     /// A camera, a screen share, or whose share to watch. Nothing answers: the call's own
     /// events say what the network did.
     CallPicture(Picture),
+    /// A local ICE candidate gathered by `mediad` for a Signal call, to send in `IceUpdate`.
+    CallIce { conversation_id: String, candidate: String },
     /// Rings everyone (`None`) or specific people (`Some`) in the current direct/group call.
     CallRing { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// Stops ringing everyone (`None`) or specific people (`Some`) in the current direct/group call.
@@ -3502,6 +3504,36 @@ impl Context {
     /// Whose voice each receive slot carries.
     pub fn tiny_slots(&self, conversation_id: &str, audio: Vec<protocol::TinySlot>) {
         self.hub.calls.tiny_slots(&self.hub, &self.key(conversation_id), audio);
+    }
+
+    /// Signal call: ask mediad to build a pure-Rust `str0m` WebRTC SDP offer.
+    pub fn signal_offer(&self, conversation_id: &str, offer: protocol::SignalOffer) -> Result<String, String> {
+        self.hub.calls.signal_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    /// Signal call: ask mediad to accept an incoming SDP offer and return our SDP answer.
+    pub fn signal_accept(&self, conversation_id: &str, accept: protocol::SignalAccept) -> Result<String, String> {
+        self.hub.calls.signal_accept(&self.hub, &self.key(conversation_id), accept)
+    }
+
+    /// Signal call: deliver the remote peer's SDP answer to mediad.
+    pub fn signal_answer(&self, conversation_id: &str, sdp: String) -> Result<(), String> {
+        self.hub.calls.signal_answer(&self.hub, &self.key(conversation_id), sdp)
+    }
+
+    /// Signal call: deliver one remote ICE candidate to mediad.
+    pub fn signal_ice(&self, conversation_id: &str, candidate: String) {
+        self.hub.calls.signal_ice(&self.hub, &self.key(conversation_id), candidate);
+    }
+
+    /// Sets the call's end-to-end encryption indicator (`CallSecurity`) for the shell.
+    pub fn call_security(&self, conversation_id: &str, security: Option<protocol::CallSecurity>) {
+        self.hub.calls.set_security(&self.hub, &self.key(conversation_id), security);
+    }
+
+    /// Updates the call's state directly (e.g., transitioning to `Joined` once a call is established).
+    pub fn call_state(&self, conversation_id: &str, state: CallState) {
+        self.hub.calls.set_state(&self.hub, &self.key(conversation_id), state);
     }
 
     /// The call in this room is over and the network already knows. A joined call plays the

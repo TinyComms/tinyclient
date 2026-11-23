@@ -913,11 +913,11 @@ impl Shell {
     }
 
     /// Share and camera belong on a joined call that allows video (`Call::video_allowed`) on a
-    /// network that carries it (Tiny or Discord).
+    /// network that carries it (Tiny, Discord, or Signal).
     fn call_pictures(&self, call: &Call) -> bool {
         call.state == CallState::Joined
             && call.video_allowed
-            && matches!(call.conversation.network, Network::Discord | Network::Tiny)
+            && protocol::call_pictures(call.conversation.network)
     }
 
     /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,

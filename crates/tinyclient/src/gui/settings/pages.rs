@@ -18,7 +18,7 @@ use protocol::settings::{
     self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, AUTO_WATCH_SHARE, CACHE_MB, CAMERA, CAMERA_BLUR, CAMERA_MIRROR, CAMERA_QUALITY, CAMERA_QUALITY_CHOICES,
     CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME, ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS,
     KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, PRESENCE_ACTIVITY, QUALITY_CHOICES,
-    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, STREAMER_DETECT_OBS, STREAMER_HIDE_WINDOW, STREAMER_MODE, STREAMER_MODE_CHOICES, TRANSLATE_TO, TRANSLATE_TO_CHOICES, TYPING, VOICE_QUALITY, VOICE_VOLUME,
+    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SIGNAL_ALWAYS_RELAY, SOUNDS, STREAMER_DETECT_OBS, STREAMER_HIDE_WINDOW, STREAMER_MODE, STREAMER_MODE_CHOICES, TRANSLATE_TO, TRANSLATE_TO_CHOICES, TYPING, VOICE_QUALITY, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
@@ -440,8 +440,8 @@ impl SettingsWindow {
                         .child(caption("Older messages are deleted here, never on the networks. Each conversation also keeps at most its newest 2,000.")),
                 );
                 groups.push(
-                    self.group(&["PE"], Some("Calls"), window, cx).child(caption(
-                        "When a server turns a call's encryption off, the call stops until you choose to carry on unencrypted. With this on you can't: you leave instead, and a Tiny server that cannot encrypt calls is not joined. Always the case on Incognito servers and in rooms that require it. Takes effect the next time you join.",
+                    self.group(&["PE", "P7"], Some("Calls"), window, cx).child(caption(
+                        "When a server turns a call's encryption off, the call stops until you choose to carry on unencrypted. Always relay Signal calls routes Signal call media through TURN servers to hide your IP address (calls with non-contacts are always relayed).",
                     )),
                 );
                 groups.push(
@@ -900,6 +900,10 @@ impl SettingsWindow {
             "PE" => {
                 let on = values.on(REQUIRE_CALL_E2EE);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, REQUIRE_CALL_E2EE, on, false, cx), cx)
+            }
+            "P7" => {
+                let on = values.on(SIGNAL_ALWAYS_RELAY);
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, SIGNAL_ALWAYS_RELAY, on, false, cx), cx)
             }
             "PS1" => {
                 let at = STREAMER_MODE_CHOICES.iter().position(|word| *word == values.word(GLOBAL, STREAMER_MODE)).unwrap_or(2);

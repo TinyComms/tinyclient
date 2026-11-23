@@ -49,11 +49,12 @@
 use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
-    CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, HistoryTransfer, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker,
-    MessageRequestAction, OwnCard, Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker,
-    StickerEntry, StickerPackInfo, StorageSnapshot, StoryContext, StoryDistributionList, StoryMessageData, StoryText,
-    Text, TransferOutcome, TransferProgress, Wire, FLAG_GIF, FLAG_VOICE_MESSAGE,
+    CallOutcome, CallSignal, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess,
+    GroupEdit, GroupInfo, GroupMember, GroupMembers, HangupKind, HistoryTransfer, IdentityState, InviteLinkMode,
+    LinkPreview, Linked, Linker, MessageRequestAction, OwnCard, Peer, PersonProfile, Pointer, Quote, QuotedAttachment,
+    SafetyNumber, Sticker, StickerEntry, StickerPackInfo, StorageSnapshot, StoryContext, StoryDistributionList,
+    StoryMessageData, StoryText, Text, TransferOutcome, TransferProgress, TurnServer, Wire, FLAG_GIF,
+    FLAG_VOICE_MESSAGE,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -220,6 +221,8 @@ pub struct Fake {
     profiles: Arc<Mutex<HashMap<String, PersonProfile>>>,
     /// Known sticker packs (installed or available to preview/install in tests).
     sticker_packs: Arc<Mutex<HashMap<String, StickerPackInfo>>>,
+    /// Scripted TURN relay servers returned by `turn_servers()`.
+    turn_servers: Arc<Mutex<Vec<TurnServer>>>,
 }
 
 impl Fake {
@@ -263,6 +266,11 @@ impl Fake {
             identities: Arc::new(Mutex::new(initial_identities())),
             profiles: Arc::new(Mutex::new(initial_profiles())),
             sticker_packs: Arc::default(),
+            turn_servers: Arc::new(Mutex::new(vec![TurnServer {
+                urls: vec!["turn:127.0.0.1:3478?transport=udp".into()],
+                username: "fake-turn-user".into(),
+                password: "fake-turn-pass".into(),
+            }])),
         };
         fake.listen();
         fake
@@ -270,7 +278,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles, sticker_packs) = (
+        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles, sticker_packs, turn_servers) = (
             self.events.clone(),
             self.closed.clone(),
             self.refuse.clone(),
@@ -281,6 +289,7 @@ impl Fake {
             self.identities.clone(),
             self.profiles.clone(),
             self.sticker_packs.clone(),
+            self.turn_servers.clone(),
         );
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
@@ -290,6 +299,20 @@ impl Fake {
                 let Some(line) = line.map(str::trim) else {
                     return true;
                 };
+                if let Some(rest) = line.strip_prefix("turn ") {
+                    let mut parts = rest.split_whitespace();
+                    let url = parts.next().unwrap_or("").to_owned();
+                    let username = parts.next().unwrap_or("u").to_owned();
+                    let password = parts.next().unwrap_or("p").to_owned();
+                    if !url.is_empty() {
+                        turn_servers.lock().unwrap_or_else(|p| p.into_inner()).push(TurnServer {
+                            urls: vec![url],
+                            username,
+                            password,
+                        });
+                    }
+                    return true;
+                }
                 if let Some(rest) = line.strip_prefix("profile ") {
                     let mut parts = rest.splitn(2, ' ');
                     let target = parts.next().unwrap_or("").trim();
@@ -680,11 +703,55 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
                 return Vec::new();
             };
             let sent = next().parse().unwrap_or(T0);
-            vec![Event::Call { peer: direct(author), by: author.into(), name: name.into(), video: command == "call-video", id: sent, sent }]
+            let sdp = rest(line, 3).replace("\\n", "\r\n");
+            let opaque = sdp.as_bytes().to_vec();
+            vec![Event::Call {
+                peer: direct(author),
+                by: author.into(),
+                name: name.into(),
+                video: command == "call-video",
+                id: sent,
+                sent,
+                sdp,
+                opaque,
+            }]
         }
-        "hangup" | "hangup-accepted" | "busy" => {
+        "call-answer" => {
+            let Some((author, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let id = next().parse().unwrap_or(0);
+            let sdp = rest(line, 3).replace("\\n", "\r\n");
+            let opaque = sdp.as_bytes().to_vec();
+            vec![Event::CallAnswer { peer: direct(author), by: author.into(), id, sdp, opaque }]
+        }
+        "call-ice" => {
+            let Some((author, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let id = next().parse().unwrap_or(0);
+            let candidate = rest(line, 3);
+            if candidate.is_empty() {
+                return Vec::new();
+            }
+            vec![Event::CallIce { peer: direct(author), by: author.into(), id, candidates: vec![candidate] }]
+        }
+        "call-opaque" => {
+            let Some((author, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let data = rest(line, 2).into_bytes();
+            vec![Event::CallOpaque { peer: direct(author), by: author.into(), data, urgent: true }]
+        }
+        "hangup" | "hangup-accepted" | "hangup-declined" | "busy" => {
             let id = next().parse().unwrap_or(T0);
-            vec![Event::CallEnded { id, answered: command == "hangup-accepted" }]
+            let kind = match command {
+                "hangup-accepted" => HangupKind::Accepted,
+                "hangup-declined" => HangupKind::Declined,
+                "busy" => HangupKind::Busy,
+                _ => HangupKind::Normal,
+            };
+            vec![Event::CallEnded { id, answered: kind == HangupKind::Accepted, kind }]
         }
         "call-event" => {
             let target = next();
@@ -1579,6 +1646,21 @@ impl Wire for Fake {
                 };
                 format!("post-story {target} replies={allows_replies} {body_desc}")
             }
+            Body::Call(signal) => match signal {
+                CallSignal::Offer { id, video, sdp, .. } => {
+                    let relay = !sdp.contains(" typ host") && sdp.contains("typ relay");
+                    format!("send {} call-offer {id} video={video} sdp={} relay={relay}", describe(to), sdp.starts_with("v=0"))
+                }
+                CallSignal::Answer { id, sdp, .. } => {
+                    format!("send {} call-answer {id} sdp={}", describe(to), sdp.starts_with("v=0"))
+                }
+                CallSignal::IceUpdate { id, candidates } => {
+                    format!("send {} call-ice {id} count={}", describe(to), candidates.len())
+                }
+                CallSignal::Busy { id } => format!("send {} call-busy {id}", describe(to)),
+                CallSignal::Hangup { id, kind, .. } => format!("send {} call-hangup {id} {}", describe(to), kind.word()),
+                CallSignal::Opaque { data, urgent } => format!("send {} call-opaque urgent={urgent} len={}", describe(to), data.len()),
+            },
         };
         record(&line);
         if let Peer::Direct(aci) = to {
@@ -2324,6 +2406,13 @@ impl Wire for Fake {
         }
         std::fs::write(dest, &bytes).map_err(|err| Fault::Net(err.to_string()))?;
         Ok(bytes.len() as u64)
+    }
+
+    fn turn_servers(&self) -> Result<Vec<TurnServer>, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        Ok(self.turn_servers.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
     fn close(&self) {

@@ -473,9 +473,9 @@ pub enum CallSupport {
     Restricted,
 }
 
-/// Camera and screen share run in this client on a Tiny or Discord call.
+/// Camera and screen share run in this client on a Tiny, Discord, or Signal call.
 pub fn call_pictures(network: Network) -> bool {
-    matches!(network, Network::Tiny | Network::Discord)
+    matches!(network, Network::Tiny | Network::Discord | Network::Signal)
 }
 
 /// How a conversation kind is called, as the adapter that builds its row decides.

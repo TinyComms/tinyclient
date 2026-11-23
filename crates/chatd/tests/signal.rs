@@ -6,6 +6,9 @@
 //! what comes back into the contract, and the link steps. It proves nothing about presage and
 //! libsignal underneath, which no test can reach without a real account and a phone to link from.
 
+#[path = "support/mediad.rs"]
+mod test_mediad;
+
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ContactKind, Conversation, ConversationKind, ErrorCode, Key, Link, Message,
     MessageKind, Network, Outgoing, OutgoingFile, Page, PollDraft, Relation, Request, Response, SendState, SignInInput, SignInProblem,
@@ -70,6 +73,8 @@ impl World {
         command
             .env("TINYCLIENT_DIR", &dir)
             .env("TINYCLIENT_SIGNAL_FAKE", "1")
+            .env("TINYCLIENT_MEDIAD", test_mediad::path())
+            .env("TINYCLIENT_MEDIAD_AUDIO", "tone")
             .env_remove("TINYCLIENT_SESSION_DISCORD")
             .env_remove("TINYCLIENT_SESSION_SLACK")
             .env_remove("TINYCLIENT_SESSION_TELEGRAM")
@@ -98,6 +103,8 @@ impl World {
         self.child = Command::new(chatd_bin())
             .env("TINYCLIENT_DIR", &self.dir)
             .env("TINYCLIENT_SIGNAL_FAKE", "1")
+            .env("TINYCLIENT_MEDIAD", test_mediad::path())
+            .env("TINYCLIENT_MEDIAD_AUDIO", "tone")
             .env("TINYCLIENT_SESSION_SIGNAL", SESSION)
             .env_remove("TINYCLIENT_SESSION_DISCORD")
             .env_remove("TINYCLIENT_SESSION_SLACK")
@@ -3744,4 +3751,136 @@ fn history_transfer_decline_and_expiry_and_tampered_archive_leave_device_linked(
         assert_eq!(done, Some(account()));
         world.connected();
     }
+}
+
+#[test]
+fn signal_direct_outgoing_call_offer_answer_ice_camera_and_hangup() {
+    let world = World::linked();
+    world.connected();
+
+    // Direct chat row advertises native Signal calls.
+    world.steer(&format!("incoming grace {} Hey, free to talk?", now_ms()));
+    let row = world.until("Grace's row with Native call support", || {
+        world.conversation(GRACE).filter(|r| r.call == protocol::CallSupport::Native)
+    });
+    assert_eq!(row.call, protocol::CallSupport::Native);
+
+    // Place outgoing 1:1 call: generates real str0m SDP offer, sends Offer + IceUpdate, shows E2EE safety number.
+    let resp = world.ask(Request::CallStart { conversation: key(GRACE) });
+    assert!(matches!(resp, Response::Status { .. }), "{resp:?}");
+
+    let offer_line = world.until("Signal OfferMessage sent with SDP", || {
+        world.calls().into_iter().find(|l| l.starts_with(&format!("send {GRACE} call-offer ")) && l.contains("sdp=true"))
+    });
+    assert!(offer_line.contains("relay=false"), "contact call with P7 off uses direct candidate: {offer_line}");
+    let call_id: u64 = offer_line.split_whitespace().nth(3).unwrap().parse().unwrap();
+
+    world.until("Signal local ICE update sent", || {
+        world.calls().into_iter().find(|l| l.starts_with(&format!("send {GRACE} call-ice {call_id}")))
+    });
+
+    let call = world.until("Call RingingOut with E2EE safety number", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE)
+                && c.state == protocol::CallState::RingingOut
+                && c.security.as_ref().is_some_and(|s| s.mode == protocol::SecurityMode::EndToEnd && s.code.len() == 60) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+    assert_eq!(call.security.as_ref().unwrap().members[0].user_id, GRACE);
+
+    // Remote peer sends ICE candidate and answers.
+    world.steer(&format!("call-ice grace {call_id} candidate:1 1 UDP 2130706431 127.0.0.1 45000 typ host"));
+    world.steer(&format!("call-answer grace {call_id}"));
+    let joined = world.until("Call transitions to Joined with Grace in participants", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE)
+                && c.state == protocol::CallState::Joined
+                && c.participants.iter().any(|p| p.id == GRACE) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+    assert_eq!(joined.participants.len(), 1);
+
+    // Hang up sends CallMessage.Hangup (Normal) and clears the call.
+    let end = world.ask(Request::CallEnd);
+    assert!(matches!(end, Response::Status { call: None, .. }), "{end:?}");
+    world.heard(&format!("send {GRACE} call-hangup {call_id} normal"));
+}
+
+#[test]
+fn signal_direct_incoming_call_accept_decline_busy_and_always_relay() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Fresh incoming video call rings natively; accepting sends Answer and joins.
+    let call_id = now_ms();
+    world.steer(&format!("call-video grace {call_id}"));
+    world.until("Call RingingIn from Grace", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE) && matches!(c.state, protocol::CallState::RingingIn { .. }) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+    let accepted = world.ask(Request::CallAccept);
+    assert!(matches!(accepted, Response::Status { .. }), "{accepted:?}");
+    world.until("Answer sent to Grace", || {
+        world.calls().into_iter().find(|l| l.starts_with(&format!("send {GRACE} call-answer {call_id}")))
+    });
+    world.until("Joined incoming Signal call with safety number", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE)
+                && c.state == protocol::CallState::Joined
+                && c.security.as_ref().is_some_and(|s| s.mode == protocol::SecurityMode::EndToEnd) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+
+    // 2. While in a call with Grace, a second incoming call from Alan receives Busy.
+    let second_id = call_id + 10;
+    world.steer(&format!("call alan {second_id}"));
+    world.heard(&format!("send {ALAN} call-busy {second_id}"));
+
+    // Hang up Grace.
+    let _ = world.ask(Request::CallEnd);
+    world.heard(&format!("send {GRACE} call-hangup {call_id} normal"));
+
+    // 3. Incoming call declined sends Hangup(Declined).
+    let third_id = now_ms();
+    world.steer(&format!("call grace {third_id}"));
+    world.until("Second RingingIn from Grace", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE) && matches!(c.state, protocol::CallState::RingingIn { .. }) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+    let _ = world.ask(Request::CallDecline);
+    world.heard(&format!("send {GRACE} call-hangup {third_id} declined"));
+
+    // 4. Privacy P7 ("Always relay Signal calls"): outgoing offer uses TURN relay candidates only.
+    let set_resp = world.ask(Request::Set {
+        scope: protocol::settings::GLOBAL.into(),
+        key: protocol::settings::SIGNAL_ALWAYS_RELAY.into(),
+        value: Some("on".into()),
+    });
+    assert!(matches!(set_resp, Response::Ok), "{set_resp:?}");
+    let _ = world.ask(Request::CallStart { conversation: key(GRACE) });
+    world.until("Relay-only Signal offer sent", || {
+        world.calls().into_iter().find(|l| {
+            l.starts_with(&format!("send {GRACE} call-offer "))
+                && l.contains("sdp=true")
+                && l.contains("relay=true")
+        })
+    });
+    let _ = world.ask(Request::CallEnd);
 }

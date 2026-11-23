@@ -1490,6 +1490,7 @@ impl Demo {
             | Command::Wanted(_)
             | Command::WantedSpan { .. }
             | Command::Played { .. }
+            | Command::CallIce { .. }
             | Command::Stop => {}
         }
     }
