@@ -1857,12 +1857,18 @@ pub enum Command {
     /// A camera, a screen share, or whose share to watch. Nothing answers: the call's own
     /// events say what the network did.
     CallPicture(Picture),
+    /// A local ICE candidate gathered by `mediad` for a Signal call, to send in `IceUpdate`.
+    CallIce { conversation_id: String, candidate: String },
     /// Rings everyone (`None`) or specific people (`Some`) in the current direct/group call.
     CallRing { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// Stops ringing everyone (`None`) or specific people (`Some`) in the current direct/group call.
     CallStopRinging { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// Adds friends to the current direct or group call, returning the resulting conversation id.
     CallAddPeople { conversation_id: String, people: Vec<String>, reply: Reply<String> },
+    /// Raises or lowers our hand in the active group call.
+    CallRaiseHand { conversation_id: String, raised: bool, reply: Reply<()> },
+    /// Sends a transient emoji reaction in the active group call.
+    CallReact { conversation_id: String, emoji: String, reply: Reply<()> },
     /// A Tiny server's live socket: take or leave a seat in a room's call, remove someone from
     /// one, or hear that the user opened the server.
     Tiny(tiny::live::Ask),
@@ -2301,6 +2307,9 @@ impl Command {
             Command::CallJoin(conversation_id) => {
                 let detail = format!("{} calls are not built yet.", ctx.account.network.label());
                 ctx.call_failed(&conversation_id, CallFailure::Refused, &detail);
+            }
+            Command::CallRaiseHand { reply, .. } | Command::CallReact { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
             }
             _ => {}
         }
@@ -3514,6 +3523,46 @@ impl Context {
     /// Whose voice each receive slot carries.
     pub fn tiny_slots(&self, conversation_id: &str, audio: Vec<protocol::TinySlot>) {
         self.hub.calls.tiny_slots(&self.hub, &self.key(conversation_id), audio);
+    }
+
+    /// Signal call: ask mediad to build a pure-Rust `str0m` WebRTC SDP offer.
+    pub fn signal_offer(&self, conversation_id: &str, offer: protocol::SignalOffer) -> Result<String, String> {
+        self.hub.calls.signal_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    /// Signal call: ask mediad to accept an incoming SDP offer and return our SDP answer.
+    pub fn signal_accept(&self, conversation_id: &str, accept: protocol::SignalAccept) -> Result<String, String> {
+        self.hub.calls.signal_accept(&self.hub, &self.key(conversation_id), accept)
+    }
+
+    /// Signal call: deliver the remote peer's SDP answer to mediad.
+    pub fn signal_answer(&self, conversation_id: &str, sdp: String) -> Result<(), String> {
+        self.hub.calls.signal_answer(&self.hub, &self.key(conversation_id), sdp)
+    }
+
+    /// Signal call: deliver one remote ICE candidate to mediad.
+    pub fn signal_ice(&self, conversation_id: &str, candidate: String) {
+        self.hub.calls.signal_ice(&self.hub, &self.key(conversation_id), candidate);
+    }
+
+    /// Sets the call's end-to-end encryption indicator (`CallSecurity`) for the shell.
+    pub fn call_security(&self, conversation_id: &str, security: Option<protocol::CallSecurity>) {
+        self.hub.calls.set_security(&self.hub, &self.key(conversation_id), security);
+    }
+
+    /// Updates the call's state directly (e.g., transitioning to `Joined` once a call is established).
+    pub fn call_state(&self, conversation_id: &str, state: CallState) {
+        self.hub.calls.set_state(&self.hub, &self.key(conversation_id), state);
+    }
+
+    /// Updates our own raised-hand state in the active group call.
+    pub fn call_hand_raised(&self, conversation_id: &str, raised: bool) {
+        self.hub.calls.set_hand_raised(&self.hub, &self.key(conversation_id), raised);
+    }
+
+    /// Updates our own active transient emoji reaction in the active group call.
+    pub fn call_reaction(&self, conversation_id: &str, emoji: Option<String>) {
+        self.hub.calls.set_reaction(&self.hub, &self.key(conversation_id), emoji);
     }
 
     /// The call in this room is over and the network already knows. A joined call plays the

@@ -169,6 +169,8 @@ pub struct Calls {
     signal: Mutex<Option<Signal>>,
     /// Who sends a Tiny renegotiation offer. The same shape as `signal`.
     offer: Mutex<Option<Signal>>,
+    /// Who sends a Signal local ICE candidate (`IceUpdate`). The same shape as `signal`.
+    ice: Mutex<Option<Signal>>,
     /// Tiny media dropped, or came back. The live socket resumes the call; the same shape as `failed`.
     tiny_down: Mutex<Option<Failed>>,
     tiny_up: Mutex<Option<Failed>>,
@@ -293,6 +295,8 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        hand_raised: false,
+        reaction: None,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -544,7 +548,11 @@ impl Live {
                 }
                 self.call.security = security;
             }
-            MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } | MediaResponse::TinyRenegotiate { .. } => return false,
+            MediaResponse::Source { .. }
+            | MediaResponse::TinyE2ee { .. }
+            | MediaResponse::TinyRenegotiate { .. }
+            | MediaResponse::SignalIce { .. }
+            | MediaResponse::Answer { .. } => return false,
             MediaResponse::Picture { path, width, height, generation, user_id, kind } => {
                 let mut changed = false;
                 if path.is_empty() {
@@ -836,6 +844,11 @@ fn heard(hub: &Hub, seen: &Mutex<Live>, frame: MediaResponse) {
         hub.calls.offer(&conversation, sdp.clone());
         return;
     }
+    if let MediaResponse::SignalIce { candidate } = &frame {
+        let conversation = crate::hub::lock(seen).call.conversation.clone();
+        hub.calls.ice(&conversation, candidate.clone());
+        return;
+    }
     let notify = match &frame {
         MediaResponse::Interrupted => Some(false),
         MediaResponse::Connected { .. } => Some(true),
@@ -978,6 +991,11 @@ impl Calls {
         *crate::hub::lock(&self.offer) = Some(Box::new(told));
     }
 
+    /// Who sends a local Signal ICE candidate (`IceUpdate`) for the call's account.
+    pub fn on_ice(&self, told: impl Fn(&Key, String) + Send + Sync + 'static) {
+        *crate::hub::lock(&self.ice) = Some(Box::new(told));
+    }
+
     /// Who hears that a Tiny call's media dropped, so the live socket can join again.
     pub fn on_tiny_down(&self, told: impl Fn(&Key) + Send + Sync + 'static) {
         *crate::hub::lock(&self.tiny_down) = Some(Box::new(told));
@@ -997,6 +1015,12 @@ impl Calls {
     fn offer(&self, conversation: &Key, sdp: String) {
         if let Some(told) = &*crate::hub::lock(&self.offer) {
             told(conversation, sdp);
+        }
+    }
+
+    fn ice(&self, conversation: &Key, candidate: String) {
+        if let Some(told) = &*crate::hub::lock(&self.ice) {
+            told(conversation, candidate);
         }
     }
 
@@ -2074,6 +2098,112 @@ impl Calls {
         let (call, running) = self.describe();
         if running && call.is_some_and(|call| call.conversation == *conversation) {
             let _ = self.request(hub, &MediaRequest::TinySlots { audio });
+        }
+    }
+
+    /// Builds a pure-Rust `str0m` WebRTC SDP offer for an outgoing Signal 1:1 or group call.
+    pub fn signal_offer(&self, hub: &Hub, conversation: &Key, mut offer: protocol::SignalOffer) -> Result<String, String> {
+        let known = self.update(hub, conversation, |live| {
+            offer.muted = live.call.muted;
+            offer.deafened = live.call.deafened;
+            live.me = offer.user_id.clone();
+        });
+        if !known {
+            return Err("That Signal call is gone.".to_owned());
+        }
+        match self.request(hub, &MediaRequest::SignalOffer(offer)) {
+            Ok(MediaResponse::Offer { sdp }) => Ok(sdp),
+            Ok(other) => Err(format!("mediad answered {} instead of Offer", other.name())),
+            Err(CallError::Media(err)) => Err(err.to_string()),
+            Err(_) => Err(ENGINE_SILENT.to_owned()),
+        }
+    }
+
+    /// Accepts an incoming Signal call SDP offer in `mediad` and returns our SDP answer.
+    pub fn signal_accept(&self, hub: &Hub, conversation: &Key, mut accept: protocol::SignalAccept) -> Result<String, String> {
+        let known = self.update(hub, conversation, |live| {
+            accept.muted = live.call.muted;
+            accept.deafened = live.call.deafened;
+            live.me = accept.user_id.clone();
+            live.joining = true;
+            live.since = Instant::now();
+        });
+        if !known {
+            return Err("That Signal call is gone.".to_owned());
+        }
+        match self.request(hub, &MediaRequest::SignalAccept(accept)) {
+            Ok(MediaResponse::Answer { sdp }) => Ok(sdp),
+            Ok(other) => Err(format!("mediad answered {} instead of Answer", other.name())),
+            Err(CallError::Media(err)) => Err(err.to_string()),
+            Err(_) => Err(ENGINE_SILENT.to_owned()),
+        }
+    }
+
+    /// Supplies the remote peer's SDP answer to our pending Signal offer in `mediad`.
+    pub fn signal_answer(&self, hub: &Hub, conversation: &Key, sdp: String) -> Result<(), String> {
+        let known = self.update(hub, conversation, |live| {
+            live.joining = true;
+            live.since = Instant::now();
+        });
+        if !known {
+            return Err("That Signal call is gone.".to_owned());
+        }
+        match self.request(hub, &MediaRequest::SignalAnswer { sdp }) {
+            Ok(MediaResponse::Done) => Ok(()),
+            Ok(other) => Err(format!("mediad answered {} instead of Done", other.name())),
+            Err(CallError::Media(err)) => Err(err.to_string()),
+            Err(_) => Err(ENGINE_SILENT.to_owned()),
+        }
+    }
+
+    /// Feeds one remote ICE candidate into the active or pending Signal `mediad` session.
+    pub fn signal_ice(&self, hub: &Hub, conversation: &Key, candidate: String) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|call| call.conversation == *conversation) {
+            let _ = self.request(hub, &MediaRequest::SignalIce { candidate });
+        }
+    }
+
+    /// Sets the call's end-to-end encryption indicator (`CallSecurity`), e.g. Signal's safety number.
+    pub fn set_security(&self, hub: &Hub, conversation: &Key, security: Option<protocol::CallSecurity>) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            live.secured = security.clone();
+            if live.call.security != security {
+                live.call.security = security.clone();
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
+        }
+    }
+
+    /// Sets our own raised-hand state in the active group call.
+    pub fn set_hand_raised(&self, hub: &Hub, conversation: &Key, raised: bool) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            if live.call.hand_raised != raised {
+                live.call.hand_raised = raised;
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
+        }
+    }
+
+    /// Sets our own active transient emoji reaction in the active group call.
+    pub fn set_reaction(&self, hub: &Hub, conversation: &Key, emoji: Option<String>) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            if live.call.reaction != emoji {
+                live.call.reaction = emoji.clone();
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
         }
     }
 

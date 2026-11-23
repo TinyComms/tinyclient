@@ -2228,6 +2228,8 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             camera: who.camera,
             sharing: who.sharing,
             ringing: false,
+            hand_raised: false,
+            reaction: None,
         });
         ctx.participants(room, roster.collect());
     }
@@ -2954,6 +2956,8 @@ fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
             camera: who.camera,
             sharing: who.sharing,
             ringing: false,
+            hand_raised: false,
+            reaction: None,
         });
     ctx.participants(direct_id, roster.collect());
 }
