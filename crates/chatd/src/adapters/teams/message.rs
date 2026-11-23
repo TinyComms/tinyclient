@@ -807,8 +807,7 @@ impl Teams {
                 return Read::Message(Box::new(message));
             }
             "RichText/Media_CallRecording" | "RichText/Media_CallTranscript" => {
-                message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
-                message.text = "Meeting recording".to_owned();
+                self.meeting_media(conversation, &mut message, content, kind.ends_with("CallTranscript"), &self.message_link(conversation, &id, raw));
                 return Read::Message(Box::new(message));
             }
             _ => {}

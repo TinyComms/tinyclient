@@ -119,6 +119,23 @@ pub struct TextViewer {
     pub loading_full: bool,
     pub truncated: bool,
     pub copied: bool,
+    download: bool,
+}
+
+impl TextViewer {
+    fn meeting(message_id: &str, title: String) -> Self {
+        let file_id = format!("meeting-transcript:{message_id}");
+        Self {
+            attachment: Attachment::new(title, protocol::MediaFile::new(&file_id, protocol::MediaKind::File)),
+            file_id,
+            language: "",
+            text: String::new(),
+            loading_full: true,
+            truncated: false,
+            copied: false,
+            download: false,
+        }
+    }
 }
 
 /// What is kept around the picture: the sides, the bar above it, the caption below. A phone
@@ -1134,6 +1151,7 @@ impl Pane {
             loading_full: needs_fetch,
             truncated,
             copied: false,
+            download: true,
         });
         window.focus(&self.focus, cx);
         if let Some(path) = full_path {
@@ -1167,6 +1185,32 @@ impl Pane {
             });
         })
         .detach();
+    }
+
+    pub(super) fn open_meeting_transcript(&mut self, message_id: String, title: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else { return };
+        let viewer = TextViewer::meeting(&message_id, title);
+        let file_id = viewer.file_id.clone();
+        self.text_viewer = Some(viewer);
+        window.focus(&self.focus, cx);
+        cx.notify();
+        let request = protocol::Request::MeetingTranscript { conversation: conversation.clone(), message_id };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.open.as_ref().is_some_and(|open| open.key == conversation) {
+                    if let Some(viewer) = this.text_viewer.as_mut().filter(|viewer| viewer.file_id == file_id) {
+                        viewer.loading_full = false;
+                        viewer.text = match answer {
+                            Ok(protocol::Response::MeetingTranscript { text }) => text,
+                            Ok(protocol::Response::Error { detail, .. }) => detail,
+                            _ => "The transcript could not be loaded.".to_owned(),
+                        };
+                        cx.notify();
+                    }
+                }
+            });
+        }).detach();
     }
 
     pub(super) fn close_text_viewer(&mut self, cx: &mut Context<Self>) {
@@ -1258,13 +1302,13 @@ impl Pane {
                                 cx.notify();
                             })),
                     )
-                    .child(
+                    .children(viewer.download.then(|| {
                         bar_button("tv-download", Icon::Download)
                             .tooltip(tip("Download", None))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.fetch_then(&download_att, super::Then::Open, cx);
-                            })),
-                    )
+                            }))
+                    }))
                     .child(
                         bar_button("tv-close", Icon::Close)
                             .tooltip(tip("Close", Some("Esc")))
@@ -1282,7 +1326,8 @@ impl Pane {
                 div()
                     .type_code()
                     .text_color(theme::text())
-                    .whitespace_nowrap()
+                    .when(viewer.download, |body| body.whitespace_nowrap())
+                    .when(!viewer.download, |body| body.whitespace_normal())
                     .child(text_body),
             );
         let panel = div()
@@ -1297,6 +1342,16 @@ impl Pane {
             .child(body);
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(panel)).priority(2).into_any_element())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn meeting_transcript_opens_a_text_viewer_with_its_own_identity() {
+    let viewer = TextViewer::meeting("42", "Design review".into());
+    assert_eq!(viewer.attachment.name, "Design review");
+    assert_eq!(viewer.file_id, "meeting-transcript:42");
+    assert!(viewer.loading_full);
+    assert!(!viewer.download);
 }
 
 #[cfg(test)]

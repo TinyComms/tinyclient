@@ -1456,6 +1456,9 @@ pub struct Message {
     /// Additional stacked cards beyond the first `card` (e.g. multiple Slack attachments).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cards: Vec<Card>,
+    /// The source file of a meeting transcript. Read through the account's adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_transcript: Option<String>,
     /// Boxed, like `card`: few messages are a poll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<Box<Poll>>,
@@ -1675,6 +1678,7 @@ impl Message {
             forwarded: None,
             card: None,
             cards: Vec::new(),
+            meeting_transcript: None,
             poll: None,
             deleted: false,
             moderated: false,
@@ -1769,6 +1773,9 @@ impl Message {
         self.cards.truncate(20);
         for card in &mut self.cards {
             card.bound();
+        }
+        if let Some(url) = &mut self.meeting_transcript {
+            clip(url, 4000);
         }
         if let Some(poll) = &mut self.poll {
             clip(&mut poll.question, 300);

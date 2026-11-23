@@ -109,6 +109,7 @@ pub fn prove_teams_markdown() -> Result<(), String> {
 }
 mod info;
 mod call_log;
+mod meeting_media;
 mod links;
 pub(crate) mod message;
 
@@ -458,6 +459,7 @@ struct State {
     /// Meeting chats and calendar events remembered this run, by id.
     meetings: HashMap<String, protocol::MeetingEvent>,
     voicemail_next: Option<String>,
+    transcript_token: Option<(String, Token)>,
 }
 
 /// What a call presents.
@@ -1307,6 +1309,9 @@ impl Teams {
             }
             Command::Meetings { reply } => {
                 let _ = reply.send(self.meetings().map_err(refuse));
+            }
+            Command::MeetingTranscript { conversation_id, message_id, reply } => {
+                let _ = reply.send(self.meeting_transcript(&conversation_id, &message_id).map_err(refuse));
             }
             Command::MeetingRsvp { id, response, propose, reply } => {
                 let _ = reply.send(self.meeting_rsvp(&id, response, propose).map_err(refuse));

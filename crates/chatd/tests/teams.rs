@@ -451,6 +451,9 @@ impl Fake {
             "/presence/v1/me/forceavailability/" if bearer("presence") => ok(json!({})),
             "/presence/v1/me/publishnote" if bearer("presence") => ok(json!({})),
             _ if path.starts_with("/msgsearch") && bearer("substrate") => self.search_endpoint(call),
+            _ if path.starts_with("/graph/v1.0/shares/") && path.contains(&format!("u!{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("https://example.sharepoint.com/:t:/s/Ops/fixture"))) && bearer("graph") => {
+                self.graph(call, &path["/graph".len()..])
+            }
             // A shared file's bytes. The cache asks Graph's shares route; this stands in for it.
             _ if call.method == "GET" && path.contains("/shares/u!") && path.ends_with("/driveItem/content") => Reply {
                 status: "200 OK",
@@ -947,6 +950,14 @@ impl Fake {
 
     /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, channel SharePoint `filesFolder`, mailbox OOO, and user org/profile.
     fn graph(&self, call: &Call, path: &str) -> Reply {
+        if call.method == "GET" && path.starts_with("/v1.0/shares/") && path.ends_with("/driveItem/content")
+            && path.contains(&format!("u!{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("https://example.sharepoint.com/:t:/s/Ops/fixture")))
+        {
+            return Reply {
+                status: "200 OK", headers: Vec::new(), kind: "application/json",
+                body: json!({"entries": [{"speakerDisplayName": "Ana Ruiz", "text": "Ready for launch."}]}).to_string().into_bytes(),
+            };
+        }
         if call.method == "GET" && path == "/v1.0/me/mailFolders/inbox/messages" {
             assert!(call.query.contains("singleValueExtendedProperties"));
             return ok(json!({"value": [{
@@ -1622,6 +1633,39 @@ fn exchange_voicemail_returns_transcript_and_accepts_read_and_delete() {
     for action in [protocol::VoicemailAction::MarkRead, protocol::VoicemailAction::Delete] {
         assert_eq!(world.ask(Request::ChangeVoicemail { account: account.clone(), id: entry.id.clone(), action }), Response::Ok);
     }
+}
+
+#[test]
+fn recording_card_and_transcript_file_are_readable() {
+    let world = World::start();
+    world.ready();
+    let conversation = key(CHAT_ANA);
+    let recording = r#"<URIObject type="Video.2/CallRecording.1">
+        <Title>Launch &amp; review</Title><RecordingStatus status="Success"/>
+        <Identifiers><Id type="callId" value="call-fixture"/></Identifiers>
+        <RecordingContent timestamp="2025-10-09T09:00:00Z" duration="0.00:42:05">
+            <item type="onedriveForBusinessVideo" uri="https://example.sharepoint.com/:v:/s/Ops/fixture"/>
+            <item type="onedriveForBusinessTranscript" uri="https://example.sharepoint.com/:t:/s/Ops/fixture"/>
+        </RecordingContent></URIObject>"#;
+    let transcript = r#"{"callId":"call-fixture"}"#;
+    let push = |id, label: &str, content: &str| {
+        let mut raw = message(CHAT_ANA, None, id, ANA, "Ana Ruiz", content);
+        raw["messagetype"] = json!(label);
+        world.fake.push("NewMessage", raw, false);
+        world.until(label, || world.message(&conversation, &id.to_string()))
+    };
+    let row = push(1_760_000_930_001, "RichText/Media_CallRecording", recording);
+    let card = row.card.expect("a recording card");
+    assert_eq!(card.title, "Launch & review");
+    assert!(card.fields.contains(&("Duration".into(), "42:05".into())));
+    assert_eq!(card.actions[0].label, "Open recording");
+    let row = push(1_760_000_930_002, "RichText/Media_CallTranscript", transcript);
+    assert_eq!(row.text, "Meeting transcript");
+    assert_eq!(row.card.unwrap().title, "Meeting transcript");
+    let Response::MeetingTranscript { text } = world.ask(Request::MeetingTranscript { conversation, message_id: row.id }) else {
+        panic!("expected the transcript text");
+    };
+    assert_eq!(text, "Ana Ruiz: Ready for launch.");
 }
 
 impl World {

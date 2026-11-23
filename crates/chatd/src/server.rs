@@ -7364,6 +7364,12 @@ impl Chat {
             }),
             Request::TranslateMessages { conversation, message_ids, to } => self.translate(conversation, message_ids, to),
             Request::Meetings { account } => self.meetings(account),
+            Request::MeetingTranscript { conversation, message_id } => match self.ask(&conversation.account(), |reply| Command::MeetingTranscript {
+                conversation_id: conversation.id, message_id, reply,
+            }) {
+                Ok(text) => Response::MeetingTranscript { text },
+                Err(refused) => *refused,
+            },
             Request::MeetingRsvp { account, id, response, propose } => self.meeting_rsvp(account, id, response, propose),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {

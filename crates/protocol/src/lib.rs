@@ -2150,6 +2150,7 @@ pub enum Request {
     Meetings {
         account: AccountKey,
     },
+    MeetingTranscript { conversation: Key, message_id: String },
     /// Accept, decline, or tentatively accept one meeting. `propose` is a new start, Unix
     /// seconds, sent with a tentative answer.
     MeetingRsvp {
@@ -4702,6 +4703,7 @@ pub enum Response {
     Meetings {
         events: Vec<MeetingEvent>,
     },
+    MeetingTranscript { text: String },
     SpaceInfo {
         info: Box<SpaceInfo>,
     },
