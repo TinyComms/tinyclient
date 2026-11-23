@@ -296,33 +296,61 @@ impl Pane {
         if !active {
             tile = tile.child(play_disc());
         }
-        tile = tile.children(badge_words.map(|words| badge(words).right(px(6.))));
-        if matches!(here, RoundPhase::Sound | RoundPhase::Muted | RoundPhase::Paused | RoundPhase::Ended) {
+        let show_speed = matches!(here, RoundPhase::Sound | RoundPhase::Muted | RoundPhase::Paused | RoundPhase::Ended);
+        if badge_words.is_some() || show_speed {
             let speed_file = file_id.clone();
-            tile = tile.child(
-                div()
-                    .id("round-speed")
-                    .absolute()
-                    .bottom(px(6.))
-                    .right(px(6.))
-                    .px(px(5.))
-                    .h(px(18.))
-                    .rounded_full()
-                    .bg(theme::raised())
-                    .type_small()
-                    .text_color(theme::accent())
-                    .cursor_pointer()
-                    .child(playing::rate_label(rate))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        let Some(account) = this.key().map(protocol::Key::account) else {
-                            return;
-                        };
-                        let file = speed_file.clone();
-                        let _ = this.shell.update(cx, |shell, cx| shell.play_faster(&account, &file, cx));
-                    })),
-            );
+            let mut pills = div()
+                .absolute()
+                .bottom(px(10.))
+                .left_0()
+                .right_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(4.));
+            if let Some(words) = badge_words {
+                pills = pills.child(
+                    div()
+                        .h(px(18.))
+                        .px(px(6.))
+                        .rounded_full()
+                        .bg(super::tokens::badge())
+                        .flex()
+                        .items_center()
+                        .type_micro()
+                        .text_color(theme::on_accent())
+                        .child(words),
+                );
+            }
+            if show_speed {
+                pills = pills.child(
+                    div()
+                        .id("round-speed")
+                        .px(px(6.))
+                        .h(px(18.))
+                        .rounded_full()
+                        .bg(theme::raised())
+                        .border_1()
+                        .border_color(theme::hairline())
+                        .flex()
+                        .items_center()
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .text_color(theme::accent_text())
+                        .cursor_pointer()
+                        .child(playing::rate_label(rate))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            let Some(account) = this.key().map(protocol::Key::account) else {
+                                return;
+                            };
+                            let file = speed_file.clone();
+                            let _ = this.shell.update(cx, |shell, cx| shell.play_faster(&account, &file, cx));
+                        })),
+                );
+            }
+            tile = tile.child(pills);
         }
         let setting = anim::autoplay();
         let hovered = self.round_hover.as_deref() == Some(file_id.as_str());

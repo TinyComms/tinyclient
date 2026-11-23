@@ -12,14 +12,13 @@ use super::rich::{self, Block, Inline, Jumbo, RunAction};
 use super::rows::Item;
 use super::text::{Look, Rich, TextEvent};
 use super::tokens::{self, Metrics, MEASURE};
-use super::when;
 use super::{edited_tip, Pane, PaneEvent, Selection, Then};
 use crate::gui::anim::{self, Play};
 use crate::gui::components::{button, glyph, sensitive_cover, tip, Avatar, ButtonKind, Shape};
 use crate::gui::phone::tokens as tokens_phone;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
-use crate::view::{age, now};
+use crate::view::now;
 use crate::client::ask;
 use gpui::{
     anchored, canvas, deferred, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
@@ -273,6 +272,7 @@ fn short_clock(unix: i64) -> String {
 
 fn day_line(at: i64, metrics: Metrics) -> Div {
     let rule = || div().flex_1().h(px(1.)).bg(theme::hairline());
+    let label = time::divider(now(), at);
     if metrics == Metrics::PHONE {
         // 24 above, 12 below, a 12/16 label between two hairlines.
         return div()
@@ -291,28 +291,29 @@ fn day_line(at: i64, metrics: Metrics) -> Div {
                     .line_height(px(tokens_phone::scaled(16.)))
                     .font_weight(theme::MEDIUM)
                     .text_color(theme::text_faint())
-                    .child(when::day_label(now(), at)),
+                    .child(label),
             )
             .child(rule());
     }
     div()
-        .h(px(36.))
+        .pt(px(12.))
+        .pb(px(4.))
         .px(px(metrics.inset))
         .flex()
         .items_center()
         .gap(px(12.))
         .child(rule())
-        .child(div().type_micro().text_color(theme::text_faint()).child(when::day_label(now(), at)))
+        .child(div().flex_none().type_micro().font_weight(theme::MEDIUM).text_color(theme::text_faint()).child(label))
         .child(rule())
 }
 
-/// The line above the first unread message: 2 pt of accent, 12 pt of air above it, no pill.
+/// The line above the first unread message: an accent rule anchored with a compact "New" pill.
 fn new_line(metrics: Metrics) -> Div {
     let phone = metrics == Metrics::PHONE;
     div()
         .w_full()
         .when(phone, |line| line.pt(px(12.)).pb(px(6.)))
-        .when(!phone, |line| line.h(px(24.)))
+        .when(!phone, |line| line.pt(px(8.)).pb(px(4.)))
         .px(px(metrics.inset))
         .flex()
         .items_center()
@@ -321,8 +322,12 @@ fn new_line(metrics: Metrics) -> Div {
         .child(
             div()
                 .flex_none()
-                .text_size(px(if phone { tokens_phone::scaled(12.) } else { 11. }))
-                .line_height(px(if phone { tokens_phone::scaled(16.) } else { 14. }))
+                .px(px(6.))
+                .py(px(1.))
+                .rounded_full()
+                .bg(theme::accent_soft())
+                .text_size(if phone { px(tokens_phone::scaled(12.)) } else { theme::sized(11.) })
+                .line_height(if phone { px(tokens_phone::scaled(16.)) } else { theme::line(14.) })
                 .font_weight(theme::SEMIBOLD)
                 .text_color(theme::accent_text())
                 .child("New"),
@@ -636,7 +641,8 @@ impl Pane {
                     .id(SharedString::from(format!("sys-{}-{idx}", message.id)))
                     .ml(px(8.))
                     .cursor_pointer()
-                    .text_color(theme::accent())
+                    .text_color(theme::accent_text())
+                    .hover(|style| style.underline())
                     .child(label)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -766,7 +772,13 @@ impl Pane {
                     .rounded_full()
                     .bg(if spec.missed { theme::danger_soft() } else { theme::accent_soft() })
                     .text_color(if spec.missed { theme::danger() } else { theme::accent_text() })
-                    .hover(|style| style.bg(if spec.missed { theme::danger_fill() } else { theme::accent_wash() }))
+                    .hover(|style| {
+                        if spec.missed {
+                            style.bg(theme::danger_fill()).text_color(theme::on_accent())
+                        } else {
+                            style.bg(theme::accent()).text_color(theme::on_accent())
+                        }
+                    })
                     .flex()
                     .items_center()
                     .cursor_pointer()
@@ -823,7 +835,7 @@ impl Pane {
                             .child(spec.label),
                     )
                     .children(faces)
-                    .child(div().type_micro().text_color(theme::text_faint()).child(short_clock(message.sent))),
+                    .child(div().type_micro().text_color(theme::text_faint()).child(time::clock(message.sent))),
             )
             .children(rate_pill)
             .children(pill)
@@ -990,6 +1002,9 @@ impl Pane {
     /// Floats 16 from the right, 12 above the composer: "12 new" while unread is below, else
     /// "Jump to latest". A click, or Escape with nothing else open, goes to the newest.
     pub(super) fn jump_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.multi_select.active {
+            return div().into_any_element();
+        }
         let words = if self.unseen > 0 { format!("{} new", self.unseen) } else { "Jump to latest".to_owned() };
         if self.metrics == Metrics::PHONE {
             // A phone: a round 44 pt button over the right edge of the list, the arrow alone;
@@ -1026,27 +1041,46 @@ impl Pane {
                 .on_click(cx.listener(|this, _, _, cx| this.jump(cx)))
                 .into_any_element();
         }
+        let unseen = self.unseen > 0;
         div()
             .id("jump")
             .absolute()
             .bottom(px(12.))
             .right(px(16.))
-            .h(px(28.))
-            .pl(px(8.))
-            .pr(px(10.))
-            .rounded(px(theme::R_CONTROL))
-            .bg(theme::overlay())
+            .h(px(30.))
+            .pl(px(10.))
+            .pr(px(12.))
+            .rounded_full()
+            .bg(if unseen { theme::accent() } else { theme::overlay() })
             .border_1()
-            .border_color(theme::border())
+            .border_color(if unseen { theme::accent() } else { theme::border() })
             .shadow(theme::shadow_popover())
             .flex()
             .items_center()
             .gap(px(6.))
             .cursor_pointer()
-            .hover(|style| style.bg(theme::over(theme::hover(), theme::overlay())))
-            .active(|style| style.bg(theme::over(theme::pressed(), theme::overlay())))
-            .child(glyph("icons/arrow-down.svg", 16., theme::text_soft()))
-            .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(words))
+            .hover(move |style| {
+                if unseen {
+                    style.bg(theme::accent_hover())
+                } else {
+                    style.bg(theme::over(theme::hover(), theme::overlay()))
+                }
+            })
+            .active(move |style| {
+                if unseen {
+                    style.bg(theme::accent_pressed())
+                } else {
+                    style.bg(theme::over(theme::pressed(), theme::overlay()))
+                }
+            })
+            .child(glyph("icons/arrow-down.svg", 15., if unseen { theme::on_accent() } else { theme::text_soft() }))
+            .child(
+                div()
+                    .type_small()
+                    .font_weight(if unseen { theme::SEMIBOLD } else { theme::MEDIUM })
+                    .text_color(if unseen { theme::on_accent() } else { theme::text() })
+                    .child(words),
+            )
             .on_click(cx.listener(|this, _, _, cx| this.jump(cx)))
             .into_any_element()
     }
@@ -1084,21 +1118,26 @@ impl Pane {
             bar
         };
         let owns = self.owns_overlay(&message.id);
+        let row_hovered = self.hover.as_deref() == Some(message.id.as_str());
+        let phone = metrics == Metrics::PHONE;
 
         let gutter: Option<AnyElement> = Some(if head {
             let face = self.avatar(message, window, cx);
             self.author_tap(face, "author-face", message, cx)
         } else {
+            let ts_tip = message_timestamp_tooltip(message, now());
             div()
+                .id(name_id("gts", &message.id))
                 .w(px(metrics.avatar))
-                .h(px(20.))
+                .h(if phone { px(tokens_phone::scaled(20.)) } else { theme::line(20.) })
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_end()
                 .type_micro()
-                .text_color(gpui::transparent_black())
+                .text_color(if row_hovered { theme::text_faint() } else { gpui::rgba(0) })
                 .group_hover("row", |style| style.text_color(theme::text_faint()))
+                .when(!phone, |g| g.tooltip(tip(ts_tip, None)))
                 .child(short_clock(message.sent))
                 .into_any_element()
         });
@@ -1130,11 +1169,12 @@ impl Pane {
         if message.deleted {
             // What it said is gone; the row stays for the thread that hangs off it.
             let tombstone = if message.moderated { "Removed by a moderator" } else { "Message deleted" };
-            sent = sent.child(div().type_body().italic().text_color(theme::text_faint()).child(tombstone));
+            sent = sent.child(div().max_w(px(MEASURE)).type_body().italic().text_color(theme::text_faint()).child(tombstone));
         } else if blocked_hidden {
             let reveal_id = message.id.clone();
             sent = sent.child(
                 div()
+                    .max_w(px(MEASURE))
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -1196,7 +1236,7 @@ impl Pane {
                             }),
                         ))
                     } else {
-                        quoted.child(div().type_body().text_color(theme::text()).child(from.text.clone()))
+                        quoted.child(div().max_w(px(MEASURE)).type_body().text_color(theme::text()).child(from.text.clone()))
                     };
                     quoted = quoted.children(attached);
                     sent.children(said)
@@ -1241,7 +1281,7 @@ impl Pane {
                         .flex()
                         .flex_col()
                         .gap(px(2.))
-                        .child(div().type_body().text_color(theme::text()).child(translated.text))
+                        .child(div().max_w(px(MEASURE)).type_body().text_color(theme::text()).child(translated.text))
                         .child(
                             div()
                                 .flex()
@@ -1272,25 +1312,6 @@ impl Pane {
                 );
             }
             sent = sent
-                .children(message.ephemeral.then(|| {
-                    div()
-                        .pb(px(3.))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(
-                            div()
-                                .px(px(6.))
-                                .py(px(1.))
-                                .rounded(px(theme::R_CONTROL))
-                                .bg(tokens::card())
-                                .border_1()
-                                .border_color(theme::hairline())
-                                .type_micro()
-                                .text_color(theme::text_faint())
-                                .child("Only visible to you"),
-                        )
-                }))
                 .children(message.announcement.then(|| {
                     div()
                         .pb(px(3.))
@@ -1343,7 +1364,7 @@ impl Pane {
                                 .rounded(px(theme::R_CONTROL))
                                 .bg(tokens::card())
                                 .type_micro()
-                                .text_color(theme::accent())
+                                .text_color(theme::accent_text())
                                 .child(if effect.is_empty() { "✨".to_owned() } else { format!("✨ {effect}") }),
                         )
                 }))
@@ -1384,7 +1405,6 @@ impl Pane {
             .min_w_0()
             .flex()
             .flex_col()
-            .children(message.via.as_ref().map(command_used))
             .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
             .children((!sensitive_hidden).then(|| self.otp_chip(message, cx)).flatten())
@@ -1428,14 +1448,16 @@ impl Pane {
             .relative()
             .px(px(metrics.inset))
             .when(head, |row| row.pt(px(3.)).pb(px(3.)))
-            // A phone gives messages of one group 12 pt of air (6 + 6); the desktop keeps its
-            // tighter paragraph flow.
-            .when(!head, |row| row.py(px(if metrics == Metrics::PHONE { 6. } else { 1. })))
+            // A phone gives messages of one group comfortable air; the desktop keeps a clean
+            // paragraph flow without clipping ascenders/descenders on hover.
+            .when(!head, |row| row.py(px(if metrics == Metrics::PHONE { 5. } else { 2. })))
             .when(editing, |row| row.bg(theme::accent_soft()))
-            .when(mentioned && !editing, |row| row.bg(theme::accent_wash()))
+            .when(failed && !editing && !owns, |row| row.bg(theme::danger_soft()))
+            .when(mentioned && !editing && !failed, |row| row.bg(theme::accent_wash()))
             // The row that owns an open menu, picker or dialog keeps `selected` (polish/01 §2).
             .when(owns && !editing, |row| row.bg(theme::selected()))
-            .when(!mentioned && !editing && !owns, |row| row.hover(|style| style.bg(tokens::row_hover())))
+            .when(!mentioned && !editing && !owns && !failed && row_hovered, |row| row.bg(tokens::row_hover()))
+            .when(!mentioned && !editing && !owns && !failed, |row| row.hover(|style| style.bg(tokens::row_hover())))
             .when(message.ephemeral && !editing, |row| row.bg(theme::warning_soft()))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1454,6 +1476,7 @@ impl Pane {
                     .bg(theme::accent_soft())
                     .with_animation(name_id("flash", &message.id), Animation::new(FLASH), |tint, done| tint.opacity(1. - done))
             }))
+            .children(message.via.as_ref().map(|via| command_used(via, metrics, selecting)))
             .children(message.reply_to.as_ref().map(|reply| self.reply_line(reply, &message.id, window, cx)))
             .child(
                 div()
@@ -1608,10 +1631,27 @@ impl Pane {
         receipt_for(message, &self.window, receipt)
     }
 
+    /// The chat-level disappearing-messages timer (in seconds), if active for this conversation.
+    fn chat_disappearing(&self, cx: &Context<Self>) -> Option<u32> {
+        let key = self.key()?;
+        self.shell
+            .upgrade()?
+            .read(cx)
+            .held_rows()
+            .find(|row| row.key == *key)
+            .and_then(|row| row.disappearing)
+    }
+
     /// The head line: who, when, and the marks a message carries.
     fn header(&self, message: &Message, receipt: Option<Receipt>, cx: &mut Context<Self>) -> Div {
         let name = message.shown_sender().to_owned();
         let phone = self.metrics == Metrics::PHONE;
+        let current = now();
+        let ts_tip = message_timestamp_tooltip(message, current);
+        let inline_expiry = message
+            .expires_at
+            .filter(|&exp| should_show_inline_expiry(exp, current, self.chat_disappearing(cx)))
+            .and_then(|exp| expiry_label(exp, current).map(|label| (exp, label)));
         let tag = |words: &'static str| {
             div()
                 .flex_none()
@@ -1621,13 +1661,13 @@ impl Pane {
                 .bg(theme::raised())
                 .flex()
                 .items_center()
-                .text_size(px(11.))
+                .text_size(theme::sized(11.))
                 .font_weight(theme::SEMIBOLD)
                 .text_color(theme::text_soft())
                 .child(words)
         };
         div()
-            .h(px(if phone { tokens_phone::scaled(20.) } else { 20. }))
+            .h(if phone { px(tokens_phone::scaled(20.)) } else { theme::line(20.) })
             .flex()
             .items_center()
             .gap(px(8.))
@@ -1664,15 +1704,30 @@ impl Pane {
                     }).flatten())
                     .child(
                         div()
+                            .id(name_id("ts", &message.id))
                             .flex_none()
-                            .text_size(px(if phone { tokens_phone::scaled(12.) } else { 11. }))
-                            .line_height(px(if phone { tokens_phone::scaled(20.) } else { 20. }))
+                            .text_size(if phone { px(tokens_phone::scaled(12.)) } else { theme::sized(11.) })
+                            .line_height(if phone { px(tokens_phone::scaled(20.)) } else { theme::line(20.) })
                             .font_weight(theme::MEDIUM)
                             .text_color(theme::text_faint())
+                            .when(!phone, |ts| ts.tooltip(tip(ts_tip, None)))
                             .child(time::clock(message.sent)),
                     )
                     .children(receipt.map(|receipt| receipt_mark(&message.id, receipt)))
-                    .children(silent_mark(message)),
+                    .children(silent_mark(message))
+                    .children(inline_expiry.map(|(exp, label)| {
+                        div()
+                            .id(name_id("expires", &message.id))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.))
+                            .type_micro()
+                            .text_color(theme::text_faint())
+                            .when(!phone, |el| el.tooltip(tip(expiry_tooltip(exp, current), None)))
+                            .child(glyph("icons/clock.svg", 11., theme::text_faint()))
+                            .child(label)
+                    })),
             )
             .children(message.sender.bot.then(|| tag("APP")))
             .children(message.saved_history.then(|| tag("SAVED")))
@@ -1703,7 +1758,7 @@ impl Pane {
                     .gap(px(4.))
                     .type_micro()
                     .text_color(theme::text_faint())
-                    .child("★")
+                    .child(glyph("icons/star.svg", 12., theme::text_faint()))
                     .child("Starred")
             }))
     }
@@ -1732,6 +1787,9 @@ impl Pane {
         }
         if let Some(emoji) = rich::jumbo(&message.text, &message.spans) {
             let mut out = vec![self.jumbo(&emoji, window, cx)];
+            if message.edited {
+                out.push(self.edited_mark(message, cx));
+            }
             return out;
         }
         let mut blocks = rich::blocks(&message.text, &message.spans);
@@ -1746,14 +1804,15 @@ impl Pane {
                 // A flex column, so the text is a flex item that is measured on its own: in a
                 // block its layout belongs to the line box, and `Rich` reads its own layout.
                 Block::Text(inline) => {
-                    let marked = inline.runs.iter().any(|run| run.mark);
-                    let hovered_time = self
+                    let hovered_run = self
                         .hovered
                         .as_ref()
                         .filter(|(id, at, _)| *id == message.id && *at == ix)
-                        .and_then(|(_, _, run)| inline.runs.get(*run))
+                        .and_then(|(_, _, run)| inline.runs.get(*run));
+                    let hovered_time = hovered_run
                         .and_then(|run| run.time)
                         .map(|(unix, _)| time::tooltip(unix));
+                    let hovered_edited = hovered_run.is_some_and(|run| run.mark);
                     let block = div()
                         .max_w(px(MEASURE))
                         .flex()
@@ -1763,7 +1822,7 @@ impl Pane {
                         .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx));
                     if let Some(words) = hovered_time {
                         block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
-                    } else if marked {
+                    } else if hovered_edited {
                         block.id(name_id("edited", &message.id)).tooltip(tip(edited_tip(message.edited_at), None)).into_any_element()
                     } else {
                         block.into_any_element()
@@ -1859,24 +1918,6 @@ impl Pane {
         }
         if edited_alone {
             out.push(self.edited_mark(message, cx));
-        }
-        if let Some(expires_at) = message.expires_at {
-            if let Some(label) = expiry_label(expires_at, crate::view::now()) {
-                out.push(
-                    div()
-                        .id(name_id("expires", &message.id))
-                        .h(px(16.))
-                        .flex()
-                        .items_center()
-                        .gap(px(4.))
-                        .type_micro()
-                        .text_color(theme::text_faint())
-                        .tooltip(tip(format!("Disappears in {label}"), None))
-                        .child(glyph("icons/clock.svg", 11., theme::text_faint()))
-                        .child(label)
-                        .into_any_element(),
-                );
-            }
         }
         out
     }
@@ -2541,7 +2582,7 @@ impl Pane {
                             })),
                     ),
             )
-            .child(crate::gui::components::scroll::scroll_content(("code-scroll-frame", block), body.pb(px(18.)).child(
+            .child(crate::gui::components::scroll::scroll_content(("code-scroll-frame", block), body.pb(px(10.)).child(
                 div()
                     .type_code()
                     .when(phone, |code| code.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(20.))))
@@ -2552,7 +2593,8 @@ impl Pane {
                         StyledText::new(SharedString::from(shown)).with_highlights(highlights).into_any_element()
                     }),
             )))
-            .children(folded.then(|| {
+            .children((lines > CODE_LINES).then(|| {
+                let collapsing = !folded;
                 div()
                     .id(("more", block))
                     .h(px(28.))
@@ -2564,9 +2606,18 @@ impl Pane {
                     .type_small()
                     .text_color(theme::accent_text())
                     .cursor_pointer()
-                    .child(format!("Show {} more lines", lines - CODE_LINES))
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(if collapsing {
+                        "Show less".to_owned()
+                    } else {
+                        format!("Show {} more lines", lines - CODE_LINES)
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.expanded.insert(key.clone());
+                        if collapsing {
+                            this.expanded.remove(&key);
+                        } else {
+                            this.expanded.insert(key.clone());
+                        }
                         cx.notify();
                     }))
             }))
@@ -2660,6 +2711,7 @@ impl Pane {
                 MediaShape::Sticker => out.push(self.sticker(message, ix, window, cx)),
                 MediaShape::Voice => out.push(self.player_row(message, ix, true, cx)),
                 MediaShape::Audio => out.push(self.player_row(message, ix, false, cx)),
+                MediaShape::ViewOnce => out.push(self.view_once_card(message, ix)),
                 MediaShape::File => out.push(self.file_row(message, ix, cx)),
                 MediaShape::Image | MediaShape::Gif | MediaShape::Video => {}
             }
@@ -2669,6 +2721,32 @@ impl Pane {
             .enumerate()
             .map(|(ix, element)| div().pt(px(if ix == 0 { 5. } else { 4. })).flex().child(element).into_any_element())
             .collect()
+    }
+
+    /// Compact cover card for view-once media so thumbnails are never rendered inline.
+    fn view_once_card(&self, message: &Message, index: usize) -> AnyElement {
+        let attachment = &message.attachments[index];
+        let kind_label = match attachment.file.kind {
+            protocol::MediaKind::Image | protocol::MediaKind::Gif => "View-once photo",
+            protocol::MediaKind::Video => "View-once video",
+            protocol::MediaKind::Audio => "View-once voice message",
+            _ => "View-once media",
+        };
+        div()
+            .id(("view-once", index))
+            .h(px(40.))
+            .px(px(12.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(tokens::card())
+            .border_1()
+            .border_color(theme::hairline())
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(glyph("icons/eye-off.svg", 15., theme::text_soft()))
+            .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(kind_label))
+            .child(div().type_small().text_color(theme::text_faint()).child("· Open on phone"))
+            .into_any_element()
     }
 
     /// Settings › Privacy › Load images (P3) off: a picture not on disk waits for a click, so
@@ -2967,6 +3045,7 @@ impl Pane {
             .bg(tokens::card())
             .border_1()
             .border_color(theme::hairline())
+            .hover(|style| style.bg(theme::over(theme::hover(), tokens::card())).border_color(tokens::border_strong()))
             .flex()
             .items_center()
             .gap(px(10.))
@@ -4533,6 +4612,8 @@ impl Pane {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
+                .opacity(0.)
+                .group_hover("link-card", |style| style.opacity(1.))
                 .tooltip(tip("Remove link preview", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -4545,8 +4626,9 @@ impl Pane {
         // not against the desktop's 440, and never run past its edge.
         let card = div()
             .id(("card", index))
+            .group("link-card")
             .relative()
-            .w(px(if phone { self.media_width() } else { 440. }))
+            .w(px(if phone { self.media_width() } else { self.media_width().min(440.) }))
             .max_w_full()
             .px(px(12.))
             .when(can_suppress, |c| c.pr(px(30.)))
@@ -4555,6 +4637,7 @@ impl Pane {
             .bg(tokens::card())
             .border_1()
             .border_color(theme::hairline())
+            .hover(|style| style.bg(theme::over(theme::hover(), tokens::card())).border_color(tokens::border_strong()))
             .cursor_pointer()
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)))
             .children(dismiss);
@@ -4885,16 +4968,17 @@ impl Pane {
             return None;
         }
         let edge = media::square_size(18., window.scale_factor());
-        let acts = self.can(message).act;
+        let acts = self.can(message).react;
         // A phone's chip is a thumb's target: 32 tall, its glyph and count a step larger.
         let phone = self.metrics == Metrics::PHONE;
+        let mine_hover_bg = theme::over(theme::hover(), theme::over(theme::accent_soft(), theme::canvas()));
         let chip = |id: ElementId, mine: bool| {
             let chip = div()
                 .id(id)
                 .flex_none()
-                .h(px(if phone { 32. } else { 26. }))
+                .h(px(if phone { 32. } else { 25. }))
                 .min_w(px(if phone { 48. } else { 0. }))
-                .px(px(if phone { 10. } else { 8. }))
+                .px(px(if phone { 10. } else { 7. }))
                 .justify_center()
                 .rounded_full()
                 .border_1()
@@ -4903,9 +4987,13 @@ impl Pane {
                 .gap(px(5.))
                 .when(acts, |chip| chip.cursor_pointer());
             if mine {
-                chip.bg(theme::accent_soft()).border_color(theme::accent())
+                chip.bg(theme::accent_soft())
+                    .border_color(theme::accent_halo())
+                    .when(acts, move |chip| chip.hover(move |style| style.bg(mine_hover_bg).border_color(theme::accent())))
             } else {
-                chip.bg(theme::raised()).border_color(gpui::transparent_black()).hover(|style| style.border_color(tokens::border_strong()))
+                chip.bg(theme::raised())
+                    .border_color(theme::hairline())
+                    .when(acts, |chip| chip.hover(|style| style.bg(theme::hover()).border_color(tokens::border_strong())))
             }
         };
         let burst_chip = |id: ElementId, mine: bool, colors: &[String]| {
@@ -4951,6 +5039,17 @@ impl Pane {
             }
         }
         let total_chips = entries.len();
+        let hidden_tip: Option<String> = (total_chips > CHIPS).then(|| {
+            entries[CHIPS..]
+                .iter()
+                .map(|&(ix, is_burst)| {
+                    let reaction = &message.reactions[ix];
+                    let count = if is_burst { reaction.burst } else { reaction.count };
+                    format!("{} {count}", emoji::display(&reaction.emoji))
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        });
         for (chip_ix, (ix, is_burst)) in entries.into_iter().take(CHIPS).enumerate() {
             let reaction = &message.reactions[ix];
             let picture = match &reaction.file {
@@ -5078,25 +5177,29 @@ impl Pane {
         }
         let hidden = total_chips.saturating_sub(CHIPS);
         if hidden > 0 {
-            row = row.child(chip("chips-more".into(), false).type_small().text_color(theme::text_soft()).child(format!("+{hidden}")));
+            let more = chip("chips-more".into(), false)
+                .cursor_default()
+                .type_small()
+                .text_color(theme::text_soft())
+                .when(!phone, |el| el.when_some(hidden_tip, |el, words| el.tooltip(tip(words, None))))
+                .child(format!("+{hidden}"));
+            row = row.child(more);
         }
-        // Always laid out and shown on hover only, so hovering a row never changes its height.
-        // Where nothing more may be added it stays laid out and never shows. A phone has no
-        // hover: there it is always shown where a reaction may be added, and absent where not.
+        // Only lay out the hover-revealed add button when adding a reaction is actually allowed;
+        // otherwise an invisible chip can wrap onto an empty ghost second line.
         let id = message.id.clone();
         let adds = acts && self.adds(message);
-        if phone && !adds {
+        if !adds {
             return Some(row.into_any_element());
         }
         let add = chip("chip-add".into(), false)
             .when(!phone, |chip| chip.opacity(0.))
-            .when(adds && !phone, |chip| chip.group_hover("row", |style| style.opacity(1.)))
-            .child(icon(Icon::SmilePlus, if phone { 18. } else { 16. }, theme::text_soft()))
-            .when(adds, |chip| {
-                chip.when(!phone, |chip| chip.tooltip(tip("Add reaction", None))).on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    this.open_picker(&id, event.position(), window, cx);
-                }))
-            });
+            .when(!phone, |chip| chip.group_hover("row", |style| style.opacity(1.)))
+            .child(icon(Icon::SmilePlus, if phone { 18. } else { 15. }, theme::text_soft()))
+            .when(!phone, |chip| chip.tooltip(tip("Add reaction", None)))
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                this.open_picker(&id, event.position(), window, cx);
+            }));
         Some(row.child(add).into_any_element())
     }
 
@@ -5151,9 +5254,10 @@ impl Pane {
         let reach = metrics.avatar / 2. + metrics.gap - 4.;
         div()
             .id("reply")
+            .max_w(px(MEASURE + metrics.avatar + metrics.gap))
+            .when(self.multi_select.active, |line| line.pl(px(18. + metrics.gap)))
             .when(!hide_reply, |line| line.h(px(20.)))
             .when(hide_reply, |line| line.min_h(px(20.)))
-            .mb(px(2.))
             .flex()
             .items_center()
             .gap(px(6.))
@@ -5171,7 +5275,7 @@ impl Pane {
                         .left(px(metrics.avatar / 2. - 1.))
                         .top(px(9.))
                         .w(px(reach))
-                        .h(px(11.))
+                        .h(px(14.))
                         .border_l_2()
                         .border_t_2()
                         .border_color(tokens::border_strong())
@@ -5228,6 +5332,7 @@ impl Pane {
                     .rounded_full()
                     .border_2()
                     .border_color(theme::canvas())
+                    .group_hover("thread", |style| style.border_color(theme::raised()))
                     .child(face),
             );
         }
@@ -5245,6 +5350,8 @@ impl Pane {
         let root = message.clone();
         let line = div()
             .id("thread")
+            .group("thread")
+            .max_w(px(MEASURE))
             .h(px(30.))
             .mt(px(2.))
             .ml(px(-8.))
@@ -5262,7 +5369,14 @@ impl Pane {
             .when(!thread.participants.is_empty(), |line| line.child(faces))
             .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::accent_text()).child(replies))
             .children(last.map(|last| div().type_small().text_color(theme::text_faint()).child(last)))
-            .children(unread);
+            .children(unread)
+            .child(
+                div()
+                    .flex_none()
+                    .opacity(0.)
+                    .group_hover("thread", |style| style.opacity(1.))
+                    .child(icon(Icon::ChevronRight, 13., theme::text_faint())),
+            );
         Some(div().flex().child(line).into_any_element())
     }
 
@@ -5315,7 +5429,6 @@ impl Pane {
             .gap(px(8.))
             .child(bar)
             .child(words.child(uploading_words(&sizes, sent, total)))
-            .children(silent_mark(message))
             .child(cancel);
         Some(line.into_any_element())
     }
@@ -5363,12 +5476,12 @@ impl Pane {
         let key = self.key()?.clone();
         let client_id = message.client_id.clone().unwrap_or_else(|| message.id.clone());
         let (again, drop) = ((key.clone(), client_id.clone()), (key, client_id));
-        let actions = div().min_w_0().max_w_full().flex().flex_wrap().items_center().gap(px(10.))
+        let actions = div().min_w_0().max_w(px(MEASURE)).flex().flex_wrap().items_center().gap(px(10.))
             .child(
                 div()
                     .id("retry")
                     .flex_none()
-                    .ml(px(4.))
+                    .ml(px(19.))
                     .font_weight(theme::SEMIBOLD)
                     .text_color(tokens::link())
                     .cursor_pointer()
@@ -5392,7 +5505,7 @@ impl Pane {
                         let _ = this.shell.update(cx, |shell, cx| shell.discard_send(conversation, client_id, cx));
                     })),
             );
-        let line = div().w_full().min_w_0().max_w_full().flex().flex_col().gap(px(4.)).type_small()
+        let line = div().w_full().min_w_0().max_w(px(MEASURE)).mt(px(3.)).flex().flex_col().gap(px(4.)).type_small()
             .child(
                 div().min_w_0().max_w_full().flex().items_start().gap(px(6.)).text_color(theme::danger())
                     .child(div().pt(px(2.)).child(icon(Icon::Alert, 13., theme::danger())))
@@ -5499,11 +5612,13 @@ fn silent_mark(message: &Message) -> Option<AnyElement> {
     )
 }
 
-/// "<person> used /command" above a bot's answer.
-fn command_used(via: &Via) -> Div {
+/// "<person> used /command" above a bot's answer, aligned with the message column.
+fn command_used(via: &Via, metrics: Metrics, selecting: bool) -> Div {
     let command = via.command.trim_start_matches('/');
+    let indent = metrics.avatar + metrics.gap + if selecting { 18. + metrics.gap } else { 0. };
     div()
         .h(px(18.))
+        .pl(px(indent))
         .mb(px(2.))
         .flex()
         .items_center()
@@ -5557,11 +5672,9 @@ fn own_face(
 }
 
 /// Some networks supply a reply count before they supply a timestamp for the last reply.
+/// Uses `time::stamp` ("Last reply 9:24 PM") so it never goes stale between redraws.
 fn last_reply_label(now: i64, last: i64) -> Option<String> {
-    (last > 0).then(|| match age(now, last).as_str() {
-        "now" => "Last reply just now".to_owned(),
-        ago => format!("Last reply {ago} ago"),
-    })
+    (last > 0).then(|| format!("Last reply {}", time::stamp(now, last)))
 }
 
 /// A view count the way Telegram's apps say it: "987", "12.4K", "1.2M". The number is cut,
@@ -5653,8 +5766,9 @@ mod tests {
     fn the_last_reply_label_requires_a_known_timestamp() {
         let now = 1_794_553_200;
         assert_eq!(last_reply_label(now, 0), None);
-        assert_eq!(last_reply_label(now, now - 20).as_deref(), Some("Last reply just now"));
-        assert_eq!(last_reply_label(now, now - 7200).as_deref(), Some("Last reply 2h ago"));
+        let recent = last_reply_label(now, now - 20).expect("known timestamp produces a label");
+        assert!(recent.starts_with("Last reply "));
+        assert!(!recent.contains("ago"));
     }
 
     #[test]
@@ -5763,6 +5877,21 @@ mod tests {
     }
 
     #[test]
+    fn expiry_tooltip_avoids_expiring_grammar_bug_and_inline_expiry_hides_chat_default() {
+        assert_eq!(expiry_tooltip(100, 100), "Expiring now");
+        assert_eq!(expiry_tooltip(90, 100), "Expiring now");
+        let tip = expiry_tooltip(100 + 7_200, 100);
+        assert!(tip.starts_with("Disappears in 2h ("), "got {tip}");
+        // In a 7-day disappearing chat, a message with 6d left does not spam an inline badge.
+        assert!(!should_show_inline_expiry(100 + 6 * 86_400, 100, Some(7 * 86_400)));
+        // Urgent (< 1 hour left) still shows inline.
+        assert!(should_show_inline_expiry(100 + 1_800, 100, Some(7 * 86_400)));
+        // Standalone self-destruct message in a non-disappearing chat still shows inline.
+        assert!(should_show_inline_expiry(100 + 6 * 86_400, 100, None));
+        assert!(should_show_inline_expiry(100 + 6 * 86_400, 100, Some(0)));
+    }
+
+    #[test]
     fn maps_url_extracted_from_location_card() {
         let card = Card {
             title: "Ferry Building".into(),
@@ -5836,4 +5965,32 @@ pub(crate) fn expiry_label(expires_at: i64, now: i64) -> Option<String> {
     } else {
         Some(format!("{left}s"))
     }
+}
+
+/// Human-readable expiration detail for a message tooltip.
+pub(crate) fn expiry_tooltip(expires_at: i64, now: i64) -> String {
+    let left = expires_at - now;
+    if left <= 0 {
+        return "Expiring now".to_owned();
+    }
+    let label = expiry_label(expires_at, now).unwrap_or_default();
+    format!("Disappears in {label} ({})", time::tooltip(expires_at))
+}
+
+/// Full tooltip for a message timestamp, appending disappearing expiry when set.
+pub(crate) fn message_timestamp_tooltip(message: &Message, now: i64) -> String {
+    let sent = time::tooltip(message.sent);
+    match message.expires_at {
+        Some(expires_at) => format!("{sent} · {}", expiry_tooltip(expires_at, now)),
+        None => sent,
+    }
+}
+
+/// Only show an inline expiry badge in the message header when the message is disappearing soon
+/// (`< 1h`) or has a standalone self-destruct timer in a chat with no chat-level timer. Normal
+/// messages in a chat with a header disappearing timer keep their rows clean and show expiry on
+/// timestamp hover.
+pub(crate) fn should_show_inline_expiry(expires_at: i64, now: i64, chat_disappearing: Option<u32>) -> bool {
+    let left = expires_at - now;
+    left < 3_600 || chat_disappearing.unwrap_or(0) == 0
 }

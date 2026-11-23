@@ -858,6 +858,11 @@ impl InfoPane {
                 }
             }
         }
+        if let Some(row) = self.row.clone().filter(|r| r.kind == protocol::ConversationKind::Direct) {
+            if let Some(disappearing) = profile::details::disappearing_row(self, &row, None, cx) {
+                top = top.child(disappearing.mt(px(12.)));
+            }
+        }
         if network == Network::Discord && online && person.relation == protocol::Relation::Friend {
             if let Some(row) = self.row.as_ref().filter(|r| r.kind == protocol::ConversationKind::Direct) {
                 let dm_key = row.key.clone();

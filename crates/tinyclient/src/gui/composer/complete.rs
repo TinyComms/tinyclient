@@ -132,7 +132,7 @@ pub fn channels(found: Vec<Conversation>, account: &AccountKey, space: &str, que
 /// The popover: 340 wide, 40 pt rows, the selected one filled. `pick` is told the row clicked.
 pub fn draw(list: &List, hub: &Hub, pick: impl Fn(usize, &mut Window, &mut App) + Clone + 'static, cx: &mut App) -> Div {
     let ring = Ring::on(theme::overlay());
-    menu().w(px(WIDTH)).max_w(px(WIDTH)).children(list.rows.iter().enumerate().map(|(ix, row)| {
+    menu().w_full().max_w(px(WIDTH)).children(list.rows.iter().enumerate().map(|(ix, row)| {
         let face = match &row.person {
             Some(person) => {
                 let picture = hub.avatar(&person.key.account(), person.avatar.as_ref(), cx);

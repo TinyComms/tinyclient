@@ -173,8 +173,9 @@ pub fn scaled(size: f32) -> f32 {
 
 /// A sheet floats above the page: a real, soft shadow cast upward from its 12 pt top edge.
 pub fn shadow_sheet() -> Vec<BoxShadow> {
+    let alpha = if crate::gui::theme::is_light() { 0.45 * 0.35 } else { 0.45 };
     vec![BoxShadow {
-        color: hsla(0., 0., 0., 0.45).into(),
+        color: hsla(0., 0., 0., alpha).into(),
         offset: point(px(0.), px(-8.)),
         blur_radius: px(24.),
         spread_radius: px(0.),
@@ -185,7 +186,7 @@ pub fn shadow_sheet() -> Vec<BoxShadow> {
 /// The 1 pt light at the top of a bar, painted inside it.
 pub fn top_highlight() -> Vec<BoxShadow> {
     vec![BoxShadow {
-        color: rgba(0xffffff0f).into(),
+        color: if crate::gui::theme::is_light() { rgba(0x00000010) } else { rgba(0xffffff0f) }.into(),
         offset: point(px(0.), px(1.)),
         blur_radius: px(0.),
         spread_radius: px(0.),

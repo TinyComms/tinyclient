@@ -51,7 +51,7 @@ impl Shell {
         // A tap opens Encryption, where the safety numbers are.
         let encryption = (!open.encryption.is_unknown()).then(|| {
             let sealed = open.encryption.is_sealed();
-            let (icon, tone) = if sealed { ("icons/lock.svg", theme::text_soft()) } else { ("icons/triangle-alert.svg", theme::text_faint()) };
+            let (icon, tone) = if sealed { ("icons/lock.svg", theme::online()) } else { ("icons/triangle-alert.svg", theme::warning()) };
             let conversation = open.key.clone();
             div()
                 .id("phone-encryption")
@@ -59,7 +59,7 @@ impl Shell {
                 .aria_label(format!("Encryption: {}", phone_words(open.encryption)))
                 .tab_index(0)
                 .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
-                .flex_1()
+                .flex_initial()
                 .min_w_0()
                 .flex()
                 .items_center()
@@ -72,6 +72,39 @@ impl Shell {
                 .child(div().flex_none().child(glyph(icon, 11., tone)))
                 .child(div().min_w_0().truncate().child(phone_words(open.encryption)))
         });
+        let disappearing = open.disappearing.filter(|&s| s > 0).map(|secs| {
+            let label = protocol::format_disappearing(secs);
+            div()
+                .id("phone-disappearing")
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(3.))
+                .phone_stamp()
+                .font_weight(theme::REGULAR)
+                .text_color(theme::text_soft())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
+                .child(div().flex_none().child(glyph("icons/clock.svg", 11., theme::text_soft())))
+                .child(label)
+        });
+        let meta_dot = || div().flex_none().phone_stamp().text_color(theme::text_faint()).child("·");
+        let mut meta_items: Vec<gpui::AnyElement> = Vec::new();
+        if let Some(sub) = subtitle {
+            meta_items.push(sub.into_any_element());
+        }
+        if let Some(enc) = encryption {
+            if !meta_items.is_empty() {
+                meta_items.push(meta_dot().into_any_element());
+            }
+            meta_items.push(enc.into_any_element());
+        }
+        if let Some(dis) = disappearing {
+            if !meta_items.is_empty() {
+                meta_items.push(meta_dot().into_any_element());
+            }
+            meta_items.push(dis.into_any_element());
+        }
         // The call is one of the strip's glyphs (`call_pill` draws it so on a phone): 44 pt, no
         // box, beside Members and Details.
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx));
@@ -126,9 +159,9 @@ impl Shell {
                             .child(div().id("phone-conversation-title").role(gpui::Role::Heading).aria_label(open.title.clone())
                                 .min_w_0().truncate().phone_title().child(open.title.clone())),
                     )
-                    // One line under the title: where it is, then whether it is encrypted.
-                    .when(subtitle.is_some() || encryption.is_some(), |column| {
-                        column.child(div().min_w_0().flex().items_center().gap(px(6.)).children(subtitle).children(encryption))
+                    // One line under the title: where it is, whether it is encrypted, and disappearing timer.
+                    .when(!meta_items.is_empty(), |column| {
+                        column.child(div().min_w_0().flex().items_center().gap(px(5.)).children(meta_items))
                     }),
             )
             .children(call)
