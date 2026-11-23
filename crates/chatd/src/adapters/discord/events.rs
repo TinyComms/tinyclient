@@ -335,6 +335,7 @@ impl Discord {
             "SOUNDBOARD_SOUNDS" | "GUILD_SOUNDBOARD_SOUND_CREATE" | "GUILD_SOUNDBOARD_SOUND_UPDATE" => self.soundboard_listed(data),
             "GUILD_SOUNDBOARD_SOUND_DELETE" => self.soundboard_removed(data),
             "STREAM_CREATE" => self.stream_created(data)?,
+            "STREAM_UPDATE" => self.stream_updated(data)?,
             "STREAM_SERVER_UPDATE" => self.stream_server(data)?,
             "STREAM_DELETE" => self.stream_deleted(data)?,
             "CALL_CREATE" | "CALL_UPDATE" => self.call_changed(from_str(data)?),

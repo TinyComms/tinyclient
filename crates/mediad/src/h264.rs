@@ -29,7 +29,7 @@ fn nal_type(nal: &[u8]) -> u8 {
 }
 
 /// The NALs of an Annex B buffer, without their start codes. A buffer with no start code is one NAL.
-fn split(frame: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn split(frame: &[u8]) -> Vec<&[u8]> {
     let mut codes = Vec::new();
     let mut at = 0;
     while at + 3 <= frame.len() {

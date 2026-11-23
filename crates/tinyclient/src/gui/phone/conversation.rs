@@ -40,7 +40,24 @@ impl Shell {
         let direct = open.kind == ConversationKind::Direct;
         let size = 28.;
         // The face its row in the sidebar wears, so the page and the row it came from match.
-        let face = self.conversation_avatar(open, size, theme::canvas(), cx);
+        let base_face = self.conversation_avatar(open, size, theme::canvas(), cx);
+        let story_peer = direct
+            .then(|| open.peer.as_ref().map(|peer| protocol::Key { id: peer.clone(), ..open.key.clone() }))
+            .flatten();
+        let face = if let Some((peer_key, ring)) = story_peer.and_then(|k| self.story_ring_for(&k).map(|r| (k, r.clone()))) {
+            let wrapped = crate::gui::stories::wrap_avatar_ring(base_face, size, ring.has_unseen(), ring.close_friends);
+            div()
+                .id("phone-header-story-avatar")
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_story_viewer(peer_key.clone(), None, cx);
+                }))
+                .child(wrapped)
+                .into_any_element()
+        } else {
+            base_face.into_any_element()
+        };
         // The network's icon leads the title where networks are mixed, as on the desktop.
         let mixed = open.space.is_none();
         let place = open.space_title.trim().to_owned();

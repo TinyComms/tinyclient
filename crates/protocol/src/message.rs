@@ -1594,6 +1594,9 @@ pub struct Message {
     /// Telegram reply keyboard for this message. Inline keyboards are not carried.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard: Option<ReplyKeyboard>,
+    /// A forwarded or shared story attached to this message (Telegram `MessageMedia::Story`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story: Option<Box<crate::SharedStory>>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -1721,6 +1724,7 @@ impl Message {
             loading: false,
             media_unread: false,
             keyboard: None,
+            story: None,
         }
     }
 
@@ -1776,6 +1780,9 @@ impl Message {
         }
         if let Some(url) = &mut self.meeting_transcript {
             clip(url, 4000);
+        }
+        if let Some(story) = &mut self.story {
+            story.bound();
         }
         if let Some(poll) = &mut self.poll {
             clip(&mut poll.question, 300);

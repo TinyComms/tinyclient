@@ -57,6 +57,9 @@ pub enum FromMedia {
     /// The camera (`share` false) or the screen (`share` true) should be announced, or withdrawn.
     /// Nothing is sent on the same turn: the gateway announces the SSRC first.
     Picture { share: bool, on: bool },
+    /// The Go Live leg started or stopped sending the share's sound. Speaking flag 2, not the
+    /// microphone's 1, and only on that connection.
+    Soundshare(bool),
 }
 
 pub struct Setup {
@@ -1353,7 +1356,11 @@ impl Loop {
         self.drops.unnamed += self.held.expire(Instant::now());
         self.setup.audio.log_glitches();
         self.meter.troubles = self.setup.audio.troubles();
-        let stats = self.meter.second(self.streams.values_mut().map(Stream::counts));
+        let mut stats = self.meter.second(self.streams.values_mut().map(Stream::counts));
+        let video = self.setup.controls.video_stats.lock().unwrap().sample(Instant::now());
+        if !video.encoder_backends.is_empty() || !video.decoder_backends.is_empty() {
+            stats.video = Some(video);
+        }
         self.setup.controls.publish_stats(stats);
         let users = self.setup.users.lock().unwrap();
         self.streams.retain(|ssrc, stream| {

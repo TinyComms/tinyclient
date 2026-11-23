@@ -359,6 +359,10 @@ enum Then {
 pub enum PaneEvent {
     /// The reply line under this message was clicked.
     OpenThread(Rc<Message>),
+    /// A forwarded/shared story card was clicked: open the Story Viewer on that peer/story.
+    OpenStory { peer: Key, story_id: Option<String> },
+    /// The user clicked "Stop sharing" directly on an active live location message.
+    StopLiveLocation { conversation: Key, message_id: String },
 }
 
 impl EventEmitter<PaneEvent> for Pane {}

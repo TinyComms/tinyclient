@@ -98,9 +98,8 @@ pub fn choose(probe: &Result<(), String>) -> Choice {
 }
 
 /// Whether this machine has a hardware H.264 encoder Media Foundation can drive, asked once
-/// and remembered for the process: the share and camera paths read this to keep the
-/// OpenH264 download off a machine that will never need it, and [`Encoder::open`] asks the
-/// system again before it opens. The probe runs on a thread of its own, so the answer is
+/// and remembered for the process. The capture paths use it to choose the camera profile
+/// and skip opening hardware when none was listed. The probe runs on a thread of its own, so the answer is
 /// the machine's and not the asking thread's apartment; an answer that was never really
 /// taken (the probe's thread would not start) is not remembered and is asked again at the
 /// next open.
@@ -198,7 +197,7 @@ unsafe fn release(list: *mut Option<IMFActivate>, count: u32, keep: Option<usize
 /// whole life (the share's or the camera's capture thread), and drops after the encoder's
 /// transform, which is the field before it, so nothing is asked of Media Foundation after
 /// it let go.
-struct Platform {
+pub(crate) struct Platform {
     /// Whether this guard's thread was brought into the MTA by [`platform`].
     com: bool,
     /// Whether this guard started Media Foundation.
@@ -207,7 +206,7 @@ struct Platform {
 
 /// COM in the Multi Threaded Apartment, per thread, and Media Foundation, per process.
 /// Both keep count, so an encoder thread that meets another's work answers at once.
-fn platform() -> Result<Platform, String> {
+pub(crate) fn platform() -> Result<Platform, String> {
     // SAFETY: the apartment call is the documented per-thread init; its result is checked.
     let started = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if started.is_err() {
@@ -313,8 +312,7 @@ trait Source {
 }
 
 /// The machine's own encoders, as MFTEnumEx lists them: the first hardware MFT that takes
-/// NV12 and answers H.264, activated, shut down in the activate's own hands, with every
-/// activate the listing handed out let go.
+/// NV12 and answers H.264. Its activation object stays alive until the stream ends.
 struct Hardware;
 
 impl Source for Hardware {
@@ -329,26 +327,27 @@ impl Source for Hardware {
         // SAFETY: the activation object hands out the transform it stands for, once.
         let transform: IMFTransform = unsafe { activate.ActivateObject() }
             .map_err(|err| format!("the hardware encoder could not be started: {err}"))?;
-        // The activate need not keep the encoder's setup alive once the transform is out:
-        // its shutdown hands the lifetime to the transform this encoder holds, the way
-        // MFTEnumEx's own contract asks.
-        // SAFETY: the activate is still owned here.
-        unsafe { let _ = activate.ShutdownObject(); }
-        drop(activate);
-        // Both casts are on the transform this open created; `cast` is safe in
-        // windows-core: it cannot name a null or wrong-vtable object without an `Err`.
-        let events: IMFMediaEventGenerator = transform.cast()
-            .map_err(|err| format!("the hardware encoder has no event queue: {err}"))?;
+        // The event queue belongs to the active transform. ShutdownObject closes it,
+        // so keep the activation reference until RealMft drops.
+        let events: IMFMediaEventGenerator = match transform.cast() {
+            Ok(events) => events,
+            Err(err) => {
+                // SAFETY: this worker owns the activation and is finished using the transform.
+                unsafe { let _ = activate.ShutdownObject(); }
+                return Err(format!("the hardware encoder has no event queue: {err}"));
+            }
+        };
         // `codec` is `None` when the MFT exposes no codec properties, which leaves a
         // keyframe ask and a bitrate move without their handle; the picture still encodes.
         let codec: Option<ICodecAPI> = transform.cast().ok();
-        Ok(Box::new(RealMft { transform, events, codec, tune_said: false }))
+        Ok(Box::new(RealMft { activate, transform, events, codec, tune_said: false }))
     }
 }
 
 /// The machine's encoder as COM hands it over: the async MFT, its event queue, and the
 /// codec properties that survive a frame.
 struct RealMft {
+    activate: IMFActivate,
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     codec: Option<ICodecAPI>,
@@ -362,6 +361,13 @@ struct RealMft {
 /// apartment is the MTA and Media Foundation objects answer from every thread of the
 /// process, so even a move after the fact would stay within what the platform allows.
 unsafe impl Send for RealMft {}
+
+impl Drop for RealMft {
+    fn drop(&mut self) {
+        // SAFETY: the worker owns the activation and no longer drives the transform.
+        unsafe { let _ = self.activate.ShutdownObject(); }
+    }
+}
 
 impl Mft for RealMft {
     fn unlock(&mut self) -> Result<(), String> {

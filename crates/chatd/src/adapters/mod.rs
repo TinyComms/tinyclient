@@ -54,6 +54,12 @@ pub fn prove_discord_voice_move() -> Result<(), String> {
 pub fn prove_discord_wave17b() -> Result<(), String> {
     discord::prove_wave17b()
 }
+
+/// `TINYCLIENT_PROVE=discord-wave15-share`. A preview is a jpeg, a named viewer is kept, and
+/// the identity post is the public key.
+pub fn prove_discord_wave15_share() -> Result<(), String> {
+    discord::prove_wave15_share()
+}
 mod recovery;
 pub mod net;
 mod script;
@@ -380,8 +386,8 @@ impl From<Vec<MessageHit>> for SearchPage {
 pub enum Picture {
     /// Our camera, on or off.
     Camera(bool),
-    /// Our screen, on or off.
-    Share(bool),
+    /// Our screen, on or off. `preview` sends Discord a small picture outside the encrypted stream.
+    Share { on: bool, preview: bool },
     /// Whose share to watch. `None` stops watching.
     Watch(Option<String>),
 }
@@ -1552,6 +1558,73 @@ pub enum Command {
         good: bool,
         reply: Reply<()>,
     },
+    /// List active story rings (`peer_id: None`) or one peer's stories (`peer_id: Some`).
+    /// Never marks any story as read.
+    Stories {
+        peer_id: Option<String>,
+        reply: Reply<(Vec<protocol::PeerStoryRing>, Vec<protocol::Story>)>,
+    },
+    /// Explicitly mark a peer's stories read up to `story_id` (`stories.readStories`).
+    ReadStory {
+        peer_id: String,
+        story_id: String,
+        reply: Reply<()>,
+    },
+    /// React to a story (`stories.sendReaction`) or clear reaction when `emoji` is `None`.
+    ReactStory {
+        peer_id: String,
+        story_id: String,
+        emoji: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Reply privately to a story (`inputReplyToStory`). Returns `(conversation_id, message)`.
+    ReplyStory {
+        peer_id: String,
+        story_id: String,
+        client_id: String,
+        text: String,
+        reply: Reply<(String, protocol::Message)>,
+    },
+    /// Send a one-time location (`inputMediaGeoPoint`).
+    SendLocation {
+        conversation_id: String,
+        client_id: String,
+        point: protocol::GeoPoint,
+        reply_to: Option<String>,
+        reply: Reply<protocol::Message>,
+    },
+    /// Start sharing a live location (`inputMediaGeoLive`).
+    StartLiveLocation {
+        conversation_id: String,
+        client_id: String,
+        point: protocol::GeoPoint,
+        period_secs: u32,
+        proximity_alert_radius: Option<u32>,
+        reply_to: Option<String>,
+        reply: Reply<protocol::LiveLocationShare>,
+    },
+    /// Update coordinates of an active live location share (`messages.editMessage`).
+    UpdateLiveLocation {
+        conversation_id: String,
+        message_id: String,
+        point: protocol::GeoPoint,
+        proximity_alert_radius: Option<u32>,
+        reply: Reply<protocol::LiveLocationShare>,
+    },
+    /// Stop one active live location share (`messages.editMessage` with `stopped: true`).
+    StopLiveLocation {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<()>,
+    },
+    /// Stop all active live location shares on this account.
+    StopAllLiveLocations {
+        reply: Reply<()>,
+    },
+    /// List active live location shares on this account.
+    ActiveLiveLocations {
+        reply: Reply<Vec<protocol::LiveLocationShare>>,
+    },
     /// Translate one message on demand into `to` (normalized ISO 639-1 language tag).
     /// Never called for end-to-end encrypted conversations.
     Translate {
@@ -1878,12 +1951,18 @@ pub enum Command {
     /// A camera, a screen share, or whose share to watch. Nothing answers: the call's own
     /// events say what the network did.
     CallPicture(Picture),
+    /// A local ICE candidate gathered by `mediad` for a Signal call, to send in `IceUpdate`.
+    CallIce { conversation_id: String, candidate: String },
     /// Rings everyone (`None`) or specific people (`Some`) in the current direct/group call.
     CallRing { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// Stops ringing everyone (`None`) or specific people (`Some`) in the current direct/group call.
     CallStopRinging { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// Adds friends to the current direct or group call, returning the resulting conversation id.
     CallAddPeople { conversation_id: String, people: Vec<String>, reply: Reply<String> },
+    /// Raises or lowers our hand in the active group call.
+    CallRaiseHand { conversation_id: String, raised: bool, reply: Reply<()> },
+    /// Sends a transient emoji reaction in the active group call.
+    CallReact { conversation_id: String, emoji: String, reply: Reply<()> },
     /// A Tiny server's live socket: take or leave a seat in a room's call, remove someone from
     /// one, or hear that the user opened the server.
     Tiny(tiny::live::Ask),
@@ -2217,6 +2296,16 @@ impl Command {
             Command::Favourite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Transcribe { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Stories { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReadStory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReactStory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReplyStory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartLiveLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UpdateLiveLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StopLiveLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StopAllLiveLocations { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActiveLiveLocations { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Voicemails { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2325,6 +2414,9 @@ impl Command {
             Command::CallJoin(conversation_id) => {
                 let detail = format!("{} calls are not built yet.", ctx.account.network.label());
                 ctx.call_failed(&conversation_id, CallFailure::Refused, &detail);
+            }
+            Command::CallRaiseHand { reply, .. } | Command::CallReact { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
             }
             _ => {}
         }
@@ -2963,6 +3055,10 @@ impl Context {
         self.hub.store().message(&self.key(conversation_id), message_id)
     }
 
+    pub fn stored_conversation(&self, conversation_id: &str) -> rusqlite::Result<Option<protocol::Conversation>> {
+        self.hub.store().conversation(&self.key(conversation_id))
+    }
+
     /// The conversation a stored message is in. `None` when this account has no such message,
     /// so a receipt for it is not filed onto some other chat.
     pub fn conversation_of_message(&self, message_id: &str) -> rusqlite::Result<Option<String>> {
@@ -3391,6 +3487,22 @@ impl Context {
         });
     }
 
+    /// Publishes updated active story rings for this account (never marks anything seen).
+    pub fn stories(&self, rings: Vec<protocol::PeerStoryRing>) {
+        self.hub.changed(Change::Stories {
+            account: self.account.clone(),
+            rings,
+        });
+    }
+
+    /// Publishes the authoritative list of active live location shares for this account.
+    pub fn live_locations(&self, shares: Vec<protocol::LiveLocationShare>) {
+        self.hub.changed(Change::LiveLocations {
+            account: self.account.clone(),
+            shares,
+        });
+    }
+
     /// What the shell has on screen, across every account. Also arrives as `Command::Watch`.
     pub fn watching(&self) -> Arc<Watching> {
         self.hub.watching()
@@ -3556,6 +3668,28 @@ impl Context {
         self.hub.calls.set_move_notice(&self.hub, &self.key(conversation_id), notice);
     }
 
+    /// People watching our own share.
+    pub fn set_viewers(&self, conversation_id: &str, viewers: Vec<Participant>) {
+        self.hub.calls.set_viewers(&self.hub, &self.key(conversation_id), viewers);
+    }
+
+    /// The stream we are watching stopped sending, or started again.
+    pub fn set_stream_paused(&self, conversation_id: &str, paused: bool) {
+        self.hub.calls.set_stream_paused(&self.hub, &self.key(conversation_id), paused);
+    }
+
+    /// The jpeg mediad painted of our share, when one is on disk. Empty otherwise.
+    pub fn share_frame(&self) -> Option<String> {
+        let (call, _) = self.hub.calls.describe();
+        let call = call?;
+        if call.conversation.account() != self.account {
+            return None;
+        }
+        let path = call.share_view.as_ref()?.path.clone();
+        let lower = path.to_ascii_lowercase();
+        (lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".png")).then_some(path)
+    }
+
     /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).
     pub fn self_moderation(&self, conversation_id: &str, server_muted: bool, server_deafened: bool, suppressed: bool) {
         self.hub.calls.set_self_moderation(&self.hub, &self.key(conversation_id), server_muted, server_deafened, suppressed);
@@ -3579,6 +3713,46 @@ impl Context {
     /// Whose voice each receive slot carries.
     pub fn tiny_slots(&self, conversation_id: &str, audio: Vec<protocol::TinySlot>) {
         self.hub.calls.tiny_slots(&self.hub, &self.key(conversation_id), audio);
+    }
+
+    /// Signal call: ask mediad to build a pure-Rust `str0m` WebRTC SDP offer.
+    pub fn signal_offer(&self, conversation_id: &str, offer: protocol::SignalOffer) -> Result<String, String> {
+        self.hub.calls.signal_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    /// Signal call: ask mediad to accept an incoming SDP offer and return our SDP answer.
+    pub fn signal_accept(&self, conversation_id: &str, accept: protocol::SignalAccept) -> Result<String, String> {
+        self.hub.calls.signal_accept(&self.hub, &self.key(conversation_id), accept)
+    }
+
+    /// Signal call: deliver the remote peer's SDP answer to mediad.
+    pub fn signal_answer(&self, conversation_id: &str, sdp: String) -> Result<(), String> {
+        self.hub.calls.signal_answer(&self.hub, &self.key(conversation_id), sdp)
+    }
+
+    /// Signal call: deliver one remote ICE candidate to mediad.
+    pub fn signal_ice(&self, conversation_id: &str, candidate: String) {
+        self.hub.calls.signal_ice(&self.hub, &self.key(conversation_id), candidate);
+    }
+
+    /// Sets the call's end-to-end encryption indicator (`CallSecurity`) for the shell.
+    pub fn call_security(&self, conversation_id: &str, security: Option<protocol::CallSecurity>) {
+        self.hub.calls.set_security(&self.hub, &self.key(conversation_id), security);
+    }
+
+    /// Updates the call's state directly (e.g., transitioning to `Joined` once a call is established).
+    pub fn call_state(&self, conversation_id: &str, state: CallState) {
+        self.hub.calls.set_state(&self.hub, &self.key(conversation_id), state);
+    }
+
+    /// Updates our own raised-hand state in the active group call.
+    pub fn call_hand_raised(&self, conversation_id: &str, raised: bool) {
+        self.hub.calls.set_hand_raised(&self.hub, &self.key(conversation_id), raised);
+    }
+
+    /// Updates our own active transient emoji reaction in the active group call.
+    pub fn call_reaction(&self, conversation_id: &str, emoji: Option<String>) {
+        self.hub.calls.set_reaction(&self.hub, &self.key(conversation_id), emoji);
     }
 
     /// The call in this room is over and the network already knows. A joined call plays the

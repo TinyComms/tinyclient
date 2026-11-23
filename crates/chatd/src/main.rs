@@ -337,6 +337,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-discord-wave17b:0");
         return Ok(());
     }
+    // The lab's discord-wave15-share driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-wave15-share") {
+        if let Err(err) = chatd::adapters::prove_discord_wave15_share() {
+            eprintln!("discord-wave15-share: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-wave15-share:0");
+        return Ok(());
+    }
     // The lab's discord-nitro-length driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-nitro-length") {
         if let Err(err) = chatd::adapters::prove_discord_nitro_length() {
@@ -1048,6 +1057,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-wave13:0");
         return Ok(());
     }
+    // The lab's signal-wave19 driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-wave19") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_wave19() {
+            eprintln!("signal-wave19: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-wave19:0");
+        return Ok(());
+    }
 
     // The lab's signal-send-file driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-send-file") {
@@ -1128,6 +1146,15 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-messages-wave12:0");
+        return Ok(());
+    }
+    // The lab's telegram-wave15c driver (#540 stories & #452 live location sharing).
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-wave15c") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_wave15c() {
+            eprintln!("telegram-wave15c: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-wave15c:0");
         return Ok(());
     }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());

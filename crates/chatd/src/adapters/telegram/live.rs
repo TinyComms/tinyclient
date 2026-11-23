@@ -332,6 +332,9 @@ fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, cove
     let Some((conversation, mut mapped)) = placed(account, raw) else {
         return;
     };
+    if let tl::enums::Message::Message(msg) = raw {
+        super::location::observe_message(account, &conversation, msg);
+    }
     if let tl::enums::Message::Service(svc) = raw {
         match &svc.action {
             tl::enums::MessageAction::SetMessagesTtl(ttl) => {
@@ -820,6 +823,8 @@ pub(super) fn apply(account: &Account, update: &Update) {
         // `need_debug` is intentionally ignored: tinyclient's media stack is not tgcalls, so we do
         // not upload incompatible call debug logs via `phone.saveCallDebug`.
         Update::PhoneCall(phone) => phone_call(account, &phone.phone_call),
+        Update::Story(story) => super::stories::apply_story(account, story),
+        Update::ReadStories(read) => super::stories::apply_read(account, read),
         // A chat joined, left or changed: what changed came with the update's chats, which
         // `learn` has already written.
         _ => {}
@@ -923,6 +928,7 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
             wants: Vec::new(),
             group: None,
             members: Vec::new(),
+            pending_story: None,
         };
         finish(account, conversation, &mut mapped, &HashMap::new());
         return Some(mapped.message);

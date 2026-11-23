@@ -1304,7 +1304,10 @@ impl Demo {
             Command::SlashCommands { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AllUnreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
+            Command::CallRing { reply, .. }
+            | Command::CallStopRinging { reply, .. }
+            | Command::CallRaiseHand { reply, .. }
+            | Command::CallReact { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::CallAddPeople { reply, .. } => {
@@ -1478,6 +1481,16 @@ impl Demo {
             Command::MeetingInvitees { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateMeeting { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Stories { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReadStory { reply, .. }
+            | Command::ReactStory { reply, .. }
+            | Command::StopLiveLocation { reply, .. }
+            | Command::StopAllLiveLocations { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReplyStory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartLiveLocation { reply, .. }
+            | Command::UpdateLiveLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActiveLiveLocations { reply } => drop(reply.send(Ok(Vec::new()))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }
@@ -1499,6 +1512,7 @@ impl Demo {
             | Command::Wanted(_)
             | Command::WantedSpan { .. }
             | Command::Played { .. }
+            | Command::CallIce { .. }
             | Command::Stop => {}
         }
     }

@@ -2,7 +2,7 @@
 //! call served over stdin and stdout (`serve`), and the other modes `main` dispatches on.
 
 use crate::session::{self, Controls};
-use crate::{audio, out, permission, picture, tiny};
+use crate::{audio, out, permission, picture, signal, tiny};
 use protocol::{
     media_process_needed, read_frame, CallFailure, Content, Direction, MediaRequest, MediaResponse, SecurityMode, VideoStream,
     DEVICES_LIMIT,
@@ -69,6 +69,10 @@ struct Call {
     offer: Option<tiny::Offer>,
     /// Our user id on that server, and whether the call running is one.
     tiny: Option<String>,
+    /// A Signal call's pending offer, out with the remote peer and not yet answered.
+    signal_offer: Option<signal::Offer>,
+    /// Our user id and peer id for a Signal call.
+    signal_peer: Option<(String, String)>,
 }
 
 impl Call {
@@ -87,15 +91,18 @@ impl Call {
     fn apply(&mut self, request: MediaRequest) -> MediaResponse {
         match request {
             MediaRequest::Streams => {}
-            MediaRequest::ShareSend { on, screen, quality, show_cursor } => {
+            MediaRequest::ShareSend { on, screen, quality, show_cursor, sound, .. } => {
                 // What the share captures, chosen before the probe so the probe tries that one,
                 // and what it spends. Before a call is up the request is only noted: the voice
                 // tests ask then, and a headless run must not open a screen to answer them.
+                // Sound is stored before the share flag, so the stream thread that sees the
+                // share also sees whether its sound goes with it. Nothing here opens a loopback.
                 if on {
                     picture::choose_screen(screen);
                     picture::choose_quality(quality);
                     picture::choose_cursor(show_cursor);
                 }
+                self.controls.set_share_sound(on && sound == Some(true));
                 if on && (self.voice.is_some() || self.tiny.is_some()) {
                     if let Err(words) = picture::probe_screen() {
                         return MediaResponse::Refused { detail: words };
@@ -360,6 +367,102 @@ impl Call {
             MediaRequest::TinyRoster { user_ids } => {
                 self.controls.e2ee(|e2ee| e2ee.roster(user_ids));
                 self.controls.e2ee_report();
+                return MediaResponse::Done;
+            }
+            MediaRequest::SignalOffer(spec) => {
+                if self.voice.is_some() {
+                    return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
+                }
+                self.controls.muted.store(spec.muted, Ordering::Relaxed);
+                self.controls.deafened.store(spec.deafened, Ordering::Relaxed);
+                return match signal::Offer::new(&spec) {
+                    Ok(offer) => {
+                        let sdp = offer.sdp().to_owned();
+                        for candidate in offer.local_candidates() {
+                            out::send(&MediaResponse::SignalIce { candidate: candidate.clone() });
+                        }
+                        self.signal_offer = Some(offer);
+                        self.signal_peer = Some((spec.user_id, spec.peer_id));
+                        MediaResponse::Offer { sdp }
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: signal offer failed: {err}");
+                        MediaResponse::Refused { detail: ENGINE.to_owned() }
+                    }
+                };
+            }
+            MediaRequest::SignalAccept(spec) => {
+                if self.voice.is_some() {
+                    return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
+                }
+                self.controls.muted.store(spec.muted, Ordering::Relaxed);
+                self.controls.deafened.store(spec.deafened, Ordering::Relaxed);
+                let answer = match signal::Answer::from_offer(&spec) {
+                    Ok(answer) => answer,
+                    Err(err) => {
+                        tracing::warn!("mediad: signal offer could not be accepted: {err}");
+                        return MediaResponse::Refused { detail: "The Signal call offer didn't work with tinyclient. Try again.".to_owned() };
+                    }
+                };
+                let sdp = answer.sdp().to_owned();
+                for candidate in answer.local_candidates() {
+                    out::send(&MediaResponse::SignalIce { candidate: candidate.clone() });
+                }
+                let link = answer.into_link();
+                self.video = Video::default();
+                let (controls, user_id, peer_id) = (self.controls.clone(), spec.user_id, spec.peer_id);
+                let spawned = out::spawn(std::thread::Builder::new().name("signal".to_owned()), move || {
+                    out::or_fail(CallFailure::Engine, ENGINE_STOPPED, || signal::run(link, user_id, peer_id, controls));
+                    tracing::warn!("mediad: signal call over, exiting");
+                    out::exit(0);
+                });
+                match spawned {
+                    Ok(voice) => {
+                        self.voice = Some(voice);
+                        return MediaResponse::Answer { sdp };
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: signal call thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+            }
+            MediaRequest::SignalAnswer { sdp } => {
+                let Some(offer) = self.signal_offer.take() else {
+                    return MediaResponse::Refused { detail: "No Signal offer is waiting for an answer.".to_owned() };
+                };
+                let link = match offer.accept(&sdp) {
+                    Ok(link) => link,
+                    Err(err) => {
+                        tracing::warn!("mediad: signal answer refused: {err}");
+                        return MediaResponse::Refused { detail: "The Signal call answer didn't work with tinyclient. Try again.".to_owned() };
+                    }
+                };
+                self.video = Video::default();
+                let (user_id, peer_id) = self.signal_peer.clone().unwrap_or_default();
+                let controls = self.controls.clone();
+                let spawned = out::spawn(std::thread::Builder::new().name("signal".to_owned()), move || {
+                    out::or_fail(CallFailure::Engine, ENGINE_STOPPED, || signal::run(link, user_id, peer_id, controls));
+                    tracing::warn!("mediad: signal call over, exiting");
+                    out::exit(0);
+                });
+                match spawned {
+                    Ok(voice) => {
+                        self.voice = Some(voice);
+                        return MediaResponse::Done;
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: signal call thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+            }
+            MediaRequest::SignalIce { candidate } => {
+                if let Some(offer) = self.signal_offer.as_mut() {
+                    let _ = offer.add_remote_candidate(&candidate);
+                } else {
+                    self.controls.push_signal_ice(candidate);
+                }
                 return MediaResponse::Done;
             }
             MediaRequest::Devices { input, output, camera } => {

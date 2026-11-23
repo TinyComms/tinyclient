@@ -318,6 +318,8 @@ struct Inner {
     file_order: VecDeque<(AccountKey, String)>,
     wanted_files: Vec<(AccountKey, String)>,
     fetch_pending: bool,
+    /// Per-person active story rings (Telegram #540).
+    story_rings: HashMap<Key, protocol::PeerStoryRing>,
     /// Repaints the window when something a view looks up has changed.
     notify: Option<Notify>,
 }
@@ -336,6 +338,23 @@ impl Hub {
         if let Some(notify) = notify {
             notify(cx);
         }
+    }
+
+    /// Replaces the known story rings for `account` and repaints People and avatar surfaces.
+    pub fn set_story_rings(&self, account: &AccountKey, rings: &[protocol::PeerStoryRing], cx: &mut App) {
+        {
+            let mut inner = self.0.borrow_mut();
+            inner.story_rings.retain(|k, _| k.account() != *account);
+            for ring in rings {
+                inner.story_rings.insert(ring.peer.clone(), ring.clone());
+            }
+        }
+        self.notify(cx);
+    }
+
+    /// Active story ring metadata for `person`, if any.
+    pub fn story_ring(&self, person: &Key) -> Option<protocol::PeerStoryRing> {
+        self.0.borrow().story_rings.get(person).cloned()
     }
 
     /// The people `source` draws now. Call it whenever the visible rows change, with every

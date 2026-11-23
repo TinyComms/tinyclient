@@ -521,7 +521,12 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     account.live().unread_check = Some(Instant::now());
     retry_unread_channels(account);
     contacts(account)?;
-    blocked_list(account)
+    blocked_list(account)?;
+    // Load active story rings without marking any story read (#540), and recover any still-live
+    // location shares across restarts/reconnects (#452).
+    let _ = super::stories::load_all(account);
+    super::location::recover_on_reconnect(account);
+    Ok(())
 }
 
 /// People this account has blocked. Recorded one at a time so the contact list `contacts`
@@ -1671,6 +1676,14 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
     }
     // A pin names the message it points at. The words are filled once that message is known.
     content::quote_pin(&mut mapped.message);
+    // Normalize forwarded/shared story peer key and hydrate deferred story media via
+    // `stories.getStoriesByID` (never `stories.readStories`).
+    if let Some(shared) = mapped.message.story.as_mut() {
+        shared.peer = account.ctx.key(&shared.peer.id);
+    }
+    if let Some((story_peer, story_id)) = mapped.pending_story.take() {
+        super::stories::hydrate_shared(account, story_peer, story_id, mapped);
+    }
     // Preserve any previously saved speech-to-text transcripts across history refreshes.
     if !mapped.message.attachments.is_empty() {
         if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &mapped.message.id) {

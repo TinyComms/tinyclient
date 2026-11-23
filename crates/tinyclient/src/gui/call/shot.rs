@@ -73,6 +73,7 @@ pub(super) fn stats() -> Option<protocol::CallStats> {
         video: std::env::var_os("TINYCLIENT_SHOT_VIDEO").map(|_| protocol::VideoStats {
             send_kbps: 440, receive_kbps: 2100, send_fps: 30, receive_fps: 60, rendered_fps: 58,
             receive_expected: true, watching_ms: 30_000, width: 1920, height: 1080, frame_age_ms: Some(16),
+            ..Default::default()
         }),
         link_measured: true,
         rtt_ms: if poor { 184 } else { 38 },
@@ -139,6 +140,7 @@ pub(super) fn security(members: &[String]) -> Option<CallSecurity> {
         unsupported: Vec::new(),
         server_lacks: mode == SecurityMode::Transport,
         required: false,
+        ..CallSecurity::default()
     })
 }
 
@@ -328,6 +330,11 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         raised: Vec::new(),
         effect: None,
         move_notice: (name == "moved_notice").then(|| "Bea added Cy. The call moved to Campfire.".to_owned()),
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
+        hand_raised: false,
+        reaction: None,
     })
 }
 
@@ -490,6 +497,11 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         raised: Vec::new(),
         effect: None,
         move_notice: None,
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
+        hand_raised: false,
+        reaction: None,
     }
 }
 
@@ -516,6 +528,7 @@ fn sealed(call: &mut Call) {
         unsupported: Vec::new(),
         server_lacks: false,
         required: false,
+        ..CallSecurity::default()
     });
 }
 

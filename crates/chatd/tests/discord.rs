@@ -9,7 +9,7 @@ use base64::Engine;
 use protocol::{
     read_frame, write_frame, AccountKey, AutomodAction, AutomodRule, AutomodTrigger, Call, CallState, CallSupport,
     Change, Conversation, ConversationKind, ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind,
-    Network, Occupants, Page, Person, Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response, StageVoiceAction,
+    MediaRequest, Network, Occupants, Page, Person, Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response, StageVoiceAction,
     SendState, SpaceSafety, Style, Watching,
 };
 use serde_json::{json, Value};
@@ -13589,4 +13589,94 @@ fn an_activity_a_stage_and_a_soundboard_are_part_of_a_discord_voice_channel() {
         Response::Status { call: Some(call), .. } => call.effect.filter(|effect| effect.user_id == "2001" && effect.sound_id == "q"),
         other => panic!("{other:?}"),
     });
+}
+
+#[test]
+fn a_share_posts_one_preview_and_viewers_come_from_the_stream() {
+    let world = World::launch(&[("TINYCLIENT_MEDIAD_SCREEN", "null")], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+
+    world.ask(Request::Media(MediaRequest::ShareSend {
+        on: true,
+        screen: None,
+        quality: None,
+        show_cursor: None,
+        sound: None,
+        preview: Some(true),
+    }));
+    wait("go live", || world.discord.frames_of(18).pop());
+    world.discord.push(
+        "STREAM_CREATE",
+        json!({
+            "stream_key": "guild:4000:4201:1000",
+            "rtc_server_id": "900",
+            "rtc_channel_id": "4201",
+        }),
+    );
+    let posted = wait("one preview upload", || {
+        let posts = world.discord.requests_to("POST", "/streams/guild:4000:4201:1000/preview");
+        (posts.len() == 1).then_some(posts)
+    });
+    let thumb = posted[0].body["thumbnail"].as_str().unwrap_or("");
+    assert!(thumb.starts_with("data:image/jpeg;base64,"), "{thumb}");
+
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2002", "session_id": "voice-dev",
+            "self_mute": true, "self_deaf": false, "mute": false, "deaf": false,
+            "self_stream": true, "self_video": false
+        }),
+    );
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2006", "session_id": "voice-sam",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+            "self_stream": false, "self_video": false,
+            "member": {"user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock"}, "nick": null, "roles": []}
+        }),
+    );
+    wait("dev's preview asked once", || {
+        (world.discord.requests_to("GET", "/streams/guild:4000:4201:2002/preview").len() == 1).then_some(())
+    });
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2002", "session_id": "voice-dev",
+            "self_mute": true, "self_deaf": false, "mute": false, "deaf": false,
+            "self_stream": true, "self_video": false
+        }),
+    );
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.discord.requests_to("GET", "/streams/guild:4000:4201:2002/preview").len(), 1, "a roster tick does not poll");
+
+    world.discord.push(
+        "STREAM_UPDATE",
+        json!({
+            "stream_key": "guild:4000:4201:1000",
+            "viewer_ids": ["2002", "2006"],
+            "paused": false
+        }),
+    );
+    let watching = wait("the viewers", || {
+        call().filter(|call| call.viewers.len() == 2)
+    });
+    assert_eq!(
+        watching.viewers.iter().map(|person| (person.id.as_str(), person.name.as_str())).collect::<Vec<_>>(),
+        [("2002", "Dev Patel"), ("2006", "Sam Whitlock")]
+    );
+
+    world.ask(Request::Media(MediaRequest::ShareWatch { source: Some("2002".into()) }));
+    world.discord.push(
+        "STREAM_UPDATE",
+        json!({"stream_key": "guild:4000:4201:2002", "viewer_ids": ["1000"], "paused": true}),
+    );
+    wait("the watched stream paused", || call().filter(|call| call.stream_paused));
 }

@@ -70,11 +70,16 @@
 	<string>Tiny uses the camera for video calls and to take photos or videos to attach.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Tiny uses Face ID to confirm that you approve adding a device to your account.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Tiny uses your location only when you choose to send your current location or start sharing your live location in a chat.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Tiny uses background location updates only while you are actively sharing your live location in a chat, and stops immediately when it expires or you tap Stop.</string>
 
-	<!-- A call keeps its audio session (and its sound) when the app goes to the background. -->
+	<!-- A call keeps its audio session (and live location keeps updating while actively shared) in the background. -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>location</string>
 	</array>
 
 	<key>UISupportedInterfaceOrientations</key>

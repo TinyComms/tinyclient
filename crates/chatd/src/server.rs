@@ -335,6 +335,15 @@ impl Chat {
                 adapter.command(Command::Tiny(adapters::tiny::live::Ask::Offer { sdp }));
             }
         });
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_ice(move |conversation, candidate| {
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::CallIce {
+                    conversation_id: conversation.id.clone(),
+                    candidate,
+                });
+            }
+        });
         // Tiny media dropped, or came back, while the call is still up. The live socket joins
         // again, or notes that the link held. A Discord call does this inside mediad.
         let adapters = chat.adapters.clone();
@@ -4623,6 +4632,137 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Stories { account, peer_id } => {
+                match self.ask(&account, |reply| Command::Stories { peer_id, reply }) {
+                    Ok((rings, stories)) => Response::Stories { rings, stories },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ReadStory { account, peer_id, story_id } => {
+                match self.ask(&account, |reply| Command::ReadStory { peer_id, story_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ReactStory { account, peer_id, story_id, emoji } => {
+                match self.ask(&account, |reply| Command::ReactStory { peer_id, story_id, emoji, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ReplyStory { account, peer_id, story_id, client_id, text } => {
+                if text.trim().is_empty() {
+                    return error(ErrorCode::Refused, "Reply text cannot be empty.");
+                }
+                match self.ask(&account, |reply| Command::ReplyStory {
+                    peer_id,
+                    story_id,
+                    client_id,
+                    text,
+                    reply,
+                }) {
+                    Ok((conversation_id, message)) => Response::StoryReplied {
+                        conversation: Key::new(&account, conversation_id),
+                        message: Box::new(message),
+                    },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SendLocation { conversation, client_id, point, reply_to } => {
+                if !point.is_valid() {
+                    return error(ErrorCode::Refused, "Location coordinates are out of range.");
+                }
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::SendLocation {
+                    conversation_id: conversation.id,
+                    client_id,
+                    point,
+                    reply_to,
+                    reply,
+                }) {
+                    Ok(_) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StartLiveLocation { conversation, client_id, point, period_secs, proximity_alert_radius, reply_to } => {
+                if !point.is_valid() {
+                    return error(ErrorCode::Refused, "Location coordinates are out of range.");
+                }
+                if !protocol::valid_live_period(period_secs) {
+                    return error(ErrorCode::Refused, "Invalid live location duration.");
+                }
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::StartLiveLocation {
+                    conversation_id: conversation.id,
+                    client_id,
+                    point,
+                    period_secs,
+                    proximity_alert_radius,
+                    reply_to,
+                    reply,
+                }) {
+                    Ok(share) => Response::LiveLocation { share },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UpdateLiveLocation { conversation, message_id, point, proximity_alert_radius } => {
+                if !point.is_valid() {
+                    return error(ErrorCode::Refused, "Location coordinates are out of range.");
+                }
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::UpdateLiveLocation {
+                    conversation_id: conversation.id,
+                    message_id,
+                    point,
+                    proximity_alert_radius,
+                    reply,
+                }) {
+                    Ok(share) => Response::LiveLocation { share },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StopLiveLocation { conversation, message_id } => {
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::StopLiveLocation {
+                    conversation_id: conversation.id,
+                    message_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StopAllLiveLocations { account } => {
+                if let Some(acct) = account {
+                    match self.ask(&acct, |reply| Command::StopAllLiveLocations { reply }) {
+                        Ok(()) => Response::Ok,
+                        Err(refused) => *refused,
+                    }
+                } else {
+                    let accounts = self.hub.store().accounts().unwrap_or_default();
+                    for row in accounts {
+                        let _ = self.ask(&row.key, |reply| Command::StopAllLiveLocations { reply });
+                    }
+                    Response::Ok
+                }
+            }
+            Request::ActiveLiveLocations { account } => {
+                if let Some(acct) = account {
+                    match self.ask(&acct, |reply| Command::ActiveLiveLocations { reply }) {
+                        Ok(shares) => Response::LiveLocations { shares },
+                        Err(refused) => *refused,
+                    }
+                } else {
+                    let mut all = Vec::new();
+                    let accounts = self.hub.store().accounts().unwrap_or_default();
+                    for row in accounts {
+                        if let Ok(shares) = self.ask(&row.key, |reply| Command::ActiveLiveLocations { reply }) {
+                            all.extend(shares);
+                        }
+                    }
+                    Response::LiveLocations { shares: all }
+                }
+            }
             Request::Translate { conversation, message_id, to } => {
                 let encryption = self
                     .hub
@@ -6668,6 +6808,34 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::CallRaiseHand { raised } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallRaiseHand {
+                    conversation_id,
+                    raised,
+                    reply,
+                }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallReact { emoji } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallReact {
+                    conversation_id,
+                    emoji,
+                    reply,
+                }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
             Request::Handoff { conversation } => {
                 let conversation_id = conversation.id.clone();
                 match self.ask(&conversation.account(), |reply| Command::Handoff { conversation_id, reply }) {
@@ -6734,7 +6902,7 @@ impl Chat {
                 }
                 let picture = match &request {
                     MediaRequest::Camera { on } => Some(Picture::Camera(*on)),
-                    MediaRequest::ShareSend { on, .. } => Some(Picture::Share(*on)),
+                    MediaRequest::ShareSend { on, preview, .. } => Some(Picture::Share { on: *on, preview: *preview == Some(true) }),
                     MediaRequest::ShareWatch { source } => Some(Picture::Watch(source.clone())),
                     _ => None,
                 };
@@ -6750,7 +6918,7 @@ impl Chat {
                 if asked.is_ok() {
                     if let (Some(call), true) = self.hub.calls.describe() {
                         if let Some(picture) = picture {
-                            if call.conversation.network == Network::Discord {
+                            if matches!(call.conversation.network, Network::Discord | Network::Signal) {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
                             }
                         }

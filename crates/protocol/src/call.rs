@@ -266,9 +266,18 @@ pub struct Participant {
     /// They hold the room's share.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sharing: bool,
-    /// Being rung for this call and not yet joined (Discord DM / group DM calls).
+    /// Being rung for this call and not yet joined (Discord DM / group DM calls, Signal group calls).
     #[serde(default, skip_serializing_if = "is_false")]
     pub ringing: bool,
+    /// A short preview of their live stream, as a local file. Empty until one was fetched.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
+    /// Raised hand in a group call (e.g., Signal group calls).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hand_raised: bool,
+    /// Active transient emoji reaction in a group call (e.g., Signal group calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<String>,
 }
 
 /// The most screens and windows `mediad --screens` lists.
@@ -441,6 +450,22 @@ pub struct Call {
     /// A soundboard sound just played, so the shell can flash that person's tile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<SoundEffect>,
+    /// People watching our own share, named from the ids the network sent. Not inferred from
+    /// who is merely in the voice channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewers: Vec<Participant>,
+    /// The stream we are watching has stopped sending. The tile says so.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream_paused: bool,
+    /// A Go Live leg's own MLS group. It does not replace [`Call::security`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_security: Option<CallSecurity>,
+    /// Whether our own hand is raised in the active group call.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hand_raised: bool,
+    /// Our own active transient emoji reaction in the active group call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<String>,
 }
 
 /// A Discord Activity in a voice channel. tinyclient shows it and hands the join to Discord.
@@ -560,6 +585,12 @@ pub struct CallSecurity {
     /// Only with [`SecurityMode::Transport`]: the server itself has no end-to-end encryption.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub server_lacks: bool,
+    /// This report is the Go Live leg, not the voice call. chatd keeps it on [`Call::stream_security`].
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub stream: bool,
+    /// Our DAVE identity public key (hex). Empty on a Tiny call. chatd publishes it once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity: String,
     /// This call is never carried on unencrypted: the person chose so, the server is an Incognito
     /// host, or the room only takes end-to-end encrypted calls. A [`SecurityMode::Blocked`] call
     /// then offers no way on but leaving.
@@ -667,7 +698,8 @@ pub struct VoiceJoin {
     pub dave: Dave,
     pub muted: bool,
     pub deafened: bool,
-    /// A Go Live connection, not the call's own voice. Its loop sends pictures and no audio.
+    /// A Go Live connection, not the call's own voice. Its loop sends the screen, and that
+    /// screen's sound when the share asked for it.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub stream: bool,
     /// This Go Live connection only receives. It sends no picture of its own.
@@ -744,6 +776,58 @@ pub struct TinyPicture {
     pub kind: PictureKind,
 }
 
+/// One TURN relay server handed out by Signal's calling relay endpoint (`/v1/accounts/turn`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalRelay {
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password: String,
+}
+
+/// What mediad needs to build a WebRTC offer for a Signal 1:1 or group call (pure-Rust `str0m`
+/// Opus + H.264 over DTLS-SRTP).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalOffer {
+    pub user_id: String,
+    pub peer_id: String,
+    /// Host or IP used to choose the local route when direct candidates are allowed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
+    /// When true, gather only TURN relay candidates (no host IP exposed to the peer).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub relay_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<SignalRelay>,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub deafened: bool,
+}
+
+/// What mediad needs to accept an incoming Signal call offer and produce an SDP answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalAccept {
+    pub user_id: String,
+    pub peer_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    pub offer_sdp: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub relay_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<SignalRelay>,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub deafened: bool,
+}
+
 /// chatd to mediad, over mediad's stdin. Closing stdin ends the call. Each request gets exactly
 /// one reply (`Streams`, `Done` or `Refused`), in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -765,6 +849,14 @@ pub enum MediaRequest {
         /// the capture can.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         show_cursor: Option<bool>,
+        /// The sound of the shared screen or window, on the Go Live audio SSRC. `None` is off,
+        /// which is what an older shell asked for, and what a phone sends: it has no loopback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sound: Option<bool>,
+        /// Send Discord a small preview of the share, outside the encrypted stream. `None` is
+        /// off: an older shell, or a phone, which has no switch for it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<bool>,
     },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
@@ -837,6 +929,14 @@ pub enum MediaRequest {
     /// off ([`SecurityMode::Blocked`]). Answered `Done`, or `Refused` in words when the call is
     /// not blocked or may not carry on unencrypted ([`CallSecurity::required`]).
     TinyTransport,
+    /// A Signal 1:1 or group call: build a pure-Rust `str0m` WebRTC SDP offer. Answered `Offer`.
+    SignalOffer(SignalOffer),
+    /// Accept an incoming Signal call SDP offer and start media. Answered `Answer`.
+    SignalAccept(SignalAccept),
+    /// Apply the remote peer's SDP answer to our pending Signal offer and start media. Answered `Done`.
+    SignalAnswer { sdp: String },
+    /// Feed a remote ICE candidate (`candidate:...`) into the active or pending Signal WebRTC session.
+    SignalIce { candidate: String },
 
     // What the shell and the room decide about the sound, for mediad to apply. Each is answered
     // `Done`, and each holds until sent again.
@@ -1109,6 +1209,11 @@ pub struct CallStats {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoStats {
+    /// Distinct encoders and decoders that produced video in the sampled interval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encoder_backends: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoder_backends: Vec<String>,
     /// A remote video slot is selected and being watched.
     pub receive_expected: bool,
     /// Time this receive slot has been watched, so startup is not called a stall.
@@ -1188,8 +1293,10 @@ pub enum MediaResponse {
     Ready { engine_linked: bool },
     Streams { video: Vec<VideoStream> },
     Done,
-    /// The SDP offer for a Tiny server call, in answer to `TinyOffer`.
+    /// The SDP offer for a Tiny or Signal call, in answer to `TinyOffer` or `SignalOffer`.
     Offer { sdp: String },
+    /// The SDP answer for an incoming Signal call, in answer to `SignalAccept`.
+    Answer { sdp: String },
     /// The connection as it is now, in answer to `Stats`.
     Stats(CallStats),
     /// This mediad cannot do what was asked.
@@ -1274,6 +1381,8 @@ pub enum MediaResponse {
     Notice { detail: String },
     /// Sources dropped because the requested watch list exceeded this device's decode budget.
     WatchRefused { refused: Vec<(String, PictureKind)> },
+    /// A local ICE candidate gathered for an active Signal call, for chatd to send in `IceUpdate`.
+    SignalIce { candidate: String },
 }
 
 impl MediaResponse {
@@ -1284,6 +1393,7 @@ impl MediaResponse {
             MediaResponse::Streams { .. } => "Streams",
             MediaResponse::Done => "Done",
             MediaResponse::Offer { .. } => "Offer",
+            MediaResponse::Answer { .. } => "Answer",
             MediaResponse::Stats(_) => "Stats",
             MediaResponse::Refused { .. } => "Refused",
             MediaResponse::LogsSaved { .. } => "LogsSaved",
@@ -1304,6 +1414,7 @@ impl MediaResponse {
             MediaResponse::SelfView { .. } => "SelfView",
             MediaResponse::Notice { .. } => "Notice",
             MediaResponse::WatchRefused { .. } => "WatchRefused",
+            MediaResponse::SignalIce { .. } => "SignalIce",
         }
     }
 
@@ -1314,6 +1425,7 @@ impl MediaResponse {
             MediaResponse::Streams { .. }
                 | MediaResponse::Done
                 | MediaResponse::Offer { .. }
+                | MediaResponse::Answer { .. }
                 | MediaResponse::Stats(_)
                 | MediaResponse::Refused { .. }
                 | MediaResponse::LogsSaved { .. }
@@ -1375,15 +1487,25 @@ mod tests {
     #[test]
     fn a_share_without_a_screen_is_the_frame_an_older_build_sends() {
         let older: MediaRequest = serde_json::from_str(r#"{"media":"share_send","on":true}"#).unwrap();
-        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None });
+        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: None });
         assert_eq!(serde_json::to_string(&older).unwrap(), r#"{"media":"share_send","on":true}"#);
         // The pointer is on when nothing is said, so an older shell gets it like everyone.
-        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false) };
+        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false), sound: None, preview: None };
         let json = serde_json::to_string(&chosen).unwrap();
         assert!(json.contains(r#""quality":"balanced""#) && json.contains(r#""show_cursor":false"#));
+        assert!(!json.contains("sound"), "{json}");
+        assert!(!json.contains("preview"), "{json}");
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), chosen);
-        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true) };
+        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true), sound: None, preview: None };
         assert_eq!(serde_json::to_string(&shown).unwrap(), r#"{"media":"share_send","on":true,"show_cursor":true}"#);
+        let heard = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: Some(true), preview: None };
+        let json = serde_json::to_string(&heard).unwrap();
+        assert_eq!(json, r#"{"media":"share_send","on":true,"sound":true}"#);
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), heard);
+        let previewed = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: Some(true) };
+        let json = serde_json::to_string(&previewed).unwrap();
+        assert_eq!(json, r#"{"media":"share_send","on":true,"preview":true}"#);
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), previewed);
     }
 
     #[test]
@@ -1477,4 +1599,80 @@ mod tests {
             assert_eq!(CameraQuality::parse(q.word()), Some(q));
         }
     }
+
+    #[test]
+    fn signal_call_media_frames_round_trip() {
+        let offer = MediaRequest::SignalOffer(SignalOffer {
+            user_id: "me-aci".into(),
+            peer_id: "grace-aci".into(),
+            host: "127.0.0.1".into(),
+            video: true,
+            relay_only: true,
+            relays: vec![SignalRelay {
+                urls: vec!["turn:turn1.whispersystems.org:443?transport=tcp".into()],
+                username: "u".into(),
+                password: "p".into(),
+            }],
+            muted: false,
+            deafened: false,
+        });
+        let json = serde_json::to_string(&offer).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), offer);
+
+        let accept = MediaRequest::SignalAccept(SignalAccept {
+            user_id: "me-aci".into(),
+            peer_id: "grace-aci".into(),
+            host: "127.0.0.1".into(),
+            offer_sdp: "v=0\r\n".into(),
+            video: true,
+            relay_only: false,
+            relays: Vec::new(),
+            muted: false,
+            deafened: false,
+        });
+        let json = serde_json::to_string(&accept).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), accept);
+
+        let ans_req = MediaRequest::SignalAnswer { sdp: "v=0\r\n".into() };
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&ans_req).unwrap()).unwrap(), ans_req);
+
+        let ice_req = MediaRequest::SignalIce { candidate: "candidate:1 1 UDP 2130706431 127.0.0.1 9 typ host".into() };
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&ice_req).unwrap()).unwrap(), ice_req);
+
+        let ans_resp = MediaResponse::Answer { sdp: "v=0\r\n".into() };
+        assert!(ans_resp.is_reply());
+        assert_eq!(ans_resp.name(), "Answer");
+        assert_eq!(serde_json::from_str::<MediaResponse>(&serde_json::to_string(&ans_resp).unwrap()).unwrap(), ans_resp);
+
+        let ice_resp = MediaResponse::SignalIce { candidate: "candidate:1 1 UDP 2130706431 127.0.0.1 9 typ host".into() };
+        assert!(!ice_resp.is_reply());
+        assert_eq!(ice_resp.name(), "SignalIce");
+        assert_eq!(serde_json::from_str::<MediaResponse>(&serde_json::to_string(&ice_resp).unwrap()).unwrap(), ice_resp);
+
+        // Group call raise-hand and emoji reaction fields default cleanly for older builds and round-trip when set.
+        let p = Participant {
+            id: "grace".into(),
+            name: "Grace".into(),
+            hand_raised: true,
+            reaction: Some("👏".into()),
+            ..Participant::default()
+        };
+        let wire = serde_json::to_string(&p).unwrap();
+        assert!(wire.contains(r#""hand_raised":true"#) && wire.contains(r#""reaction":"👏""#), "{wire}");
+        assert_eq!(serde_json::from_str::<Participant>(&wire).unwrap(), p);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn video_codec_backends_are_optional_on_the_wire() {
+    let stats = VideoStats::default();
+    let old = serde_json::to_value(&stats).unwrap();
+    assert!(old.get("encoder_backends").is_none());
+    let mut new = old.clone();
+    new["encoder_backends"] = serde_json::json!(["VideoToolbox", "OpenH264"]);
+    new["decoder_backends"] = serde_json::json!(["VideoToolbox"]);
+    let round_trip = serde_json::to_value(serde_json::from_value::<VideoStats>(new.clone()).unwrap()).unwrap();
+    assert_eq!(round_trip, new);
+    assert_eq!(serde_json::from_value::<VideoStats>(old).unwrap(), stats);
 }

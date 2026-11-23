@@ -267,6 +267,11 @@ mod tests {
         request_to_speak: false,
         raised: Vec::new(),
         effect: None,
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
+        hand_raised: false,
+        reaction: None,
         }
     }
 

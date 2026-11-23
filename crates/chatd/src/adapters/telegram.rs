@@ -60,6 +60,7 @@ mod files;
 mod filing;
 mod info;
 mod live;
+mod location;
 mod manage;
 mod members;
 mod peers;
@@ -69,6 +70,7 @@ mod real;
 mod secret;
 mod send;
 pub mod signin;
+mod stories;
 mod sync;
 
 pub(crate) fn capability_ceiling() -> protocol::Capabilities {
@@ -316,6 +318,10 @@ struct Live {
     played_sent: VecDeque<(String, i32)>,
     /// Messages whose `readMessageContents` mention consumption has already been accounted for.
     contents_read: VecDeque<(String, i32)>,
+    /// Active stories and shared-story hydration cache (#540).
+    stories: stories::State,
+    /// Active live location shares and rate-limited edits (#452).
+    live_geo: location::State,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -536,6 +542,132 @@ pub fn prove_telegram_view_once() -> Result<(), String> {
     content::prove_view_once()
 }
 
+/// The lab's telegram-wave15c driver (#540 stories & #452 live location sharing).
+pub fn prove_telegram_wave15c() -> Result<(), String> {
+    // 1. Validate GeoPoint parsing and live period bounds.
+    let pt = protocol::GeoPoint::parse_typed("37.7749, -122.4194")
+        .ok_or_else(|| "typed coordinates did not parse".to_owned())?;
+    if !pt.is_valid() {
+        return Err("parsed point was not valid".to_owned());
+    }
+    if protocol::GeoPoint::parse_typed("91.5, 0.0").is_some() {
+        return Err("out-of-range latitude was accepted".to_owned());
+    }
+    for &(period, _) in protocol::LIVE_LOCATION_PRESETS {
+        if !protocol::valid_live_period(period) {
+            return Err(format!("live preset period {period} rejected"));
+        }
+    }
+    // 2. Verify indefinite live location maps to "Until turned off" and "Still sharing".
+    let dir = peers::Directory::new(7_001);
+    let mut live_msg = tl::types::Message {
+        out: true,
+        mentioned: false,
+        media_unread: false,
+        silent: false,
+        post: false,
+        from_scheduled: false,
+        legacy: false,
+        edit_hide: false,
+        pinned: false,
+        noforwards: false,
+        invert_media: false,
+        offline: false,
+        video_processing_pending: false,
+        paid_suggested_post_stars: false,
+        paid_suggested_post_ton: false,
+        guestchat_via_from: None,
+        id: 77,
+        from_id: Some(Who::User(7_001).peer()),
+        from_boosts_applied: None,
+        from_rank: None,
+        peer_id: Who::User(7_002).peer(),
+        saved_peer_id: None,
+        fwd_from: None,
+        via_bot_id: None,
+        via_business_bot_id: None,
+        reply_to: None,
+        date: 1_700_000_000,
+        message: String::new(),
+        media: Some(
+            tl::types::MessageMediaGeoLive {
+                geo: tl::types::GeoPoint {
+                    long: -122.4194,
+                    lat: 37.7749,
+                    access_hash: 0,
+                    accuracy_radius: Some(15),
+                }
+                .into(),
+                heading: Some(180),
+                period: protocol::LIVE_LOCATION_INDEFINITE as i32,
+                proximity_notification_radius: Some(250),
+            }
+            .into(),
+        ),
+        reply_markup: None,
+        entities: None,
+        views: None,
+        forwards: None,
+        replies: None,
+        edit_date: None,
+        post_author: None,
+        grouped_id: None,
+        reactions: None,
+        restriction_reason: None,
+        ttl_period: None,
+        quick_reply_shortcut_id: None,
+        effect: None,
+        factcheck: None,
+        report_delivery_until_date: None,
+        paid_message_stars: None,
+        suggested_post: None,
+        schedule_repeat_period: None,
+        summary_from_language: None,
+        rich_message: None,
+    };
+    let mapped_live = content::map(&dir, &live_msg.clone().into())
+        .ok_or_else(|| "indefinite live location did not map".to_owned())?;
+    let card = mapped_live
+        .message
+        .card
+        .as_ref()
+        .ok_or_else(|| "indefinite live location produced no card".to_owned())?;
+    if !card.fields.iter().any(|(k, v)| k == "Shared for" && v == "Until turned off") {
+        return Err(format!("missing 'Until turned off' field: {:?}", card.fields));
+    }
+    if !card.fields.iter().any(|(k, v)| k == "Status" && v == "Still sharing") {
+        return Err(format!("indefinite live location not marked Still sharing: {:?}", card.fields));
+    }
+    // 3. Verify forwarded story maps as a normal message with SharedStory (not Unsupported).
+    live_msg.id = 78;
+    live_msg.media = Some(
+        tl::types::MessageMediaStory {
+            via_mention: false,
+            peer: Who::User(7_002).peer(),
+            id: 301,
+            story: None,
+        }
+        .into(),
+    );
+    let mapped_story = content::map(&dir, &live_msg.into())
+        .ok_or_else(|| "forwarded story did not map".to_owned())?;
+    if !matches!(mapped_story.message.kind, protocol::MessageKind::Normal) {
+        return Err("forwarded story fell back to Unsupported".to_owned());
+    }
+    if mapped_story.pending_story != Some((Who::User(7_002), 301)) {
+        return Err("forwarded story did not schedule getStoriesByID hydration".to_owned());
+    }
+    let shared = mapped_story
+        .message
+        .story
+        .as_ref()
+        .ok_or_else(|| "forwarded story missing SharedStory metadata".to_owned())?;
+    if shared.story_id != "301" {
+        return Err(format!("unexpected story_id {}", shared.story_id));
+    }
+    Ok(())
+}
+
 /// A user's last-seen as the contract's presence. Where Telegram hides the time ("recently",
 /// "within a week") the person is not known to be offline, so nothing is claimed.
 pub(super) fn presence(status: Option<&tl::enums::UserStatus>) -> Presence {
@@ -669,10 +801,13 @@ fn connect(
         }
         live::retry_pending(&account);
         sync::retry_unread_channels(&account);
+        location::tick(&account);
+        let unread_check = account.live().unread_check;
         let wait = [
             Some(said + HERE_EVERY),
             live::pending_deadline(&account),
-            account.live().unread_check,
+            unread_check,
+            location::next_deadline(&account),
         ].into_iter().flatten().min().unwrap_or(said + HERE_EVERY).saturating_duration_since(Instant::now());
         match events.recv_timeout(wait) {
             Ok(Event::Update { update, users, chats }) => {
@@ -690,10 +825,12 @@ fn connect(
     current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
     // Whether the session is over is asked of the wire that just failed: a revoked session
     // closes the connection first and says why only when asked.
-    match wire::call(account.wire.as_ref(), &tl::functions::updates::GetState {}) {
+    let outcome = match wire::call(account.wire.as_ref(), &tl::functions::updates::GetState {}) {
         Err(fault) if fault.signed_out() => Failure::SignedOut("Telegram ended this session.".to_owned()),
         _ => Failure::Dropped(ended),
-    }
+    };
+    location::on_session_lost(&account, matches!(outcome, Failure::SignedOut(_)));
+    outcome
 }
 
 struct Held {
@@ -813,6 +950,16 @@ fn offline(ctx: &Context, command: Command) {
         Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(down()))),
         Command::Transcribe { reply, .. } => drop(reply.send(Err(down()))),
         Command::RateTranscript { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Stories { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ReadStory { reply, .. }
+        | Command::ReactStory { reply, .. }
+        | Command::StopLiveLocation { reply, .. }
+        | Command::StopAllLiveLocations { reply } => drop(reply.send(Err(down()))),
+        Command::ReplyStory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SendLocation { reply, .. } => drop(reply.send(Err(down()))),
+        Command::StartLiveLocation { reply, .. }
+        | Command::UpdateLiveLocation { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ActiveLiveLocations { reply } => drop(reply.send(Ok(Vec::new()))),
         Command::Translate { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. }
@@ -1313,6 +1460,36 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::RateTranscript { conversation_id, message_id, transcription_id, good, reply } => {
             let _ = reply.send(info::rate_transcript(account, &conversation_id, &message_id, transcription_id, good).map_err(refused));
+        }
+        Command::Stories { peer_id, reply } => {
+            let _ = reply.send(stories::list(account, peer_id.as_deref()).map_err(refused));
+        }
+        Command::ReadStory { peer_id, story_id, reply } => {
+            let _ = reply.send(stories::read_story(account, &peer_id, &story_id).map_err(refused));
+        }
+        Command::ReactStory { peer_id, story_id, emoji, reply } => {
+            let _ = reply.send(stories::react_story(account, &peer_id, &story_id, emoji.as_deref()).map_err(refused));
+        }
+        Command::ReplyStory { peer_id, story_id, client_id, text, reply } => {
+            let _ = reply.send(stories::reply_story(account, &peer_id, &story_id, &client_id, &text).map_err(refused));
+        }
+        Command::SendLocation { conversation_id, client_id, point, reply_to, reply } => {
+            let _ = reply.send(location::send_one_time(account, &conversation_id, &client_id, point, reply_to.as_deref()).map_err(refused));
+        }
+        Command::StartLiveLocation { conversation_id, client_id, point, period_secs, proximity_alert_radius, reply_to, reply } => {
+            let _ = reply.send(location::start_live(account, &conversation_id, &client_id, point, period_secs, proximity_alert_radius, reply_to.as_deref()).map_err(refused));
+        }
+        Command::UpdateLiveLocation { conversation_id, message_id, point, proximity_alert_radius, reply } => {
+            let _ = reply.send(location::update_live(account, &conversation_id, &message_id, point, proximity_alert_radius).map_err(refused));
+        }
+        Command::StopLiveLocation { conversation_id, message_id, reply } => {
+            let _ = reply.send(location::stop_live(account, &conversation_id, &message_id).map_err(refused));
+        }
+        Command::StopAllLiveLocations { reply } => {
+            let _ = reply.send(location::stop_all(account).map_err(refused));
+        }
+        Command::ActiveLiveLocations { reply } => {
+            let _ = reply.send(Ok(location::active_list(account)));
         }
         Command::Translate { conversation_id, message_id, to, reply } => {
             let _ = reply.send(translate::one(account, &conversation_id, &message_id, &to).map_err(refused));
