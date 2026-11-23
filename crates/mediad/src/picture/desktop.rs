@@ -5,7 +5,7 @@ use super::*;
 use crate::{h264, rt, video::Track};
 use crate::platform::VideoFrame;
 #[cfg(any(target_os = "macos", all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
-use crate::platform::EncoderConfig;
+use crate::platform::EncoderConfig as PlatformEncoderConfig;
 #[cfg(target_os = "macos")]
 use crate::platform::H264Encoder;
 #[cfg(any(target_os = "macos", all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
@@ -149,7 +149,7 @@ impl Backend {
         }
         #[cfg(any(target_os = "macos", all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         {
-            let config = EncoderConfig { width, height, bitrate_bps: bps, fps: fps.round().max(1.) as u32, screen };
+            let config = PlatformEncoderConfig { width, height, bitrate_bps: bps, fps: fps.round().max(1.) as u32, screen };
             #[cfg(target_os = "macos")]
             return crate::vt_codec::Encoder::new(config).map(Self::VideoToolbox);
             #[cfg(target_os = "linux")]
