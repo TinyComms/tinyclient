@@ -277,6 +277,8 @@ struct Fake {
     counter: u32,
     /// Video SSRC and its retransmission, put on Ready when a test wants opcode 12.
     video: Option<(u32, u32)>,
+    /// Optional low simulcast camera SSRC and RTX SSRC (`rid` `"50"`).
+    video_low: Option<(u32, u32)>,
 }
 
 /// The server's end of one websocket.
@@ -420,7 +422,7 @@ impl Fake {
         // socket "in an indeterminate state" (SO_RCVTIMEO), and a timeout as long as the gap between
         // packets loses one now and then: sent, and never heard, with the sequence one short.
         udp.set_nonblocking(true).unwrap();
-        Fake { listener, udp, client: None, mode: AES, counter: 0, video: None }
+        Fake { listener, udp, client: None, mode: AES, counter: 0, video: None, video_low: None }
     }
 
     fn endpoint(&self) -> String {
@@ -488,7 +490,11 @@ impl Fake {
         let port = self.udp.local_addr().unwrap().port();
         let mut ready = json!({ "ssrc": OUR_SSRC, "ip": "127.0.0.1", "port": port, "modes": offered, "experiments": [] });
         if let Some((ssrc, rtx)) = self.video {
-            ready["streams"] = json!([{ "rid": "100", "ssrc": ssrc, "rtx_ssrc": rtx }]);
+            let mut streams = vec![json!({ "rid": "100", "ssrc": ssrc, "rtx_ssrc": rtx })];
+            if let Some((low_ssrc, low_rtx)) = self.video_low {
+                streams.push(json!({ "rid": "50", "ssrc": low_ssrc, "rtx_ssrc": low_rtx }));
+            }
+            ready["streams"] = Value::Array(streams);
         }
         peer.send(2, ready);
 
@@ -521,6 +527,16 @@ impl Fake {
         assert_eq!(select["codecs"][1]["rtx_payload_type"], 104);
         assert_eq!(select["codecs"][1]["decode"], true);
         assert_eq!(select["codecs"][1]["encode"], stream.is_some());
+        assert_eq!(select["codecs"][2]["name"], "VP8");
+        assert_eq!(select["codecs"][2]["payload_type"], 105);
+        assert_eq!(select["codecs"][2]["rtx_payload_type"], 106);
+        assert_eq!(select["codecs"][2]["encode"], false);
+        assert_eq!(select["codecs"][2]["decode"], true);
+        assert_eq!(select["codecs"][3]["name"], "AV1");
+        assert_eq!(select["codecs"][3]["payload_type"], 107);
+        assert_eq!(select["codecs"][3]["rtx_payload_type"], 108);
+        assert_eq!(select["codecs"][3]["encode"], false);
+        assert_eq!(select["codecs"][3]["decode"], true);
         assert_eq!(select["data"]["address"], "127.0.0.1");
         assert_eq!(select["data"]["port"], from.port());
         let mode = select["data"]["mode"].as_str().unwrap();
@@ -588,6 +604,29 @@ impl Fake {
             Aes256Gcm::new_from_slice(&KEY).unwrap().encrypt(&nonce::<12>(&counter).into(), payload)
         } else {
             XChaCha20Poly1305::new_from_slice(&KEY).unwrap().encrypt(&nonce::<24>(&counter).into(), payload)
+        };
+        datagram.extend_from_slice(&sealed.unwrap());
+        datagram.extend_from_slice(&counter);
+        self.udp.send_to(&datagram, self.client.unwrap()).unwrap();
+    }
+
+    /// One video RTP packet from a remote member on `ssrc` with `payload_type` and `marker`.
+    fn send_video_rtp(&mut self, ssrc: u32, payload_type: u8, sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) {
+        let second = (payload_type & 0x7f) | if marker { 0x80 } else { 0 };
+        let mut datagram = vec![0x80, second];
+        datagram.extend_from_slice(&sequence.to_be_bytes());
+        datagram.extend_from_slice(&timestamp.to_be_bytes());
+        datagram.extend_from_slice(&ssrc.to_be_bytes());
+        let counter = self.counter.to_be_bytes();
+        self.counter += 1;
+        let sealed = if self.mode == AES {
+            Aes256Gcm::new_from_slice(&KEY)
+                .unwrap()
+                .encrypt(&nonce::<12>(&counter).into(), Payload { msg: payload, aad: &datagram })
+        } else {
+            XChaCha20Poly1305::new_from_slice(&KEY)
+                .unwrap()
+                .encrypt(&nonce::<24>(&counter).into(), Payload { msg: payload, aad: &datagram })
         };
         datagram.extend_from_slice(&sealed.unwrap());
         datagram.extend_from_slice(&counter);
@@ -1513,7 +1552,7 @@ fn a_balanced_share_tells_the_voice_server_1080p_at_30_and_a_later_pick_is_told_
     assert_eq!(told["streams"][0]["max_framerate"], 15);
     assert_eq!(told["streams"][0]["max_bitrate"], 1_500_000);
     drop(voice);
-    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false }), MediaResponse::Done);
+    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false, stream_owner: None }), MediaResponse::Done);
     assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
 
@@ -1535,7 +1574,7 @@ fn a_go_live_leg_offers_a_screen_and_does_not_speak_or_exit() {
     }
     assert!(peer.held.iter().all(|(op, _)| *op != 5), "a screen leg spoke: {:?}", peer.held);
     assert!(mediad.child.try_wait().unwrap().is_none(), "the screen leg ended the process");
-    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false }), MediaResponse::Done);
+    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false, stream_owner: None }), MediaResponse::Done);
     assert!(mediad.child.try_wait().unwrap().is_none(), "stopping the screen ended the process");
     assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
@@ -1582,7 +1621,7 @@ fn a_go_live_leg_with_sound_sends_opus_on_its_audio_ssrc_and_says_it_is_sharing_
     let frames: Vec<Vec<u8>> = heard.into_iter().map(|rtp| rtp.payload).collect();
     assert!(is_the_tone(decoded_level(&frames)), "decoded {:?}", decoded_level(&frames));
     drop(voice);
-    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false }), MediaResponse::Done);
+    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false, stream_owner: None }), MediaResponse::Done);
     assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
 
@@ -1654,7 +1693,7 @@ fn watched_go_live_audio_is_opened_and_mixed_at_its_own_volume() {
     assert!(measure(&mut stream) < 800., "deafen left the stream playing");
     assert_eq!(mediad.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
     assert!(is_the_tone(measure(&mut stream)), "undeafening did not restore stream audio at full gain");
-    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: true }), MediaResponse::Done);
+    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: true, stream_owner: None }), MediaResponse::Done);
     assert!(measure(&mut stream) < 800., "the old stream kept playing after Stop watching");
     assert!(mediad.child.try_wait().unwrap().is_none(), "stopping the stream ended the voice call");
     assert_eq!(mediad.hang_up().0.code(), Some(0));
@@ -1779,4 +1818,245 @@ fn dave_a_member_still_unencrypted_while_we_join_is_heard() {
     let loudest = played(&played_to).chunks(960 * 2 * 20).map(rms).fold(0., f64::max);
     assert!(is_the_tone(loudest), "played level {loudest}");
     let _ = std::fs::remove_file(played_to);
+}
+
+fn sample_vp8_keyframe() -> Vec<u8> {
+    let (w, h) = (64usize, 48usize);
+    let cfg = vp8_encoder::EncoderConfig::new(w as u32, h as u32, 30, 500_000);
+    let mut enc = vp8_encoder::Encoder::new(cfg).unwrap();
+    let mut i420 = vec![190u8; w * h];
+    i420.extend(std::iter::repeat(110u8).take((w / 2) * (h / 2)));
+    i420.extend(std::iter::repeat(150u8).take((w / 2) * (h / 2)));
+    let pic = vp8_decoder::Picture::from_i420(&i420, w as u32, h as u32).unwrap();
+    enc.encode(&pic, true).unwrap().unwrap().data
+}
+
+#[test]
+fn vp8_and_av1_frames_decode_and_paint_pictures() {
+    let mut fake = Fake::new();
+    let mut mediad = Mediad::start("null", None);
+    mediad.join(&fake.endpoint(), NO_DAVE);
+    let mut peer = fake.accept();
+    fake.handshake(&mut peer, &[AES], 0, 30_000);
+    mediad.connected();
+    peer.expect(15);
+
+    // Announce two remote camera streams: 222 sends VP8 on SSRC 5001, 333 sends AV1 on SSRC 5002.
+    peer.send(12, json!({
+        "user_id": "222",
+        "audio_ssrc": 2001,
+        "streams": [{ "type": "video", "rid": "100", "ssrc": 5001, "rtx_ssrc": 5002, "active": true, "quality": 100 }]
+    }));
+    peer.send(12, json!({
+        "user_id": "333",
+        "audio_ssrc": 2002,
+        "streams": [{ "type": "video", "rid": "100", "ssrc": 6001, "rtx_ssrc": 6002, "active": true, "quality": 100 }]
+    }));
+    // Wait until mediad has processed both op 12 announcements (per-SSRC op 15 reflects both SSRCs).
+    let wants = loop {
+        let w = peer.expect(15);
+        if w.get("5001").is_some() && w.get("6001").is_some() {
+            break w;
+        }
+    };
+    assert!(wants["5001"].as_u64().unwrap_or(0) > 0);
+    assert!(wants["6001"].as_u64().unwrap_or(0) > 0);
+
+    // Send a real VP8 keyframe on PT 105 (VP8) for user 222.
+    let vp8_key = sample_vp8_keyframe();
+    for (i, piece) in mediad::vp8::packetize(&vp8_key, 200).iter().enumerate() {
+        fake.send_video_rtp(5001, mediad::rtp::VP8, 10 + i as u16, 90_000, piece.marker, &piece.payload);
+    }
+    // Send a real AV1 keyframe on PT 107 (AV1) for user 333.
+    for (i, piece) in mediad::av1::packetize(mediad::av1::SAMPLE_KEYFRAME_OBU, 16).iter().enumerate() {
+        fake.send_video_rtp(6001, mediad::rtp::AV1, 20 + i as u16, 90_000, piece.marker, &piece.payload);
+    }
+
+    let mut painted = std::collections::HashMap::new();
+    let deadline = Instant::now() + PATIENCE;
+    while painted.len() < 2 && Instant::now() < deadline {
+        if let MediaResponse::Picture { path, width, height, user_id, kind, .. } = mediad.event_serving(&mut peer, "VP8/AV1 picture", |e| {
+            matches!(e, MediaResponse::Picture { path, .. } if !path.is_empty())
+        }) {
+            assert_eq!(kind, protocol::PictureKind::Camera);
+            assert_eq!((width, height), (64, 48));
+            assert!(std::path::Path::new(&path).is_file(), "painted JPEG missing: {path}");
+            painted.insert(user_id, path);
+        }
+    }
+    assert!(painted.contains_key("222"), "VP8 user 222 did not paint: {painted:?}");
+    assert!(painted.contains_key("333"), "AV1 user 333 did not paint: {painted:?}");
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
+}
+
+#[test]
+fn camera_simulcast_announces_two_layers_and_sends_per_ssrc_sink_wants() {
+    let mut fake = Fake::new();
+    fake.video = Some((100, 101));
+    fake.video_low = Some((200, 201));
+    let tls = tls();
+    let pattern = PathBuf::from("pattern");
+    let mut mediad = Mediad::start_in(
+        "null",
+        None,
+        &[
+            ("TINYCLIENT_DIR", &tls.dir),
+            ("TINYCLIENT_VOICE_TRUST", &tls.certificate),
+            ("TINYCLIENT_MEDIAD_PICTURE", &pattern),
+        ],
+    );
+    mediad.join(&fake.endpoint(), NO_DAVE);
+    let mut peer = fake.accept();
+    let identify = fake.handshake(&mut peer, &[AES], 0, 30_000);
+    assert_eq!(identify["streams"].as_array().unwrap().len(), 2, "camera identify offers two simulcast layers");
+    assert_eq!(identify["streams"][0]["rid"], "100");
+    assert_eq!(identify["streams"][1]["rid"], "50");
+    mediad.connected();
+    peer.expect(15);
+
+    // Ask for HD camera quality + turn camera on -> op 12 announces BOTH simulcast layers!
+    assert_eq!(
+        mediad.ask(MediaRequest::CameraSettings(protocol::CameraSettings {
+            quality: protocol::CameraQuality::Hd,
+            mirror: true,
+            blur: false,
+        })),
+        MediaResponse::Done
+    );
+    let cam = mediad.ask(MediaRequest::Camera { on: true });
+    assert!(matches!(cam, MediaResponse::Streams { .. }), "{cam:?}");
+    let announced = peer.expect(12);
+    let streams = announced["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 2, "op 12 must announce both camera simulcast layers: {announced}");
+    assert_eq!(streams[0]["rid"], "100");
+    assert_eq!(streams[0]["ssrc"], 100);
+    assert_eq!(streams[0]["rtx_ssrc"], 101);
+    assert_eq!(streams[0]["max_resolution"]["height"], 720);
+    assert_eq!(streams[0]["max_framerate"], 30);
+    assert_eq!(streams[1]["rid"], "50");
+    assert_eq!(streams[1]["ssrc"], 200);
+    assert_eq!(streams[1]["rtx_ssrc"], 201);
+    assert_eq!(streams[1]["max_resolution"]["height"], 360);
+    assert_eq!(streams[1]["max_framerate"], 15);
+
+    // Now announce two remote cameras (222 with two simulcast layers, 333 with one layer) and
+    // send MediaRequest::Watch scaling 222=Large, 333=Small -> op 15 requests 100 and 50!
+    peer.send(12, json!({
+        "user_id": "222",
+        "audio_ssrc": 2001,
+        "streams": [
+            { "type": "video", "rid": "100", "ssrc": 7001, "rtx_ssrc": 7002, "active": true, "quality": 100 },
+            { "type": "video", "rid": "50", "ssrc": 7003, "rtx_ssrc": 7004, "active": true, "quality": 50 }
+        ]
+    }));
+    peer.send(12, json!({
+        "user_id": "333",
+        "audio_ssrc": 2002,
+        "streams": [{ "type": "video", "rid": "100", "ssrc": 8001, "rtx_ssrc": 8002, "active": true, "quality": 100 }]
+    }));
+    let watch = mediad.ask(MediaRequest::Watch {
+        sources: vec![
+            protocol::WatchSource { user_id: "222".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Large },
+            protocol::WatchSource { user_id: "333".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Small },
+        ],
+    });
+    assert!(matches!(watch, MediaResponse::Streams { .. }), "{watch:?}");
+    let wants = loop {
+        let w = peer.expect(15);
+        if w.get("7001") == Some(&json!(100)) && w.get("8001") == Some(&json!(50)) {
+            break w;
+        }
+    };
+    assert_eq!(wants["7001"], 100);
+    assert_eq!(wants["8001"], 50);
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
+}
+
+#[test]
+fn two_remote_cameras_and_one_go_live_stream_paint_all_three_simultaneously() {
+    let mut voice = Fake::new();
+    let mut mediad = Mediad::start("null", None);
+    mediad.join(&voice.endpoint(), NO_DAVE);
+    let mut voice_peer = voice.accept();
+    voice.handshake(&mut voice_peer, &[AES], 0, 30_000);
+    mediad.connected();
+    voice_peer.expect(15);
+
+    // Open a Go Live watch leg for user 444 alongside the voice leg.
+    let mut stream = Fake::new();
+    let mut join = session(&stream.endpoint(), "session-1", "stream-token", NO_DAVE);
+    join.stream = true;
+    join.watch = true;
+    join.group_id = "899".into();
+    join.stream_owner = Some("444".into());
+    assert_eq!(mediad.ask(MediaRequest::Stream(join)), MediaResponse::Done);
+    let mut stream_peer = stream.accept();
+    stream.handshake_kind(&mut stream_peer, &[AES], 0, 30_000, None);
+    stream_peer.expect(15);
+
+    // Tell mediad we are watching 444's share AND both remote cameras (222, 333).
+    let _ = mediad.ask(MediaRequest::Watch {
+        sources: vec![
+            protocol::WatchSource { user_id: "444".into(), kind: protocol::PictureKind::Share, size: protocol::WatchSize::Large },
+            protocol::WatchSource { user_id: "222".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Small },
+            protocol::WatchSource { user_id: "333".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Small },
+        ],
+    });
+
+    // Announce two cameras on the voice leg + one Go Live stream on the watch leg.
+    voice_peer.send(12, json!({
+        "user_id": "222",
+        "audio_ssrc": 2001,
+        "streams": [{ "type": "video", "rid": "100", "ssrc": 5001, "rtx_ssrc": 5002, "active": true, "quality": 100 }]
+    }));
+    voice_peer.send(12, json!({
+        "user_id": "333",
+        "audio_ssrc": 2002,
+        "streams": [{ "type": "video", "rid": "100", "ssrc": 6001, "rtx_ssrc": 6002, "active": true, "quality": 100 }]
+    }));
+    stream_peer.send(12, json!({
+        "user_id": "444",
+        "audio_ssrc": 2003,
+        "streams": [{ "type": "video", "rid": "100", "ssrc": 9001, "rtx_ssrc": 9002, "active": true, "quality": 100 }]
+    }));
+    // Wait until both legs have ingested their op 12 maps (per-SSRC op 15 arrives).
+    loop {
+        let w = voice_peer.expect(15);
+        if w.get("5001").is_some() && w.get("6001").is_some() {
+            break;
+        }
+    }
+    loop {
+        let w = stream_peer.expect(15);
+        if w.get("9001").is_some() {
+            break;
+        }
+    }
+
+    // Send frames on all three SSRCs: 222 (VP8 camera), 333 (AV1 camera), 444 (AV1 Go Live share).
+    let vp8_key = sample_vp8_keyframe();
+    for (i, piece) in mediad::vp8::packetize(&vp8_key, 200).iter().enumerate() {
+        voice.send_video_rtp(5001, mediad::rtp::VP8, 1 + i as u16, 90_000, piece.marker, &piece.payload);
+    }
+    for (i, piece) in mediad::av1::packetize(mediad::av1::SAMPLE_KEYFRAME_OBU, 16).iter().enumerate() {
+        voice.send_video_rtp(6001, mediad::rtp::AV1, 1 + i as u16, 90_000, piece.marker, &piece.payload);
+    }
+    for (i, piece) in mediad::av1::packetize(mediad::av1::SAMPLE_KEYFRAME_OBU, 16).iter().enumerate() {
+        stream.send_video_rtp(9001, mediad::rtp::AV1, 1 + i as u16, 90_000, piece.marker, &piece.payload);
+    }
+
+    let mut seen: std::collections::HashSet<(String, protocol::PictureKind)> = std::collections::HashSet::new();
+    let deadline = Instant::now() + PATIENCE;
+    while seen.len() < 3 && Instant::now() < deadline {
+        if let MediaResponse::Picture { path, user_id, kind, .. } = mediad.event_serving(&mut voice_peer, "three pictures", |e| {
+            matches!(e, MediaResponse::Picture { path, .. } if !path.is_empty())
+        }) {
+            assert!(std::path::Path::new(&path).is_file(), "painted JPEG missing: {path}");
+            seen.insert((user_id, kind));
+        }
+    }
+    assert!(seen.contains(&("222".to_owned(), protocol::PictureKind::Camera)), "camera 222 missing: {seen:?}");
+    assert!(seen.contains(&("333".to_owned(), protocol::PictureKind::Camera)), "camera 333 missing: {seen:?}");
+    assert!(seen.contains(&("444".to_owned(), protocol::PictureKind::Share)), "Go Live share 444 missing: {seen:?}");
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
 }

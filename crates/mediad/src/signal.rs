@@ -472,6 +472,7 @@ pub fn run(mut link: Link, user_id: String, peer_id: String, controls: Arc<Contr
                         } else if data.mid == link.video && !data.data.is_empty() {
                             let key = data.is_keyframe();
                             let frame = Received {
+                                codec: crate::video::VideoCodec::H264,
                                 key,
                                 contiguous: data.contiguous,
                                 data: data.data,

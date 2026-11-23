@@ -517,8 +517,9 @@ impl Outgoing {
             }
             None => Ok(Encoded::default()),
         };
+        let low_profile = profile.low_layer();
         let high = layer(&mut self.high, high, profile.max, profile.bps, profile.fps as f32)?;
-        let low = layer(&mut self.low, low, CAMERA_LOW, CAMERA_LOW_BPS, FULL_FPS)?;
+        let low = layer(&mut self.low, low, low_profile.max, low_profile.bps, low_profile.fps as f32)?;
         Ok((high, low))
     }
 
@@ -610,6 +611,8 @@ impl HardwareDecoder {
 pub struct Incoming {
     decoder: Option<Decoder>,
     hardware: Option<HardwareDecoder>,
+    vp8: Option<crate::vp8::Vp8Decoder>,
+    av1: Option<crate::av1::Av1Decoder>,
     software_only: bool,
     waiting_for_key: bool,
     pending: u8,
@@ -624,6 +627,8 @@ impl Incoming {
     pub fn reset(&mut self) {
         self.decoder = None;
         self.hardware = None;
+        self.vp8 = None;
+        self.av1 = None;
         self.waiting_for_key = true;
         self.pending = 0;
         self.sps.clear();
@@ -635,11 +640,45 @@ impl Incoming {
         self.last_backend
     }
 
-    /// Decode every access unit so the decoder's reference frames stay current. Convert
-    /// to RGB only when a painter is due.
+    /// Decode every access unit (`H264`, `Vp8`, or `Av1`) so the decoder's reference frames stay
+    /// current. Convert to RGB only when a painter is due.
     #[allow(clippy::result_unit_err)]
-    pub fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+    pub fn decode(&mut self, codec: crate::video::VideoCodec, data: &[u8], paint: Option<Tag>) -> Result<(), ()> {
         self.last_backend = None;
+        match codec {
+            crate::video::VideoCodec::H264 => self.decode_h264(data, paint),
+            crate::video::VideoCodec::Vp8 => {
+                let decoder = self.vp8.get_or_insert_with(crate::vp8::Vp8Decoder::new);
+                let Some(planes) = decoder.decode(data)? else {
+                    return Ok(());
+                };
+                self.last_backend = Some("VP8");
+                if let Some(tag) = paint {
+                    let (w, h) = (planes.width as u32, planes.height as u32);
+                    self.paint(rgb(&planes), w, h, tag);
+                }
+                Ok(())
+            }
+            crate::video::VideoCodec::Av1 => {
+                if self.av1.is_none() {
+                    self.av1 = crate::av1::Av1Decoder::new().ok();
+                }
+                let decoder = self.av1.as_mut().ok_or(())?;
+                let Some(planes) = decoder.decode(data)? else {
+                    return Ok(());
+                };
+                self.last_backend = Some("AV1");
+                if let Some(tag) = paint {
+                    let (w, h) = (planes.width as u32, planes.height as u32);
+                    self.paint(rgb(&planes), w, h, tag);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(clippy::result_unit_err)]
+    fn decode_h264(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
         let (mut idr, mut has_sps, mut has_pps) = (false, false, false);
         for unit in h264::split(annex_b) {
             match unit[0] & 31 {
@@ -1451,13 +1490,13 @@ mod tests {
     fn a_failed_hardware_decoder_is_retired_and_waits_for_an_idr() {
         let mut incoming = Incoming { hardware: Some(HardwareDecoder::Refuses), ..Incoming::default() };
         let delta = [0, 0, 0, 1, 0x41, 0xae];
-        assert_eq!(incoming.decode(&delta, None), Err(()));
+        assert_eq!(incoming.decode(crate::video::VideoCodec::H264, &delta, None), Err(()));
         assert!(incoming.hardware.is_none());
         assert!(incoming.software_only);
         assert!(incoming.waiting_for_key);
         assert_eq!(incoming.backend_name(), None);
         incoming.reset();
-        assert_eq!(incoming.decode(&delta, None), Err(()));
+        assert_eq!(incoming.decode(crate::video::VideoCodec::H264, &delta, None), Err(()));
         assert!(incoming.hardware.is_none());
         assert!(incoming.decoder.is_none());
     }
@@ -1690,7 +1729,7 @@ mod tests {
             }
             if !encoded.bytes.is_empty() {
                 let tag = (n == 0).then(|| Tag { user: "ada".into(), kind: protocol::PictureKind::Share, small: false });
-                incoming.decode(&encoded.bytes, tag).expect("every frame decodes");
+                incoming.decode(crate::video::VideoCodec::H264, &encoded.bytes, tag).expect("every frame decodes");
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut painted = incoming.painted();
                 while n == 0 && painted.is_empty() && std::time::Instant::now() < deadline {

@@ -55,6 +55,12 @@ pub fn prove_discord_voice_move() -> Result<(), String> {
 pub fn prove_discord_wave15_share() -> Result<(), String> {
     discord::prove_wave15_share()
 }
+
+/// `TINYCLIENT_PROVE=discord-wave15a3`. Multi-stream Go Live watch map keeps multiple streams
+/// concurrently and unwatching one preserves the others.
+pub fn prove_discord_wave15a3() -> Result<(), String> {
+    discord::prove_wave15a3()
+}
 mod recovery;
 pub mod net;
 mod script;
@@ -383,8 +389,11 @@ pub enum Picture {
     Camera(bool),
     /// Our screen, on or off. `preview` sends Discord a small picture outside the encrypted stream.
     Share { on: bool, preview: bool },
-    /// Whose share to watch. `None` stops watching.
+    /// Whose share to watch. `None` stops watching all shares.
     Watch(Option<String>),
+    /// Full multi-stream watch list: Discord opens/closes individual Go Live watch legs to match
+    /// the `PictureKind::Share` entries while keeping every other watched stream open.
+    WatchList(Vec<protocol::WatchSource>),
 }
 
 /// One page of a forum's posts, in the network's order. `None` from [`Command::OpenForum`] means

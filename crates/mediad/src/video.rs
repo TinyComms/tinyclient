@@ -741,9 +741,19 @@ fn capture<S: Source>(mut work: Capture<S>, orders: &Orders) {
     }
 }
 
+/// Video bitstream codec carried in a received frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Vp8,
+    Av1,
+}
+
 /// One received frame, not yet opened.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Received {
+    pub codec: VideoCodec,
     pub data: Arc<[u8]>,
     pub key: bool,
     pub contiguous: bool,
@@ -855,7 +865,7 @@ pub trait Screen {
     /// Decodes one frame, always, and has it painted for `paint` if given. `Err` when it did
     /// not decode. What was painted comes back from [`Screen::painted`], later.
     #[allow(clippy::result_unit_err)]
-    fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()>;
+    fn decode(&mut self, codec: VideoCodec, data: &[u8], paint: Option<Tag>) -> Result<(), ()>;
     /// The pictures painted since this was last asked.
     fn painted(&mut self) -> Vec<(Tag, Painted)>;
     fn reset(&mut self);
@@ -869,8 +879,8 @@ impl Screen for Incoming {
         self.backend_name()
     }
 
-    fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
-        Incoming::decode(self, annex_b, paint)
+    fn decode(&mut self, codec: VideoCodec, data: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+        Incoming::decode(self, codec, data, paint)
     }
 
     fn painted(&mut self) -> Vec<(Tag, Painted)> {
@@ -981,7 +991,7 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
             .then(|| Tag { user: frame.user.clone(), kind: frame.kind, small: self.small });
         let painting = paint.is_some();
         let began = Instant::now();
-        let decoded = self.screen.decode(&opened, paint);
+        let decoded = self.screen.decode(frame.codec, &opened, paint);
         if let Some(name) = self.screen.decoder_backend() {
             self.controls.video_stats.lock().unwrap().decoded_with(name);
         }
@@ -2014,7 +2024,7 @@ mod tests {
     }
 
     impl Screen for Glass {
-        fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+        fn decode(&mut self, _codec: VideoCodec, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
             self.decoded.lock().unwrap().push((annex_b[0], paint.is_some()));
             if self.fails.contains(&annex_b[0]) {
                 return Err(());
@@ -2041,6 +2051,7 @@ mod tests {
 
     fn frame(name: u8, key: bool) -> Received {
         Received {
+            codec: VideoCodec::H264,
             data: vec![name].into(),
             key,
             contiguous: true,

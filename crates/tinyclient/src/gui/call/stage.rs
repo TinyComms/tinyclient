@@ -448,7 +448,7 @@ pub(in crate::gui) fn streams(stage: &Stage, me: &str, sending: Option<Sending>)
         });
     }
     let any_share = found.iter().any(|stream| stream.share);
-    if any_share {
+    if any_share && stage.key.network != Network::Discord {
         for stream in &mut found {
             if !stream.share && !stream.mine {
                 stream.watchable = false;
@@ -585,6 +585,27 @@ mod tests {
         );
         let quiet = Stage { video: false, ..stage };
         assert!(streams(&quiet, "me", None).is_empty(), "a stage with video off has no streams");
+    }
+
+    #[test]
+    fn discord_stage_keeps_all_cameras_watchable_beside_multiple_go_live_shares() {
+        let stage = Stage {
+            key: Key { network: Network::Discord, account: "1".into(), id: "900".into() },
+            ..stage_of(vec![
+                seat("ada", false, true),
+                seat("bev", true, false),
+                seat("cal", true, true),
+            ])
+        };
+        let found = streams(&stage, "me", None);
+        assert_eq!(
+            found,
+            vec![
+                Stream { user_id: "ada".into(), share: false, mine: false, watchable: true },
+                Stream { user_id: "bev".into(), share: true, mine: false, watchable: true },
+                Stream { user_id: "cal".into(), share: true, mine: false, watchable: true },
+            ]
+        );
     }
 
     #[test]
