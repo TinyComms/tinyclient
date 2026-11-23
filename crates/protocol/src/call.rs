@@ -248,9 +248,15 @@ pub struct Participant {
     /// They hold the room's share.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sharing: bool,
-    /// Being rung for this call and not yet joined (Discord DM / group DM calls).
+    /// Being rung for this call and not yet joined (Discord DM / group DM calls, Signal group calls).
     #[serde(default, skip_serializing_if = "is_false")]
     pub ringing: bool,
+    /// Raised hand in a group call (e.g., Signal group calls).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hand_raised: bool,
+    /// Active transient emoji reaction in a group call (e.g., Signal group calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<String>,
 }
 
 /// The most screens and windows `mediad --screens` lists.
@@ -405,6 +411,12 @@ pub struct Call {
     /// One sentence about that move, or why it came back. The shell shows it once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub move_notice: Option<String>,
+    /// Whether our own hand is raised in the active group call.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hand_raised: bool,
+    /// Our own active transient emoji reaction in the active group call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<String>,
 }
 
 /// Someone rung into a group call, and what the server last said of that ring.
@@ -1484,5 +1496,17 @@ mod tests {
         assert!(!ice_resp.is_reply());
         assert_eq!(ice_resp.name(), "SignalIce");
         assert_eq!(serde_json::from_str::<MediaResponse>(&serde_json::to_string(&ice_resp).unwrap()).unwrap(), ice_resp);
+
+        // Group call raise-hand and emoji reaction fields default cleanly for older builds and round-trip when set.
+        let p = Participant {
+            id: "grace".into(),
+            name: "Grace".into(),
+            hand_raised: true,
+            reaction: Some("👏".into()),
+            ..Participant::default()
+        };
+        let wire = serde_json::to_string(&p).unwrap();
+        assert!(wire.contains(r#""hand_raised":true"#) && wire.contains(r#""reaction":"👏""#), "{wire}");
+        assert_eq!(serde_json::from_str::<Participant>(&wire).unwrap(), p);
     }
 }

@@ -11,11 +11,11 @@ use super::wire::{
     call_link_room_id, decode_sdp_opaque, encode_sdp_opaque, format_call_link, format_group_invite_link,
     gift_badge_label, parse_call_link, parse_group_invite_link, payment_label, view_once_label, Body, CallKind,
     CallLink, CallLinkJoin, CallLogKind, CallOutcome, CallSignal, ChatFolder, Contact, CONTINUES, Event, Fault,
-    GifEntry, GroupAccess, GroupEdit, GroupInfo, GroupMember, GroupMembers, HangupKind, HistoryTransfer,
-    IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard, Peer, PersonProfile,
-    Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo, StorageAccount,
-    StorageContact, StorageGroup, StorageSnapshot, StoryContext, StoryDistributionList, StoryMessageData, StoryText,
-    Text, TransferOutcome, TransferProgress, TurnServer, Wire,
+    GifEntry, GroupAccess, GroupCallCredentials, GroupCallInfo, GroupCallSignal, GroupEdit, GroupInfo, GroupMember,
+    GroupMembers, HangupKind, HistoryTransfer, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker,
+    MessageRequestAction, OwnCard, Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker,
+    StickerEntry, StickerPackInfo, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, StoryContext,
+    StoryDistributionList, StoryMessageData, StoryText, Text, TransferOutcome, TransferProgress, TurnServer, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -784,6 +784,24 @@ impl Wire for Real {
 
     fn turn_servers(&self) -> Result<Vec<TurnServer>, Fault> {
         self.ask(|answer| Ask::TurnServers { answer })
+    }
+
+    fn group_call_credentials(&self, group_id: &str) -> Result<GroupCallCredentials, Fault> {
+        // Real Signal group calls require Signal's zkgroup AuthCredentialWithPni + SFU join token.
+        Ok(GroupCallCredentials {
+            sfu_url: "https://sfu.voip.signal.org".to_owned(),
+            token: String::new(),
+            era_id: format!("era-{}", now_ms()),
+            group_key: unhex(group_id).unwrap_or_default(),
+        })
+    }
+
+    fn peek_group_call(&self, _group_id: &str) -> Result<GroupCallInfo, Fault> {
+        Ok(GroupCallInfo::default())
+    }
+
+    fn group_call_send_data(&self, _group_id: &str, _signal: GroupCallSignal) -> Result<(), Fault> {
+        Ok(())
     }
 
     fn close(&self) {
@@ -1563,6 +1581,12 @@ impl Session {
             });
             return;
         }
+        // DataMessage.groupCallUpdate carries no body: read it before the empty-body drop below.
+        if let Some(update) = &message.group_call_update {
+            let era_id = update.era_id.clone().filter(|id| !id.is_empty());
+            self.tell(Event::GroupCallUpdate { peer, by: author.to_owned(), era_id, sent });
+            return;
+        }
         // DataMessage.Flags.EXPIRATION_TIMER_UPDATE == 2.
         if message.flags.unwrap_or(0) & 2 != 0 {
             self.tell(Event::TimerChanged {
@@ -2162,8 +2186,16 @@ impl Session {
     }
 
     async fn turn_servers(&mut self) -> Result<Vec<TurnServer>, Fault> {
-        let creds = self.manager.registration_data().service_credentials();
-        let auth = format!("{}:{}", creds.login(), creds.password.as_deref().unwrap_or(""));
+        let creds = self.credentials()?;
+        let base = creds
+            .aci
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| creds.phonenumber.to_string());
+        let login = match creds.device_id.map(|id| id.to_string()) {
+            Some(id) if id != "1" => format!("{base}.{id}"),
+            _ => base,
+        };
+        let auth = format!("{}:{}", login, creds.password.as_deref().unwrap_or(""));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -3642,6 +3674,12 @@ impl Session {
                 };
                 ContentBody::CallMessage(call_msg)
             }
+            Body::GroupCallUpdate { era_id } => ContentBody::DataMessage(DataMessage {
+                group_call_update: Some(data_message::GroupCallUpdate { era_id }),
+                timestamp: Some(at),
+                group_v2,
+                ..Default::default()
+            }),
         };
         self.deliver(to, content, at).await?;
         Ok(at)

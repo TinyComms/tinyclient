@@ -1859,6 +1859,10 @@ pub enum Command {
     CallStopRinging { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// Adds friends to the current direct or group call, returning the resulting conversation id.
     CallAddPeople { conversation_id: String, people: Vec<String>, reply: Reply<String> },
+    /// Raises or lowers our hand in the active group call.
+    CallRaiseHand { conversation_id: String, raised: bool, reply: Reply<()> },
+    /// Sends a transient emoji reaction in the active group call.
+    CallReact { conversation_id: String, emoji: String, reply: Reply<()> },
     /// A Tiny server's live socket: take or leave a seat in a room's call, remove someone from
     /// one, or hear that the user opened the server.
     Tiny(tiny::live::Ask),
@@ -2291,6 +2295,9 @@ impl Command {
             Command::CallJoin(conversation_id) => {
                 let detail = format!("{} calls are not built yet.", ctx.account.network.label());
                 ctx.call_failed(&conversation_id, CallFailure::Refused, &detail);
+            }
+            Command::CallRaiseHand { reply, .. } | Command::CallReact { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
             }
             _ => {}
         }
@@ -3534,6 +3541,16 @@ impl Context {
     /// Updates the call's state directly (e.g., transitioning to `Joined` once a call is established).
     pub fn call_state(&self, conversation_id: &str, state: CallState) {
         self.hub.calls.set_state(&self.hub, &self.key(conversation_id), state);
+    }
+
+    /// Updates our own raised-hand state in the active group call.
+    pub fn call_hand_raised(&self, conversation_id: &str, raised: bool) {
+        self.hub.calls.set_hand_raised(&self.hub, &self.key(conversation_id), raised);
+    }
+
+    /// Updates our own active transient emoji reaction in the active group call.
+    pub fn call_reaction(&self, conversation_id: &str, emoji: Option<String>) {
+        self.hub.calls.set_reaction(&self.hub, &self.key(conversation_id), emoji);
     }
 
     /// The call in this room is over and the network already knows. A joined call plays the

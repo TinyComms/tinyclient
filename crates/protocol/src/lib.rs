@@ -3265,6 +3265,14 @@ pub enum Request {
     CallAddPeople {
         people: Vec<String>,
     },
+    /// Raises or lowers our hand in the active group call (Signal group calls).
+    CallRaiseHand {
+        raised: bool,
+    },
+    /// Sends a transient emoji reaction in the active group call (Signal group calls).
+    CallReact {
+        emoji: String,
+    },
     /// Where the official app takes this conversation's call.
     Handoff {
         conversation: Key,

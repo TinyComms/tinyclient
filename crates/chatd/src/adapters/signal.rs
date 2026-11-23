@@ -51,11 +51,11 @@ use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, Filing, FolderRow, PersonDetails, PersonRow};
 use protocol::{
-    Attachment, CallFailure, CallSecurity, CallState, CatalogItem, CatalogKind, Contact, ContactKind,
+    Attachment, CallFailure, CallRing, CallSecurity, CallState, CatalogItem, CatalogKind, Contact, ContactKind,
     ConversationKind, ConversationRights, Delivery, Link, Mark, MediaFile, MediaKind, MemberSection, Message,
-    MessageKind, Outgoing, Participant, Person, Poll, PollBallot, PollDraft, Reaction, RelateAction, Relation,
-    ReplyTo, ReportReason, ReportTarget, SecureMember, SecurityMode, SignalAccept, SignalOffer, SignalRelay, Span,
-    Special, Trust,
+    MessageKind, Occupant, Outgoing, Participant, Person, Poll, PollBallot, PollDraft, Reaction, RelateAction,
+    Relation, ReplyTo, ReportReason, ReportTarget, SecureMember, SecurityMode, SignalAccept, SignalOffer,
+    SignalRelay, Span, Special, Trust,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -63,7 +63,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use wire::{view_once_label, Body, CallSignal, Event, Fault, HangupKind, Peer, Quote, Text, Wire};
+use wire::{
+    decode_group_call_signal, encode_group_call_signal, view_once_label, Body, CallSignal, Event, Fault,
+    GroupCallInfo, GroupCallSignal, GroupRingMode, HangupKind, Peer, Quote, Text, Wire,
+};
 
 /// Signal has no on-demand server history backfill, so nothing is paced (linked-device history
 /// transfer runs once during linking in `signin`).
@@ -762,6 +765,13 @@ struct Live {
     ring: Option<Ring>,
     /// Active outgoing or joined Signal 1:1 call managed by this adapter.
     active_call: Option<ActiveSignalCall>,
+    /// Active Signal group call we are currently joined in.
+    active_group_call: Option<ActiveGroupCall>,
+    /// Live group-call state per group conversation id (`g.<hex>`), tracked from
+    /// `groupCallUpdate`, SFU peeks, and participant signals.
+    group_calls: HashMap<String, GroupCallTrack>,
+    /// Pending incoming Signal group-call ring (`conversation_id`, `group_id`, `era_id`, `caller_aci`, `ring_id`).
+    group_ring: Option<IncomingGroupRing>,
     /// The user's own Signal settings. Off until the phone says.
     read_receipts: bool,
     typing: bool,
@@ -888,6 +898,51 @@ struct ActiveSignalCall {
     sharing: bool,
     pending_ice: Vec<String>,
     sent_ms: u64,
+}
+
+#[derive(Clone, Default)]
+struct GroupMemberCallState {
+    muted: bool,
+    camera: bool,
+    sharing: bool,
+    hand_raised: bool,
+    reaction: Option<String>,
+}
+
+/// Tracked state of a live Signal group call for one group conversation (`g.<hex>`).
+#[derive(Clone, Default)]
+struct GroupCallTrack {
+    era_id: String,
+    members: Vec<String>,
+    full: bool,
+    states: HashMap<String, GroupMemberCallState>,
+    /// Verified group members whose sender key we accepted for this era.
+    sender_keys: HashMap<String, Vec<u8>>,
+}
+
+/// Incoming group-call ring waiting to be accepted, declined, or cancelled.
+#[derive(Clone)]
+struct IncomingGroupRing {
+    conversation: String,
+    group_id: String,
+    era_id: String,
+    caller: String,
+    ring_id: i64,
+}
+
+/// Active Signal group call we have joined through the SFU.
+#[derive(Clone)]
+struct ActiveGroupCall {
+    conversation: String,
+    group_id: String,
+    era_id: String,
+    muted: bool,
+    deafened: bool,
+    camera: bool,
+    sharing: bool,
+    hand_raised: bool,
+    reaction: Option<String>,
+    ringing: Vec<CallRing>,
 }
 
 impl Live {
@@ -2229,8 +2284,19 @@ fn apply(account: &Account, event: Event) {
         Event::CallIce { peer, by, id, candidates } => {
             call_ice_received(account, &peer, &by, id, candidates);
         }
-        Event::CallOpaque { .. } => {}
+        Event::CallOpaque { peer, by, data, urgent } => {
+            call_opaque_received(account, &peer, &by, &data, urgent);
+        }
         Event::CallEnded { id, answered, kind } => ended_call(account, id, answered, kind),
+        Event::GroupCallUpdate { peer, by, era_id, sent } => {
+            group_call_update(account, &peer, &by, era_id, sent);
+        }
+        Event::GroupCallRoster { group_id, info } => {
+            apply_group_call_roster(account, &group_id, info);
+        }
+        Event::GroupCallParticipantState { group_id, aci, muted, camera, sharing, hand_raised, reaction } => {
+            group_call_participant_state(account, &group_id, &aci, muted, camera, sharing, hand_raised, reaction);
+        }
         Event::CallEvent { peer, call_id, timestamp, kind, incoming, outcome } => {
             apply_call_event(account, &peer, call_id, timestamp, kind, incoming, outcome);
         }
@@ -3184,15 +3250,18 @@ fn signal_relays(account: &Account) -> Vec<SignalRelay> {
         .collect()
 }
 
-/// Starts an outgoing 1:1 Signal call or answers an incoming ring (`Command::CallJoin`).
+/// Starts an outgoing 1:1 Signal call or answers an incoming ring, or starts/joins a Signal group call (`Command::CallJoin`).
 fn call_join(account: &Account, conversation_id: &str) {
     let Ok(target_peer) = peer(conversation_id) else {
         account.ctx.call_failed(conversation_id, CallFailure::Refused, "That Signal conversation can't be called.");
         return;
     };
-    let Peer::Direct(peer_aci) = target_peer.clone() else {
-        account.ctx.call_failed(conversation_id, CallFailure::Refused, "Signal group calls are not enabled yet.");
-        return;
+    let peer_aci = match target_peer.clone() {
+        Peer::Direct(aci) => aci,
+        Peer::Group(group_id) => {
+            group_call_join(account, conversation_id, &group_id);
+            return;
+        }
     };
 
     let always_relay = account.ctx.hub.settings().on(protocol::settings::SIGNAL_ALWAYS_RELAY);
@@ -3442,8 +3511,12 @@ fn call_ice_send(account: &Account, conversation_id: &str, candidate: String) {
     );
 }
 
-/// Leaves, cancels, or declines a Signal 1:1 call (`Command::CallLeave`).
+/// Leaves, cancels, or declines a Signal 1:1 or group call (`Command::CallLeave`).
 fn call_leave(account: &Account, conversation_id: &str) {
+    if conversation_id.starts_with("g.") {
+        group_call_leave(account, conversation_id);
+        return;
+    }
     // Declining an incoming ring before accepting.
     let declined_ring = {
         let mut live = account.live();
@@ -3525,6 +3598,624 @@ fn ended_call(account: &Account, id: u64, answered: bool, kind: HangupKind) {
     line.kind = MessageKind::System;
     line.sender.id = ring.author;
     let _ = account.ctx.quiet_line(&ring.conversation, &line, true);
+}
+
+/// Checks whether `aci` is a known member of `conversation` (`g.<hex>`).
+fn is_group_member(live: &Live, conversation: &str, aci: &str) -> bool {
+    if let Some(members) = live.groups.get(conversation) {
+        if members.iter().any(|m| m == aci) {
+            return true;
+        }
+    }
+    if let Some(info) = live.group_info.get(conversation) {
+        if info.member_ids.iter().any(|m| m == aci) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pushes current Signal group-call occupants to `ctx.occupants` (driving the live Join banner)
+/// and updates `ctx.participants` when we are joined in this group call.
+fn publish_group_call_state(account: &Account, conversation: &str) {
+    let (occupants, total, joined_participants) = {
+        let live = account.live();
+        let Some(track) = live.group_calls.get(conversation) else {
+            return {
+                drop(live);
+                account.ctx.occupants(conversation, Vec::new(), 0);
+            };
+        };
+        let occupants: Vec<Occupant> = track
+            .members
+            .iter()
+            .map(|aci| {
+                let st = track.states.get(aci).cloned().unwrap_or_default();
+                Occupant {
+                    person: account.ctx.key(aci),
+                    name: if aci == &account.me { account.name.clone() } else { live.name(aci) },
+                    avatar: None,
+                    muted: st.muted,
+                    deafened: false,
+                    server_muted: false,
+                    server_deafened: false,
+                    suppressed: false,
+                    streaming: st.sharing,
+                    camera: st.camera,
+                    speaking: false,
+                }
+            })
+            .collect();
+        let total = occupants.len() as u32;
+        let joined_participants = live
+            .active_group_call
+            .as_ref()
+            .filter(|c| c.conversation == conversation)
+            .map(|_| {
+                track
+                    .members
+                    .iter()
+                    .filter(|aci| aci.as_str() != account.me)
+                    .map(|aci| {
+                        let st = track.states.get(aci).cloned().unwrap_or_default();
+                        Participant {
+                            id: aci.clone(),
+                            name: live.name(aci),
+                            avatar: None,
+                            muted: st.muted,
+                            camera: st.camera,
+                            sharing: st.sharing,
+                            hand_raised: st.hand_raised,
+                            reaction: st.reaction,
+                            ..Participant::default()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+        (occupants, total, joined_participants)
+    };
+    account.ctx.occupants(conversation, occupants, total);
+    if let Some(participants) = joined_participants {
+        account.ctx.participants(conversation, participants);
+    }
+}
+
+/// Handles `DataMessage.groupCallUpdate` (`era_id` = `Some` when running, `None` when ended).
+fn group_call_update(account: &Account, peer: &Peer, by: &str, era_id: Option<String>, sent: u64) {
+    let Peer::Group(group_id) = peer else {
+        return;
+    };
+    let conversation = peer.conversation();
+    if account.live().blocked.contains(&conversation) {
+        return;
+    }
+    match era_id.filter(|id| !id.is_empty()) {
+        Some(era) => {
+            let peeked = account.wire.peek_group_call(group_id).ok().filter(|i| !i.members.is_empty());
+            let new_era = {
+                let mut live = account.live();
+                let entry = live.group_calls.entry(conversation.clone()).or_default();
+                let is_new = entry.era_id != era;
+                entry.era_id = era.clone();
+                if let Some(info) = peeked {
+                    entry.members = info.members;
+                    entry.full = info.full;
+                } else if !by.is_empty() && !entry.members.iter().any(|m| m == by) {
+                    entry.members.push(by.to_owned());
+                }
+                is_new
+            };
+            publish_group_call_state(account, &conversation);
+            if new_era && !by.is_empty() {
+                let starter = if by == account.me { account.name.clone() } else { account.live().name(by) };
+                let mut line = Message::plain(
+                    format!("signal-gcall-{era}"),
+                    starter.clone(),
+                    format!("{starter} started a group call"),
+                    i64::try_from(sent / 1_000).unwrap_or(0),
+                    by == account.me,
+                );
+                line.kind = MessageKind::System;
+                line.sender.id = by.to_owned();
+                let _ = account.ctx.quiet_line(&conversation, &line, false);
+            }
+        }
+        None => {
+            account.live().group_calls.remove(&conversation);
+            let ring_cleared = {
+                let mut live = account.live();
+                if live.group_ring.as_ref().is_some_and(|r| r.conversation == conversation) {
+                    live.group_ring.take().is_some()
+                } else {
+                    false
+                }
+            };
+            if ring_cleared {
+                account.ctx.ring_stopped(&conversation);
+            }
+            account.ctx.occupants(&conversation, Vec::new(), 0);
+        }
+    }
+}
+
+/// Applies an SFU roster snapshot (`Event::GroupCallRoster` or peek result).
+fn apply_group_call_roster(account: &Account, group_id: &str, info: GroupCallInfo) {
+    let conversation = Peer::Group(group_id.to_owned()).conversation();
+    if info.members.is_empty() && info.era_id.is_empty() {
+        account.live().group_calls.remove(&conversation);
+        account.ctx.occupants(&conversation, Vec::new(), 0);
+        return;
+    }
+    {
+        let mut live = account.live();
+        let entry = live.group_calls.entry(conversation.clone()).or_default();
+        if !info.era_id.is_empty() {
+            entry.era_id = info.era_id;
+        }
+        entry.members = info.members;
+        entry.full = info.full;
+    }
+    publish_group_call_state(account, &conversation);
+}
+
+/// Applies a remote participant's raise-hand, reaction, or media-state update in a group call.
+#[allow(clippy::too_many_arguments)]
+fn group_call_participant_state(
+    account: &Account,
+    group_id: &str,
+    aci: &str,
+    muted: Option<bool>,
+    camera: Option<bool>,
+    sharing: Option<bool>,
+    hand_raised: Option<bool>,
+    reaction: Option<Option<String>>,
+) {
+    let conversation = Peer::Group(group_id.to_owned()).conversation();
+    {
+        let mut live = account.live();
+        let entry = live.group_calls.entry(conversation.clone()).or_default();
+        if !entry.members.iter().any(|m| m == aci) {
+            entry.members.push(aci.to_owned());
+        }
+        let st = entry.states.entry(aci.to_owned()).or_default();
+        if let Some(m) = muted {
+            st.muted = m;
+        }
+        if let Some(c) = camera {
+            st.camera = c;
+        }
+        if let Some(s) = sharing {
+            st.sharing = s;
+        }
+        if let Some(h) = hand_raised {
+            st.hand_raised = h;
+        }
+        if let Some(r) = reaction {
+            st.reaction = r;
+        }
+    }
+    publish_group_call_state(account, &conversation);
+}
+
+/// Decodes incoming `CallMessage.opaque` payloads for Signal group calls (ring, sender key,
+/// raise hand, reactions, media state), enforcing group membership before accepting rings or keys.
+fn call_opaque_received(account: &Account, _peer: &Peer, by: &str, data: &[u8], _urgent: bool) {
+    let Some(signal) = decode_group_call_signal(data) else {
+        return;
+    };
+    let group_id = match &signal {
+        GroupCallSignal::Ring { group_id, .. }
+        | GroupCallSignal::RaiseHand { group_id, .. }
+        | GroupCallSignal::Reaction { group_id, .. }
+        | GroupCallSignal::SenderKey { group_id, .. }
+        | GroupCallSignal::MediaState { group_id, .. } => group_id.clone(),
+    };
+    let conversation = Peer::Group(group_id.clone()).conversation();
+    // Enforce group membership: reject sender keys, rings, and state updates from non-members.
+    if by != account.me && !is_group_member(&account.live(), &conversation, by) {
+        tracing::warn!(by, group = %conversation, "chatd: Signal: ignoring group call signal from non-member");
+        return;
+    }
+    match signal {
+        GroupCallSignal::Ring { group_id, era_id, ring_id, mode } => match mode {
+            GroupRingMode::Ringing => {
+                if by == account.me {
+                    return;
+                }
+                let caller = account.live().name(by);
+                {
+                    let mut live = account.live();
+                    live.group_ring = Some(IncomingGroupRing {
+                        conversation: conversation.clone(),
+                        group_id,
+                        era_id: era_id.clone(),
+                        caller: by.to_owned(),
+                        ring_id,
+                    });
+                    let entry = live.group_calls.entry(conversation.clone()).or_default();
+                    entry.era_id = era_id;
+                    if !entry.members.iter().any(|m| m == by) {
+                        entry.members.push(by.to_owned());
+                    }
+                }
+                publish_group_call_state(account, &conversation);
+                account.ctx.ring(&conversation, &caller);
+            }
+            GroupRingMode::Cancelled => {
+                let stop = {
+                    let mut live = account.live();
+                    if live.group_ring.as_ref().is_some_and(|r| r.conversation == conversation) {
+                        live.group_ring.take().is_some()
+                    } else {
+                        false
+                    }
+                };
+                if stop {
+                    account.ctx.ring_stopped(&conversation);
+                }
+            }
+            GroupRingMode::Declined | GroupRingMode::Busy => {
+                let state = if mode == GroupRingMode::Declined { "declined" } else { "busy" };
+                let updated = {
+                    let mut live = account.live();
+                    live.active_group_call
+                        .as_mut()
+                        .filter(|c| c.conversation == conversation)
+                        .map(|c| {
+                            if let Some(r) = c.ringing.iter_mut().find(|r| r.id == by) {
+                                r.state = state.to_owned();
+                            } else {
+                                c.ringing.push(CallRing { id: by.to_owned(), name: String::new(), state: state.to_owned() });
+                            }
+                            c.ringing.clone()
+                        })
+                };
+                if let Some(mut ringing) = updated {
+                    for r in &mut ringing {
+                        if r.name.is_empty() {
+                            r.name = account.live().name(&r.id);
+                        }
+                    }
+                    account.ctx.set_ringing(&conversation, ringing);
+                }
+            }
+        },
+        GroupCallSignal::SenderKey { group_id: _, era_id, key_bytes } => {
+            if key_bytes.len() < 16 {
+                return;
+            }
+            let mut live = account.live();
+            let entry = live.group_calls.entry(conversation).or_default();
+            if entry.era_id.is_empty() || entry.era_id == era_id {
+                entry.era_id = era_id;
+                entry.sender_keys.insert(by.to_owned(), key_bytes);
+            }
+        }
+        GroupCallSignal::RaiseHand { group_id, era_id: _, raised } => {
+            group_call_participant_state(account, &group_id, by, None, None, None, Some(raised), None);
+        }
+        GroupCallSignal::Reaction { group_id, era_id: _, emoji } => {
+            let val = (!emoji.is_empty()).then_some(emoji);
+            group_call_participant_state(account, &group_id, by, None, None, None, None, Some(val));
+        }
+        GroupCallSignal::MediaState { group_id, era_id: _, muted, camera, sharing } => {
+            group_call_participant_state(
+                account,
+                &group_id,
+                by,
+                Some(muted),
+                Some(camera),
+                Some(sharing),
+                None,
+                None,
+            );
+        }
+    }
+}
+
+/// Joins an active Signal group call or starts a new one through Signal's SFU + `mediad`.
+fn group_call_join(account: &Account, conversation_id: &str, group_id: &str) {
+    let (is_member, group_members) = {
+        let live = account.live();
+        let members = live
+            .groups
+            .get(conversation_id)
+            .cloned()
+            .or_else(|| live.group_info.get(conversation_id).map(|g| g.member_ids.clone()))
+            .unwrap_or_default();
+        let member = members.is_empty() || members.iter().any(|m| m == &account.me);
+        (member, members)
+    };
+    if !is_member {
+        account.ctx.call_failed(conversation_id, CallFailure::Refused, "You are no longer a member of this group.");
+        return;
+    }
+
+    // Clear any incoming group ring for this conversation.
+    let incoming_ring = {
+        let mut live = account.live();
+        if live.group_ring.as_ref().is_some_and(|r| r.conversation == conversation_id) {
+            live.group_ring.take()
+        } else {
+            None
+        }
+    };
+
+    let creds = match account.wire.group_call_credentials(group_id) {
+        Ok(c) => c,
+        Err(fault) => {
+            account.ctx.call_failed(conversation_id, CallFailure::Refused, &fault.words());
+            return;
+        }
+    };
+    let peeked = account.wire.peek_group_call(group_id).ok();
+    let starting_new = peeked.as_ref().is_none_or(|p| p.era_id.is_empty() && p.members.is_empty())
+        && incoming_ring.is_none();
+    let era_id = incoming_ring
+        .as_ref()
+        .map(|r| r.era_id.clone())
+        .or_else(|| peeked.as_ref().filter(|p| !p.era_id.is_empty()).map(|p| p.era_id.clone()))
+        .unwrap_or_else(|| creds.era_id.clone());
+
+    let always_relay = account.ctx.hub.settings().on(protocol::settings::SIGNAL_ALWAYS_RELAY);
+    let relays = signal_relays(account);
+    let offer_spec = SignalOffer {
+        user_id: account.me.clone(),
+        peer_id: group_id.to_owned(),
+        host: "127.0.0.1".to_owned(),
+        video: true,
+        relay_only: always_relay,
+        relays,
+        muted: false,
+        deafened: false,
+    };
+    let offer_sdp = match account.ctx.signal_offer(conversation_id, offer_spec) {
+        Ok(sdp) => sdp,
+        Err(detail) => {
+            account.ctx.call_failed(conversation_id, CallFailure::Engine, &detail);
+            return;
+        }
+    };
+
+    let (answer_sdp, roster) = match account.wire.group_call_join(group_id, &era_id, &offer_sdp) {
+        Ok(res) => res,
+        Err(fault) => {
+            account.ctx.call_failed(conversation_id, CallFailure::Refused, &fault.words());
+            return;
+        }
+    };
+
+    // Distribute frame-encryption sender key ONLY to verified group members via 1:1 `CallMessage.opaque`.
+    let mut sender_key = [0u8; 32];
+    let _ = getrandom::fill(&mut sender_key);
+    let key_opaque = encode_group_call_signal(&GroupCallSignal::SenderKey {
+        group_id: group_id.to_owned(),
+        era_id: roster.era_id.clone(),
+        key_bytes: sender_key.to_vec(),
+    });
+    for member_aci in &group_members {
+        if member_aci != &account.me {
+            let _ = account.wire.send(
+                &Peer::Direct(member_aci.clone()),
+                Body::Call(CallSignal::Opaque { data: key_opaque.clone(), urgent: true }),
+            );
+        }
+    }
+
+    // If starting a fresh group call, notify the group via `DataMessage.groupCallUpdate`.
+    if starting_new {
+        let _ = account.wire.send(
+            &Peer::Group(group_id.to_owned()),
+            Body::GroupCallUpdate { era_id: Some(roster.era_id.clone()) },
+        );
+    }
+
+    // Update local active group call & roster state.
+    {
+        let mut live = account.live();
+        live.active_group_call = Some(ActiveGroupCall {
+            conversation: conversation_id.to_owned(),
+            group_id: group_id.to_owned(),
+            era_id: roster.era_id.clone(),
+            muted: false,
+            deafened: false,
+            camera: false,
+            sharing: false,
+            hand_raised: false,
+            reaction: None,
+            ringing: Vec::new(),
+        });
+        let entry = live.group_calls.entry(conversation_id.to_owned()).or_default();
+        entry.era_id = roster.era_id.clone();
+        entry.members = roster.members.clone();
+        entry.full = roster.full;
+        entry.sender_keys.insert(account.me.clone(), sender_key.to_vec());
+    }
+
+    // Build E2EE security badge for the Signal group call.
+    let sec_members: Vec<SecureMember> = roster
+        .members
+        .iter()
+        .filter(|m| m.as_str() != account.me)
+        .map(|aci| SecureMember {
+            user_id: aci.clone(),
+            key: String::new(),
+            safety: String::new(),
+            trust: match account.live().identity_states.get(aci) {
+                Some(wire::IdentityState::Verified) => Trust::Verified,
+                _ => Trust::Unverified,
+            },
+        })
+        .collect();
+    account.ctx.call_security(
+        conversation_id,
+        Some(CallSecurity {
+            mode: SecurityMode::EndToEnd,
+            code: String::new(),
+            emojis: Vec::new(),
+            epoch: 1,
+            members: sec_members,
+            unsupported: Vec::new(),
+            server_lacks: false,
+            required: true,
+        }),
+    );
+    publish_group_call_state(account, conversation_id);
+
+    if answer_sdp.starts_with("v=0") {
+        if let Err(detail) = account.ctx.signal_answer(conversation_id, answer_sdp) {
+            account.ctx.call_failed(conversation_id, CallFailure::Engine, &detail);
+        }
+    } else {
+        account.ctx.call_state(conversation_id, CallState::Joined);
+    }
+}
+
+/// Leaves or declines a Signal group call (`Command::CallLeave`).
+fn group_call_leave(account: &Account, conversation_id: &str) {
+    let declined_ring = {
+        let mut live = account.live();
+        if live.group_ring.as_ref().is_some_and(|r| r.conversation == conversation_id) {
+            live.group_ring.take()
+        } else {
+            None
+        }
+    };
+    if let Some(ring) = declined_ring {
+        account.ctx.ring_stopped(&ring.conversation);
+        let data = encode_group_call_signal(&GroupCallSignal::Ring {
+            group_id: ring.group_id,
+            era_id: ring.era_id,
+            ring_id: ring.ring_id,
+            mode: GroupRingMode::Declined,
+        });
+        let _ = account.wire.send(
+            &Peer::Direct(ring.caller),
+            Body::Call(CallSignal::Opaque { data, urgent: true }),
+        );
+        return;
+    }
+
+    let ended = {
+        let mut live = account.live();
+        if live.active_group_call.as_ref().is_some_and(|c| c.conversation == conversation_id) {
+            live.active_group_call.take()
+        } else {
+            None
+        }
+    };
+    let Some(call) = ended else {
+        return;
+    };
+    let _ = account.wire.group_call_leave(&call.group_id, &call.era_id);
+    let was_last = {
+        let mut live = account.live();
+        if let Some(track) = live.group_calls.get_mut(conversation_id) {
+            track.members.retain(|m| m != &account.me);
+            track.states.remove(&account.me);
+            if track.members.is_empty() {
+                live.group_calls.remove(conversation_id);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        }
+    };
+    if was_last {
+        let _ = account.wire.send(&Peer::Group(call.group_id), Body::GroupCallUpdate { era_id: None });
+    }
+    publish_group_call_state(account, conversation_id);
+}
+
+/// Rings or stops ringing members of the active Signal group call (`Command::CallRing` / `CallStopRinging`).
+fn group_call_ring(account: &Account, conversation_id: &str, people: Option<Vec<String>>, stop: bool) -> Result<(), Refusal> {
+    let (group_id, era_id, targets) = {
+        let live = account.live();
+        let Some(call) = live.active_group_call.as_ref().filter(|c| c.conversation == conversation_id) else {
+            return Err(Refusal::Refused("Join the group call before ringing members.".to_owned()));
+        };
+        let all_members = live
+            .groups
+            .get(conversation_id)
+            .cloned()
+            .or_else(|| live.group_info.get(conversation_id).map(|g| g.member_ids.clone()))
+            .unwrap_or_default();
+        let in_call: HashSet<String> = live
+            .group_calls
+            .get(conversation_id)
+            .map(|t| t.members.iter().cloned().collect())
+            .unwrap_or_default();
+        let wanted: Vec<String> = match people {
+            Some(list) => list.into_iter().filter(|id| id != &account.me && all_members.iter().any(|m| m == id)).collect(),
+            None => all_members.into_iter().filter(|id| id != &account.me && !in_call.contains(id)).collect(),
+        };
+        (call.group_id.clone(), call.era_id.clone(), wanted)
+    };
+    let mode = if stop { GroupRingMode::Cancelled } else { GroupRingMode::Ringing };
+    let data = encode_group_call_signal(&GroupCallSignal::Ring {
+        group_id,
+        era_id,
+        ring_id: now_ms() as i64,
+        mode,
+    });
+    let mut ringing_list = Vec::new();
+    for target in &targets {
+        let _ = account.wire.send(
+            &Peer::Direct(target.clone()),
+            Body::Call(CallSignal::Opaque { data: data.clone(), urgent: true }),
+        );
+        if !stop {
+            ringing_list.push(CallRing {
+                id: target.clone(),
+                name: account.live().name(target),
+                state: "ringing".to_owned(),
+            });
+        }
+    }
+    if let Some(active) = account.live().active_group_call.as_mut().filter(|c| c.conversation == conversation_id) {
+        active.ringing = ringing_list.clone();
+    }
+    account.ctx.set_ringing(conversation_id, ringing_list);
+    Ok(())
+}
+
+/// Toggles raising/lowering our hand in the active Signal group call (`Command::CallRaiseHand`).
+fn group_call_raise_hand(account: &Account, conversation_id: &str, raised: bool) -> Result<(), Refusal> {
+    let (group_id, era_id) = {
+        let mut live = account.live();
+        let Some(active) = live.active_group_call.as_mut().filter(|c| c.conversation == conversation_id) else {
+            return Err(Refusal::Refused("Raise hand is only available in a Signal group call.".to_owned()));
+        };
+        active.hand_raised = raised;
+        (active.group_id.clone(), active.era_id.clone())
+    };
+    account
+        .wire
+        .group_call_send_data(&group_id, GroupCallSignal::RaiseHand { group_id: group_id.clone(), era_id, raised })
+        .map_err(refused)?;
+    account.ctx.call_hand_raised(conversation_id, raised);
+    Ok(())
+}
+
+/// Sends a transient emoji reaction in the active Signal group call (`Command::CallReact`).
+fn group_call_react(account: &Account, conversation_id: &str, emoji: String) -> Result<(), Refusal> {
+    let emoji = emoji.trim().to_owned();
+    let (group_id, era_id) = {
+        let mut live = account.live();
+        let Some(active) = live.active_group_call.as_mut().filter(|c| c.conversation == conversation_id) else {
+            return Err(Refusal::Refused("Call reactions are only available in a Signal group call.".to_owned()));
+        };
+        active.reaction = (!emoji.is_empty()).then(|| emoji.clone());
+        (active.group_id.clone(), active.era_id.clone())
+    };
+    account
+        .wire
+        .group_call_send_data(&group_id, GroupCallSignal::Reaction { group_id: group_id.clone(), era_id, emoji: emoji.clone() })
+        .map_err(refused)?;
+    account.ctx.call_reaction(conversation_id, (!emoji.is_empty()).then_some(emoji));
+    Ok(())
 }
 
 fn call_event_label(kind: wire::CallKind, incoming: bool, outcome: wire::CallOutcome) -> &'static str {
@@ -3749,6 +4440,122 @@ fn search_people(account: &Account, query: &str) {
     account.ctx.searched(query);
 }
 
+/// The lab's signal-wave19 driver: proves Signal 1:1 voice/video calling (#716) and Signal
+/// group calls (#719) capabilities, relay policy, wire encoding/decoding, and parity table.
+pub fn prove_signal_wave19() -> Result<(), String> {
+    use protocol::{CallOffer, CallSupport, MediaRequest, MediaResponse, Network, Participant, SignalAccept, SignalOffer, SignalRelay};
+
+    if call_offer(ConversationKind::Direct) != CallOffer::Native
+        || call_offer(ConversationKind::Direct).support() != CallSupport::Native
+    {
+        return Err("Signal direct calls must advertise CallSupport::Native".to_owned());
+    }
+    if call_offer(ConversationKind::Group) != CallOffer::Native
+        || call_offer(ConversationKind::Group).support() != CallSupport::Native
+    {
+        return Err("Signal group calls must advertise CallSupport::Native".to_owned());
+    }
+    if !protocol::call_pictures(Network::Signal) {
+        return Err("protocol::call_pictures(Network::Signal) must be true".to_owned());
+    }
+    if !protocol::settings::signal_relay_only(false, false)
+        || !protocol::settings::signal_relay_only(true, true)
+        || protocol::settings::signal_relay_only(true, false)
+    {
+        return Err("signal_relay_only policy check failed".to_owned());
+    }
+    let sdp = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\n";
+    let opaque = wire::encode_sdp_opaque(sdp, &[]);
+    if wire::decode_sdp_opaque(&opaque) != sdp {
+        return Err("SDP opaque round-trip failed".to_owned());
+    }
+    for sig in [
+        GroupCallSignal::Ring {
+            group_id: "g1".into(),
+            era_id: "era-1".into(),
+            ring_id: 7,
+            mode: GroupRingMode::Ringing,
+        },
+        GroupCallSignal::RaiseHand { group_id: "g1".into(), era_id: "era-1".into(), raised: true },
+        GroupCallSignal::Reaction { group_id: "g1".into(), era_id: "era-1".into(), emoji: "👏".into() },
+        GroupCallSignal::SenderKey { group_id: "g1".into(), era_id: "era-1".into(), key_bytes: vec![0x42; 32] },
+        GroupCallSignal::MediaState {
+            group_id: "g1".into(),
+            era_id: "era-1".into(),
+            muted: false,
+            camera: true,
+            sharing: true,
+        },
+    ] {
+        let enc = encode_group_call_signal(&sig);
+        if decode_group_call_signal(&enc) != Some(sig) {
+            return Err("GroupCallSignal opaque round-trip failed".to_owned());
+        }
+    }
+    let offer_req = MediaRequest::SignalOffer(SignalOffer {
+        user_id: "me".into(),
+        peer_id: "grace".into(),
+        host: "127.0.0.1".into(),
+        video: true,
+        relay_only: true,
+        relays: vec![SignalRelay {
+            urls: vec!["turn:127.0.0.1:3478?transport=udp".into()],
+            username: "u".into(),
+            password: "p".into(),
+        }],
+        muted: false,
+        deafened: false,
+    });
+    let json = serde_json::to_string(&offer_req).map_err(|e| e.to_string())?;
+    if serde_json::from_str::<MediaRequest>(&json).map_err(|e| e.to_string())? != offer_req {
+        return Err("SignalOffer MediaRequest round-trip failed".to_owned());
+    }
+    let accept_req = MediaRequest::SignalAccept(SignalAccept {
+        user_id: "me".into(),
+        peer_id: "grace".into(),
+        host: "127.0.0.1".into(),
+        offer_sdp: sdp.to_owned(),
+        video: true,
+        relay_only: false,
+        relays: Vec::new(),
+        muted: false,
+        deafened: false,
+    });
+    let json = serde_json::to_string(&accept_req).map_err(|e| e.to_string())?;
+    if serde_json::from_str::<MediaRequest>(&json).map_err(|e| e.to_string())? != accept_req {
+        return Err("SignalAccept MediaRequest round-trip failed".to_owned());
+    }
+    let ans = MediaResponse::Answer { sdp: sdp.to_owned() };
+    if !ans.is_reply() || ans.name() != "Answer" {
+        return Err("MediaResponse::Answer contract check failed".to_owned());
+    }
+    let participant = Participant {
+        id: "grace".into(),
+        name: "Grace".into(),
+        hand_raised: true,
+        reaction: Some("🎉".into()),
+        sharing: true,
+        ..Participant::default()
+    };
+    let pjson = serde_json::to_string(&participant).map_err(|e| e.to_string())?;
+    if serde_json::from_str::<Participant>(&pjson).map_err(|e| e.to_string())? != participant {
+        return Err("Participant raise-hand/reaction round-trip failed".to_owned());
+    }
+    let parity = crate::adapters::parity::markdown();
+    for label in ["Direct audio", "Group audio", "Camera", "Screen share", "Ring a direct call"] {
+        let row = parity
+            .lines()
+            .find(|l| l.starts_with(&format!("| {label} |")))
+            .ok_or_else(|| format!("missing parity row {label}"))?;
+        let cols: Vec<&str> = row.split('|').map(str::trim).filter(|c| !c.is_empty()).collect();
+        // Order: label(0), Discord(1), Slack(2), Telegram(3), Teams(4), Signal(5), Messages(6), Tiny(7)
+        if cols.get(5).copied() != Some("N") {
+            return Err(format!("Signal parity row {label} expected N, got {:?}", cols.get(5)));
+        }
+    }
+    Ok(())
+}
+
 /// The lab checks this without a Signal account: which typed queries are usernames.
 pub fn prove_signal_username() -> Result<(), String> {
     for username in ["ada.42", "@ada.42", "Ada.42", "@Ada.42", "He110.01", "usr.999999999", "_identifier.42"] {
@@ -3825,12 +4632,11 @@ pub(crate) fn capability_ceiling() -> protocol::Capabilities {
     capabilities(true)
 }
 
-/// Signal direct 1:1 calls run natively through `mediad` (pure-Rust `str0m` Opus + H.264).
-/// Signal has no voice rooms (`Voice` is absent).
+/// Signal direct 1:1 calls and group calls run natively through `mediad` (pure-Rust `str0m`
+/// Opus + H.264). Signal has no voice rooms (`Voice` is absent).
 pub(crate) fn call_offer(kind: ConversationKind) -> protocol::CallOffer {
     match kind {
-        ConversationKind::Direct => protocol::CallOffer::Native,
-        ConversationKind::Group => protocol::CallOffer::Missing,
+        ConversationKind::Direct | ConversationKind::Group => protocol::CallOffer::Native,
         _ => protocol::CallOffer::Absent,
     }
 }
@@ -4307,6 +5113,20 @@ fn serve(account: &Arc<Account>, command: Command) {
                 active.muted = muted;
                 active.deafened = deafened;
             }
+            let group_update = {
+                let mut live = account.live();
+                live.active_group_call.as_mut().map(|g| {
+                    g.muted = muted;
+                    g.deafened = deafened;
+                    (g.group_id.clone(), g.era_id.clone(), g.muted, g.camera, g.sharing)
+                })
+            };
+            if let Some((group_id, era_id, muted, camera, sharing)) = group_update {
+                let _ = account.wire.group_call_send_data(
+                    &group_id,
+                    GroupCallSignal::MediaState { group_id: group_id.clone(), era_id, muted, camera, sharing },
+                );
+            }
         }
         Command::CallPicture(picture) => {
             if let Some(active) = account.live().active_call.as_mut() {
@@ -4321,8 +5141,37 @@ fn serve(account: &Arc<Account>, command: Command) {
                     Picture::Watch(_) => {}
                 }
             }
+            let group_update = {
+                let mut live = account.live();
+                live.active_group_call.as_mut().map(|g| {
+                    match &picture {
+                        Picture::Camera(on) => g.camera = *on,
+                        Picture::Share(on) => g.sharing = *on,
+                        Picture::Watch(_) => {}
+                    }
+                    (g.group_id.clone(), g.era_id.clone(), g.muted, g.camera, g.sharing)
+                })
+            };
+            if let Some((group_id, era_id, muted, camera, sharing)) = group_update {
+                let _ = account.wire.group_call_send_data(
+                    &group_id,
+                    GroupCallSignal::MediaState { group_id: group_id.clone(), era_id, muted, camera, sharing },
+                );
+            }
         }
         Command::CallIce { conversation_id, candidate } => call_ice_send(account, &conversation_id, candidate),
+        Command::CallRing { conversation_id, people, reply } => {
+            let _ = reply.send(group_call_ring(account, &conversation_id, people, false));
+        }
+        Command::CallStopRinging { conversation_id, people, reply } => {
+            let _ = reply.send(group_call_ring(account, &conversation_id, people, true));
+        }
+        Command::CallRaiseHand { conversation_id, raised, reply } => {
+            let _ = reply.send(group_call_raise_hand(account, &conversation_id, raised));
+        }
+        Command::CallReact { conversation_id, emoji, reply } => {
+            let _ = reply.send(group_call_react(account, &conversation_id, emoji));
+        }
         other => other.unsupported(ctx),
     }
 }
@@ -4564,16 +5413,23 @@ fn conversation_info(account: &Account, conversation_id: &str) -> Result<Convers
     };
     let live = account.live();
     match peer {
-        Peer::Group(_) => {
-            let Some(group) = live.group_info.get(conversation_id) else {
+        Peer::Group(ref group_id) => {
+            let peeked = account.wire.peek_group_call(group_id).ok();
+            let Some(group) = live.group_info.get(conversation_id).cloned() else {
                 return Err(Refusal::Refused("This group isn't one Signal still knows for you.".into()));
             };
             let timer = live.timer_of(conversation_id).seconds;
             let disappearing = if timer > 0 { Some(timer) } else if group.timer_secs > 0 { Some(group.timer_secs) } else { None };
+            drop(live);
+            if let Some(info) = peeked {
+                if !info.era_id.is_empty() || !info.members.is_empty() {
+                    apply_group_call_roster(account, group_id, info);
+                }
+            }
             Ok(ConversationAbout {
-                description: group.description.clone(),
+                description: group.description,
                 members: Some(group.members),
-                link: group.invite_link.clone(),
+                link: group.invite_link,
                 disappearing,
                 ..ConversationAbout::default()
             })

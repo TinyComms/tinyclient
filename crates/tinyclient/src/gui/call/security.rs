@@ -145,7 +145,7 @@ pub(super) fn signal_safety_lines(call: &Call) -> Option<Vec<String>> {
     if security.mode != SecurityMode::EndToEnd || security.code.is_empty() {
         return None;
     }
-    let lines = code_lines(&security.code, 5, 4);
+    let lines = grouped_lines(&security.code, 5, 4);
     (!lines.is_empty()).then_some(lines)
 }
 
@@ -695,6 +695,8 @@ mod tests {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        hand_raised: false,
+        reaction: None,
         }
     }
 

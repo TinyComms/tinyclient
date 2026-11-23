@@ -6625,6 +6625,34 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::CallRaiseHand { raised } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallRaiseHand {
+                    conversation_id,
+                    raised,
+                    reply,
+                }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallReact { emoji } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallReact {
+                    conversation_id,
+                    emoji,
+                    reply,
+                }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
             Request::Handoff { conversation } => {
                 let conversation_id = conversation.id.clone();
                 match self.ask(&conversation.account(), |reply| Command::Handoff { conversation_id, reply }) {

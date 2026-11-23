@@ -295,6 +295,8 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        hand_raised: false,
+        reaction: None,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -2169,6 +2171,34 @@ impl Calls {
             live.secured = security.clone();
             if live.call.security != security {
                 live.call.security = security.clone();
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
+        }
+    }
+
+    /// Sets our own raised-hand state in the active group call.
+    pub fn set_hand_raised(&self, hub: &Hub, conversation: &Key, raised: bool) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            if live.call.hand_raised != raised {
+                live.call.hand_raised = raised;
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
+        }
+    }
+
+    /// Sets our own active transient emoji reaction in the active group call.
+    pub fn set_reaction(&self, hub: &Hub, conversation: &Key, emoji: Option<String>) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            if live.call.reaction != emoji {
+                live.call.reaction = emoji.clone();
                 changed = true;
             }
         }) && changed
