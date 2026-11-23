@@ -55,7 +55,7 @@ def run(ctx):
     env = {"RUN": run_id, "SCENARIO": ctx.scenario["id"], "SRC_TAR": remote_tar}
     if os.environ.get("E2E_SABOTAGE"):
         env["E2E_SABOTAGE"] = os.environ["E2E_SABOTAGE"]
-    headless = ctx.scenario["id"] == "tiny-video-received"
+    headless = ctx.scenario["id"] in ("tiny-video-received", "gpu-codecs-wave18")
     timeout = int(host.get("build_timeout", 3600) if headless else host.get("driver_timeout", 600))
     code, text = _mac.remote(host, _read("run-macos.sh"), env, log, timeout=timeout)
     run_log = os.path.join(ctx.out_dir, "run.log")

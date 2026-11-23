@@ -1,0 +1,16 @@
+{
+  "id": "gpu-codecs-wave18",
+  "title": "Desktop call video reports the selected H.264 encoder and decoder and plays through OpenH264 fallback",
+  "platforms": [
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "not_applicable": {
+    "android": "This scenario targets desktop hardware codecs.",
+    "ios": "This scenario targets desktop hardware codecs."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 120
+}

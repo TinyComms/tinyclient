@@ -32,6 +32,8 @@ pub mod framing;
 pub mod gateway;
 #[cfg(test)]
 mod harness;
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod ffmpeg_codec;
 pub mod h264;
 pub mod hear;
 pub mod inproc;
@@ -40,6 +42,10 @@ pub mod media;
 /// The machine's own H.264 hardware encoder, ahead of the OpenH264 download. Windows only.
 #[cfg(windows)]
 mod mf_encoder;
+#[cfg(windows)]
+mod mf_decoder;
+#[cfg(target_os = "macos")]
+mod vt_codec;
 pub mod ogg;
 pub mod opus;
 pub mod pace;

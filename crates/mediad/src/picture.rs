@@ -125,11 +125,11 @@ impl CameraProfile {
 
 /// Whether this machine has a hardware H.264 encoder available for HD camera encoding.
 pub fn has_hardware_encoder() -> bool {
-    #[cfg(all(windows, not(any(target_os = "android", target_os = "ios"))))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        crate::mf_encoder::available().is_ok()
+        desktop::hardware_encoder_available()
     }
-    #[cfg(not(all(windows, not(any(target_os = "android", target_os = "ios")))))]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         false
     }
