@@ -6864,6 +6864,7 @@ impl Chat {
                     MediaRequest::Camera { on } => Some(Picture::Camera(*on)),
                     MediaRequest::ShareSend { on, preview, .. } => Some(Picture::Share { on: *on, preview: *preview == Some(true) }),
                     MediaRequest::ShareWatch { source } => Some(Picture::Watch(source.clone())),
+                    MediaRequest::Watch { sources } => Some(Picture::WatchList(sources.clone())),
                     _ => None,
                 };
                 let asked = match request {

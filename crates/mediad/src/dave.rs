@@ -472,13 +472,30 @@ impl Dave {
         }
     }
 
+    /// Maps a received/sent [`crate::video::VideoCodec`] to `davey`'s per-codec framing enum.
+    pub fn video_codec(codec: crate::video::VideoCodec) -> Codec {
+        match codec {
+            crate::video::VideoCodec::H264 => Codec::H264,
+            crate::video::VideoCodec::Vp8 => Codec::VP8,
+            crate::video::VideoCodec::Av1 => Codec::AV1,
+        }
+    }
+
     /// One H.264 access unit, Annex B, as it goes into RTP. The NAL headers stay clear. Unencrypted
     /// until the group has keys. `None` drops the frame: it could not be sealed.
     pub fn encrypt_video(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        self.encrypt_video_codec(Codec::H264, frame)
+    }
+
+    /// Seals one video frame according to `codec`'s DAVE unencrypted-range rules:
+    /// - `Codec::H264`: Annex B start codes, NAL headers, and slice PPS bytes remain clear.
+    /// - `Codec::VP8`: 10-byte uncompressed header for keyframes (`frame[0] & 1 == 0`), 1 byte for delta frames.
+    /// - `Codec::AV1`: OBU header, optional extension, and non-last LEB128 size stay clear; last OBU clears `has_size`.
+    pub fn encrypt_video_codec(&mut self, codec: Codec, frame: &[u8]) -> Option<Vec<u8>> {
         if !self.encrypting() {
             return Some(frame.to_vec());
         }
-        match self.session.as_mut()?.encrypt(MediaType::VIDEO, Codec::H264, frame) {
+        match self.session.as_mut()?.encrypt(MediaType::VIDEO, codec, frame) {
             Ok(sealed) => Some(sealed.into_owned()),
             Err(err) => {
                 tracing::warn!("mediad: dave: a picture was not encrypted, dropped: {err}");
@@ -804,6 +821,57 @@ pub(crate) mod tests {
         let skipped = first_packet.sequence.wrapping_add(2);
         let later = &pieces[pieces.len() - 1];
         assert!(broken.push(skipped, 18_000, later.marker, &later.payload).is_none(), "a gap does not invent an access unit");
+    }
+
+    #[test]
+    fn vp8_and_av1_dave_unencrypted_ranges_and_rtp_round_trip() {
+        let (mut first, mut second) = grouped(9);
+
+        // VP8 keyframe: first 10 bytes stay unencrypted, payload after byte 10 is encrypted.
+        let mut vp8_key = vec![0x10, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x00, 0x30, 0x00];
+        vp8_key.extend_from_slice(&[0x42u8; 32]);
+        let sealed_key = first.encrypt_video_codec(Codec::VP8, &vp8_key).expect("seal vp8 key");
+        assert!(sealed_key.ends_with(&MARKER));
+        assert_eq!(&sealed_key[..10], &vp8_key[..10], "VP8 keyframe leaves 10 header bytes clear");
+        assert_ne!(&sealed_key[10..42], &vp8_key[10..42], "VP8 keyframe body is encrypted");
+        let mut vp8_asm = crate::vp8::Assembler::default();
+        let pieces = crate::vp8::packetize(&sealed_key, 20);
+        let mut reassembled = None;
+        for (i, p) in pieces.iter().enumerate() {
+            reassembled = vp8_asm.push(i as u16, 90_000, p.marker, &p.payload);
+        }
+        let opened_key = second.decrypt_video(Some(111), reassembled.as_ref().unwrap()).unwrap();
+        assert_eq!(opened_key, vp8_key);
+
+        // VP8 delta frame: only byte 0 stays unencrypted.
+        let mut vp8_delta = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc];
+        vp8_delta.extend_from_slice(&[0x77u8; 16]);
+        let sealed_delta = first.encrypt_video_codec(Codec::VP8, &vp8_delta).expect("seal vp8 delta");
+        assert_eq!(sealed_delta[0], vp8_delta[0], "VP8 delta leaves first byte clear");
+        assert_ne!(&sealed_delta[1..12], &vp8_delta[1..12], "VP8 delta bytes after byte 0 are encrypted");
+        assert_eq!(second.decrypt_video(Some(111), &sealed_delta).as_deref(), Some(vp8_delta.as_slice()));
+
+        // AV1 multi-OBU keyframe: OBU headers + non-last LEB128 sizes stay clear, last OBU clears has_size.
+        let av1_frame = crate::av1::SAMPLE_KEYFRAME_OBU;
+        let sealed_av1 = first.encrypt_video_codec(Codec::AV1, av1_frame).expect("seal av1");
+        assert!(sealed_av1.ends_with(&MARKER));
+        // First OBU (Sequence Header, 0x0a, size 0x0a) keeps header+size clear, encrypts 10-byte payload.
+        assert_eq!(&sealed_av1[..2], &[0x0a, 0x0a]);
+        assert_ne!(&sealed_av1[2..12], &av1_frame[2..12]);
+        // Second (last) OBU (Frame, originally 0x32 with has_size=1) has has_size cleared to 0x30.
+        assert_eq!(sealed_av1[12], 0x30, "AV1 last OBU clears obu_has_size_field for DAVE trailer");
+        // Round-trip sealed AV1 through AV1 RTP packetizer -> Assembler -> DAVE decrypt -> Av1Decoder!
+        let mut av1_asm = crate::av1::Assembler::default();
+        let av1_pieces = crate::av1::packetize(&sealed_av1, 16);
+        assert!(av1_pieces.len() > 1);
+        let mut av1_unit = None;
+        for (i, p) in av1_pieces.iter().enumerate() {
+            av1_unit = av1_asm.push(i as u16, 90_000, p.marker, &p.payload);
+        }
+        let opened_av1 = second.decrypt_video(Some(111), av1_unit.as_ref().unwrap()).unwrap();
+        let mut dec = crate::av1::Av1Decoder::new().unwrap();
+        let planes = dec.decode(&opened_av1).unwrap().unwrap();
+        assert_eq!((planes.width, planes.height), (64, 48));
     }
 
     #[test]

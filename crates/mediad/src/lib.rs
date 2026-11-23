@@ -22,6 +22,7 @@
 
 pub mod alert;
 pub mod audio;
+pub mod av1;
 pub mod broadcast;
 pub mod cue;
 pub mod dave;
@@ -73,6 +74,7 @@ pub mod talk;
 pub mod tiny;
 pub mod video;
 pub mod video_stats;
+pub mod vp8;
 
 /// Samples a second, on the wire and in every buffer between the codec and the devices.
 pub const RATE: u32 = 48_000;

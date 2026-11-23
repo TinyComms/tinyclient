@@ -15,10 +15,18 @@ pub const AES_GCM: &str = "aead_aes256_gcm_rtpsize";
 pub const XCHACHA: &str = "aead_xchacha20_poly1305_rtpsize";
 /// Opus, as Discord numbers it.
 pub const PAYLOAD_TYPE: u8 = 120;
-/// H.264 constrained baseline, the one picture codec this client sends and decodes.
+/// H.264 constrained baseline, the picture codec this client sends and decodes.
 pub const H264: u8 = 103;
 /// Retransmission of an H.264 packet. The payload is the original sequence, then the original bytes.
 pub const RTX: u8 = 104;
+/// VP8 video (decode-only on Discord calls).
+pub const VP8: u8 = 105;
+/// Retransmission of a VP8 packet.
+pub const VP8_RTX: u8 = 106;
+/// AV1 video (decode-only on Discord calls).
+pub const AV1: u8 = 107;
+/// Retransmission of an AV1 packet.
+pub const AV1_RTX: u8 = 108;
 /// One-byte RTP extension ids Discord's video uses.
 pub const EXT_PLAYOUT: u8 = 6;
 pub const EXT_CONTENT: u8 = 7;
@@ -92,14 +100,39 @@ pub fn one_byte(elements: &[(u8, &[u8])]) -> Vec<u8> {
     body
 }
 
+/// Maps a dynamic RTP payload type to the video codec it carries, or `None` if it is not a
+/// primary video payload type offered by this client.
+pub fn video_codec(payload_type: u8) -> Option<crate::video::VideoCodec> {
+    match payload_type {
+        H264 => Some(crate::video::VideoCodec::H264),
+        VP8 => Some(crate::video::VideoCodec::Vp8),
+        AV1 => Some(crate::video::VideoCodec::Av1),
+        _ => None,
+    }
+}
+
+/// Maps an RTX RTP payload type to the primary video codec it repairs.
+pub fn rtx_codec(payload_type: u8) -> Option<crate::video::VideoCodec> {
+    match payload_type {
+        RTX => Some(crate::video::VideoCodec::H264),
+        VP8_RTX => Some(crate::video::VideoCodec::Vp8),
+        AV1_RTX => Some(crate::video::VideoCodec::Av1),
+        _ => None,
+    }
+}
+
 /// The extensions on one video packet: the layer's RID, whether it is a screen, and a zero
 /// playout delay. An RTX packet names the repaired RID instead of the original.
 pub fn video_extension(screen: bool, repaired: bool) -> Vec<u8> {
-    let rid: &[u8] = b"100";
+    video_extension_rid("100", screen, repaired)
+}
+
+/// [`video_extension`] with an explicit simulcast RID (e.g. `"100"` high, `"50"` low).
+pub fn video_extension_rid(rid: &str, screen: bool, repaired: bool) -> Vec<u8> {
     let content = [u8::from(screen)];
     let delay = [0u8, 0, 0];
     let id = if repaired { EXT_REPAIRED } else { EXT_RID };
-    one_byte(&[(id, rid), (EXT_CONTENT, &content), (EXT_PLAYOUT, &delay)])
+    one_byte(&[(id, rid.as_bytes()), (EXT_CONTENT, &content), (EXT_PLAYOUT, &delay)])
 }
 
 impl Cipher {

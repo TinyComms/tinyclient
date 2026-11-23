@@ -13575,3 +13575,69 @@ fn a_share_posts_one_preview_and_viewers_come_from_the_stream() {
     );
     wait("the watched stream paused", || call().filter(|call| call.stream_paused));
 }
+
+#[test]
+fn watching_two_go_live_streams_keeps_both_active_and_unwatching_one_preserves_the_other() {
+    use protocol::{PictureKind, WatchSize, WatchSource};
+    let world = World::launch(&[("TINYCLIENT_MEDIAD_SCREEN", "null")], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+
+    // Two remote users are streaming Go Live in the same voice channel.
+    for (uid, session) in [("2002", "voice-dev"), ("2006", "voice-sam")] {
+        world.discord.push(
+            "VOICE_STATE_UPDATE",
+            json!({
+                "guild_id": "4000", "channel_id": "4201", "user_id": uid, "session_id": session,
+                "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+                "self_stream": true, "self_video": true
+            }),
+        );
+    }
+
+    // Watch both Go Live streams simultaneously via multi-stream MediaRequest::Watch.
+    world.ask(Request::Media(MediaRequest::Watch {
+        sources: vec![
+            WatchSource { user_id: "2002".into(), kind: PictureKind::Share, size: WatchSize::Large },
+            WatchSource { user_id: "2006".into(), kind: PictureKind::Share, size: WatchSize::Small },
+        ],
+    }));
+
+    // Discord gateway receives op 20 STREAM_WATCH for BOTH stream keys.
+    let watched_keys = wait("both stream keys watched", || {
+        let keys: std::collections::HashSet<String> = world
+            .discord
+            .frames_of(20)
+            .into_iter()
+            .filter_map(|f| f["d"]["stream_key"].as_str().map(str::to_owned))
+            .collect();
+        (keys.contains("guild:4000:4201:2002") && keys.contains("guild:4000:4201:2006")).then_some(keys)
+    });
+    assert_eq!(watched_keys.len(), 2);
+
+    // Pause stream 2002 while keeping 2006 live -> stream_paused becomes true.
+    world.discord.push(
+        "STREAM_UPDATE",
+        json!({"stream_key": "guild:4000:4201:2002", "viewer_ids": ["1000"], "paused": true}),
+    );
+    wait("paused stream 2002", || call().filter(|c| c.stream_paused));
+
+    // Unwatch ONLY 2002 while keeping 2006 in the Watch list -> 2006 stays watched, stream_paused clears,
+    // and no second op 20 is sent for 2006 because it remained open!
+    world.ask(Request::Media(MediaRequest::Watch {
+        sources: vec![WatchSource { user_id: "2006".into(), kind: PictureKind::Share, size: WatchSize::Large }],
+    }));
+    wait("stream_paused cleared after unwatching paused 2002", || call().filter(|c| !c.stream_paused));
+
+    // Confirm 2006 is still tracked in watches: a STREAM_UPDATE pause on 2006 still flips stream_paused!
+    world.discord.push(
+        "STREAM_UPDATE",
+        json!({"stream_key": "guild:4000:4201:2006", "viewer_ids": ["1000"], "paused": true}),
+    );
+    wait("remaining stream 2006 still tracked", || call().filter(|c| c.stream_paused));
+}

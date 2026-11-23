@@ -337,6 +337,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-discord-wave15-share:0");
         return Ok(());
     }
+    // The lab's discord-wave15a3 driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-wave15a3") {
+        if let Err(err) = chatd::adapters::prove_discord_wave15a3() {
+            eprintln!("discord-wave15a3: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-wave15a3:0");
+        return Ok(());
+    }
     // The lab's discord-nitro-length driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-nitro-length") {
         if let Err(err) = chatd::adapters::prove_discord_nitro_length() {
