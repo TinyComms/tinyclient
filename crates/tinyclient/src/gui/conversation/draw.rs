@@ -598,6 +598,14 @@ fn huddle_row_spec(note: &protocol::CallNote, starter: &str) -> CallRowSpec {
     CallRowSpec { icon: "icons/headphones.svg", missed: note.outcome == CallOutcome::Missed, label, pill }
 }
 
+fn huddle_thread_label(replies: u32) -> String {
+    match replies {
+        0 => "Huddle thread".to_owned(),
+        1 => "Huddle thread · 1 reply".to_owned(),
+        count => format!("Huddle thread · {count} replies"),
+    }
+}
+
 /// A small square button inside a row or a bar.
 fn tool(id: impl Into<ElementId>, which: Icon, size: f32) -> Stateful<Div> {
     div()
@@ -623,6 +631,7 @@ impl Pane {
         let body = match &item {
             Item::Start => self.start_row(window, cx).into_any_element(),
             Item::Older => self.older_row(cx).into_any_element(),
+            Item::Root(message) if self.slack_huddle(message) => self.huddle_card(message, window, cx),
             Item::Root(message) => self.message_row(message, true, true, window, cx),
             Item::Replies(count) => replies_line(*count, metrics).into_any_element(),
             Item::Day(at) => day_line(*at, metrics).into_any_element(),
@@ -711,7 +720,7 @@ impl Pane {
         message.call.is_some() && self.key().is_some_and(|key| key.network == protocol::Network::Slack)
     }
 
-    fn huddle_card(&mut self, message: &Message, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn huddle_card(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let (Some(note), Some(key)) = (&message.call, self.key().cloned()) else {
             return self.system_row(message, cx).into_any_element();
         };
@@ -734,6 +743,15 @@ impl Pane {
             );
         }
         let count = note.participants.len();
+        let thread = message.thread.as_ref().filter(|_| !self.is_thread()).map(|thread| {
+            let root = message.clone();
+            div().flex().items_center().gap(px(6.)).flex_wrap()
+                .child(div().type_small().text_color(theme::text_soft()).child(huddle_thread_label(thread.replies)))
+                .child(button("huddle-thread", ButtonKind::Secondary, "Open thread").on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(PaneEvent::OpenThread(root.clone()));
+                })))
+        });
         let shell = self.shell.clone();
         div()
             .id(SharedString::from(format!("huddle-{}", message.id)))
@@ -765,6 +783,8 @@ impl Pane {
                     let _ = shell.update(cx, |shell, cx| shell.call_handoff(key.clone(), cx));
                 })))
             }))
+            .children(thread)
+            .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, window, cx)))
             .into_any_element()
     }
 
@@ -3609,6 +3629,9 @@ impl Pane {
                     .child(
                         div()
                             .id(SharedString::from(format!("card-open-{}-{ix}", message.id)))
+                            .role(gpui::Role::Link)
+                            .tab_index(0)
+                            .focus_visible(|style| style.shadow(theme::focus_ring()))
                             .cursor_pointer()
                             .type_small()
                             .font_weight(theme::MEDIUM)
@@ -5895,6 +5918,13 @@ mod tests {
         theirs.sender.avatar = Some(picture("mara"));
         assert_eq!(face(&sending(), &[Rc::new(theirs)], None), None);
         assert_eq!(own_face(&sending(), None, &messages, "", || None), None);
+    }
+
+    #[test]
+    fn slack_huddle_thread_names_itself_before_and_after_replies() {
+        assert_eq!(huddle_thread_label(0), "Huddle thread");
+        assert_eq!(huddle_thread_label(1), "Huddle thread · 1 reply");
+        assert_eq!(huddle_thread_label(3), "Huddle thread · 3 replies");
     }
 
     #[test]

@@ -1640,6 +1640,48 @@ impl Slack {
         Some(framed)
     }
 
+    /// A huddle can carry a Canvas file or just name it. `canvas_thread_ts` is a timestamp,
+    /// so it is never used as a file id. The workspace's document URL works for a bare id.
+    fn huddle_notes(&self, event: &Value, files: &[Value]) -> (Option<usize>, Option<Card>) {
+        let room = &event["room"];
+        let references = [&room["canvas"], &room["notes_canvas"], &event["canvas"], &event["notes_canvas"]];
+        let valid_id = |id: &str| id.starts_with('F') && id.len() > 1 && id.bytes().all(|byte| byte.is_ascii_alphanumeric());
+        let reference = references.into_iter().find(|entry| {
+            first(&[&entry["file_id"], &entry["id"], entry]).is_some_and(valid_id)
+        });
+        let file_id = reference
+            .and_then(|entry| first(&[&entry["file_id"], &entry["id"], entry]))
+            .or_else(|| first(&[
+                &room["canvas_file_id"], &room["canvas_id"], &room["notes_canvas_id"],
+                &event["canvas_file_id"], &event["canvas_id"], &event["notes_canvas_id"],
+            ]).filter(|id| valid_id(id)));
+        let slot = match file_id {
+            Some(id) => files.iter().position(|file| file["id"] == id),
+            None => files.iter().position(|file| file["is_huddle_notes"] == true || is_canvas(file)),
+        };
+        let file = slot.map(|index| &files[index]).or(reference).unwrap_or(&Value::Null);
+        if matches!(file["mode"].as_str(), Some("tombstone" | "hidden_by_limit")) {
+            return (None, None);
+        }
+        let link = file_id.or_else(|| file["id"].as_str().filter(|id| valid_id(id)))
+            .map(|id| format!("{}docs/{}/{id}", self.session.url, self.session.team_id))
+            .unwrap_or_default();
+        let mut card = self.canvas_card(file, &link);
+        if card.title_link.is_empty() {
+            return (None, None);
+        }
+        if first(&[&file["title"], &file["name"]]).is_some() {
+            card.author = "Huddle notes".to_owned();
+        } else {
+            card.title = "Huddle notes".to_owned();
+            card.author.clear();
+        }
+        if matches!(card.text.as_str(), "Shared Slack canvas" | "Huddle notes canvas") {
+            card.text.clear();
+        }
+        (slot, Some(card))
+    }
+
     /// Maps a Slack Canvas file (`filetype` `quip` / `canvas` / `slack_canvas`) into a structured
     /// readable card with an "Open in Slack" link instead of a bare download chip.
     fn canvas_card(&self, file: &Value, fallback_link: &str) -> Card {
@@ -2065,7 +2107,20 @@ impl Slack {
                 }
             }
         }
-        for file in event["files"].as_array().into_iter().flatten() {
+        let files = event["files"].as_array().map_or(&[][..], Vec::as_slice);
+        let notes_file = if huddle.is_some() {
+            let (file, card) = self.huddle_notes(event, files);
+            if let Some(card) = card {
+                push_card(&mut framed, &mut extra_cards, card);
+            }
+            file
+        } else {
+            None
+        };
+        for (index, file) in files.iter().enumerate() {
+            if notes_file == Some(index) {
+                continue;
+            }
             let name = first(&[&file["name"], &file["title"]]).unwrap_or("file");
             match file["mode"].as_str() {
                 // Deleted since.
@@ -2158,7 +2213,8 @@ impl Slack {
         // ones are at its end. Slack documents the field and not its order.
         let repliers = event["reply_users"].as_array().into_iter().flatten().filter_map(Value::as_str);
         let repliers: Vec<protocol::Key> = repliers.rev().take(THREAD_FACES).map(|id| self.ctx.key(id)).collect();
-        let summary = (thread == Some(ts) && replies > 0).then(|| ThreadSummary {
+        let root = thread.is_none_or(|root| root == ts);
+        let summary = ((root && huddle.is_some()) || (thread == Some(ts) && replies > 0)).then(|| ThreadSummary {
             participants: repliers,
             // Slack says how many only for a thread the user follows, and only where it sends
             // the thread's own state (`conversations.replies`). 0 otherwise.

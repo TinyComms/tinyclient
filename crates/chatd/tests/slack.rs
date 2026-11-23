@@ -2527,6 +2527,42 @@ fn a_thread_is_a_conversation_that_can_be_read_and_answered() {
 }
 
 #[test]
+fn slack_huddle_history_opens_its_thread_and_links_its_notes() {
+    let world = World::start_with(|fake| {
+        fake.extra_conversations.lock().unwrap().push(json!({
+            "id": "C0HUD", "name": "huddle-fixture", "is_channel": true, "is_member": true, "created": 1760000000,
+        }));
+    });
+    world.ready();
+    let channel = alpha("C0HUD");
+    let history = world.until("the huddle history", || Some(world.messages(&channel)).filter(|page| page.len() == 3));
+    let [quiet, ended, live] = history.as_slice() else { unreachable!() };
+    assert_eq!(live.call.as_ref().unwrap().outcome, protocol::CallOutcome::Live);
+    assert_eq!(ended.call.as_ref().unwrap().participants, ["U0ANA", "U0BEN"]);
+    let summary = ended.thread.as_ref().expect("the huddle thread");
+    assert_eq!(summary.id, "C0HUD:1760000200.000200");
+    assert_eq!(summary.replies, 3);
+
+    let notes: Vec<_> = ended.all_cards().collect();
+    let [notes] = notes.as_slice() else { panic!("expected one notes card, got {notes:?}") };
+    assert_eq!(notes.author, "Huddle notes");
+    assert_eq!(notes.title, "Launch recap");
+    assert_eq!(notes.text, "The team agreed to launch Tuesday.");
+    assert_eq!(notes.title_link, "https://acme.slack.com/docs/T01ALPHA/F0NOTES");
+    assert!(quiet.call.is_some(), "sparse huddles still have a summary");
+    assert_eq!(quiet.thread.as_ref().unwrap().replies, 0);
+    let notes = quiet.all_cards().next().expect("canvas id alone makes a notes card");
+    assert_eq!(notes.title_link, "https://acme.slack.com/docs/T01ALPHA/F0QUIET");
+
+    let thread = alpha(&summary.id);
+    let replies = world.until("the huddle's replies", || Some(world.messages(&thread)).filter(|page| page.len() == 4));
+    assert_eq!(replies.last().unwrap().text, "The launch checklist is ready");
+    let asked = world.fake.calls(ALPHA, "conversations.replies");
+    assert!(asked.iter().any(|call| call.params["channel"] == "C0HUD" && call.params["ts"] == "1760000200.000200"));
+    assert!(world.message(&channel, &replies.last().unwrap().id).is_none());
+}
+
+#[test]
 fn a_message_with_no_replies_can_start_its_thread() {
     let world = World::start();
     world.ready();
