@@ -3813,7 +3813,7 @@ impl Chat {
     }
 
     /// Shows the network's sign-in and waits for the user to finish it.
-    fn sign_in(&self, network: Network, at: Option<(i32, i32)>, resume: Option<String>) -> Response {
+    fn sign_in(&self, network: Network, at: Option<(i32, i32)>, resume: Option<String>, kind: Option<String>) -> Response {
         if !adapters::supported(network) {
             return error(
                 ErrorCode::Unsupported,
@@ -3840,7 +3840,8 @@ impl Chat {
         if let Some(account) = resume {
             return self.resume_sign_in(network, at, &account);
         }
-        let label = network.label().to_lowercase();
+        let personal = network == Network::Teams && kind.as_deref() == Some("personal");
+        let label = if personal { "teams-personal".to_owned() } else { network.label().to_lowercase() };
         let fresh = network == Network::Discord && self.discord_open();
         let store = if fresh { Self::fresh_discord_store() } else { label.clone() };
         let session = match web {
@@ -6248,7 +6249,7 @@ impl Chat {
                 }
             }
 
-            Request::SignIn { network, at, resume } => self.sign_in(network, at, resume),
+            Request::SignIn { network, at, resume, kind } => self.sign_in(network, at, resume, kind),
             Request::SignInBegin { network } => self.sign_in_step(network, None),
             Request::SignInAnswer { network, input } => self.sign_in_step(network, Some(input)),
             Request::SignInCancel { network } => {

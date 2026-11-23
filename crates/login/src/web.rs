@@ -60,19 +60,21 @@ pub fn sign_in(provider: &dyn WebSignIn, network: &str, open: Option<&str>) -> R
 }
 
 /// As [`sign_in`], with `store` naming the web view's persistent data. A second Discord account
-/// passes a fresh store so it does not reuse the first account's cookies.
+/// passes a fresh store so it does not reuse the first account's cookies. `teams-personal` is
+/// a personal Microsoft account.
 pub fn sign_in_in(provider: &dyn WebSignIn, network: &str, open: Option<&str>, store: &str) -> Result<String, i32> {
-    let flow = match network {
-        "teams" => Some(Flow::new()?),
-        "discord" | "slack" => None,
+    let (site_name, flow) = match network {
+        "teams-personal" => ("teams", Some(Flow::for_cloud(teams::Cloud::Personal)?)),
+        "teams" => ("teams", Some(Flow::new()?)),
+        "discord" | "slack" => (network, None),
         _ => return Err(USAGE),
     };
     if let Some(url) = open {
-        if network != "slack" || !slack_page(url) {
+        if site_name != "slack" || !slack_page(url) {
             return Err(USAGE);
         }
     }
-    let site = match network {
+    let site = match site_name {
         "slack" => SLACK,
         "discord" => DISCORD,
         _ => Site { title: teams::TITLE, start: "", probe: teams::PROBE, read: |_| None, cookie: None, detour: None },

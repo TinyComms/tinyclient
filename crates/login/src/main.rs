@@ -64,6 +64,7 @@ fn main() {
         Some("slack") => "slack",
         Some("discord") => "discord",
         Some("teams") => "teams",
+        Some("teams-personal") => "teams-personal",
         Some("messages") => "messages",
         other => {
             tracing::warn!("tinyclient-login: no web sign-in for {other:?}");
@@ -85,19 +86,26 @@ fn main() {
         }
         messages::run();
     }
+    let personal = network == "teams-personal";
     let site = match network {
         "slack" => SLACK,
         "discord" => DISCORD,
         "teams" => teams::site(),
+        "teams-personal" => teams::site_personal(),
         _ => unreachable!(),
     };
     let at = parse_at(&args).unwrap_or_else(|why| {
         tracing::warn!("tinyclient-login: {why}");
         std::process::exit(USAGE);
     });
-    let store = if fresh { format!("{network}-fresh-{}", std::process::id()) } else { network.to_owned() };
+    let store_name = if personal { "teams-personal" } else { network };
+    let store = if fresh {
+        format!("{store_name}-fresh-{}", std::process::id())
+    } else {
+        store_name.to_owned()
+    };
     #[cfg(target_os = "macos")]
-    macos::run(site, at, start.as_deref(), fresh);
+    macos::run(site, at, start.as_deref(), fresh, personal);
     #[cfg(not(target_os = "macos"))]
     desktop::run(site, at, &store, start.as_deref());
 }

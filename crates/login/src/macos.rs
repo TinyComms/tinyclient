@@ -130,7 +130,7 @@ fn fresh_uuid() -> String {
     )
 }
 
-pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>, fresh: bool) {
+pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>, fresh: bool, personal: bool) {
     let mtm = MainThreadMarker::new().expect("main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -168,8 +168,15 @@ pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>, fresh: bool)
         window.setFrameOrigin(NSPoint::new(x, y));
     }
 
-    // The shared store is one fixed id. `--fresh` is a new empty store.
-    let uuid = if fresh { fresh_uuid() } else { "c0a1e5b2-7d44-4f18-9a6e-3b8d1f0c6e27" };
+    // The shared store is one fixed id. `--fresh` is a new empty store. A personal Microsoft
+    // account keeps its own store, so it does not share cookies with a work sign-in.
+    let uuid = if fresh {
+        fresh_uuid()
+    } else if personal {
+        "a13c0e7e-5b21-4d0a-9f66-2c4e8a1b7d90"
+    } else {
+        "c0a1e5b2-7d44-4f18-9a6e-3b8d1f0c6e27"
+    };
     let store_id = NSUUID::initWithUUIDString(NSUUID::alloc(), &NSString::from_str(uuid)).expect("uuid");
     let store = unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&store_id, mtm) };
     let config = unsafe { WKWebViewConfiguration::new(mtm) };
