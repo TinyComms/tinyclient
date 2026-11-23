@@ -1,0 +1,13 @@
+{
+  "id": "desktop-capture-wave13",
+  "title": "Share a chosen display or covered window and use voice shortcuts on Wayland",
+  "platforms": ["linux", "macos"],
+  "not_applicable": {
+    "windows": "The native capture and global keyboard backends already exist there.",
+    "android": "Android uses MediaProjection and has no desktop Global Shortcuts portal.",
+    "ios": "iOS uses a broadcast extension and has no desktop Global Shortcuts portal."
+  },
+  "needs": ["server", "two-people"],
+  "release": false,
+  "max_still_seconds": 60
+}

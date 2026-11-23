@@ -114,10 +114,15 @@ pub enum Shape {
     Voice,
     /// An audio file: its name over a bar, played in place.
     Audio,
+    /// View-once media: hidden behind a compact cover card rather than rendered inline.
+    ViewOnce,
     File,
 }
 
 pub fn shape(attachment: &Attachment) -> Shape {
+    if attachment.view_once {
+        return Shape::ViewOnce;
+    }
     let has_still = attachment.thumb.is_some();
     match attachment.file.kind {
         _ if attachment.sticker => Shape::Sticker,

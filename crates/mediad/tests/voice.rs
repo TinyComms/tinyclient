@@ -260,6 +260,7 @@ fn session(endpoint: &str, session_id: &str, token: &str, dave: Dave) -> VoiceJo
         deafened: false,
         stream: false,
         watch: false,
+        stream_owner: None,
         group_id: String::new(),
     }
 }
@@ -1536,6 +1537,81 @@ fn a_go_live_leg_offers_a_screen_and_does_not_speak_or_exit() {
     assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false }), MediaResponse::Done);
     assert!(mediad.child.try_wait().unwrap().is_none(), "stopping the screen ended the process");
     assert_eq!(mediad.hang_up().0.code(), Some(0));
+}
+
+#[test]
+fn watched_go_live_audio_is_opened_and_mixed_at_its_own_volume() {
+    use davey::DaveSession;
+    let mut voice = Fake::new();
+    let played_to = sink("go-live-audio");
+    let mut mediad = Mediad::start("null", Some(&played_to));
+    mediad.join(&voice.endpoint(), NO_DAVE);
+    let mut call_peer = voice.accept();
+    voice.handshake(&mut call_peer, &[AES], 0, 30_000);
+    mediad.connected();
+
+    // Muting the person's voice and muting our microphone both leave their stream audible.
+    assert_eq!(mediad.ask(MediaRequest::Gain { user_id: THEM.into(), percent: 100, muted: true }), MediaResponse::Done);
+    assert_eq!(mediad.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
+    let stream_gain = |percent, muted| MediaRequest::Gain { user_id: protocol::discord_stream_gain_key(THEM), percent, muted };
+    assert_eq!(mediad.ask(stream_gain(50, false)), MediaResponse::Done);
+
+    let mut stream = Fake::new();
+    let mut join = session(&stream.endpoint(), "session-1", "stream-token", Dave { max_version: 1, required: true });
+    const GROUP: u64 = 899;
+    join.stream = true;
+    join.watch = true;
+    join.group_id = GROUP.to_string();
+    join.stream_owner = Some(THEM.into());
+    assert_eq!(mediad.ask(MediaRequest::Stream(join)), MediaResponse::Done);
+    let mut peer = stream.accept();
+    stream.handshake_kind(&mut peer, &[AES], 1, 30_000, None);
+    peer.expect(15);
+
+    let server = mls::Server::new();
+    assert!(!peer.expect_binary(26).is_empty());
+    peer.send_binary(25, &server.package());
+    let version = std::num::NonZeroU16::new(1).unwrap();
+    let mut them = DaveSession::new(version, THEM.parse().unwrap(), GROUP, None).unwrap();
+    them.set_external_sender(&server.package()).unwrap();
+    let package = them.create_key_package().unwrap();
+    peer.send(11, json!({ "user_ids": [THEM] }));
+    peer.send_binary(27, &server.add(&package, GROUP, 0));
+    let (commit, welcome) = mls::split(&peer.expect_binary(28));
+    peer.send_binary(29, &[&7u16.to_be_bytes()[..], &commit].concat());
+    assert_eq!(peer.expect(23), json!({ "transition_id": 7 }));
+    them.process_welcome(&welcome).unwrap();
+    peer.send(22, json!({ "transition_id": 7 }));
+    peer.send(12, json!({ "user_id": THEM, "audio_ssrc": THEIR_SSRC, "streams": [] }));
+    mediad.event("stream audio SSRC", |event| matches!(event, MediaResponse::Source { ssrc: THEIR_SSRC, .. }));
+
+    let frames = tone_frames(45);
+    let mut sequence = 0u16;
+    let mut measure = |stream: &mut Fake| {
+        let start = played(&played_to).len();
+        let sealed: Vec<_> = frames.iter().map(|frame| them.encrypt_opus(frame).unwrap().into_owned()).collect();
+        let tone: Vec<_> = sealed.iter().map(|frame| {
+            sequence += 1;
+            (sequence, frame.as_slice())
+        }).collect();
+        stream.talk(&tone);
+        played(&played_to)[start..].chunks_exact(960 * 2 * 15).skip(1).map(rms).fold(0., f64::max)
+    };
+    let audible = measure(&mut stream);
+    assert!((2000. ..3500.).contains(&audible), "expected stream audio at 50 %, heard {audible}");
+
+    assert_eq!(mediad.ask(stream_gain(50, true)), MediaResponse::Done);
+    assert!(measure(&mut stream) < 800., "the stream mute left the tone playing");
+    assert_eq!(mediad.ask(stream_gain(100, false)), MediaResponse::Done);
+    assert_eq!(mediad.ask(MediaRequest::Audio { muted: true, deafened: true }), MediaResponse::Done);
+    assert!(measure(&mut stream) < 800., "deafen left the stream playing");
+    assert_eq!(mediad.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
+    assert!(is_the_tone(measure(&mut stream)), "undeafening did not restore stream audio at full gain");
+    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: true }), MediaResponse::Done);
+    assert!(measure(&mut stream) < 800., "the old stream kept playing after Stop watching");
+    assert!(mediad.child.try_wait().unwrap().is_none(), "stopping the stream ended the voice call");
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
+    let _ = std::fs::remove_file(played_to);
 }
 
 #[test]

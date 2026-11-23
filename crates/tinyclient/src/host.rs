@@ -159,10 +159,11 @@ pub const DIAGNOSTICS: &str = if cfg!(target_os = "macos") {
     "Version, Linux, memory and connection states. No messages, names, tokens, or log lines."
 };
 
-/// Settings › Appearance, under text size. Reduce Motion is read from macOS only; `caption`
-/// shows the keys as Ctrl elsewhere.
+/// Settings › Appearance, under text size. `caption` shows the keys as Ctrl off macOS.
 pub const APPEARANCE_CAPTION: &str = if cfg!(target_os = "macos") {
     "Text size is also ⌘+, ⌘− and ⌘0. Reduce Motion follows System Settings."
+} else if cfg!(any(windows, target_os = "linux")) {
+    "Text size is also ⌘+, ⌘− and ⌘0. Reduce Motion follows the system animation setting."
 } else {
     "Text size is also ⌘+, ⌘− and ⌘0."
 };

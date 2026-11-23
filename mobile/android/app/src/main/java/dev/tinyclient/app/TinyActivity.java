@@ -16,6 +16,7 @@ public class TinyActivity extends GpuiInputActivity {
         TinyPlatform.attach(this);
         super.onCreate(savedInstanceState);
         applySecure();
+        if (savedInstanceState == null) ShareItems.handle(this, getIntent());
         selfTest(getIntent());
     }
 
@@ -56,12 +57,14 @@ public class TinyActivity extends GpuiInputActivity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         TinyPlatform.onPermissionsResult(requestCode, permissions, grantResults);
+        ShareItems.onPermissions(this, requestCode, grantResults);
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         TinyPlatform.onActivityResult(requestCode, resultCode, data);
+        ShareItems.onResult(this, requestCode, resultCode, data);
     }
 
     @Override
@@ -82,6 +85,7 @@ public class TinyActivity extends GpuiInputActivity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        ShareItems.handle(this, intent);
         selfTest(intent);
     }
 

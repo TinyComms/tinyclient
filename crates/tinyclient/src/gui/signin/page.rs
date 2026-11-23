@@ -175,6 +175,74 @@ impl Sheet {
             )
     }
 
+    /// Signal linking on a phone: same-phone link-URI handoff via "Open Signal to link" plus the
+    /// QR code for scanning from a separate primary phone, with an honest delivery note.
+    pub(super) fn phone_signal_qr_step(&self, tile: Div, has_problem: bool, cx: &Context<Sheet>) -> Div {
+        let link_uri = self
+            .code
+            .as_ref()
+            .map(|(uri, _)| uri.clone())
+            .filter(|uri| super::is_signal_link_uri(uri));
+        let open_signal = (!has_problem).then(|| match link_uri {
+            Some(uri) => wide(button("signin-open-signal", ButtonKind::Primary, "Open Signal to link"))
+                .on_click(move |_, _, cx| {
+                    cx.open_url(&uri);
+                })
+                .into_any_element(),
+            None => wide(button_disabled("Getting a link from Signal…")).into_any_element(),
+        });
+        let delivery_note = div()
+            .mt(px(20.))
+            .p(px(14.))
+            .rounded(px(12.))
+            .bg(theme::raised())
+            .flex()
+            .gap(px(12.))
+            .child(div().pt(px(1.)).child(glyph("icons/lock.svg", 18., theme::text_soft())))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .phone_preview()
+                    .whitespace_normal()
+                    .text_color(theme::text_soft())
+                    .child(super::SIGNAL_MOBILE_DELIVERY_NOTE),
+            );
+        div()
+            .flex()
+            .flex_col()
+            .child(self.header(self.title(), false, cx))
+            .child(
+                div()
+                    .mt(px(8.))
+                    .whitespace_normal()
+                    .text_color(theme::text_soft())
+                    .child("Link this device as a companion to your primary Signal app. Your primary phone keeps your account."),
+            )
+            .children(open_signal.map(|btn| div().mt(px(24.)).child(btn)))
+            .child(
+                div()
+                    .mt(px(28.))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(div().flex_1().h(px(1.)).bg(theme::hairline()))
+                    .child(div().phone_preview().text_color(theme::text_faint()).child("or scan from your primary phone"))
+                    .child(div().flex_1().h(px(1.)).bg(theme::hairline())),
+            )
+            .child(div().mt(px(20.)).flex().justify_center().child(tile))
+            .child(
+                div()
+                    .mt(px(16.))
+                    .phone_preview()
+                    .whitespace_normal()
+                    .text_color(theme::text_soft())
+                    .text_center()
+                    .child("In Signal on your primary phone: Settings > Linked devices > Link new device, then scan this code."),
+            )
+            .child(delivery_note)
+    }
+
     /// Whether Discord, Slack or Teams is being signed in by the shell now, and what it said
     /// when it last failed.
     fn web_state(&self, cx: &gpui::App) -> (bool, Option<String>) {

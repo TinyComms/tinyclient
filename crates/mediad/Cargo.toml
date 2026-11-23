@@ -104,12 +104,20 @@ libc = "0.2"
 objc2 = "0.6"
 # A screen grab for a share. CoreGraphics is on the system; this does not compile C.
 core-graphics = "0.24"
+# macOS display and window capture uses ScreenCaptureKit and Core Video.
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSError", "NSString"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "bitflags", "CVBase", "CVPixelBuffer", "CVReturn"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCShareableContent", "SCStream", "block2", "dispatch2", "libc", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # A screen grab over the X11 protocol. Pure Rust, so the release image needs no X11 headers.
 # An X11 session (XFCE, MATE, Cinnamon, i3, and the rest) uses this. A Wayland session uses the
 # desktop portal instead (`picture/portal.rs`).
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["composite", "randr", "shm", "xfixes"] }
+memmap2 = "0.9"
 # The session bus for xdg-desktop-portal. Pure Rust, so this does not link a second libdbus
 # beside the one chatd already vendors.
 zbus = "5"

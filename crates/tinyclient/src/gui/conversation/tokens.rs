@@ -7,15 +7,33 @@ use gpui::{rgb, rgba, Rgba};
 /// Links, mentions and "N replies": the accent adjusted for body-text contrast.
 pub fn link() -> Rgba { theme::accent_text() }
 pub fn row_hover() -> Rgba {
-    if theme::is_light() { rgba(0x00000008) } else { rgba(0xffffff08) }
+    if theme::is_high_contrast() {
+        if theme::is_light() { rgba(0x00000014) } else { rgba(0xffffff18) }
+    } else if theme::is_light() {
+        rgba(0x0000000a)
+    } else {
+        rgba(0xffffff0c)
+    }
 }
 /// A mention of me inside the text.
 pub fn mention_me() -> Rgba {
-    if theme::is_light() { rgba(0x1d5bd62e) } else { rgba(0x2f6feb52) }
+    if theme::is_high_contrast() {
+        if theme::is_light() { rgba(0x1d5bd638) } else { rgba(0x2f6feb66) }
+    } else if theme::is_light() {
+        rgba(0x1d5bd62e)
+    } else {
+        rgba(0x2f6feb52)
+    }
 }
 pub fn border_strong() -> Rgba { theme::border_strong() }
 pub fn code_inline() -> Rgba {
-    if theme::is_light() { rgba(0x0000000f) } else { rgba(0xffffff14) }
+    if theme::is_high_contrast() {
+        if theme::is_light() { rgba(0x00000018) } else { rgba(0xffffff20) }
+    } else if theme::is_light() {
+        rgba(0x0000000f)
+    } else {
+        rgba(0xffffff14)
+    }
 }
 /// Opaque, so a picture's box hides the row tint behind it.
 pub fn media_fill() -> Rgba { theme::raised() }
@@ -23,7 +41,15 @@ pub fn card() -> Rgba { theme::raised() }
 pub fn code_bg() -> Rgba { theme::raised() }
 pub fn code_keyword() -> Rgba { if theme::is_light() { rgb(0x7c3aed) } else { rgb(0xc792ea) } }
 pub fn code_string() -> Rgba { if theme::is_light() { rgb(0x1e7e34) } else { rgb(0xc3e88d) } }
-pub fn code_comment() -> Rgba { if theme::is_light() { rgb(0x5b606d) } else { rgb(0x7f8c98) } }
+pub fn code_comment() -> Rgba {
+    if theme::is_high_contrast() {
+        if theme::is_light() { rgb(0x3f4450) } else { rgb(0xa3b0bc) }
+    } else if theme::is_light() {
+        rgb(0x5b606d)
+    } else {
+        rgb(0x7f8c98)
+    }
+}
 pub fn code_number() -> Rgba { if theme::is_light() { rgb(0xb84314) } else { rgb(0xf78c6c) } }
 pub fn code_type() -> Rgba { if theme::is_light() { rgb(0x9a5b00) } else { rgb(0xffcb6b) } }
 pub fn code_function() -> Rgba { if theme::is_light() { rgb(0x1852c9) } else { rgb(0x82aaff) } }
@@ -57,14 +83,8 @@ pub fn badge() -> Rgba { rgba(0x000000a6) }
 pub fn scrim() -> Rgba { if theme::is_light() { rgba(0x000000c0) } else { rgba(0x0b0b0df0) } }
 pub fn selection() -> Rgba { theme::selection() }
 
-/// Code's face. Menlo is on Apple systems only: Android has its own mono face (`theme::MONO`),
-/// and without it a code span fell back to the proportional system face there.
-// TODO(design): the desktops off Apple likely want `theme::MONO` too; left as drawn so their
-// screenshots stay put.
-#[cfg(target_os = "android")]
+/// Code's face: platform monospace across macOS, Windows, Linux, and mobile.
 pub const MONO: &str = crate::gui::theme::MONO;
-#[cfg(not(target_os = "android"))]
-pub const MONO: &str = "Menlo";
 
 /// The widest a line of text, a code block or a card may be.
 pub const MEASURE: f32 = 620.;

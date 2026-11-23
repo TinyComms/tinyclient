@@ -100,6 +100,7 @@ pub(in crate::gui) fn bar_button(id: &'static str, icon: &'static str, look: Bar
     };
     div()
         .id(id)
+        .role(gpui::Role::Button)
         .relative()
         .size(px(44.))
         .rounded_full()
@@ -108,7 +109,7 @@ pub(in crate::gui) fn bar_button(id: &'static str, icon: &'static str, look: Bar
         .justify_center()
         .bg(fill)
         .map(|button| match look {
-            BarLook::Held => button.opacity(0.55),
+            BarLook::Held => button.opacity(0.55).aria_disabled(true),
             _ => button
                 .cursor_pointer()
                 .tab_index(0)
@@ -141,6 +142,8 @@ pub(in crate::gui) fn talk(push: bool, held: Option<bool>, key: Option<String>) 
 fn stream_button(id: &'static str, icon: &'static str, words: &'static str) -> Stateful<Div> {
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(words)
         .flex_none()
         .size(px(32.))
         .rounded_full()
@@ -273,10 +276,12 @@ impl Shell {
         let place_chip = subject.space.as_ref().map(|space| {
             chip(space.clone(), theme::text_soft(), theme::hover())
         });
-        let can_add_people = call.conversation.network == Network::Discord
-            && subject.kind.is_direct()
-            && call.state == CallState::Joined
-            && (call.participants.len() + 1) < 10;
+        let picker = self.call_add_picker(&call, subject.kind);
+        let can_add_people = picker
+            || (call.conversation.network == Network::Discord
+                && subject.kind.is_direct()
+                && call.state == CallState::Joined
+                && (call.participants.len() + 1) < 10);
 
         let back = icon_button("call-view-back", "icons/arrow-left.svg", false)
             .tooltip(tip("Back to conversation (Esc)", None))
@@ -327,7 +332,16 @@ impl Shell {
             )
             .h(px(28.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| this.call_menu_toggle(Menu::AddPeople, cx)))
+            .on_click(cx.listener({
+                let picker = picker;
+                move |this, _, window, cx| {
+                    if picker {
+                        this.open_call_people(window, cx);
+                    } else {
+                        this.call_menu_toggle(Menu::AddPeople, cx);
+                    }
+                }
+            }))
         });
         let bar = drags_window(div())
             .h(px(TOP_BAR))
@@ -1234,6 +1248,10 @@ impl Shell {
         } else {
             self.call_stream_body(people, stream, call, Size::Big, cx).into_any_element()
         };
+        let volume = call
+            .filter(|_| stream.share && !mine)
+            .and_then(|call| self.call_stream_volume(call, &user_id, cx))
+            .map(|controls| controls.absolute().top(px(10.)).left(px(10.)));
         div()
             .id(if full { "tiny-stream-whole" } else { "tiny-stream-focused" })
             .relative()
@@ -1250,6 +1268,7 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, window, cx| this.call_open_stream(&user_id, mine, window, cx)))
             })
             .child(body)
+            .children(volume)
             .child(caption(
                 if mine { format!("Your {what}") } else { format!("{name}'s {what}") },
                 false,
@@ -1734,6 +1753,8 @@ impl Shell {
         let room_context = opts.room_context;
         let leave = div()
             .id("tiny-leave")
+            .role(gpui::Role::Button)
+            .aria_label(if connecting { "Cancel joining" } else { "Leave the call" })
             .h(px(44.))
             .px(px(20.))
             .rounded_full()
@@ -1757,12 +1778,13 @@ impl Shell {
             .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::on_accent()).child(leave_word))
             .into_any_element();
         let mute = match opts.held {
-            Some(words) => bar_button("tiny-bar-mute", "icons/mic-off.svg", BarLook::Held).tooltip(tip(words, None)),
+            Some(words) => bar_button("tiny-bar-mute", "icons/mic-off.svg", BarLook::Held).aria_label(words).tooltip(tip(words, None)),
             None => bar_button(
                 "tiny-bar-mute",
                 if muted { "icons/mic-off.svg" } else { "icons/mic.svg" },
                 if muted { BarLook::Off } else { BarLook::Rest },
             )
+            .aria_label(if muted { "Unmute" } else { "Mute" })
             .tooltip(tip(if muted { "Unmute" } else { "Mute" }, Some("⌘⇧M")))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if room_context {
@@ -1786,6 +1808,7 @@ impl Shell {
         });
         let deafen = if opts.held_ears {
             bar_button("tiny-bar-deafen", "icons/headphone-off.svg", BarLook::Held)
+                .aria_label("A moderator deafened you here")
                 .tooltip(tip("A moderator deafened you here", None))
         } else {
             bar_button(
@@ -1793,6 +1816,7 @@ impl Shell {
                 if deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" },
                 if deafened { BarLook::Off } else { BarLook::Rest },
             )
+            .aria_label(if deafened { "Undeafen" } else { "Deafen" })
             .tooltip(tip(if deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if room_context {
@@ -1812,6 +1836,7 @@ impl Shell {
                 "icons/monitor-up.svg",
                 if share_on { BarLook::On } else { BarLook::Rest },
             )
+            .aria_label(if share_on { "Stop sharing" } else { "Share your screen" })
             .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if share_on {
@@ -1828,6 +1853,7 @@ impl Shell {
                 "icons/video.svg",
                 if camera_on { BarLook::On } else { BarLook::Rest },
             )
+            .aria_label(if camera_on { "Turn camera off" } else { "Turn camera on" })
             .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -1841,6 +1867,7 @@ impl Shell {
         let popout_open = self.call_popout_open();
         let popout = pictures.then(|| {
             bar_button("tiny-bar-popout", "icons/picture-in-picture-2.svg", if popout_open { BarLook::On } else { BarLook::Rest })
+                .aria_label(if popout_open { "Bring video back" } else { "Pop out video" })
                 .tooltip(tip(if popout_open { "Bring video back" } else { "Pop out video" }, Some("⇧⌘O")))
                 .on_click(cx.listener(|this, _, _, cx| this.call_toggle_popout(cx)))
         });
@@ -1861,6 +1888,8 @@ impl Shell {
                 };
                 div()
                     .id("tiny-bar-health")
+                    .role(gpui::Role::Button)
+                    .aria_label(words.clone())
                     .size(px(44.))
                     .rounded_full()
                     .bg(theme::selected())
@@ -1882,6 +1911,7 @@ impl Shell {
             "icons/settings.svg",
             if menu == Some(Menu::Devices) { BarLook::On } else { BarLook::Rest },
         )
+        .aria_label("Devices")
         .tooltip(tip("Devices", None))
         .on_click(cx.listener(move |this, _, _, cx| {
             if has_call {

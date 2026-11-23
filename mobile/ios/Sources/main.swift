@@ -7,4 +7,5 @@ import UIKit
 //
 // `import UIKit` is not decorative: it makes Swift link UIKit and CoreGraphics, which the Rust
 // static library calls into (CGBitmapContextCreate and friends). Without it the link fails.
+Attachments.shared.install()
 tinyclient_ios_main()

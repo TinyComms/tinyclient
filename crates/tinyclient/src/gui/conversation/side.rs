@@ -18,7 +18,7 @@ use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
 use gpui::{div, prelude::*, px, AnyElement, Context, Entity, Focusable, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, Window};
-use protocol::{BrowsedChannel, Capabilities, ConversationKind, Key, Link, Message, MessageHit, Network, Person, Request, Response, SearchSort, SharedItem, ThreadSummary};
+use protocol::{BrowsedChannel, Capabilities, ConversationKind, Key, Link, Message, MessageHit, Network, Person, Request, Response, SharedItem, ThreadSummary};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -1101,19 +1101,23 @@ impl Shell {
     }
 
     fn set_search_sort(&mut self, sort: protocol::SearchSort, cx: &mut Context<Self>) {
-        let was_searched = if let Some(page) = self.conversation_state.side.search.as_mut() {
+        let (was_searched, tab) = if let Some(page) = self.conversation_state.side.search.as_mut() {
             if page.filters.sort == sort {
                 return;
             }
             let had = page.network.is_some();
             page.filters.sort = sort;
             page.reset_network();
-            had
+            (had, page.tab)
         } else {
             return;
         };
         if was_searched {
-            self.ask_network(None, cx);
+            match tab {
+                SearchTab::Messages => self.ask_network(None, cx),
+                SearchTab::Files => self.ask_files(None, cx),
+                _ => {}
+            }
         }
         cx.notify();
     }
@@ -1149,26 +1153,6 @@ impl Shell {
             }
         }
         (channels, people)
-    }
-
-    fn toggle_search_sort(&mut self, cx: &mut Context<Self>) {
-        let tab = {
-            let Some(page) = self.conversation_state.side.search.as_mut() else {
-                return;
-            };
-            page.filters.sort = match page.filters.sort {
-                SearchSort::Newest => SearchSort::Relevance,
-                SearchSort::Relevance | SearchSort::Oldest => SearchSort::Newest,
-            };
-            page.reset_network();
-            page.tab
-        };
-        match tab {
-            SearchTab::Messages => self.ask_network(None, cx),
-            SearchTab::Files => self.ask_files(None, cx),
-            _ => {}
-        }
-        cx.notify();
     }
 
     fn select_search_tab(&mut self, tab: SearchTab, cx: &mut Context<Self>) {
@@ -2503,28 +2487,6 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         }
         SearchTab::Messages => body,
     };
-
-    let sort_label = match page.filters.sort {
-        SearchSort::Newest => "Sort: Newest",
-        SearchSort::Oldest => "Sort: Oldest",
-        SearchSort::Relevance => "Sort: Relevance",
-    };
-    filter_chips = filter_chips.child(
-        div()
-            .id("sf-sort")
-            .px(px(8.))
-            .h(px(22.))
-            .rounded(px(theme::R_CONTROL))
-            .flex()
-            .items_center()
-            .type_micro()
-            .cursor_pointer()
-            .text_color(theme::text_soft())
-            .bg(theme::raised())
-            .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_search_sort(cx)))
-            .child(sort_label),
-    );
 
     let load_more = match page.tab {
         SearchTab::Messages => page.network_cursor.clone().map(|cursor| {

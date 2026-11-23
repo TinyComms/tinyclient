@@ -100,6 +100,7 @@ pub struct Controls {
     picture_slots: Mutex<Option<Vec<TinyPicture>>>,
     /// Multi-stream watch list accepted by the decode budget.
     watch_sources: Mutex<Vec<protocol::WatchSource>>,
+    pub(crate) watched_audio: Mutex<Option<discord_video::WatchAudio>>,
     /// A Tiny server call's end-to-end encryption (`e2ee`), shared by chatd's requests and the
     /// call's loop.
     pub(crate) tiny_e2ee: Mutex<crate::e2ee::E2ee>,
@@ -201,6 +202,9 @@ impl Controls {
     /// Asks a Go Live leg to return. The voice call stays up.
     pub fn stop_leg(&self, watch: bool) {
         self.leg_flag(watch).store(true, Ordering::Relaxed);
+        if watch {
+            self.watched_audio.lock().unwrap().take();
+        }
     }
 
     /// A new leg is about to start, so the stop from the one it replaces is cleared.
@@ -287,6 +291,9 @@ impl Controls {
     /// Mute and deafen as asked, with the cue the change calls for (S8).
     pub fn set_audio(&self, muted: bool, deafened: bool) {
         let was = (self.muted.swap(muted, Ordering::Relaxed), self.deafened.swap(deafened, Ordering::Relaxed));
+        if deafened {
+            self.watched_audio.lock().unwrap().take();
+        }
         if let Some(cue) = mine(was, (muted, deafened)) {
             self.cue(cue);
         }
@@ -684,7 +691,12 @@ impl Call {
         if ssrc == 0 || user_id == self.join.user_id {
             return;
         }
-        let known = self.users.lock().unwrap().insert(ssrc, user_id.clone());
+        let mut users = self.users.lock().unwrap();
+        if self.join.watch {
+            users.retain(|&previous, user| previous == ssrc || *user != user_id);
+        }
+        let known = users.insert(ssrc, user_id.clone());
+        drop(users);
         if known.as_ref() != Some(&user_id) {
             out::send(&MediaResponse::Source { user_id, ssrc });
         }
@@ -730,7 +742,11 @@ impl Call {
                     }
                     self.users.lock().unwrap().retain(|_, user| *user != user_id);
                     self.videos.lock().unwrap().retain(|_, remote| remote.user_id != user_id);
-                    out::send(&MediaResponse::Gone { user_id });
+                    if self.join.watch && self.join.stream_owner.as_deref() == Some(&user_id) {
+                        self.controls.watched_audio.lock().unwrap().take();
+                    } else if !self.join.stream {
+                        out::send(&MediaResponse::Gone { user_id });
+                    }
                 }
             }
             dave::PREPARE_TRANSITION => {
@@ -921,6 +937,8 @@ impl Call {
             user_id: self.join.user_id.clone(),
             pipe,
             watch: self.join.watch,
+            stream_owner: self.join.stream_owner.clone(),
+            users: self.users.clone(),
         };
         let thread = out::spawn(std::thread::Builder::new().name("stream".to_owned()), move || discord_video::run(leg)).map_err(|err| {
             tracing::warn!("mediad: the stream thread did not start: {err}");
@@ -1330,6 +1348,7 @@ mod tests {
             deafened: false,
             stream,
             watch,
+            stream_owner: None,
             group_id: String::new(),
         }
     }

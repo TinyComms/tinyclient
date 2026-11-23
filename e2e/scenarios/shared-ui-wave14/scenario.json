@@ -1,0 +1,8 @@
+{
+  "id": "shared-ui-wave14",
+  "title": "A message can be translated and restored through the accessible UI, and phone attachments are staged as drafts",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}

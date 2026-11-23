@@ -435,7 +435,7 @@ impl State {
     pub fn new(cx: &mut Context<Shell>) -> State {
         #[cfg(feature = "gui-shot")]
         shot::schedule(cx);
-        Self::with_focus(cx.focus_handle())
+        Self::with_focus(cx.focus_handle().tab_index(0).tab_stop(true))
     }
 
     fn with_focus(focus: FocusHandle) -> State {
@@ -2062,6 +2062,9 @@ impl Shell {
     pub(super) fn join_pill(&self, conversation: &Conversation, cx: &mut Context<Self>) -> Stateful<Div> {
         let key = conversation.key.clone();
         let title = conversation.title.clone();
+        let group_call = conversation.kind == ConversationKind::Group;
+        let hover_group = if group_call { "group-call" } else { "voice" };
+        let icon = if group_call { "icons/phone.svg" } else { "icons/volume-2.svg" };
         div()
             .id(row_id("join", &key))
             .flex_none()
@@ -2088,13 +2091,13 @@ impl Shell {
                 if super::phone::active() {
                     pill.h(px(30.)).px(px(12.)).rounded(px(15.)).text_size(px(13.))
                 } else {
-                    pill.invisible().group_hover("voice", |style| style.visible())
+                    pill.invisible().group_hover(hover_group, |style| style.visible())
                 }
             })
             // The press belongs to the pill: the row's open must not fire with it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
-            .child(glyph("icons/volume-2.svg", 12., theme::text()))
+            .child(glyph(icon, 12., theme::text()))
             .child("Join")
     }
 
@@ -2110,11 +2113,12 @@ impl Shell {
         // An empty voice channel rests at a muted row's weight, and a stage with nobody on
         // stage reads as one (`02` §4).
         let empty_voice = empty_voice_row(c.kind, stage, selected, inside.is_some(), live.is_some());
-        let title_color = if empty_voice { theme::text_faint() } else { tone.title };
+        let faint = if selected { theme::text_soft() } else { theme::text_faint() };
+        let title_color = if empty_voice { faint } else { tone.title };
         let leading = match c.kind {
             ConversationKind::Direct | ConversationKind::Group => self.conversation_avatar(c, 20., surface, cx).into_any_element(),
             kind => {
-                let icon_color = if c.muted || empty_voice { theme::text_faint() } else { theme::text_soft() };
+                let icon_color = if c.muted || empty_voice { faint } else { theme::text_soft() };
                 let icon = if c.key.network == Network::Teams && kind == ConversationKind::Channel && !c.private { None } else { Some(kind_glyph(kind, c.private, c.call)) };
                 div().size(px(20.)).flex_none().flex().items_center().justify_center().children(icon.map(|icon| glyph(icon, if kind == ConversationKind::Thread { 14. } else { 16. }, icon_color))).into_any_element()
             }
@@ -2132,7 +2136,7 @@ impl Shell {
         } else {
             inside.and_then(|row| voice_count(row.total, if c.call == CallSupport::Native { c.limit } else { 0 }))
         };
-        let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
+        let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., faint));
         let (picked, menu_row) = (c.clone(), c.clone());
         let ours = self
             .snapshot
@@ -2142,7 +2146,11 @@ impl Shell {
                 call.conversation == c.key
                     && !matches!(call.state, protocol::CallState::Failed { .. })
             });
-        let join = joins_from_list(c) && !ours;
+        let voice_join = joins_from_list(c) && !ours;
+        let group_join = c.kind == ConversationKind::Group && c.call == CallSupport::Native && inside.is_some() && !ours;
+        let show_join = voice_join || group_join;
+        let hover_group = if c.kind == ConversationKind::Group { "group-call" } else { "voice" };
+        let count_icon = if c.kind == ConversationKind::Group { "icons/phone.svg" } else { "icons/volume-2.svg" };
         let voice_status = discord_voice_status(c);
         let content = div()
             // 16 a level less the gap after it (none at the top), as the tree's other rows.
@@ -2157,12 +2165,12 @@ impl Shell {
             .children(status.map(|emoji| div().flex_none().type_small().child(emoji)))
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
             .child(div().flex_1())
-            .children(join.then(|| self.join_pill(c, cx)))
+            .children(show_join.then(|| self.join_pill(c, cx)))
             .children(draft)
-            .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(if soft { theme::text_soft() } else { theme::text_faint() }).child(count))))
-            .children(live.map(|line| div().flex_none().type_micro().text_color(theme::text_faint()).child(line)))
+            .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph(count_icon, 12., faint)).child(div().type_micro().text_color(if soft { theme::text_soft() } else { faint }).child(count))))
+            .children(live.map(|line| div().flex_none().type_micro().text_color(faint).child(line)))
             .children(row_badge(c))
-            .when(join, |row| row.group("voice"));
+            .when(show_join, |row| row.group(hover_group));
         let height = if voice_status.is_some() { theme::ROW_MID } else { theme::ROW_ONE };
         let drop = c.clone();
         list_row(row_id("tree", &c.key), theme::row_height(height), selected, focused, content)
@@ -2188,7 +2196,7 @@ impl Shell {
                         move |this, _, cx| {
                             if voice && ours {
                                 this.call_phone_restore(cx);
-                            } else if join {
+                            } else if voice_join {
                                 this.call_start(picked.key.clone(), cx);
                             } else {
                                 this.pick_row(&picked, cx);
@@ -2209,7 +2217,7 @@ impl Shell {
                         if !crate::gui::conversation::press_opens_row(crate::gui::conversation::modifier_held(event.modifiers)) {
                             return;
                         }
-                        if join && event.click_count == 2 {
+                        if voice_join && event.click_count == 2 {
                             this.call_start(picked.key.clone(), cx);
                         } else {
                             this.pick_row(&picked, cx);
@@ -2752,6 +2760,10 @@ impl Shell {
             .child(
                 div()
                     .id("jump")
+                    .role(gpui::Role::Button)
+                    .aria_label("Jump to conversation")
+                    .tab_index(0)
+                    .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                     .flex_1()
                     .h(px(field))
                     .px(px(8.))
@@ -2771,6 +2783,7 @@ impl Shell {
             )
             .child(
                 icon_button("compose", "icons/square-pen.svg", false)
+                    .aria_label("New message")
                     .when(phone, |button| button.size(px(field)))
                     .tooltip(tip("New message", Some("⌘N")))
                     .on_click(cx.listener(|this, _, window, cx| this.open_switcher("@", window, cx))),
@@ -6532,6 +6545,8 @@ impl Shell {
             .child(
                 div()
                     .id("sidebar-list")
+                    .role(gpui::Role::List)
+                    .aria_label(if people { "People" } else { "Conversations" })
                     .flex_1()
                     .min_h_0()
                     .track_focus(&self.sidebar_state.focus)

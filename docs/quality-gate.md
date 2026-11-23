@@ -59,6 +59,12 @@ captain is about to cut, on all five platforms, and the lab posts `e2e-release` 
 "enforce"`, blocks without it. Everything else the captain checks is unchanged: one release a
 local day, the freeze file, CI green on that SHA, a clean `main`.
 
+For main-window changes, include a keyboard and screen-reader pass with NVDA on Windows
+and VoiceOver on macOS. Open a conversation, read the last three messages with sender
+and time, send a reply, and check that closing a message menu returns focus. GPUI uses
+AccessKit for Windows UI Automation, macOS accessibility, and Linux AT-SPI. Use Orca
+for the equivalent Linux check when AT-SPI is available.
+
 ### Gate 4, in detail
 
 "Done" already means the installed app on Zeppelin reports the new version with screenshots. The

@@ -6,9 +6,9 @@
 //! no hook into other apps' input and no administrator: `GetAsyncKeyState` on Windows (keys and
 //! the middle and side mouse buttons), `CGEventSourceKeyState` on macOS (with Input Monitoring
 //! allowed; without it every key reads up and Settings says what to allow), `XQueryKeymap` on
-//! X11 through a libX11 opened at run time. Wayland lets no app see keys meant for another, so
-//! there mute and deafen keys work while tinyclient's window is in front, and push-to-talk does
-//! not; Settings says so.
+//! X11 through a libX11 opened at run time. On Wayland, the Global Shortcuts portal sends
+//! press and release for approved shortcuts. Unregistered mute and deafen keys still work in
+//! tinyclient's window.
 //!
 //! The talk keys go to chatd from the watching thread itself, so their downs and ups arrive in
 //! the order they happened (`CallTalk`; with no call chatd refuses and nothing happens). Mute
@@ -23,6 +23,17 @@ use protocol::Request;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+mod wayland;
+#[cfg(any(test, target_os = "linux"))]
+mod wayland_keys;
+
+enum Notice {
+    Action(Action),
+    #[cfg(target_os = "linux")]
+    PortalChanged,
+}
 
 /// How often the keys are looked at: 10 ms, well inside a word's first syllable.
 const POLL: Duration = Duration::from_millis(10);
@@ -66,6 +77,9 @@ impl Action {
 pub enum Reach {
     /// In any app.
     Everywhere,
+    /// In any app for shortcuts accepted by the Wayland portal.
+    #[cfg(target_os = "linux")]
+    Portal,
     /// In any app once the system allows it (macOS Input Monitoring).
     Permission,
     /// Only while tinyclient's window is in front, and push-to-talk not at all.
@@ -74,7 +88,29 @@ pub enum Reach {
 
 /// What this system lets the keys do now.
 pub fn reach() -> Reach {
+    #[cfg(target_os = "linux")]
+    if wayland::has_shortcuts() {
+        return Reach::Portal;
+    }
     platform::reach()
+}
+
+/// The trigger the desktop actually registered for this action.
+pub fn portal_trigger(action: Action) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    return wayland::trigger(action);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = action;
+        None
+    }
+}
+
+pub fn wayland_session() -> bool {
+    #[cfg(target_os = "linux")]
+    return platform::is_wayland();
+    #[cfg(not(target_os = "linux"))]
+    false
 }
 
 /// Asks the system to let the keys be watched (macOS: the Input Monitoring prompt, once).
@@ -113,14 +149,21 @@ pub fn start(shell: WeakEntity<Shell>, cx: &mut App) {
     if STARTED.swap(true, Ordering::Relaxed) {
         return;
     }
-    let (toggles, toggled) = channel::<Action>();
-    if reach() == Reach::Window {
-        in_window(toggles, cx);
-    } else {
-        let spawned = std::thread::Builder::new().name("hotkeys".to_owned()).stack_size(256 * 1024).spawn(move || watch(&toggles));
+    let (toggles, toggled) = channel::<Notice>();
+    let window_only = platform::reach() == Reach::Window;
+    if window_only {
+        in_window(toggles.clone(), cx);
+    }
+    if !window_only || wayland_session() {
+        let spawned = std::thread::Builder::new().name("hotkeys".to_owned()).stack_size(512 * 1024).spawn(move || {
+            #[cfg(target_os = "linux")]
+            if wayland_session() {
+                return wayland::watch(&toggles);
+            }
+            watch(&toggles)
+        });
         if let Err(err) = spawned {
             tracing::warn!("tinyclient: the voice keys could not be watched: {err}");
-            return;
         }
     }
     cx.spawn(async move |cx| {
@@ -131,7 +174,15 @@ pub fn start(shell: WeakEntity<Shell>, cx: &mut App) {
             let Ok(action) = action else {
                 return;
             };
-            let _ = shell.update(cx, |shell, cx| shell.hotkey(action, cx));
+            match action {
+                Notice::Action(action) => {
+                    let _ = shell.update(cx, |shell, cx| shell.hotkey(action, cx));
+                }
+                #[cfg(target_os = "linux")]
+                Notice::PortalChanged => {
+                    let _ = shell.update(cx, |_, cx| cx.refresh_windows());
+                }
+            }
         }
     })
     .detach();
@@ -144,7 +195,7 @@ fn bindings() -> [Option<Binding>; 4] {
 }
 
 /// The watching thread. Never returns while the app runs.
-fn watch(toggles: &Sender<Action>) {
+fn watch(toggles: &Sender<Notice>) {
     let Some(mut keys) = platform::Keys::open() else {
         tracing::warn!("tinyclient: the keyboard cannot be watched here; voice keys work in the window only");
         return;
@@ -168,24 +219,25 @@ fn watch(toggles: &Sender<Action>) {
                 continue;
             }
             held[at] = down;
-            match action {
-                Action::Talk | Action::Priority => {
-                    let priority = action == Action::Priority;
-                    let talk = Request::CallTalk { held: down, priority };
-                    // No call: chatd says so, and there is nothing to do about it.
-                    let _ = crate::client::ask(&talk);
-                    TALK_HELD[usize::from(priority)].store(down, Ordering::Relaxed);
-                    // The shell redraws its push-to-talk pill.
-                    if toggles.send(action).is_err() {
-                        return;
-                    }
-                }
-                // The shell is gone: so is the app.
-                Action::Mute | Action::Deafen if down && toggles.send(action).is_err() => return,
-                _ => {}
+            if !emit(action, down, toggles) {
+                return;
             }
         }
     }
+}
+
+/// Keep talk edges ordered on the watching thread. The shell handles toggle actions.
+fn emit(action: Action, down: bool, toggles: &Sender<Notice>) -> bool {
+    match action {
+        Action::Talk | Action::Priority => {
+            let priority = action == Action::Priority;
+            let _ = crate::client::ask(&Request::CallTalk { held: down, priority });
+            TALK_HELD[usize::from(priority)].store(down, Ordering::Relaxed);
+        }
+        Action::Mute | Action::Deafen if !down => return true,
+        _ => {}
+    }
+    toggles.send(Notice::Action(action)).is_ok()
 }
 
 /// Whether the binding's key is down with at least its modifiers. Other modifiers held as well
@@ -197,7 +249,7 @@ fn pressed(keys: &mut platform::Keys, binding: &Binding) -> bool {
 
 /// Where no app may watch the keyboard (Wayland): the mute and deafen keys, while a tinyclient
 /// window has the keys.
-fn in_window(toggles: Sender<Action>, cx: &mut App) {
+fn in_window(toggles: Sender<Notice>, cx: &mut App) {
     cx.observe_keystrokes(move |event, _, _| {
         if PAUSED.load(Ordering::Relaxed) {
             return;
@@ -207,8 +259,8 @@ fn in_window(toggles: Sender<Action>, cx: &mut App) {
         };
         let bound = bindings();
         for (at, action) in [(2, Action::Mute), (3, Action::Deafen)] {
-            if bound[at] == Some(pressed) {
-                let _ = toggles.send(action);
+            if bound[at] == Some(pressed) && portal_trigger(action).is_none() {
+                let _ = toggles.send(Notice::Action(action));
             }
         }
     })
@@ -459,9 +511,13 @@ mod platform {
     /// X11 reports only the first five pointer buttons in its state: the side ones are not there.
     pub const SIDE_BUTTONS: bool = false;
 
+    pub fn is_wayland() -> bool {
+        std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
+            || std::env::var("XDG_SESSION_TYPE").is_ok_and(|kind| kind.eq_ignore_ascii_case("wayland"))
+    }
+
     pub fn reach() -> Reach {
-        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var("XDG_SESSION_TYPE").is_ok_and(|kind| kind == "wayland");
-        if wayland || std::env::var_os("DISPLAY").is_none() {
+        if is_wayland() || std::env::var_os("DISPLAY").is_none() {
             Reach::Window
         } else {
             Reach::Everywhere

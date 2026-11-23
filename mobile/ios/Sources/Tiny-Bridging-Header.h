@@ -14,5 +14,6 @@
 
 /// Starts the Rust window. Call once, on the main thread.
 void tinyclient_ios_main(void);
+void tinyclient_native_share_received(int kind, const char *json);
 
 #endif /* TINY_BRIDGING_HEADER_H */

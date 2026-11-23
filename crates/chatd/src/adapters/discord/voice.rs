@@ -716,6 +716,7 @@ impl Discord {
                 deafened: call.deafened,
                 stream: false,
                 watch: false,
+                stream_owner: None,
                 group_id: String::new(),
             };
             (call.conversation.clone(), join, again)
@@ -1397,12 +1398,16 @@ impl Discord {
                 }
             }
             Picture::Watch(Some(user)) => {
-                let key = {
+                let _gate = self.stream_gate.lock().unwrap();
+                let (key, replaced) = {
                     let mut state = self.state.lock().unwrap();
                     let Some(call) = state.voice.call.as_ref() else {
                         return;
                     };
                     let key = stream_key(call.guild.as_deref(), &call.conversation, &user);
+                    let replaced = state.voice.watch.as_ref()
+                        .filter(|slot| slot.key != key)
+                        .map(|_| call.conversation.clone());
                     state.voice.watch = Some(StreamSlot {
                         key: key.clone(),
                         rtc_server: None,
@@ -1412,8 +1417,11 @@ impl Discord {
                         told: false,
                         drop: false,
                     });
-                    key
+                    (key, replaced)
                 };
+                if let Some(conversation) = replaced {
+                    self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: true });
+                }
                 self.tell(20, json!({ "stream_key": key }));
             }
             Picture::Watch(None) => {
@@ -1587,6 +1595,7 @@ impl Discord {
                     deafened,
                     stream: true,
                     watch,
+                    stream_owner: slot.key.rsplit_once(':').filter(|_| watch).map(|(_, owner)| owner.to_owned()),
                     group_id: server_num.saturating_sub(1).to_string(),
                 },
             ))

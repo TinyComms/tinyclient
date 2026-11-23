@@ -37,7 +37,7 @@ const FRAME_SETTLE: Duration = Duration::from_millis(500);
 
 static REDUCE_MOTION: AtomicBool = AtomicBool::new(false);
 
-/// macOS's Reduce Motion: menus, popovers, modals and toasts then appear at once.
+/// With system animations disabled, menus, popovers, modals and toasts appear at once.
 pub fn reduce_motion() -> bool {
     REDUCE_MOTION.load(Ordering::Relaxed)
 }
@@ -45,14 +45,32 @@ pub fn reduce_motion() -> bool {
 /// Reads Reduce Motion once, off the main thread, at launch.
 pub fn read_reduce_motion() {
     let _ = std::thread::Builder::new().name("reduce-motion".into()).stack_size(64 * 1024).spawn(|| {
-        let answer = std::process::Command::new("/usr/bin/defaults")
-            .args(["read", "com.apple.universalaccess", "reduceMotion"])
-            .stderr(std::process::Stdio::null())
-            .output();
-        if let Ok(output) = answer {
-            REDUCE_MOTION.store(String::from_utf8_lossy(&output.stdout).trim() == "1", Ordering::Relaxed);
-        }
+        REDUCE_MOTION.store(system_reduce_motion(), Ordering::Relaxed);
     });
+}
+
+#[cfg(target_os = "macos")]
+fn system_reduce_motion() -> bool {
+    command_out("/usr/bin/defaults", &["read", "com.apple.universalaccess", "reduceMotion"]).as_deref() == Some("1")
+}
+
+#[cfg(windows)]
+fn system_reduce_motion() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION};
+    let mut enabled = 1i32;
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes a BOOL to the supplied initialized storage.
+    let ok = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&mut enabled as *mut i32).cast(), 0) };
+    ok != 0 && enabled == 0
+}
+
+#[cfg(target_os = "linux")]
+fn system_reduce_motion() -> bool {
+    command_out("gsettings", &["get", "org.gnome.desktop.interface", "enable-animations"]).as_deref() == Some("false")
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn system_reduce_motion() -> bool {
+    false
 }
 
 /// Diagnostics, with what takes a process to find out: the operating system and the window's

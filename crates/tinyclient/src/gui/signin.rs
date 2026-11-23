@@ -39,7 +39,7 @@ use gpui::{
     canvas, deferred, div, fill, point, prelude::*, px, rgb, size, App, Bounds, Context, Deferred, Div, Entity,
     FocusHandle, Focusable, Global, MouseButton, Rgba, SharedString, Stateful, Task, WeakEntity, Window,
 };
-use protocol::{AccountKey, Change, CodeVia, ErrorCode, Network, Request, Response, SignInInput, SignInProblem, SignInStep};
+use protocol::{AccountKey, Change, CodeVia, ErrorCode, Network, Request, Response, SignInInput, SignInProblem, SignInStep, TransferStage};
 use std::io;
 use std::rc::Rc;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -61,6 +61,34 @@ const BOX: (f32, f32) = (48., 56.);
 const RETRY: Duration = Duration::from_secs(2);
 /// Above the popovers and menus of the shell, which use 1 to 3.
 const PRIORITY: usize = 8;
+
+/// Valid Signal device-linking URI that the primary Signal app can open directly on the same
+/// phone or tablet (`sgnl://linkdevice?uuid=...&pub_key=...`).
+pub(super) fn is_signal_link_uri(link: &str) -> bool {
+    let Some(query) = link.strip_prefix("sgnl://linkdevice?") else {
+        return false;
+    };
+    if query.is_empty() || query.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let mut has_uuid = false;
+    let mut has_pub_key = false;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "uuid" && !v.is_empty() {
+                has_uuid = true;
+            } else if k == "pub_key" && !v.is_empty() {
+                has_pub_key = true;
+            }
+        }
+    }
+    has_uuid && has_pub_key
+}
+
+/// Clear disclosure shown when linking Signal on a phone or tablet: companion devices receive
+/// messages over a websocket only while the app is open, with no background push notifications.
+pub(super) const SIGNAL_MOBILE_DELIVERY_NOTE: &str =
+    "Linked Signal devices do not receive background push notifications on phones or tablets. New Signal messages arrive while tinyclient is open.";
 
 /// The invite, when present, is authoritative even if another server was typed first.
 fn invite_notice(input: &str, server: &str) -> String {
@@ -338,7 +366,7 @@ fn step_problem(step: &SignInStep) -> Option<&SignInProblem> {
         | SignInStep::Server { problem }
         | SignInStep::Invite { problem, .. }
         | SignInStep::Browser { problem, .. } => problem.as_ref(),
-        SignInStep::Emoji { .. } | SignInStep::Done { .. } | SignInStep::Failed { .. } => None,
+        SignInStep::Emoji { .. } | SignInStep::Transfer { .. } | SignInStep::Done { .. } | SignInStep::Failed { .. } => None,
     }
 }
 
@@ -1089,17 +1117,39 @@ impl Sheet {
         };
         let phone_only = matches!(self.network, Network::Signal | Network::Messages | Network::Tiny);
         let steps = qr_steps(self.network);
-        // Signal links a computer only from the phone: there is no other way in to offer.
-        // On a phone Telegram's code cannot be scanned by the phone it is on: the number is the way in,
-        // and the code is for linking from another device.
+        if phone::active() && self.network == Network::Signal {
+            return self.phone_signal_qr_step(tile, problem.is_some(), cx);
+        }
+        // On a phone Telegram's code cannot be scanned by the phone it is on: the number is the
+        // way in, and the code is for linking from another device.
         if phone::active() && !phone_only {
             return self.phone_qr_step(tile, steps, cx);
         }
-        let other_way = if self.network == Network::Messages {
+        let open_signal_uri = (self.network == Network::Signal && phone::HANDHELD && problem.is_none())
+            .then(|| self.code.as_ref().map(|(uri, _)| uri.clone()).filter(|uri| is_signal_link_uri(uri)))
+            .flatten();
+        let other_way: Option<Stateful<Div>> = if self.network == Network::Messages {
             (!phone::active()).then(|| self.answer_link("signin-use-google", "Continue with Google instead", || SignInInput::Back, cx))
+        } else if !phone_only {
+            Some(self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx))
         } else {
-            (!phone_only).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx))
+            open_signal_uri.map(|uri| {
+                link("signin-open-signal", "Open Signal to link").on_click(move |_, _, cx| {
+                    cx.open_url(&uri);
+                })
+            })
         };
+        let tablet_delivery_note = (self.network == Network::Signal && phone::HANDHELD).then(|| {
+            div()
+                .mt(px(14.))
+                .p(px(10.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::raised())
+                .type_small()
+                .whitespace_normal()
+                .text_color(theme::text_soft())
+                .child(SIGNAL_MOBILE_DELIVERY_NOTE)
+        });
         let mobile_note = (self.network == Network::Messages && phone::active()).then(|| {
             div()
                 .mt(px(12.))
@@ -1115,6 +1165,7 @@ impl Sheet {
             .child(self.header(self.title(), self.network == Network::Messages && !phone::active(), cx))
             .child(div().mt(px(20.)).mb(px(18.)).flex().justify_center().child(tile))
             .child(div().flex().flex_col().gap(px(8.)).children(steps.into_iter().enumerate().map(|(at, words)| numbered(at + 1, words))))
+            .children(tablet_delivery_note)
             .children(mobile_note)
             .child(footer(22.).child(other_way.map_or_else(|| div().into_any_element(), IntoElement::into_any_element)).child(self.cancel("Cancel", cx)))
     }
@@ -1548,6 +1599,63 @@ impl Sheet {
             .child(footer)
     }
 
+    fn transfer_step(
+        &self,
+        stage: TransferStage,
+        chats: u32,
+        messages: u32,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+        detail: &str,
+        cx: &Context<Sheet>,
+    ) -> Div {
+        let (title, body, terminal) = transfer_copy(stage, chats, messages, downloaded_bytes, total_bytes, detail);
+        let pct = transfer_progress_ratio(stage, downloaded_bytes, total_bytes);
+        let bar = pct.map(|ratio| {
+            div()
+                .mt(px(14.))
+                .w_full()
+                .h(px(6.))
+                .rounded(px(3.))
+                .bg(theme::raised())
+                .overflow_hidden()
+                .child(div().h_full().w(gpui::relative(ratio)).bg(theme::accent()).rounded(px(3.)))
+        });
+        let counters = transfer_counters(stage, chats, messages, downloaded_bytes, total_bytes).map(|line| {
+            div()
+                .mt(px(10.))
+                .type_small()
+                .text_color(theme::text_soft())
+                .child(line)
+        });
+        let action: gpui::AnyElement = if terminal {
+            self.primary("Continue", |this, cx| this.answer(SignInInput::Skip, cx), cx)
+        } else if self.busy {
+            page::wide(button_disabled("Skipping…").h(px(32.))).into_any_element()
+        } else {
+            page::wide(button("signin-skip", ButtonKind::Secondary, "Skip").h(px(32.)))
+                .on_click(cx.listener(|this, _, _, cx| this.answer(SignInInput::Skip, cx)))
+                .into_any_element()
+        };
+        let note = (!terminal).then(|| {
+            div()
+                .mt(px(14.))
+                .type_small()
+                .whitespace_normal()
+                .text_color(theme::text_faint())
+                .child("This device is already linked. Skipping finishes immediately and shows new messages going forward.")
+        });
+        div()
+            .flex()
+            .flex_col()
+            .child(self.header(title, false, cx))
+            .child(div().mt(px(10.)).whitespace_normal().text_color(theme::text_soft()).child(body))
+            .children(bar)
+            .children(counters)
+            .children(note)
+            .child(footer(22.).child(div()).child(action))
+    }
+
     fn title(&self) -> &'static str {
         match self.network {
             Network::Telegram => "Sign in to Telegram",
@@ -1613,6 +1721,114 @@ fn run_your_own() -> Div {
                 tracing::warn!("tinyclient: {why}");
             }
         }))
+}
+
+/// Human-readable byte size for Signal history transfer progress.
+fn format_transfer_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Title, explanatory body, and whether the transfer step is terminal (needs "Continue" instead of "Skip").
+fn transfer_copy(
+    stage: TransferStage,
+    _chats: u32,
+    _messages: u32,
+    _downloaded_bytes: u64,
+    _total_bytes: u64,
+    detail: &str,
+) -> (&'static str, String, bool) {
+    let custom = detail.trim();
+    match stage {
+        TransferStage::Waiting => (
+            "Waiting for your phone",
+            "Accept \"Transfer message history\" on your primary phone to bring your existing Signal chats and recent media to this device.".to_owned(),
+            false,
+        ),
+        TransferStage::Downloading => (
+            "Transferring message history",
+            "Downloading your encrypted Signal message history archive…".to_owned(),
+            false,
+        ),
+        TransferStage::Importing => (
+            "Importing message history",
+            "Decrypting and importing your chats and messages into this device…".to_owned(),
+            false,
+        ),
+        TransferStage::Declined => (
+            "History transfer skipped",
+            if custom.is_empty() {
+                "Your phone chose not to transfer message history. This device is linked and ready for new messages.".to_owned()
+            } else {
+                format!("{custom} This device is linked and ready for new messages.")
+            },
+            true,
+        ),
+        TransferStage::Expired => (
+            "History transfer expired",
+            if custom.is_empty() {
+                "The history transfer timed out or expired on Signal's servers. This device is linked and ready for new messages.".to_owned()
+            } else {
+                format!("{custom} This device is linked and ready for new messages.")
+            },
+            true,
+        ),
+        TransferStage::Failed => (
+            "History transfer failed",
+            if custom.is_empty() {
+                "Message history could not be imported. This device is linked and ready for new messages.".to_owned()
+            } else {
+                format!("{custom} This device is linked and ready for new messages.")
+            },
+            true,
+        ),
+    }
+}
+
+fn transfer_progress_ratio(stage: TransferStage, downloaded_bytes: u64, total_bytes: u64) -> Option<f32> {
+    match stage {
+        TransferStage::Downloading if total_bytes > 0 => {
+            Some((downloaded_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0) as f32)
+        }
+        TransferStage::Importing => Some(1.0),
+        _ => None,
+    }
+}
+
+fn transfer_counters(
+    stage: TransferStage,
+    chats: u32,
+    messages: u32,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+) -> Option<String> {
+    match stage {
+        TransferStage::Downloading if total_bytes > 0 => Some(format!(
+            "{} of {}",
+            format_transfer_bytes(downloaded_bytes.min(total_bytes)),
+            format_transfer_bytes(total_bytes)
+        )),
+        TransferStage::Downloading if downloaded_bytes > 0 => {
+            Some(format!("{} downloaded", format_transfer_bytes(downloaded_bytes)))
+        }
+        TransferStage::Importing if chats > 0 || messages > 0 => Some(format!(
+            "{chats} {} · {messages} {}",
+            if chats == 1 { "chat" } else { "chats" },
+            if messages == 1 { "message" } else { "messages" }
+        )),
+        _ => None,
+    }
 }
 
 /// The browser step's button after it stopped: the provider by name, when the server gave one.
@@ -1840,6 +2056,9 @@ impl Render for Sheet {
                         .child(div().whitespace_normal().text_color(theme::text_soft())
                             .child("Open Messages on your Android phone and select this matching emoji to finish pairing. Keep your phone online."))
                         .child(footer(22.).child(div()).child(self.cancel("Cancel", cx))),
+                    SignInStep::Transfer { stage, chats, messages, downloaded_bytes, total_bytes, detail } => {
+                        self.transfer_step(*stage, *chats, *messages, *downloaded_bytes, *total_bytes, detail, cx)
+                    }
                     SignInStep::Failed { reason } => self.failed_step(reason, cx),
                     SignInStep::Done { .. } => div(),
                 }
@@ -2050,4 +2269,48 @@ mod tests {
         assert_eq!(matching_server(&link, &servers), Some(account));
         let other = protocol::invite_url("http://example.com", "token").unwrap();
         assert_eq!(matching_server(&other, &servers), None);
+    }
+
+    #[test]
+    fn signal_link_uri_requires_scheme_uuid_and_pub_key() {
+        assert!(is_signal_link_uri("sgnl://linkdevice?uuid=abc-123&pub_key=BpubKey1"));
+        assert!(is_signal_link_uri("sgnl://linkdevice?uuid=abc-123&pub_key=BpubKey1&capabilities=transfer"));
+        assert!(!is_signal_link_uri(""));
+        assert!(!is_signal_link_uri("https://signal.org/linkdevice?uuid=a&pub_key=b"));
+        assert!(!is_signal_link_uri("sgnl://linkdevice?uuid=abc-123"));
+        assert!(!is_signal_link_uri("sgnl://linkdevice?pub_key=BpubKey1"));
+        assert!(!is_signal_link_uri("sgnl://linkdevice?uuid=abc 123&pub_key=BpubKey1"));
+        assert!(SIGNAL_MOBILE_DELIVERY_NOTE.contains("background push") && SIGNAL_MOBILE_DELIVERY_NOTE.contains("while tinyclient is open"));
+    }
+
+    #[test]
+    fn signal_transfer_step_copy_and_progress_cover_all_stages() {
+        let (title, body, terminal) = transfer_copy(TransferStage::Waiting, 0, 0, 0, 0, "");
+        assert_eq!(title, "Waiting for your phone");
+        assert!(body.contains("Transfer message history"));
+        assert!(!terminal);
+        assert_eq!(transfer_progress_ratio(TransferStage::Waiting, 0, 0), None);
+        assert_eq!(transfer_counters(TransferStage::Waiting, 0, 0, 0, 0), None);
+
+        let ratio = transfer_progress_ratio(TransferStage::Downloading, 512 * 1024, 2 * 1024 * 1024).unwrap();
+        assert!((ratio - 0.25).abs() < 0.001);
+        assert_eq!(
+            transfer_counters(TransferStage::Downloading, 0, 0, 1_572_864, 4_718_592).as_deref(),
+            Some("1.5 MB of 4.5 MB")
+        );
+
+        assert_eq!(
+            transfer_counters(TransferStage::Importing, 1, 1, 100, 100).as_deref(),
+            Some("1 chat · 1 message")
+        );
+        assert_eq!(
+            transfer_counters(TransferStage::Importing, 3, 42, 100, 100).as_deref(),
+            Some("3 chats · 42 messages")
+        );
+
+        for stage in [TransferStage::Declined, TransferStage::Expired, TransferStage::Failed] {
+            let (_, body, terminal) = transfer_copy(stage, 0, 0, 0, 0, "Reason.");
+            assert!(terminal);
+            assert!(body.contains("Reason.") && body.contains("device is linked"));
+        }
     }

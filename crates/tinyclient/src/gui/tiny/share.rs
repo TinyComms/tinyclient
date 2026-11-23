@@ -39,11 +39,15 @@ impl Shell {
         });
     }
 
-    /// Shares what the picker has picked; the primary screen when it listed nothing.
+    /// Shares the selected source from the visible tab.
     fn tiny_share_picked(&mut self, cx: &mut Context<Self>) {
-        let picked = self.tiny_state.screen_pick.as_ref().and_then(|id| self.tiny_state.screens.iter().flatten().find(|screen| screen.id == *id)).cloned();
-        let screen = picked.as_ref().map(|screen| screen.id.clone());
-        self.tiny_state.shared = picked;
+        let Some(picked) = self.tiny_state.screen_pick.as_ref().and_then(|id| {
+            self.tiny_state.screens.iter().flatten().find(|screen| screen.id == *id && screen.window == self.tiny_state.screen_windows)
+        }).cloned() else {
+            return;
+        };
+        let screen = Some(picked.id.clone());
+        self.tiny_state.shared = Some(picked);
         self.close_modal(cx);
         let quality = Some(self.tiny_state.share_quality);
         let show_cursor = Some(self.tiny_state.share_cursor);
@@ -64,18 +68,25 @@ impl Shell {
             segmented()
                 .mt(px(14.))
                 .child(segment("tiny-share-screens", "Screens", !windows).on_click(cx.listener(|this, _, _, cx| {
-                    this.tiny_state.screen_windows = false;
-                    cx.notify();
+                    if this.tiny_state.screen_windows {
+                        this.tiny_state.screen_windows = false;
+                        let displays = this.tiny_state.screens.iter().flatten().filter(|screen| !screen.window);
+                        this.tiny_state.screen_pick = displays.clone().find(|screen| screen.primary).or_else(|| displays.into_iter().next()).map(|screen| screen.id.clone());
+                        cx.notify();
+                    }
                 })))
                 .child(segment("tiny-share-windows", "Windows", windows).on_click(cx.listener(|this, _, _, cx| {
-                    this.tiny_state.screen_windows = true;
-                    cx.notify();
+                    if !this.tiny_state.screen_windows {
+                        this.tiny_state.screen_windows = true;
+                        this.tiny_state.screen_pick = None;
+                        cx.notify();
+                    }
                 })))
         });
         let body = match &state.screens {
             None => div().h(px(THUMB_H + 40.)).flex().items_center().justify_center().type_ui().text_color(theme::text_soft()).child("Looking for screens and windows…").into_any_element(),
             Some(screens) if screens.is_empty() => {
-                div().mt(px(12.)).whitespace_normal().type_ui().text_color(theme::text_soft()).child("Your whole screen is shared. Everyone in the call can watch it.").into_any_element()
+                div().mt(px(12.)).whitespace_normal().type_ui().text_color(theme::text_soft()).child("No screens or windows are available to share.").into_any_element()
             }
             Some(screens) => div()
                 .id("tiny-share-list")
@@ -121,7 +132,7 @@ impl Shell {
                     this.tiny_state.share_cursor = false;
                     cx.notify();
                 }))));
-        let ready = state.screens.is_some();
+        let ready = state.screen_pick.is_some();
         let go = if ready && !self.tiny_state.busy {
             button("tiny-share-go", ButtonKind::Primary, "Share").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_share_picked(cx))).into_any_element()
         } else {
@@ -182,10 +193,9 @@ impl Shell {
     }
 }
 
-/// `mediad --screens`, with its pictures in the support folder. Empty when mediad could not say,
-/// and the share is then the primary screen.
+/// `mediad --screens`, with its pictures in the support folder.
 fn read_screens() -> Vec<ScreenSource> {
     let folder = protocol::support_dir().join("screens");
-    let stdout = protocol::media_host::output(protocol::launch::no_console(&mut std::process::Command::new(crate::gui::settings::mediad_path())).arg("--screens").arg(&folder).stderr(std::process::Stdio::null())).unwrap_or_default();
+    let stdout = protocol::media_host::output(protocol::launch::no_console(&mut std::process::Command::new(crate::gui::settings::mediad_path())).arg("--screens").arg(&folder).env("TINYCLIENT_SHARE_PICKER_PID", std::process::id().to_string()).stderr(std::process::Stdio::null())).unwrap_or_default();
     serde_json::from_slice::<Vec<ScreenSource>>(&stdout).unwrap_or_default().into_iter().take(SCREENS_LIMIT).collect()
 }

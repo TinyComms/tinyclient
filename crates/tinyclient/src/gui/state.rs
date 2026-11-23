@@ -1011,6 +1011,13 @@ impl Shell {
     /// Opens a conversation in the conversation region. The sidebar does not follow.
     pub(super) fn select(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
         self.sidebar_state.navigation_changed();
+        #[cfg(target_os = "android")]
+        if self.sidebar_state.find(&self.trees, &key).is_some_and(|row| {
+            !row.read_only && !row.archived && !row.locked
+                && !matches!(row.kind, protocol::ConversationKind::Forum | protocol::ConversationKind::Voice)
+        }) {
+            crate::mobile_share::note_recent(&key, title);
+        }
         if self.open.as_ref() == Some(&key) {
             return;
         }

@@ -73,11 +73,13 @@ fn control(id: &'static str, icon: &'static str, look: Look, enabled: bool) -> S
     div()
         .id(id)
         .group(id)
+        .role(gpui::Role::Button)
+        .aria_disabled(!enabled)
         .flex_none()
         .w(px(40.))
         .h(px(32.))
         .rounded(px(8.))
-        .tab_index(0)
+        .when(enabled, |control| control.tab_index(0))
         .focus_visible(|style| style.shadow(theme::focus_ring()))
         .bg(fill)
         .text_color(color)
@@ -105,6 +107,8 @@ fn leave() -> Stateful<Div> {
     let id = "call-leave";
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label("Leave call")
         .group(id)
         .flex_none()
         .w(px(48.))
@@ -128,6 +132,8 @@ fn worded(id: &'static str, icon: Option<&'static str>, word: &'static str, fill
     let lit = (color == theme::danger()).then(|| (id, theme::on_accent()));
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(word)
         .group(id)
         .h(px(32.))
         .px(px(14.))
@@ -427,7 +433,7 @@ impl Shell {
                 .border_t_1()
                 .border_color(theme::hairline())
                 .children(dock_picture)
-                .child(card),
+                .child(div().id("call-controls").role(gpui::Role::Group).aria_label("Call controls").child(card)),
         )
     }
 
@@ -1228,13 +1234,28 @@ impl Shell {
             .as_deref()
             .unwrap_or(call.conversation.network.label());
         let alone = self.call_left_alone(call);
+        let ringing = call.ringing.iter().filter(|ring| ring.state == "ringing").count();
         let words = match (&call.state, alone.as_deref()) {
+            (CallState::Connecting | CallState::Reconnecting, _) if call.moved_from.is_some() => "Moving the call…".to_owned(),
             (CallState::RingingOut, _) => "Ringing…".to_owned(),
             (CallState::Connecting, _) => "Connecting…".to_owned(),
             (CallState::Reconnecting, _) => "Reconnecting…".to_owned(),
             // Alone in a direct call: said, and left to me. tinyclient does not hang up for me.
             (_, Some(peer)) if subject.kind == ConversationKind::Direct => {
                 format!("{} left", peer.split_whitespace().next().unwrap_or(peer))
+            }
+            (CallState::Joined, _)
+                if subject.kind == ConversationKind::Group && call.participants.is_empty() && ringing > 0 =>
+            {
+                format!("Ringing {ringing}…")
+            }
+            (CallState::Joined, _) if subject.kind == ConversationKind::Group && call.participants.is_empty() => {
+                "Waiting for others".to_owned()
+            }
+            _ if call.move_notice.as_ref().is_some_and(|words| !words.is_empty())
+                && std::env::var("TINYCLIENT_SHOT_CALL").ok().as_deref() == Some("moved_notice") =>
+            {
+                call.move_notice.clone().unwrap_or_default()
             }
             _ => place.to_owned(),
         };
@@ -1265,6 +1286,7 @@ impl Shell {
             if off { Look::Off } else { Look::Rest },
             mute_enabled,
         )
+        .aria_label(mute_tip)
         .tooltip(tip(mute_tip, mute_enabled.then_some("⌘⇧M")))
         .when(mute_enabled, |mute| {
             mute.on_click(cx.listener(|this, _, _, cx| {
@@ -1304,6 +1326,7 @@ impl Shell {
             if deafen_off { Look::Off } else { Look::Rest },
             deafen_enabled,
         )
+        .aria_label(deafen_tip)
         .tooltip(tip(deafen_tip, deafen_enabled.then_some("⌘⇧D")))
         .when(deafen_enabled, |deafen| {
             deafen.on_click(cx.listener(|this, _, _, cx| {
@@ -1321,6 +1344,7 @@ impl Shell {
                 if share_on { Look::On } else { Look::Rest },
                 enabled,
             )
+            .aria_label(if share_on { "Stop sharing" } else { "Share your screen" })
             .when(enabled, |share| {
                 share
                     .tooltip(tip(
@@ -1355,6 +1379,7 @@ impl Shell {
                 },
                 enabled,
             )
+            .aria_label(if camera_on { "Turn camera off" } else { "Turn camera on" })
             .when(enabled, |camera| {
                 camera
                     .tooltip(tip(
@@ -1378,28 +1403,39 @@ impl Shell {
             && alone.is_some())
         .then(|| {
             control("call-ring-again", "icons/phone-outgoing.svg", Look::Rest, true)
+                .aria_label("Ring again")
                 .tooltip(tip("Ring again", None))
                 .on_click(cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
                     this.call_ask(Request::CallRing { people: None }, cx);
                 }))
         });
-        let add_people = (call.conversation.network == Network::Discord
+        let picker = self.call_add_picker(call, subject.kind);
+        let discord_add = !picker
+            && call.conversation.network == Network::Discord
             && subject.kind.is_direct()
             && joined
             && enabled
-            && (call.participants.len() + 1) < 10)
-        .then(|| {
+            && (call.participants.len() + 1) < 10;
+        let add_people = (picker || discord_add).then(|| {
             control(
                 "call-add-people",
                 "icons/user-plus.svg",
                 if menu == Some(Menu::AddPeople) { Look::Open } else { Look::Rest },
                 true,
             )
+            .aria_label("Add people")
             .tooltip(tip("Add people", None))
-            .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.call_menu_toggle(Menu::AddPeople, cx);
+            .on_click(cx.listener({
+                let picker = picker;
+                move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    if picker {
+                        this.open_call_people(window, cx);
+                    } else {
+                        this.call_menu_toggle(Menu::AddPeople, cx);
+                    }
+                }
             }))
         });
         let devices = control(
@@ -1412,6 +1448,7 @@ impl Shell {
             },
             enabled,
         )
+        .aria_label("Devices")
         .when(enabled, |devices| {
             devices
                 .tooltip(tip("Devices", None))
@@ -1483,6 +1520,9 @@ impl Shell {
     fn call_incoming(&self, call: &Call, subject: &Subject, from: &str, cx: &mut Context<Self>) -> Div {
         let words = match subject.kind {
             ConversationKind::Direct => "Incoming call".to_owned(),
+            ConversationKind::Group if subject.occupied > 0 => {
+                format!("{from} is calling · {} in the call", subject.occupied)
+            }
             _ => format!("{from} is calling"),
         };
         let decline = worded(
@@ -1658,11 +1698,14 @@ mod tests {
             share_view: None,
             picture_source: None,
             video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
+        move_notice: None,
         }
     }
 
     fn mara() -> Subject {
-        Subject { title: "Mara Okafor".into(), kind: ConversationKind::Direct, avatar: None, space: None }
+        Subject { title: "Mara Okafor".into(), kind: ConversationKind::Direct, avatar: None, space: None, occupied: 0 }
     }
 
     fn said(reason: CallFailure, detail: &str) -> Failure {
@@ -1735,7 +1778,7 @@ mod tests {
     }
 
     fn lounge() -> Subject {
-        Subject { title: "Lounge".into(), kind: ConversationKind::Voice, avatar: None, space: Some("Night Shift".into()) }
+        Subject { title: "Lounge".into(), kind: ConversationKind::Voice, avatar: None, space: Some("Night Shift".into()), occupied: 0 }
     }
 
     #[test]

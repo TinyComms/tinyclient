@@ -101,7 +101,7 @@ fn sound_row(row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
 }
 
 /// Disappearing-messages timer control in the info pane (separate from local `keep_days`).
-fn disappearing_row(
+pub(in crate::gui) fn disappearing_row(
     pane: &InfoPane,
     row: &Conversation,
     info: Option<&protocol::ConversationInfo>,
@@ -354,14 +354,17 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         let mut manage_bar = div().mt(px(10.)).flex().flex_wrap().items_center().gap(px(6.));
         if facts::can_rename(row) {
             let key = row.key.clone();
-            let current = row.title.clone();
+            // An unnamed Tiny group is titled by its people, which is not a name to edit: the
+            // field starts empty there, and saving it empty clears the name.
+            let tiny_group = row.key.network == Network::Tiny && row.kind == ConversationKind::Group;
+            let (current, hint) = if tiny_group { (String::new(), "Group name (empty to clear)") } else { (row.title.clone(), "Conversation name") };
             manage_bar = manage_bar.child(
                 button("details-rename", ButtonKind::Secondary, "Edit name")
                     .h(px(26.))
                     .px(px(8.))
                     .type_small()
                     .on_click(cx.listener(move |pane, _, _, cx| {
-                        pane.start_manage(key.clone(), ManageKind::Rename, &current, "Conversation name", cx);
+                        pane.start_manage(key.clone(), ManageKind::Rename, &current, hint, cx);
                     })),
             );
         }
@@ -420,7 +423,18 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     .h(px(26.))
                     .px(px(8.))
                     .type_small()
-                    .on_click(cx.listener(move |pane, _, _, cx| {
+                    .on_click(cx.listener(move |pane, _, window, cx| {
+                        // A Tiny group picks people by name, not by id.
+                        if key.network == Network::Tiny {
+                            let key = key.clone();
+                            let _ = pane.shell_weak().update(cx, |shell, cx| {
+                                let row = shell.held_rows().find(|row| row.key == key).cloned();
+                                if let Some(row) = row {
+                                    shell.open_add_people(&row, window, cx);
+                                }
+                            });
+                            return;
+                        }
                         pane.start_manage(key.clone(), ManageKind::AddMembers, "", "Person IDs (comma-separated)", cx);
                     })),
             );

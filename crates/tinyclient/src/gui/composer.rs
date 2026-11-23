@@ -48,6 +48,7 @@ mod tray;
 mod typing;
 
 pub use typing::preview_for as typing_preview_for;
+pub(super) use typing::wording_for as typing_wording_for;
 
 use super::components::place::{max_height, placed, Layer, Place};
 use super::components::{button, glyph, menu, menu_item, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};
@@ -326,11 +327,12 @@ pub(crate) fn format_countdown(seconds: u32) -> String {
 
 /// Formats a timed mute expiry (`ban_until`) as a human-readable local time sentence.
 pub(crate) fn format_ban_until(until: i64, now: i64) -> String {
-    let at = crate::gui::time::local(until);
+    let clock = crate::gui::time::clock(until);
     if until - now >= 24 * 3600 {
-        format!("You can send messages again on {:04}-{:02}-{:02} at {:02}:{:02}.", at.year, at.month, at.day, at.hour, at.minute)
+        let date = crate::gui::time::date(until);
+        format!("You can send messages again on {date} at {clock}.")
     } else {
-        format!("You can send messages again at {:02}:{:02}.", at.hour, at.minute)
+        format!("You can send messages again at {clock}.")
     }
 }
 
@@ -783,6 +785,8 @@ pub struct Composer {
     slash_dismissed: bool,
     slash_commands: HashMap<AccountKey, Vec<protocol::SlashCommand>>,
     slash_asked: HashSet<AccountKey>,
+    /// Conversations whose out-of-office banner was dismissed by the user this session.
+    ooo_dismissed: HashSet<Key>,
 }
 
 /// A reply-keyboard button that shares something, held until the person confirms.
@@ -1018,6 +1022,7 @@ impl Composer {
             slash_dismissed: false,
             slash_commands: HashMap::new(),
             slash_asked: HashSet::new(),
+            ooo_dismissed: HashSet::new(),
         }
     }
 
@@ -3528,13 +3533,33 @@ impl Composer {
         if !self.controls().attach {
             return;
         }
-        let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = asked.await {
-                let _ = this.update(cx, |this, cx| this.stage_files_for(target, paths, false, cx));
-            }
-        })
-        .detach();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            let Some(picked) = crate::mobile_share::pick() else { return };
+            cx.spawn(async move |this, cx| {
+                match picked.await {
+                    Ok(Ok(mut items)) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.stage_files_for(target, std::mem::take(&mut items.files), true, cx);
+                        });
+                    }
+                    Ok(Err(message)) => {
+                        let _ = this.update(cx, |this, cx| this.tell(&target.key, (message.into(), Tone::Refused), cx));
+                    }
+                    Err(_) => {}
+                }
+            }).detach();
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(Some(paths))) = asked.await {
+                    let _ = this.update(cx, |this, cx| this.stage_files_for(target, paths, false, cx));
+                }
+            })
+            .detach();
+        }
     }
 
     /// When a network has no GIF catalog (`!can.gifs`), the button asks for a `.gif` file and stages it like any other attachment.
@@ -4661,6 +4686,7 @@ impl Composer {
                 .pl(px(12.))
                 .pr(px(6.))
                 .rounded(px(theme::R_FLOAT))
+                .bg(theme::raised())
                 .border_1()
                 .border_color(theme::border())
                 .flex()
@@ -4702,6 +4728,7 @@ impl Composer {
                 .pl(px(12.))
                 .pr(px(6.))
                 .rounded(px(theme::R_FLOAT))
+                .bg(theme::raised())
                 .border_1()
                 .border_color(theme::border())
                 .flex()
@@ -4732,6 +4759,7 @@ impl Composer {
                 .pl(px(12.))
                 .pr(px(6.))
                 .rounded(px(theme::R_FLOAT))
+                .bg(theme::raised())
                 .border_1()
                 .border_color(theme::border())
                 .flex()
@@ -4776,9 +4804,9 @@ impl Composer {
             .pl(px(12.))
             .pr(px(6.))
             .rounded(px(theme::R_FLOAT))
+            .bg(if expired { theme::danger_soft() } else { theme::raised() })
             .border_1()
             .border_color(if expired { theme::danger_soft() } else { theme::border() })
-            .when(expired, |bar| bar.bg(theme::danger_soft()))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -4900,10 +4928,14 @@ impl Composer {
         // A phone's bar is the same line at the phone's run, 40 tall, its close a 36 pt target.
         let phone = crate::gui::phone::active();
         let bar = div()
+            .relative()
+            .overflow_hidden()
             .h(px(if phone { (crate::gui::phone::tokens::scaled(18.) + 22.).max(40.) } else { 32. }))
             .flex_none()
             .pl(px(12.))
             .pr(px(4.))
+            .rounded_t(px(theme::R_FLOAT - 1.))
+            .bg(theme::hover())
             .border_b_1()
             .border_color(theme::hairline())
             .flex()
@@ -4915,7 +4947,8 @@ impl Composer {
                 bar.phone_preview()
             })
             .text_color(theme::text_soft())
-            .cursor_default();
+            .cursor_default()
+            .child(div().absolute().top_0().bottom_0().left_0().w(px(2.)).bg(theme::accent()));
         let strong = |words: String| div().flex_none().max_w(px(if phone { 140. } else { 220. })).truncate().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(words);
         let faint = |words: String| div().flex_1().min_w_0().truncate().text_color(theme::text_faint()).child(words);
         let close = div()
@@ -5254,6 +5287,9 @@ impl Composer {
         };
         div()
             .id(id)
+            .role(gpui::Role::Button)
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .relative()
             .flex_none()
             .size(px(card_control()))
@@ -5347,24 +5383,31 @@ impl Composer {
         let send_tip = if slowmode_wait > 0 {
             format!("Slow mode: wait {}", format_countdown(slowmode_wait))
         } else {
-            match (self.editing.is_some(), controls.silent) {
+            let mut tip_text = match (self.editing.is_some(), controls.silent) {
                 (true, _) => "Save  ↩".to_owned(),
                 (false, true) => "Send  ↩ · Silently  ⌥↩".to_owned(),
                 (false, false) => "Send  ↩".to_owned(),
+            };
+            if self.editing.is_none() && controls.schedule {
+                tip_text.push_str(" · Right-click to schedule");
             }
+            tip_text
         };
         let attach = controls.attach.then(|| {
             self.card_button("attach", Some("icons/paperclip.svg"), false, None)
+                .aria_label("Attach files")
                 .tooltip(tip("Attach files", Some("⌘U")))
                 .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
         });
         let poll_btn = controls.poll.then(|| {
             self.card_button("create-poll", Some("icons/list.svg"), self.poll_composer.is_some(), None)
+                .aria_label("Create poll")
                 .tooltip(tip("Create poll", None))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_poll_composer(cx)))
         });
         let thread_btn = self.can_create_thread().then(|| {
             self.card_button("create-thread", Some("icons/messages-square.svg"), self.thread_composer.is_some(), None)
+                .aria_label("Create thread")
                 .tooltip(tip("Create thread", None))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_thread_composer(cx)))
         });
@@ -5373,13 +5416,14 @@ impl Composer {
             let slot = if catalog { Some(Trigger::Gif) } else { None };
             let button = self.card_button("gif", None, catalog && open_tab == Some(Tab::Gifs), slot);
             if catalog {
-                button.tooltip(tip("GIFs", Some("⇧⌘G"))).on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Gifs, window, cx)))
+                button.aria_label("GIFs").tooltip(tip("GIFs", Some("⇧⌘G"))).on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Gifs, window, cx)))
             } else {
-                button.tooltip(tip("Attach a GIF file", None)).on_click(cx.listener(|this, _, _, cx| this.attach_gif(cx)))
+                button.aria_label("Attach a GIF file").tooltip(tip("Attach a GIF file", None)).on_click(cx.listener(|this, _, _, cx| this.attach_gif(cx)))
             }
         });
         let smile = controls.emoji.then(|| {
             self.card_button("emoji", Some("icons/smile.svg"), open_tab == Some(Tab::Emoji) || open_tab == Some(Tab::Stickers), Some(Trigger::Smile))
+                .aria_label("Emoji")
                 .tooltip(tip("Emoji", Some("⌘E")))
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
         });
@@ -5448,6 +5492,11 @@ impl Composer {
         };
         let send = div()
             .id("send")
+            .role(gpui::Role::Button)
+            .aria_label(if self.editing.is_some() { "Save edited message" } else { "Send message" })
+            .aria_disabled(!ready)
+            .when(ready, |send| send.tab_index(0))
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .relative()
             .h(px(card_control()))
             .min_w(px(card_control()))
@@ -5525,17 +5574,18 @@ impl Composer {
                 .children(smile)
                 .child(send)
         } else {
+            let has_leading = controls.attach || poll_btn.is_some() || thread_btn.is_some();
             div()
                 .min_h(px(card_height() - 2.))
-                .pl(px(if controls.attach { 5. } else { 12. }))
+                .pl(px(if has_leading { 5. } else { 12. }))
                 .pr(px(5.))
                 .py(px(5.))
                 .flex()
                 .items_end()
-                .children(attach.map(|attach| attach.mr(px(4.))))
-                .children(poll_btn.map(|btn| btn.mr(px(4.))))
-                .children(thread_btn.map(|btn| btn.mr(px(4.))))
-                .child(field)
+                .children(attach.map(|attach| attach.mr(px(2.))))
+                .children(poll_btn.map(|btn| btn.mr(px(2.))))
+                .children(thread_btn.map(|btn| btn.mr(px(2.))))
+                .child(field.when(has_leading, |field| field.ml(px(2.))))
                 .children(sim_btn.map(|btn| btn.mr(px(4.))))
                 .children(gif.map(|gif| gif.mr(px(2.))))
                 .children(video_mode.map(|mode| mode.mr(px(2.))))
@@ -5547,13 +5597,15 @@ impl Composer {
         div()
             .min_h(px(card_height()))
             .rounded(px(theme::R_FLOAT))
-            .bg(theme::raised())
+            .bg(theme::over(theme::raised(), theme::canvas()))
             .border_1()
             .border_color(match (armed, focused) {
                 (true, _) => theme::warning(),
-                (false, true) => theme::border_strong(),
+                (false, true) => theme::focus(),
                 (false, false) => theme::border(),
             })
+            .when(focused && !armed, |card| card.shadow(theme::field_halo()))
+            .when(!focused && !armed, |card| card.hover(|style| style.border_color(theme::border_strong())))
             .flex()
             .flex_col()
             .cursor_text()
@@ -5733,7 +5785,7 @@ impl Composer {
             let rows = self.slash_rows(&query);
             let selected = if rows.is_empty() { 0 } else { self.slash_at.min(rows.len() - 1) };
             let this = cx.weak_entity();
-            let mut list = menu().w(px(340.)).max_w(px(340.));
+            let mut list = menu().w_full().max_w(px(340.));
             for (ix, cmd) in rows.iter().enumerate() {
                 let command = cmd.command.clone();
                 let description = cmd.description.clone();
@@ -5761,23 +5813,11 @@ impl Composer {
                         .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(description)),
                 );
             }
-            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(list)).priority(1).into_any_element());
+            return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(list)).priority(1).into_any_element());
         }
         if let Some(slash) = self.slash.as_ref().filter(|slash| !slash.rows.is_empty()) {
             let selected = slash.selected;
-            let mut panel = div()
-                .w(px(360.))
-                .max_w_full()
-                .p(px(4.))
-                .rounded(px(theme::R_FLOAT))
-                .bg(theme::overlay())
-                .border_1()
-                .border_color(theme::overlay_edge())
-                .shadow(theme::shadow_popover())
-                .flex()
-                .flex_col()
-                .gap(px(1.))
-                .occlude();
+            let mut panel = menu().w_full().max_w(px(360.)).gap(px(1.));
             for (index, cmd) in slash.rows.iter().enumerate() {
                 let active = index == selected;
                 let hint = if cmd.usage.is_empty() { None } else { Some(cmd.usage.clone()) };
@@ -5790,13 +5830,20 @@ impl Composer {
                         .py(px(5.))
                         .rounded(px(theme::R_CONTROL))
                         .when(active, |r| r.bg(theme::selected()))
-                        .hover(|s| s.bg(theme::hover()))
+                        .when(!active, |r| r.hover(|s| s.bg(theme::hover())))
                         .cursor_pointer()
                         .flex()
                         .items_center()
                         .justify_between()
                         .gap(px(8.))
-                        .on_click(cx.listener(move |this, _, _, cx| this.complete_slash(index, cx)))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                this.complete_slash(index, cx);
+                            }),
+                        )
                         .child(
                             div()
                                 .min_w_0()
@@ -5831,7 +5878,7 @@ impl Composer {
                         }),
                 );
             }
-            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(panel)).priority(1).into_any_element());
+            return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(panel)).priority(1).into_any_element());
         }
         if self.colon.as_ref().is_some_and(|colon| !colon.cells.is_empty()) {
             let this = cx.weak_entity();
@@ -5849,7 +5896,7 @@ impl Composer {
                 }
             };
             let drawn = colon::draw(colon, customs, tone, image, pick);
-            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
+            return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
         }
         if let Some(slash) = self.app_slash.as_ref().filter(|slash| !slash.is_empty()) {
             let this = cx.weak_entity();
@@ -5857,7 +5904,7 @@ impl Composer {
                 let _ = this.update(cx, |this, cx| this.complete_app_slash(row, cx));
             };
             let drawn = slash::draw(slash, pick);
-            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
+            return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
         }
         let list = self.list.as_ref().filter(|list| !list.rows.is_empty())?;
         let this = cx.weak_entity();
@@ -5865,7 +5912,7 @@ impl Composer {
             let _ = this.update(cx, |this, cx| this.complete(row, cx));
         };
         let drawn = complete::draw(list, &self.hub, pick, cx);
-        Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element())
+        Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element())
     }
 
     /// The picker, above the card, right edge on its trigger's, inside the window.
@@ -6380,8 +6427,8 @@ fn ooo_banner_text(name: &str, away: &str, until: Option<i64>) -> (String, Optio
 
 impl Composer {
     /// Compact banner shown above the composer in a 1:1 chat when the peer is out of office.
-    fn ooo_banner(&self, target: &Target) -> Option<Div> {
-        if target.kind != ConversationKind::Direct {
+    fn ooo_banner(&self, target: &Target, cx: &mut Context<Self>) -> Option<Div> {
+        if target.kind != ConversationKind::Direct || self.ooo_dismissed.contains(&target.key) {
             return None;
         }
         let peer_id = target.peer.as_deref().filter(|id| !id.is_empty())?;
@@ -6389,6 +6436,7 @@ impl Composer {
         let (_, away) = self.peer_away.get(&peer_key)?;
         let (away, until) = away.as_ref()?;
         let (head, note) = ooo_banner_text(&target.title, away, *until);
+        let dismiss_key = target.key.clone();
         Some(
             div()
                 .mb(px(6.))
@@ -6401,7 +6449,7 @@ impl Composer {
                 .flex()
                 .items_start()
                 .gap(px(8.))
-                .child(glyph("icons/calendar.svg", 14., theme::warning()))
+                .child(div().pt(px(2.)).flex_none().child(glyph("icons/calendar.svg", 14., theme::warning())))
                 .child(
                     div()
                         .flex_1()
@@ -6411,6 +6459,25 @@ impl Composer {
                         .gap(px(2.))
                         .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(head))
                         .children(note.map(|text| div().type_small().text_color(theme::text_soft()).child(text))),
+                )
+                .child(
+                    div()
+                        .id("ooo-dismiss")
+                        .flex_none()
+                        .size(px(20.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(tip("Dismiss", None))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ooo_dismissed.insert(dismiss_key.clone());
+                            cx.notify();
+                        }))
+                        .child(glyph("icons/x.svg", 12., theme::text_soft())),
                 ),
         )
     }
@@ -6430,7 +6497,7 @@ impl Render for Composer {
         } else if std::mem::take(&mut self.focus_next) {
             window.focus(&focus, cx);
         }
-        let conversation = self.target.as_ref().map(|target| target.key.clone());
+        let conversation = self.target.as_ref().filter(|target| self.locked_for(target).is_none()).map(|target| target.key.clone());
         let active = window.is_window_active();
         self.typing.update(cx, |typing, cx| typing.show(conversation.as_ref(), active, cx));
         // A drag that ended outside, or was let go elsewhere, leaves no frame.
@@ -6447,6 +6514,9 @@ impl Render for Composer {
 
         let phone = crate::gui::phone::active();
         let dock = div()
+            .id("composer")
+            .role(gpui::Role::Group)
+            .aria_label("Composer")
             .flex_none()
             // A phone dock keeps the messages' 16 pt gutters, so the card's edges line up with
             // the words above it; its first control starts at 21, past the back-swipe strip's 20.
@@ -6483,14 +6553,16 @@ impl Render for Composer {
             return dock;
         };
         let undo = self.undo_join_bar(&target, cx);
-        let body = match self.locked_for(&target) {
+        let locked = self.locked_for(&target);
+        let show_typing = locked.is_none();
+        let body = match locked {
             Some(locked) => self.bar(locked, target.key.network, cx),
             None => self.card(focus.is_focused(window), window, cx),
         };
         let anchors = self.anchors.clone();
-        // The row sits over the card's text, not its edge.
-        dock.child(div().pl(px(13.)).child(self.typing.clone()))
-            .children(self.ooo_banner(&target))
+        // The row sits over the card's text, not its edge; hidden when the composer is locked.
+        dock.when(show_typing, |dock| dock.child(div().pl(px(13.)).child(self.typing.clone())))
+            .children(self.ooo_banner(&target, cx))
             .children(self.send_options_bar(cx))
             .children(self.poll_composer_panel(cx))
             .children(self.thread_composer_panel(cx))
@@ -6592,6 +6664,33 @@ impl Shell {
             archived: open.archived,
             locked: open.locked,
         }
+    }
+
+    /// Imports the handoff into the chosen draft without initiating a send.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub(in crate::gui) fn stage_phone_share(
+        &self, row: &Conversation, mut items: crate::mobile_share::Items, cx: &mut Context<Self>,
+    ) -> Result<(), crate::mobile_share::Items> {
+        let link = self.snapshot.as_ref().map_or(Link::SignedOut, |snapshot| snapshot.account_link(&row.key));
+        let target = self.target_of(row, link);
+        self.composer_in(false, cx).update(cx, |composer, cx| {
+            if composer.locked_for(&target).is_some()
+                || (!items.files.is_empty() && !controls(&target.can, false).attach)
+            {
+                return Err(items);
+            }
+            composer.aim(target.clone(), &row.draft, cx);
+            composer.end_edit(cx);
+            if !items.text.is_empty() {
+                let merged = crate::mobile_share::draft_with_share(composer.input.read(cx).text(), &items.text);
+                composer.input.update(cx, |input, cx| input.set_text(&merged, cx));
+                composer.follow_text(cx);
+                composer.save_draft(cx);
+            }
+            composer.stage_files_for(target, std::mem::take(&mut items.files), true, cx);
+            cx.notify();
+            Ok(())
+        })
     }
 
     /// The composer dock of the open conversation.
@@ -7666,6 +7765,10 @@ mod tests {
         assert!(soon.starts_with("You can send messages again at "), "{soon}");
         let later = format_ban_until(1_700_200_000, 1_700_000_000);
         assert!(later.starts_with("You can send messages again on "), "{later}");
+        // January (month index 0 internally) must never format as month 00.
+        let jan = format_ban_until(1_768_478_400, 1_768_000_000);
+        assert!(jan.contains("January") || jan.contains("Jan"), "expected January date, got: {jan}");
+        assert!(!jan.contains("-00-"), "month off-by-one: {jan}");
     }
 
     #[test]

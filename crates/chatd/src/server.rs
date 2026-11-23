@@ -4141,6 +4141,9 @@ impl Chat {
             Ok(row) => row,
             Err(err) => return internal(err),
         };
+        if row.as_ref().is_some_and(|row| row.kind == ConversationKind::Group) {
+            return self.tiny_group_call(conversation, row);
+        }
         let direct = row
             .as_ref()
             .is_some_and(|row| row.kind.is_direct() && row.call == CallSupport::Native);
@@ -4187,15 +4190,56 @@ impl Chat {
         }
     }
 
+    /// A group call the server lists `group_calls` for. A call already up is joined. A quiet
+    /// group is started. Either way mediad is up before the socket hears it, and a refusal ends it.
+    fn tiny_group_call(&self, conversation: Key, row: Option<protocol::Conversation>) -> Response {
+        if !row.as_ref().is_some_and(|row| row.call == CallSupport::Native) {
+            return error(ErrorCode::Unsupported, "This conversation has no calls tinyclient can join.");
+        }
+        if self.hub.link(&conversation.account()) != Link::Connected {
+            self.hub.calls.show_failed(&self.hub, conversation, protocol::CallFailure::Lost, adapters::tiny::live::OFFLINE);
+            return self.status();
+        }
+        let occupied = self.hub.occupants(&conversation).is_some_and(|inside| inside.total > 0);
+        if let Err(err) = self.hub.calls.start(&self.hub, conversation.clone()) {
+            return call_error(err);
+        }
+        let group_id = conversation.id.clone();
+        let account = conversation.account();
+        let answer = if occupied {
+            self.tiny_ask(&account, |reply| adapters::tiny::live::Ask::GroupJoin { group_id, reply })
+        } else {
+            self.tiny_ask(&account, |reply| adapters::tiny::live::Ask::GroupStart { group_id, from_direct: None, reply })
+        };
+        if answer != Response::Ok {
+            self.hub.calls.end_if(&self.hub, &conversation);
+        }
+        answer
+    }
+
     /// Accepts the ring that is showing. A Tiny direct call does not start mediad here: the
-    /// server says `call.accepted`, and the offer goes out then. Every other network starts
-    /// mediad and joins at once.
+    /// server says `call.accepted`, and the offer goes out then. A Tiny group call does start
+    /// it, then joins. Every other network starts mediad and joins at once.
     fn call_accept(&self) -> Response {
         let Some(conversation) = self.hub.calls.incoming(&self.hub) else {
             return call_error(CallError::NoCall);
         };
         if conversation.network == Network::Tiny {
+            let group = self.hub.store().conversation(&conversation).ok().flatten().is_some_and(|row| row.kind == ConversationKind::Group);
             self.hub.calls.clicked(&conversation);
+            if group {
+                return match self.hub.calls.accept(&self.hub) {
+                    Ok(conversation) => {
+                        let group_id = conversation.id.clone();
+                        let answer = self.tiny_ask(&conversation.account(), |reply| adapters::tiny::live::Ask::GroupJoin { group_id, reply });
+                        if answer != Response::Ok {
+                            self.hub.calls.end_if(&self.hub, &conversation);
+                        }
+                        answer
+                    }
+                    Err(err) => call_error(err),
+                };
+            }
             self.command(&conversation.account(), Command::CallJoin(conversation.id));
             return self.status();
         }
@@ -5098,7 +5142,10 @@ impl Chat {
                 if title.is_none() && topic.is_none() && description.is_none() {
                     return Response::Ok;
                 }
-                if title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                // A Tiny group's name may be cleared: it is then called by its people again.
+                let clears = conversation.network == Network::Tiny
+                    && matches!(self.hub.store().conversation(&conversation), Ok(Some(row)) if row.kind == ConversationKind::Group);
+                if title.as_deref().is_some_and(|t| t.trim().is_empty()) && !clears {
                     return error(ErrorCode::Refused, "A conversation name cannot be empty.");
                 }
                 let res = self.act(&conversation, |conversation_id, reply| Command::ConversationUpdate {
