@@ -129,6 +129,9 @@ impl World {
             .env_remove("TINYCLIENT_TELEGRAM_MANY")
             .env_remove("TINYCLIENT_TELEGRAM_PREMIUM")
             .stderr(Stdio::from(log));
+        if let Some(mediad) = std::env::var_os("TINYCLIENT_TEST_MEDIAD").or_else(|| std::env::var_os("TINYCLIENT_MEDIAD")) {
+            command.env("TINYCLIENT_MEDIAD", mediad);
+        }
         for (name, value) in env {
             command.env(name, value);
         }
@@ -363,7 +366,7 @@ fn the_chats_are_one_list_with_no_space_each_filed_in_every_folder_it_matches() 
     let row = |id: &str| rows.iter().find(|row| row.key.id == id).unwrap();
     assert_eq!((row("u7002").title.as_str(), row("u7002").unread, row("u7002").last_read.as_deref()), ("Odalys Brandt", 1, Some("11")));
     assert_eq!(row("u7002").preview, "Good. Trailhead at seven.");
-    assert_eq!((row("u7002").peer.as_deref(), row("u7002").call), (Some("u7002"), protocol::CallSupport::Handoff));
+    assert_eq!((row("u7002").peer.as_deref(), row("u7002").call), (Some("u7002"), protocol::CallSupport::Native));
     // Saved Messages: the user's own notes, no presence, no call.
     assert_eq!((row("u7001").title.as_str(), row("u7001").special, row("u7001").peer.as_deref(), row("u7001").call), ("Saved Messages", Special::Saved, None, protocol::CallSupport::None));
     // The login-code chat: Telegram's own, verified, read-only, no Call button.
@@ -3573,10 +3576,10 @@ fn full_user_call_flags_gate_call_support_and_video() {
     let world = World::signed_in();
     world.connected();
     let row = |id: &str| world.conversation(id).expect(id);
-    // Before users.getFullUser is asked, both people keep the optimistic hand-off button.
-    assert_eq!(row("u7002").call, protocol::CallSupport::Handoff);
+    // Before users.getFullUser is asked, both people have native 1:1 calls (`#469`).
+    assert_eq!(row("u7002").call, protocol::CallSupport::Native);
     assert!(!row("u7002").call_video);
-    assert_eq!(row("u7003").call, protocol::CallSupport::Handoff);
+    assert_eq!(row("u7003").call, protocol::CallSupport::Native);
 
     // 1. phone_calls_available = false, phone_calls_private = false -> CallSupport::None.
     world.steer("call-flags 7002 0 0 0");
@@ -3590,10 +3593,10 @@ fn full_user_call_flags_gate_call_support_and_video() {
     assert_eq!(row("u7003").call, protocol::CallSupport::Restricted);
     assert!(!row("u7003").call_video);
 
-    // 3. phone_calls_available = true, video_calls_available = true -> Handoff + call_video.
+    // 3. phone_calls_available = true, video_calls_available = true -> Native + call_video.
     world.steer("call-flags 7002 1 0 1");
     assert!(matches!(world.ask(Request::ConversationInfo { conversation: key("u7002") }), Response::ConversationInfo { .. }));
-    assert_eq!(row("u7002").call, protocol::CallSupport::Handoff);
+    assert_eq!(row("u7002").call, protocol::CallSupport::Native);
     assert!(row("u7002").call_video);
 }
 
@@ -6769,6 +6772,294 @@ fn voice_transcription_streams_update_persists_across_restart_and_reports_trial_
         "expected Premium explanation, got: {:?}",
         exhausted.failed
     );
+}
+
+fn current_call(world: &World) -> Option<protocol::Call> {
+    match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("expected Status, got {other:?}"),
+    }
+}
+
+fn calls_log_contains(world: &World, needle: &str) -> bool {
+    std::fs::read_to_string(world.dir.join("telegram.calls"))
+        .map(|s| s.lines().any(|l| l.contains(needle)))
+        .unwrap_or(false)
+}
+
+#[test]
+fn incoming_call_rings_acknowledges_received_call_declines_and_clears_on_discard_or_answer_elsewhere() {
+    let world = World::signed_in();
+    world.connected();
+
+    // 1. Incoming voice call rings, sends phone.receivedCall, and decline sends phone.discardCall(busy).
+    world.steer("call-ring-in");
+    let ring = world.until("incoming voice ring", || {
+        let call = current_call(&world)?;
+        matches!(call.state, protocol::CallState::RingingIn { .. }).then_some(call)
+    });
+    assert_eq!(ring.conversation, key("u7002"));
+    assert!(!ring.incoming_video);
+    assert_eq!(ring.state, protocol::CallState::RingingIn { from: "Odalys Brandt".into() });
+    world.until("phone.receivedCall logged", || calls_log_contains(&world, "ReceivedCall 91010").then_some(()));
+
+    assert!(matches!(world.ask(Request::CallDecline), Response::Status { .. }));
+    world.until("ring cleared after decline", || current_call(&world).is_none().then_some(()));
+    world.until("discard busy logged", || calls_log_contains(&world, "DiscardCall 91010 reason=busy").then_some(()));
+
+    // 2. Incoming video call sets incoming_video = true and stops ringing if answered on another device.
+    world.steer("call-ring-in-video");
+    let vring = world.until("incoming video ring", || {
+        let call = current_call(&world)?;
+        (matches!(call.state, protocol::CallState::RingingIn { .. }) && call.incoming_video).then_some(call)
+    });
+    assert_eq!(vring.conversation, key("u7002"));
+    world.steer("call-answer-elsewhere");
+    world.until("ring cleared when answered elsewhere", || current_call(&world).is_none().then_some(()));
+
+    // 3. Incoming call cleared cleanly when remote discards/cancels.
+    world.steer("call-ring-in");
+    world.until("incoming ring before cancel", || {
+        current_call(&world).filter(|c| matches!(c.state, protocol::CallState::RingingIn { .. }))
+    });
+    world.steer("call-discard-in");
+    world.until("ring cleared on discard", || current_call(&world).is_none().then_some(()));
+}
+
+#[test]
+fn live_group_and_channel_video_chats_show_occupants_and_clear_on_discard() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_CREW_CALL", "live")]);
+    world.connected();
+
+    // Sidebar row shows live presence before opening, without calling phone.getGroupCall on unopened chats.
+    let before_open = world.until("sidebar live occupants", || {
+        world.conversation("g8001").and_then(|c| c.occupants).filter(|o| o.live)
+    });
+    assert!(before_open.live);
+    assert!(!calls_log_contains(&world, "GetGroupCall"), "must not poll GetGroupCall for unopened chats");
+
+    // Opening the group fetches phone.getGroupCall once and populates title, count, and participants.
+    let _ = world.ask(Request::Watch(Watching {
+        conversation: Some(key("g8001")),
+        rows: vec![key("g8001")],
+        ..Watching::default()
+    }));
+    let _ = world.messages("g8001");
+    let loaded = world.until("group call participants loaded", || {
+        let occ = world.conversation("g8001")?.occupants?;
+        (occ.title == "Trail planning" && occ.total == 2 && occ.people.len() == 2).then_some(occ)
+    });
+    assert!(loaded.live);
+    assert!(loaded.people.iter().any(|p| p.name == "Odalys Brandt"));
+    assert!(loaded.people.iter().any(|p| p.name == "Tobin Reyes"));
+    assert!(calls_log_contains(&world, "GetGroupCall 88001"));
+
+    // Live participant join and leave updates keep the banner current.
+    world.steer("group-call-participant-join");
+    world.until("third participant joins", || {
+        let occ = world.conversation("g8001")?.occupants?;
+        (occ.total == 3 && occ.people.iter().any(|p| p.name == "Nia Pell")).then_some(())
+    });
+    world.steer("group-call-participant-leave");
+    world.until("participant leaves", || {
+        let occ = world.conversation("g8001")?.occupants?;
+        (!occ.people.iter().any(|p| p.name == "Tobin Reyes")).then_some(())
+    });
+
+    // Discard clears the live banner and sidebar badge completely.
+    world.steer("group-call-discard");
+    world.until("group call cleared on discard", || {
+        world.conversation("g8001").is_some_and(|c| c.occupants.is_none()).then_some(())
+    });
+
+    // Broadcast channels also show live streams.
+    world.steer("group-call-live-channel");
+    let chan_occ = world.until("channel live stream occupants", || {
+        let occ = world.conversation("c9001")?.occupants?;
+        (occ.live && occ.title == "Field broadcast").then_some(occ)
+    });
+    assert_eq!(chan_occ.total, 2);
+}
+
+#[test]
+fn scheduled_video_chat_shows_countdown_toggles_reminder_and_starts_into_live_bar() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_ADMIN", "1")]);
+    world.connected();
+
+    let crew = world.conversation("g8001").expect("g8001");
+    assert!(crew.rights.manage_call, "admin/creator must have manage_call right");
+
+    let target_ts = t0() + 7_200;
+    assert_eq!(
+        world.ask(Request::GroupCallSchedule {
+            conversation: key("g8001"),
+            schedule_date: target_ts,
+            title: Some("Alpine planning".to_owned()),
+        }),
+        Response::Ok
+    );
+    world.until("CreateGroupCall logged", || calls_log_contains(&world, "CreateGroupCall g8001 schedule=Some(").then_some(()));
+
+    // Service message records the scheduled video chat in local time, and occupants carries scheduled_at.
+    let scheduled_occ = world.until("scheduled occupants present", || {
+        let occ = world.conversation("g8001")?.occupants?;
+        (occ.scheduled_at == Some(target_ts) && !occ.live && !occ.subscribed).then_some(occ)
+    });
+    assert_eq!(scheduled_occ.title, "Alpine planning");
+    let sched_msg = world.until("scheduled service message", || {
+        world.messages("g8001").into_iter().find(|m| m.text.contains("scheduled a video chat for "))
+    });
+    assert_eq!(sched_msg.kind, MessageKind::System);
+
+    // Toggle reminder subscription on.
+    assert_eq!(
+        world.ask(Request::GroupCallSubscribe {
+            conversation: key("g8001"),
+            subscribed: true,
+        }),
+        Response::Ok
+    );
+    world.until("reminder subscribed", || {
+        world.conversation("g8001")?.occupants.filter(|o| o.subscribed)
+    });
+    assert!(calls_log_contains(&world, "ToggleGroupCallStartSubscription"));
+
+    // Start now transitions cleanly into a live video chat with CallSupport::Native.
+    assert_eq!(
+        world.ask(Request::GroupCallStart { conversation: key("g8001") }),
+        Response::Ok
+    );
+    world.until("transitioned to live video chat", || {
+        let conv = world.conversation("g8001")?;
+        let occ = conv.occupants?;
+        (occ.live && occ.scheduled_at.is_none() && conv.call == protocol::CallSupport::Native).then_some(())
+    });
+    assert!(calls_log_contains(&world, "StartScheduledGroupCall"));
+
+    // Discard clears the bar.
+    world.steer("group-call-discard");
+    world.until("cleared after discard", || {
+        world.conversation("g8001").is_some_and(|c| c.occupants.is_none()).then_some(())
+    });
+}
+
+#[test]
+fn direct_voice_call_completes_dh_handshake_emoji_signaling_and_auto_busy() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_MEDIAD_AUDIO", "null")]);
+    world.connected();
+
+    // 1. Place outgoing 1:1 voice call -> RingingOut, then remote accepts -> DH confirm -> Joined + 4 emoji.
+    assert!(matches!(world.ask(Request::CallStart { conversation: key("u7002") }), Response::Status { .. }));
+    world.until("ringing out", || {
+        current_call(&world).filter(|c| c.conversation == key("u7002") && c.state == protocol::CallState::RingingOut)
+    });
+    assert!(calls_log_contains(&world, "GetDhConfig"));
+    assert!(calls_log_contains(&world, "GetCallConfig"));
+    assert!(calls_log_contains(&world, "RequestCall u7002"));
+
+    world.steer("call-accept-out");
+    let joined = world.until("1:1 call joined with verified emoji", || {
+        let call = current_call(&world)?;
+        let sec = call.security.as_ref()?;
+        (call.state == protocol::CallState::Joined
+            && sec.mode == protocol::SecurityMode::EndToEnd
+            && sec.emojis.len() == 4)
+            .then_some(call)
+    });
+    assert_eq!(joined.conversation, key("u7002"));
+    assert!(calls_log_contains(&world, "ConfirmCall") && calls_log_contains(&world, "match=true"));
+    world.until("mediad sent encrypted signaling", || calls_log_contains(&world, "SendSignalingData").then_some(()));
+
+    // 2. Second incoming call while active is automatically discarded with busy; active call stays up.
+    world.steer("call-ring-in-second");
+    world.until("auto-busy on second incoming call", || calls_log_contains(&world, "DiscardCall 91099 reason=busy").then_some(()));
+    assert_eq!(current_call(&world).map(|c| c.state), Some(protocol::CallState::Joined));
+
+    // 3. Hang up sends DiscardCall(hangup).
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("call cleared after hangup", || current_call(&world).is_none().then_some(()));
+    world.until("hangup logged", || calls_log_contains(&world, "reason=hangup").then_some(()));
+
+    // 4. Remote busy surfaces "Busy." failure.
+    world.steer("call-busy-next");
+    assert!(matches!(world.ask(Request::CallStart { conversation: key("u7002") }), Response::Status { .. }));
+    let busy = world.until("busy failure surfaced", || {
+        let call = current_call(&world)?;
+        matches!(&call.state, protocol::CallState::Failed { reason: protocol::CallFailure::NoAnswer, detail } if detail == "Busy.")
+            .then_some(call)
+    });
+    assert_eq!(busy.conversation, key("u7002"));
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("failed call dismissed", || current_call(&world).is_none().then_some(()));
+
+    // 5. Incoming call answered inside tinyclient verifies g_a_hash + fingerprint -> Joined + 4 emoji.
+    world.steer("call-ring-in");
+    world.until("incoming ring ready to accept", || {
+        current_call(&world).filter(|c| matches!(c.state, protocol::CallState::RingingIn { .. }))
+    });
+    assert!(matches!(world.ask(Request::CallAccept), Response::Status { .. }));
+    let answered = world.until("incoming call answered and joined", || {
+        let call = current_call(&world)?;
+        let sec = call.security.as_ref()?;
+        (call.state == protocol::CallState::Joined && sec.emojis.len() == 4).then_some(call)
+    });
+    assert_eq!(answered.conversation, key("u7002"));
+    assert!(calls_log_contains(&world, "AcceptCall 91010"));
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("answered call left", || current_call(&world).is_none().then_some(()));
+}
+
+#[test]
+fn group_voice_chat_joins_muted_pages_participants_keepalives_mutes_speaks_and_leaves() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[
+            ("TINYCLIENT_MEDIAD_AUDIO", "tone"),
+            ("TINYCLIENT_TELEGRAM_CHECK_MS", "150"),
+        ],
+    );
+    world.connected();
+
+    // Seed a live group video chat with 3 participants so paging fetches 2 pages (`offset=` and `offset=p2`).
+    world.steer("group-call-live");
+    world.until("live group call", || {
+        world.conversation("g8001").filter(|c| c.call == protocol::CallSupport::Native)
+    });
+    world.steer("group-call-participant-join");
+    world.until("three participants seeded", || {
+        world.conversation("g8001")?.occupants.filter(|o| o.total == 3)
+    });
+
+    // Join the group voice chat -> joins muted by default, no 1:1 E2EE lock/emoji, pages participants.
+    assert!(matches!(world.ask(Request::CallStart { conversation: key("g8001") }), Response::Status { .. }));
+    let joined = world.until("group voice chat joined", || {
+        let call = current_call(&world)?;
+        (call.conversation == key("g8001") && call.state == protocol::CallState::Joined).then_some(call)
+    });
+    assert!(joined.muted, "Telegram group voice chat must join muted by default");
+    assert!(joined.security.is_none(), "group voice chat must not show 1:1 E2EE lock or emoji");
+    assert!(calls_log_contains(&world, "JoinGroupCall") && calls_log_contains(&world, "muted=true"));
+    world.until("paged participants fetched", || {
+        calls_log_contains(&world, "offset=p2").then_some(())
+    });
+
+    // Keepalive timer fires phone.checkGroupCall.
+    world.until("checkGroupCall keepalive fired", || calls_log_contains(&world, "CheckGroupCall").then_some(()));
+
+    // Unmuting updates Telegram via phone.editGroupCallParticipant and tone audio sends speakingInGroupCallAction.
+    assert!(matches!(world.ask(Request::CallSet { muted: false, deafened: false }), Response::Status { .. }));
+    world.until("editGroupCallParticipant unmute logged", || {
+        calls_log_contains(&world, "EditGroupCallParticipant") && calls_log_contains(&world, "muted=Some(false)")
+    }.then_some(()));
+    world.until("speakingInGroupCallAction sent", || {
+        calls_log_contains(&world, "SetTyping g8001").then_some(())
+    });
+
+    // Leaving always notifies Telegram via phone.leaveGroupCall.
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("group call cleared", || current_call(&world).is_none().then_some(()));
+    world.until("leaveGroupCall logged", || calls_log_contains(&world, "LeaveGroupCall").then_some(()));
 }
 
 #[test]

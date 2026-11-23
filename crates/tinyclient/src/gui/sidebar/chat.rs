@@ -134,6 +134,30 @@ pub fn mark(network: Network, size: f32, color: Rgba) -> gpui::AnyElement {
 
 /// What follows a name, at most one thing (C4).
 pub fn name_mark(c: &Conversation) -> Option<Div> {
+    if c.key.network == Network::Telegram {
+        if let Some(occ) = c.occupants.as_ref() {
+            if occ.live || occ.total > 0 {
+                return Some(
+                    div()
+                        .flex_none()
+                        .h(px(16.))
+                        .px(px(5.))
+                        .rounded(px(theme::R_CHIP))
+                        .bg(theme::accent_soft())
+                        .flex()
+                        .items_center()
+                        .text_size(px(10.5))
+                        .line_height(px(14.))
+                        .font_weight(theme::SEMIBOLD)
+                        .text_color(theme::accent())
+                        .child("LIVE"),
+                );
+            }
+            if occ.is_scheduled() {
+                return Some(div().flex_none().child(glyph("icons/clock.svg", 13., theme::accent())));
+            }
+        }
+    }
     match c.mark {
         Some(Mark::Scam) => Some(tag("Scam", true)),
         Some(Mark::Fake) => Some(tag("Fake", true)),

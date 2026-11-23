@@ -69,13 +69,7 @@ All are in `reports/` (ignored by git, kept on disk). Both dimensions and conten
 | Conversation | Send failure is 12 pt: `Not sent. Slow mode; wait 8 s before sending again.` at `x 8, y 407`, with `Retry` / `Delete` links at `x 310–370` — far under 44 pt and outside the 16 pt gutter | `uat-conversation-long-390.png` |
 | Conversation | The poll card's second line is clipped/blank under "Poll: Where should the aut…" | `uat-conversation-long-390.png`, `x 56–370, y 300–323` |
 | Welcome | `Sign in` buttons render about 34 pt tall (target floor is 44) | `uat-welcome-390.png`, e.g. `x 272–345, y 289–323` |
-<<<<<<< HEAD
-| First run / scope | Google Messages is still deferred on phones; Signal is now offered on phone and tablet as a linked companion device (with "Open Signal to link" URI handoff, QR tile, and an explicit background-delivery caveat; live `chatd/signal` linking on mobile still awaits `protoc`/libsignal cross-compilation in `docs/mobile-build.md`) | welcome rows `y 512–565`, `y 637–691`; scope `y 515` |
-||||||| 0022d72a
-| First run / scope | Signal and Google Messages are offered although the brief defers both for v1; the scope sheet also lists Signal | welcome rows `y 512–565`, `y 637–691`; scope `y 515` |
-=======
-| First run / scope | Signal is deferred until mobile device linking is built; Google Messages is now offered on phone/tablet via QR pairing from an Android phone (with an open-app delivery notice) | welcome rows; `gui/signin/welcome.rs` |
->>>>>>> origin/main
+| First run / scope | Both Google Messages (QR pairing from an Android phone) and Signal (linked companion device with "Open Signal to link" URI handoff and QR tile) are now offered on phone and tablet with an open-app delivery notice | welcome rows; `gui/signin/welcome.rs` |
 | 200 % nav | The 34 pt title fills a 52 pt strip; at 300 % it would spill. It fits at 200 % but has no headroom | `uat-text200-inbox-390.png`, `y 44–96` |
 | All lists | A row scrolled past the top could paint over the nav strip (seen once at 200 %); fixed below and re-shot | n/a after fix |
 

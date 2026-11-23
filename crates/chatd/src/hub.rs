@@ -783,13 +783,14 @@ impl Hub {
         for occupant in &mut occupants.people {
             clip(&mut occupant.name, 80);
         }
+        clip(&mut occupants.title, 120);
         occupants.total = occupants.total.max(occupants.people.len() as u32);
         {
             let mut live = lock(&self.live);
             let known = live.occupants.get(&conversation);
             // An empty stage keeps its topic or activity so the row can show them.
             let keep = occupants.stage && (!occupants.stage_topic.is_empty() || occupants.activity.is_some());
-            let empty = occupants.total == 0 && !keep;
+            let empty = !occupants.active() && !keep;
             if known == Some(&occupants) || (known.is_none() && (empty || live.occupants.len() >= OCCUPIED)) {
                 return;
             }

@@ -126,14 +126,37 @@ fn leave() -> Stateful<Div> {
         .tooltip(tip("Leave", Some("⌘⇧H")))
 }
 
+/// Subtitle line on the incoming call card (`#451`).
+pub(crate) fn incoming_subtitle(call: &Call, kind: ConversationKind, from: &str, occupied: u32) -> String {
+    match kind {
+        ConversationKind::Direct if call.incoming_video => "Incoming video call".to_owned(),
+        ConversationKind::Direct => "Incoming call".to_owned(),
+        ConversationKind::Group if occupied > 0 => {
+            format!("{from} is calling · {occupied} in the call")
+        }
+        _ => format!("{from} is calling"),
+    }
+}
+
+/// Accept button label for an incoming call: native calls say "Accept"; handoff-only calls say
+/// "Answer in <Network>" (`#451`).
+pub(crate) fn incoming_accept_label(call: &Call, support: protocol::CallSupport) -> String {
+    if support == protocol::CallSupport::Handoff {
+        format!("Answer in {}", call.conversation.network.label())
+    } else {
+        "Accept".to_owned()
+    }
+}
+
 /// A 32 px button with words: Cancel, Decline, Accept.
-fn worded(id: &'static str, icon: Option<&'static str>, word: &'static str, fill: Rgba, color: Rgba) -> Stateful<Div> {
+fn worded(id: &'static str, icon: Option<&'static str>, word: impl Into<gpui::SharedString>, fill: Rgba, color: Rgba) -> Stateful<Div> {
+    let word: gpui::SharedString = word.into();
     // The red ones fill on hover, and their glyph goes white with the word.
     let lit = (color == theme::danger()).then(|| (id, theme::on_accent()));
     div()
         .id(id)
         .role(gpui::Role::Button)
-        .aria_label(word)
+        .aria_label(word.clone())
         .group(id)
         .h(px(32.))
         .px(px(14.))
@@ -1561,13 +1584,14 @@ impl Shell {
     /// Someone is calling: the same card with a `positive` edge and two equal buttons. It holds
     /// nothing that can take keyboard focus.
     fn call_incoming(&self, call: &Call, subject: &Subject, from: &str, cx: &mut Context<Self>) -> Div {
-        let words = match subject.kind {
-            ConversationKind::Direct => "Incoming call".to_owned(),
-            ConversationKind::Group if subject.occupied > 0 => {
-                format!("{from} is calling · {} in the call", subject.occupied)
-            }
-            _ => format!("{from} is calling"),
-        };
+        let words = incoming_subtitle(call, subject.kind, from, subject.occupied);
+        let support = self
+            .sidebar_state
+            .find(&self.trees, &call.conversation)
+            .map(|c| c.call)
+            .unwrap_or(protocol::CallSupport::Native);
+        let accept_label = incoming_accept_label(call, support);
+        let accept_icon = if call.incoming_video { "icons/video.svg" } else { "icons/phone.svg" };
         let decline = worded(
             "call-decline",
             Some("icons/phone-off.svg"),
@@ -1579,16 +1603,24 @@ impl Shell {
         .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
         .tooltip(tip("Decline", Some("⌘⇧R")))
         .on_click(cx.listener(|this, _, _, cx| this.call_decline(cx)));
+        let conv_key = call.conversation.clone();
+        let handoff = support == protocol::CallSupport::Handoff;
         let accept = worded(
             "call-accept",
-            Some("icons/phone.svg"),
-            "Accept",
+            Some(accept_icon),
+            accept_label,
             theme::positive(),
             theme::on_accent(),
         )
         .flex_1()
         .tooltip(tip("Accept", Some("⌘⇧A")))
-        .on_click(cx.listener(|this, _, _, cx| this.call_accept(cx)));
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if handoff {
+                this.call_handoff(conv_key.clone(), cx);
+            } else {
+                this.call_accept(cx);
+            }
+        }));
         card()
             .border_color(Rgba { alpha: 0.45, ..theme::positive() })
             .child(self.call_title(call, subject, words, cx))
@@ -1750,6 +1782,7 @@ mod tests {
         request_to_speak: false,
         raised: Vec::new(),
         effect: None,
+        incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,

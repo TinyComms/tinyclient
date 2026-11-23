@@ -22,8 +22,10 @@ openmls = { version = "0.8.1", features = ["js"] }
 base64 = "0.22"
 sha2 = "0.10"
 # Transport encryption of RTP. Both share `aead`, `aes` and `ghash` with davey.
+aes = "0.8"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
+cipher = "0.4"
 # libopus 1.3.1 transpiled to Rust: no C toolchain, cmake or system library needed.
 unsafe-libopus = "=0.2.0"
 # CoreAudio capture and playback, and device enumeration.

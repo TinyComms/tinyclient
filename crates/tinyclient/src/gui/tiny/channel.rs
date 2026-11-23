@@ -267,6 +267,7 @@ mod tests {
         request_to_speak: false,
         raised: Vec::new(),
         effect: None,
+        incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,

@@ -224,6 +224,10 @@ pub struct Known {
     pub voice_banned: bool,
     /// Protected chat: Telegram refuses forwarding or saving content from here.
     pub noforwards: bool,
+    /// Group or channel currently has a live or scheduled video chat (`Chat::call_active` / `Channel::call_active`).
+    pub call_active: bool,
+    /// Video chat currently has at least one participant (`call_not_empty`).
+    pub call_not_empty: bool,
 }
 
 /// The tag Telegram's flags give: a warning wins over a tick.
@@ -443,6 +447,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 view_admin_log: false,
                 transfer_owner: active && chat.creator,
                 anonymous: active && admin.is_some_and(|r| r.anonymous),
+                manage_call: active && (chat.creator || admin.is_some_and(|r| r.manage_call)),
                 ..protocol::ConversationRights::default()
             };
             let known = Known {
@@ -457,6 +462,8 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 photo,
                 photo_dc,
                 noforwards: chat.noforwards,
+                call_active: chat.call_active,
+                call_not_empty: chat.call_not_empty,
                 ..Known::default()
             };
             (Who::Group(chat.id), known)
@@ -524,6 +531,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 view_admin_log: active && (channel.creator || admin.is_some()),
                 transfer_owner: active && channel.creator,
                 anonymous: active && admin.is_some_and(|r| r.anonymous),
+                manage_call: active && (channel.creator || admin.is_some_and(|r| r.manage_call)),
                 ..protocol::ConversationRights::default()
             };
             let known = Known {
@@ -552,6 +560,8 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 photo_dc,
                 mark: mark(channel.verified, channel.scam, channel.fake),
                 noforwards: channel.noforwards,
+                call_active: channel.call_active,
+                call_not_empty: channel.call_not_empty,
                 ..Known::default()
             };
             (Who::Channel(channel.id), known)
@@ -789,6 +799,12 @@ impl Directory {
         }
         known.voice_banned = banned;
         true
+    }
+
+    pub fn set_call_active(&mut self, who: Who, active: bool, not_empty: bool) {
+        let known = self.map.entry(who).or_default();
+        known.call_active = active;
+        known.call_not_empty = not_empty;
     }
 
     pub fn left(&mut self, who: Who) {

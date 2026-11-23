@@ -330,6 +330,24 @@ impl Chat {
             }
         });
         let adapters = chat.adapters.clone();
+        chat.hub.calls.on_telegram_signal(move |conversation, data| {
+            if conversation.network != Network::Telegram {
+                return;
+            }
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::TelegramCallSignal { conversation_id: conversation.id.clone(), data });
+            }
+        });
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_speaking(move |conversation, _user_id, speaking| {
+            if conversation.network != Network::Telegram {
+                return;
+            }
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::TelegramCallSpeaking { conversation_id: conversation.id.clone(), speaking });
+            }
+        });
+        let adapters = chat.adapters.clone();
         chat.hub.calls.on_offer(move |conversation, sdp| {
             if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
                 adapter.command(Command::Tiny(adapters::tiny::live::Ask::Offer { sdp }));
@@ -860,7 +878,10 @@ impl Chat {
 
     /// A row as the shell is told it: what is stored, and who is in it right now.
     fn row(&self, mut conversation: Conversation) -> Conversation {
-        if conversation.kind == ConversationKind::Voice || conversation.call == CallSupport::Native {
+        if conversation.kind == ConversationKind::Voice
+            || conversation.call == CallSupport::Native
+            || conversation.key.network == Network::Telegram
+        {
             conversation.occupants = self.hub.occupants(&conversation.key);
         }
         if conversation.key.network == Network::Discord && conversation.kind == ConversationKind::Voice {
@@ -6840,6 +6861,36 @@ impl Chat {
                 let conversation_id = conversation.id.clone();
                 match self.ask(&conversation.account(), |reply| Command::Handoff { conversation_id, reply }) {
                     Ok(url) => Response::Link { url },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallSchedule { conversation, schedule_date, title } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallSchedule {
+                    conversation_id,
+                    schedule_date,
+                    title,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallStart { conversation } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallStart { conversation_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallSubscribe { conversation, subscribed } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallSubscribe {
+                    conversation_id,
+                    subscribed,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
                     Err(refused) => *refused,
                 }
             }

@@ -1490,6 +1490,20 @@ impl Discord {
             unread_directs.sort_by_key(|(updated, _)| std::cmp::Reverse(*updated));
             unread_directs.truncate(if first { WARM } else { 0 });
             state.warming.extend(unread_directs.iter().map(|(_, id)| id.clone()));
+            state.guilds.shrink_to_fit();
+            for info in state.guilds.values_mut() {
+                info.roles.shrink_to_fit();
+                info.categories.shrink_to_fit();
+                info.channels.shrink_to_fit();
+                info.features.shrink_to_fit();
+            }
+            state.users.shrink_to_fit();
+            state.relations.shrink_to_fit();
+            state.rows.shrink_to_fit();
+            state.directs.shrink_to_fit();
+            state.privates.shrink_to_fit();
+            state.groups.shrink_to_fit();
+            state.folders.shrink_to_fit();
             unread_directs
         };
         for (_, id) in warm {

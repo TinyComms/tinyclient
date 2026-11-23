@@ -191,7 +191,7 @@ pub mod stages {
 /// which was done inside each offer; it is made once, by [`warm_up`] while the process waits for
 /// its call. One certificate for the process is what a browser does for its tabs, and a
 /// connection is still keyed afresh by its own handshake.
-fn dtls_cert() -> Option<str0m::crypto::dtls::DtlsCert> {
+pub(crate) fn dtls_cert() -> Option<str0m::crypto::dtls::DtlsCert> {
     static CERT: std::sync::OnceLock<Option<str0m::crypto::dtls::DtlsCert>> = std::sync::OnceLock::new();
     CERT.get_or_init(|| str0m::crypto::from_feature_flags().dtls_provider.generate_certificate()).clone()
 }

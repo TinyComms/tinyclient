@@ -330,6 +330,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         raised: Vec::new(),
         effect: None,
         move_notice: (name == "moved_notice").then(|| "Bea added Cy. The call moved to Campfire.".to_owned()),
+        incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
@@ -423,6 +424,7 @@ pub(super) fn running() -> Option<Occupants> {
         speaking: false,
     };
     (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3, ..Default::default() })
+    (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3, ..Occupants::default() })
 }
 
 // The phone's call screen (`phone`): `phone_` before a state names one of its faces. Faces and
@@ -497,6 +499,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         raised: Vec::new(),
         effect: None,
         move_notice: None,
+        incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,

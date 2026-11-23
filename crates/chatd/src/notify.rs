@@ -556,12 +556,12 @@ impl Notes {
     /// Waiting calls open the UI so leaving the active call can be confirmed there.
     fn call_while_busy(&mut self, call: Option<&Call>, verdict: Option<Verdict>, place: &str, network: &str, busy: bool) -> Option<String> {
         let ringing = call.and_then(|call| match &call.state {
-            CallState::RingingIn { from } => Some((call.conversation.clone(), from.clone())),
+            CallState::RingingIn { from } => Some((call.conversation.clone(), from.clone(), call.incoming_video)),
             _ => None,
         });
         match (ringing, self.ringing.clone()) {
-            (Some((key, _)), Some(shown)) if key == shown && self.ringing_busy == busy => None,
-            (Some((key, from)), _) => {
+            (Some((key, _, _)), Some(shown)) if key == shown && self.ringing_busy == busy => None,
+            (Some((key, from, video)), _) => {
                 self.stop_ring();
                 let verdict = verdict?;
                 self.ringing = Some(key.clone());
@@ -571,21 +571,22 @@ impl Notes {
                 if !verdict.banner {
                     return verdict.sound;
                 }
+                let kind_label = if video { "Incoming video call" } else { "Incoming call" };
                 let caller = if from.is_empty() { place.to_owned() } else { from };
                 let (title, subtitle) = match verdict.preview {
                     Preview::Nothing => (network.to_owned(), String::new()),
-                    _ => (caller, if place.is_empty() { format!("{network} · Incoming call") } else { format!("{place} · Incoming call") }),
+                    _ => (caller, if place.is_empty() { format!("{network} · {kind_label}") } else { format!("{place} · {kind_label}") }),
                 };
                 let id = ring_id(&key);
                 let note = Note {
                     id: id.clone(),
                     title,
                     subtitle,
-                    body: if busy { "Open tinyclient to answer." } else { "Incoming call" }.to_owned(),
+                    body: if busy { "Open tinyclient to answer." } else { kind_label }.to_owned(),
                     kind: if busy { Kind::Plain } else { Kind::Call },
                     reply_hint: String::new(),
                     sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
-                    locked_body: "Incoming call".to_owned(),
+                    locked_body: kind_label.to_owned(),
                     copy_code: None,
                 };
                 if let Err(err) = self.sink.post(&note) {

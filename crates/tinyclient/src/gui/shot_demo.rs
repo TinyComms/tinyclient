@@ -502,6 +502,7 @@ fn build() -> Fixture {
             .collect(),
         total: 2,
         ..Default::default()
+        ..Occupants::default()
     });
     let mut random = in_space(row(&s, "c-random", ConversationKind::Channel, "random", on_day(1, 12, 0)), harbor, "Harbor Labs", "eng", "Engineering", 1);
     said(&mut random, "theo", "who left the oat milk out");
@@ -1024,6 +1025,7 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         request_to_speak: false,
         raised: Vec::new(),
         effect: None,
+        incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,

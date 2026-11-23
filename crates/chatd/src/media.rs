@@ -160,6 +160,8 @@ enum Slot {
 type Failed = Box<dyn Fn(&Key) + Send + Sync>;
 /// Told a frame mediad has for the network's socket, and the conversation of its call.
 type Signal = Box<dyn Fn(&Key, String) + Send + Sync>;
+/// Told when our own speaking state changes in a call (for networks like Telegram group calls).
+type SpeakingHook = Box<dyn Fn(&Key, String, bool) + Send + Sync>;
 /// Publishes one account's DAVE identity key. Held in an `Arc` so the list can be called
 /// without keeping this lock across the request.
 type IdentityHook = std::sync::Arc<dyn Fn(&Key, &str) + Send + Sync>;
@@ -176,6 +178,10 @@ pub struct Calls {
     next: AtomicU64,
     failed: Mutex<Option<Failed>>,
     signal: Mutex<Option<Signal>>,
+    /// Who sends Telegram in-call signalling bytes (`phone.sendSignalingData`).
+    telegram_signal: Mutex<Option<Signal>>,
+    /// Who hears local speaking state changes (e.g. Telegram `speakingInGroupCallAction`).
+    speaking: Mutex<Option<SpeakingHook>>,
     /// Who sends a Tiny renegotiation offer. The same shape as `signal`.
     offer: Mutex<Option<Signal>>,
     /// Who sends a Signal local ICE candidate (`IceUpdate`). The same shape as `signal`.
@@ -312,6 +318,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         request_to_speak: false,
         raised: Vec::new(),
         effect: None,
+        incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
@@ -681,6 +688,8 @@ impl Live {
             | MediaResponse::Streams { .. }
             | MediaResponse::Done
             | MediaResponse::Offer { .. }
+            | MediaResponse::TelegramGroupJoin { .. }
+            | MediaResponse::TelegramSignal { .. }
             | MediaResponse::Stats(_)
             | MediaResponse::Refused { .. }
             | MediaResponse::LogsSaved { .. } => return false,
@@ -879,6 +888,15 @@ fn heard(hub: &Hub, seen: &Mutex<Live>, frame: MediaResponse) {
         hub.calls.offer(&conversation, sdp.clone());
         return;
     }
+    if let MediaResponse::TelegramSignal { data } = &frame {
+        let conversation = crate::hub::lock(seen).call.conversation.clone();
+        hub.calls.telegram_signal(&conversation, data.clone());
+        return;
+    }
+    let speaking_event = match &frame {
+        MediaResponse::Speaking { user_id, speaking } => Some((user_id.clone(), *speaking)),
+        _ => None,
+    };
     if let MediaResponse::SignalIce { candidate } = &frame {
         let conversation = crate::hub::lock(seen).call.conversation.clone();
         hub.calls.ice(&conversation, candidate.clone());
@@ -913,6 +931,11 @@ fn heard(hub: &Hub, seen: &Mutex<Live>, frame: MediaResponse) {
     }
     if let Some(call) = call {
         draw(hub, seen, call);
+    }
+    if adopted {
+        if let Some((user_id, speaking)) = speaking_event {
+            hub.calls.emit_speaking(&conversation, user_id, speaking);
+        }
     }
 }
 
@@ -1025,6 +1048,16 @@ impl Calls {
         *crate::hub::lock(&self.signal) = Some(Box::new(told));
     }
 
+    /// Who sends Telegram in-call signalling bytes (`phone.sendSignalingData`).
+    pub fn on_telegram_signal(&self, told: impl Fn(&Key, String) + Send + Sync + 'static) {
+        *crate::hub::lock(&self.telegram_signal) = Some(Box::new(told));
+    }
+
+    /// Who hears speaking state events emitted by mediad.
+    pub fn on_speaking(&self, told: impl Fn(&Key, String, bool) + Send + Sync + 'static) {
+        *crate::hub::lock(&self.speaking) = Some(Box::new(told));
+    }
+
     /// Who sends a renegotiation offer (`call.offer`) for the call's account.
     pub fn on_offer(&self, told: impl Fn(&Key, String) + Send + Sync + 'static) {
         *crate::hub::lock(&self.offer) = Some(Box::new(told));
@@ -1060,6 +1093,28 @@ impl Calls {
     fn signal(&self, conversation: &Key, frame: String) {
         if let Some(told) = &*crate::hub::lock(&self.signal) {
             told(conversation, frame);
+        }
+    }
+
+    fn telegram_signal(&self, conversation: &Key, data: String) {
+        if let Some(told) = &*crate::hub::lock(&self.telegram_signal) {
+            told(conversation, data);
+        }
+    }
+
+    fn emit_speaking(&self, conversation: &Key, user_id: String, speaking: bool) {
+        if let Some(told) = &*crate::hub::lock(&self.speaking) {
+            told(conversation, user_id, speaking);
+        }
+    }
+
+    /// True when any call is active (connecting, joined, reconnecting, or ringing out).
+    pub fn any_active(&self) -> bool {
+        let slot = crate::hub::lock(&self.slot);
+        match &*slot {
+            Slot::Active(_) => true,
+            Slot::Shown(live) => matches!(live.call.state, CallState::RingingOut),
+            Slot::Idle => false,
         }
     }
 
@@ -1846,6 +1901,11 @@ impl Calls {
     /// beside it. It does not replace the call, and it does not start mediad. A second one while
     /// one is already waiting is dropped.
     pub fn ring(&self, hub: &Arc<Hub>, conversation: Key, from: &str) {
+        self.ring_video(hub, conversation, from, false);
+    }
+
+    /// Like [`ring`], marking whether the incoming call carries video (`phoneCallRequested.video`).
+    pub fn ring_video(&self, hub: &Arc<Hub>, conversation: Key, from: &str, video: bool) {
         let state = CallState::RingingIn {
             from: from.to_owned(),
         };
@@ -1860,7 +1920,9 @@ impl Calls {
         if hold {
             let mut aside = crate::hub::lock(&self.aside);
             if aside.is_none() {
-                *aside = Some(new_call(conversation, state).call);
+                let mut live = new_call(conversation, state);
+                live.call.incoming_video = video;
+                *aside = Some(live.call);
             }
             drop(aside);
             self.tell(hub);
@@ -1869,7 +1931,9 @@ impl Calls {
         {
             let mut slot = crate::hub::lock(&self.slot);
             if matches!(&*slot, Slot::Shown(live) if live.call.conversation == conversation && matches!(live.call.state, CallState::RingingIn { .. })) { return; }
-            *slot = Slot::Shown(Box::new(new_call(conversation, state)));
+            let mut live = new_call(conversation, state);
+            live.call.incoming_video = video;
+            *slot = Slot::Shown(Box::new(live));
         }
         self.tell(hub);
         // Answering is likely: the engine is started now, not at the answer.
@@ -2086,6 +2150,87 @@ impl Calls {
             tracing::warn!("chatd: mediad did not take the voice session: {err}");
             let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
             self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
+        }
+    }
+
+    /// Hands a confirmed Telegram 1:1 call session to mediad.
+    pub fn telegram_call(&self, hub: &Hub, conversation: &Key, mut join: protocol::TelegramCallJoin) {
+        let known = self.update(hub, conversation, |live| {
+            join.muted = live.call.muted || live.call.server_muted || live.call.suppressed;
+            join.deafened = live.call.deafened || live.call.server_deafened;
+            live.joining = true;
+            live.me = join.user_id.clone();
+            live.since = Instant::now();
+        });
+        if !known {
+            return;
+        }
+        if let Err(CallError::Media(err)) = self.request(hub, &MediaRequest::TelegramCall(join)) {
+            tracing::warn!("chatd: mediad did not take the Telegram call session: {err}");
+            let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
+            self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
+        }
+    }
+
+    /// Asks mediad to build the local ICE/DTLS join params JSON and SSRC for a Telegram group call.
+    pub fn telegram_group_offer(
+        &self,
+        hub: &Arc<Hub>,
+        conversation: &Key,
+        mut offer: protocol::TelegramGroupOffer,
+    ) -> Result<(String, u32), String> {
+        let (call, running) = self.describe();
+        let here = call.as_ref().is_some_and(|call| call.conversation == *conversation) && running;
+        if !here {
+            self.start(hub, conversation.clone()).map_err(|err| match err {
+                CallError::Active => IN_ANOTHER_CALL.to_owned(),
+                CallError::NoCall => ENGINE_STOPPED.to_owned(),
+                CallError::Media(err) => err.to_string(),
+            })?;
+        }
+        // Telegram group video chats join muted by default, as official apps do.
+        offer.muted = true;
+        self.update(hub, conversation, |live| {
+            live.call.muted = true;
+            live.call.deafened = offer.deafened;
+            live.call.security = None;
+            live.me = offer.user_id.clone();
+        });
+        match self.request(hub, &MediaRequest::TelegramGroupOffer(offer)) {
+            Ok(MediaResponse::TelegramGroupJoin { params, ssrc }) => Ok((params, ssrc)),
+            other => {
+                if !here {
+                    self.end_if(hub, conversation);
+                }
+                Err(match other {
+                    Err(CallError::Media(err)) if err.kind() == io::ErrorKind::Other => err.to_string(),
+                    _ => ENGINE_SILENT.to_owned(),
+                })
+            }
+        }
+    }
+
+    /// Passes Telegram's server transport JSON (`updateGroupCallConnection`) to mediad.
+    pub fn telegram_group_answer(&self, hub: &Hub, conversation: &Key, params: String) {
+        let known = self.update(hub, conversation, |live| {
+            live.joining = true;
+            live.since = Instant::now();
+        });
+        if !known {
+            return;
+        }
+        if let Err(CallError::Media(err)) = self.request(hub, &MediaRequest::TelegramGroupAnswer { params }) {
+            tracing::warn!("chatd: mediad did not take the Telegram group answer: {err}");
+            let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
+            self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
+        }
+    }
+
+    /// Updates SSRC -> participant id mapping for a Telegram group call.
+    pub fn telegram_group_sources(&self, hub: &Hub, conversation: &Key, sources: Vec<protocol::TelegramGroupSource>) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|call| call.conversation == *conversation) {
+            let _ = self.request(hub, &MediaRequest::TelegramGroupSources { sources });
         }
     }
 }
