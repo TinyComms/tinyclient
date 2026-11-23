@@ -2,7 +2,7 @@
 //! call served over stdin and stdout (`serve`), and the other modes `main` dispatches on.
 
 use crate::session::{self, Controls};
-use crate::{audio, out, permission, picture, telegram, tiny};
+use crate::{audio, out, permission, picture, signal, telegram, tiny};
 use protocol::{
     media_process_needed, read_frame, CallFailure, Content, Direction, MediaRequest, MediaResponse, SecurityMode, VideoStream,
     DEVICES_LIMIT,
@@ -79,6 +79,10 @@ struct Call {
     tg_user_id: Option<String>,
     /// True while carrying a Telegram group call (used to allow headless test camera/share without hardware).
     tg_group_active: bool,
+    /// A Signal call's pending offer, out with the remote peer and not yet answered.
+    signal_offer: Option<signal::Offer>,
+    /// Our user id and peer id for a Signal call.
+    signal_peer: Option<(String, String)>,
 }
 
 impl Call {
@@ -97,15 +101,18 @@ impl Call {
     fn apply(&mut self, request: MediaRequest) -> MediaResponse {
         match request {
             MediaRequest::Streams => {}
-            MediaRequest::ShareSend { on, screen, quality, show_cursor } => {
+            MediaRequest::ShareSend { on, screen, quality, show_cursor, sound, .. } => {
                 // What the share captures, chosen before the probe so the probe tries that one,
                 // and what it spends. Before a call is up the request is only noted: the voice
                 // tests ask then, and a headless run must not open a screen to answer them.
+                // Sound is stored before the share flag, so the stream thread that sees the
+                // share also sees whether its sound goes with it. Nothing here opens a loopback.
                 if on {
                     picture::choose_screen(screen);
                     picture::choose_quality(quality);
                     picture::choose_cursor(show_cursor);
                 }
+                self.controls.set_share_sound(on && sound == Some(true));
                 let headless_tg = self.tg_group_active && out::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some();
                 if on && (self.voice.is_some() || self.tiny.is_some()) && !headless_tg {
                     if let Err(words) = picture::probe_screen() {
@@ -397,16 +404,32 @@ impl Call {
                 }
                 self.controls.muted.store(spec.muted, Ordering::Relaxed);
                 self.controls.deafened.store(spec.deafened, Ordering::Relaxed);
+                let public_key = if spec.conference {
+                    use base64::Engine as _;
+                    let uid = spec.user_id.strip_prefix('u').and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    let pk = crate::telegram_e2ee::generate_public_key();
+                    self.controls.init_tg_conference(uid, pk);
+                    out::send(&MediaResponse::TinySecurity(protocol::CallSecurity {
+                        mode: protocol::SecurityMode::Pending,
+                        required: true,
+                        ..protocol::CallSecurity::default()
+                    }));
+                    Some(base64::engine::general_purpose::STANDARD.encode(pk))
+                } else {
+                    self.controls.clear_tg_conference();
+                    None
+                };
                 return match telegram::GroupOffer::new(&spec) {
                     Ok(offer) => {
                         let params = offer.params_json().to_owned();
                         let ssrc = offer.ssrc();
                         self.tg_group_offer = Some(offer);
                         self.tg_user_id = Some(spec.user_id);
-                        MediaResponse::TelegramGroupJoin { params, ssrc }
+                        MediaResponse::TelegramGroupJoin { params, ssrc, public_key }
                     }
                     Err(err) => {
                         tracing::warn!("mediad: telegram group offer failed: {err}");
+                        self.controls.clear_tg_conference();
                         MediaResponse::Refused { detail: ENGINE.to_owned() }
                     }
                 };
@@ -551,6 +574,126 @@ impl Call {
             }
             MediaRequest::TelegramRtmpState { state } => {
                 self.controls.set_tg_rtmp_state(state);
+                return MediaResponse::Done;
+            }
+            MediaRequest::TelegramConferenceBlocks { sub_chain_id, blocks } => {
+                use base64::Engine as _;
+                let mut latest_sec = None;
+                for b64 in blocks {
+                    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&b64) else {
+                        let blocked = protocol::CallSecurity::telegram_conference_blocked();
+                        out::send(&MediaResponse::TinySecurity(blocked));
+                        return MediaResponse::Refused {
+                            detail: "Invalid base64 in conference E2EE chain block.".to_owned(),
+                        };
+                    };
+                    match self.controls.apply_tg_conference_block(sub_chain_id, &raw) {
+                        Ok(sec) => latest_sec = Some(sec),
+                        Err((err, blocked)) => {
+                            out::send(&MediaResponse::TinySecurity(blocked));
+                            return MediaResponse::Refused { detail: err.to_string() };
+                        }
+                    }
+                }
+                if let Some(sec) = latest_sec {
+                    out::send(&MediaResponse::TinySecurity(sec));
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::SignalOffer(spec) => {
+                if self.voice.is_some() {
+                    return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
+                }
+                self.controls.muted.store(spec.muted, Ordering::Relaxed);
+                self.controls.deafened.store(spec.deafened, Ordering::Relaxed);
+                return match signal::Offer::new(&spec) {
+                    Ok(offer) => {
+                        let sdp = offer.sdp().to_owned();
+                        for candidate in offer.local_candidates() {
+                            out::send(&MediaResponse::SignalIce { candidate: candidate.clone() });
+                        }
+                        self.signal_offer = Some(offer);
+                        self.signal_peer = Some((spec.user_id, spec.peer_id));
+                        MediaResponse::Offer { sdp }
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: signal offer failed: {err}");
+                        MediaResponse::Refused { detail: ENGINE.to_owned() }
+                    }
+                };
+            }
+            MediaRequest::SignalAccept(spec) => {
+                if self.voice.is_some() {
+                    return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
+                }
+                self.controls.muted.store(spec.muted, Ordering::Relaxed);
+                self.controls.deafened.store(spec.deafened, Ordering::Relaxed);
+                let answer = match signal::Answer::from_offer(&spec) {
+                    Ok(answer) => answer,
+                    Err(err) => {
+                        tracing::warn!("mediad: signal offer could not be accepted: {err}");
+                        return MediaResponse::Refused { detail: "The Signal call offer didn't work with tinyclient. Try again.".to_owned() };
+                    }
+                };
+                let sdp = answer.sdp().to_owned();
+                for candidate in answer.local_candidates() {
+                    out::send(&MediaResponse::SignalIce { candidate: candidate.clone() });
+                }
+                let link = answer.into_link();
+                self.video = Video::default();
+                let (controls, user_id, peer_id) = (self.controls.clone(), spec.user_id, spec.peer_id);
+                let spawned = out::spawn(std::thread::Builder::new().name("signal".to_owned()), move || {
+                    out::or_fail(CallFailure::Engine, ENGINE_STOPPED, || signal::run(link, user_id, peer_id, controls));
+                    tracing::warn!("mediad: signal call over, exiting");
+                    out::exit(0);
+                });
+                match spawned {
+                    Ok(voice) => {
+                        self.voice = Some(voice);
+                        return MediaResponse::Answer { sdp };
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: signal call thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+            }
+            MediaRequest::SignalAnswer { sdp } => {
+                let Some(offer) = self.signal_offer.take() else {
+                    return MediaResponse::Refused { detail: "No Signal offer is waiting for an answer.".to_owned() };
+                };
+                let link = match offer.accept(&sdp) {
+                    Ok(link) => link,
+                    Err(err) => {
+                        tracing::warn!("mediad: signal answer refused: {err}");
+                        return MediaResponse::Refused { detail: "The Signal call answer didn't work with tinyclient. Try again.".to_owned() };
+                    }
+                };
+                self.video = Video::default();
+                let (user_id, peer_id) = self.signal_peer.clone().unwrap_or_default();
+                let controls = self.controls.clone();
+                let spawned = out::spawn(std::thread::Builder::new().name("signal".to_owned()), move || {
+                    out::or_fail(CallFailure::Engine, ENGINE_STOPPED, || signal::run(link, user_id, peer_id, controls));
+                    tracing::warn!("mediad: signal call over, exiting");
+                    out::exit(0);
+                });
+                match spawned {
+                    Ok(voice) => {
+                        self.voice = Some(voice);
+                        return MediaResponse::Done;
+                    }
+                    Err(err) => {
+                        tracing::warn!("mediad: signal call thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+            }
+            MediaRequest::SignalIce { candidate } => {
+                if let Some(offer) = self.signal_offer.as_mut() {
+                    let _ = offer.add_remote_candidate(&candidate);
+                } else {
+                    self.controls.push_signal_ice(candidate);
+                }
                 return MediaResponse::Done;
             }
             MediaRequest::Devices { input, output, camera } => {

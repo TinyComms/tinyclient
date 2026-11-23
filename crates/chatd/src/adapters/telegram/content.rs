@@ -2547,8 +2547,20 @@ pub(super) fn call_action(
             let video = conf.video;
             let kind = if video { "group video call" } else { "group call" };
             let seconds = conf.duration.filter(|&d| d > 0).map(|d| d as u32);
+            let participants: Vec<String> = conf
+                .other_participants
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|p| Who::of(p).text())
+                .collect();
             let (outcome, text) = if conf.active {
-                (CallOutcome::Live, format!("{who} started a {kind}"))
+                let line = if outgoing {
+                    format!("{who} started a {kind}")
+                } else {
+                    format!("{who} invited you to a {kind}")
+                };
+                (CallOutcome::Live, line)
             } else if conf.missed && !outgoing {
                 let line = if video { "Missed group video call" } else { "Missed group call" };
                 (CallOutcome::Missed, line.to_owned())
@@ -2562,7 +2574,17 @@ pub(super) fn call_action(
                 let line = if video { "Declined group video call" } else { "Declined group call" };
                 (CallOutcome::Declined, line.to_owned())
             };
-            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video, call_id: None }))
+            Some((
+                text,
+                CallNote {
+                    outcome,
+                    caller_id,
+                    seconds,
+                    participants,
+                    video,
+                    call_id: Some(conf.call_id.to_string()),
+                },
+            ))
         }
         _ => None,
     }

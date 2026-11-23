@@ -1305,13 +1305,19 @@ impl Demo {
             Command::SlashCommands { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AllUnreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
+            Command::CallRing { reply, .. }
+            | Command::CallStopRinging { reply, .. }
+            | Command::CallRaiseHand { reply, .. }
+            | Command::CallReact { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Voicemails { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::VoicemailAudio { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChangeVoicemail { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1470,6 +1476,9 @@ impl Demo {
             Command::StartBot { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SharePhone { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingInvitees { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateMeeting { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
@@ -1494,7 +1503,9 @@ impl Demo {
             | Command::TelegramCallSignal { .. }
             | Command::TelegramCallSpeaking { .. }
             | Command::GroupCallParticipantGain { .. }
+            | Command::CallJoinVideo(_)
             | Command::Played { .. }
+            | Command::CallIce { .. }
             | Command::Stop => {}
             Command::GroupCallSchedule { reply, .. }
             | Command::GroupCallStart { reply, .. }
@@ -1506,7 +1517,9 @@ impl Demo {
             | Command::GroupCallSettings { reply, .. }
             | Command::GroupCallRaiseHand { reply, .. }
             | Command::GroupCallModerate { reply, .. }
-            | Command::GroupCallRtmpQuality { reply, .. } => {
+            | Command::GroupCallRtmpQuality { reply, .. }
+            | Command::ConferenceJoin { reply, .. }
+            | Command::ConferenceRemove { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
             Command::GroupCallRecord { reply, .. } => {
@@ -1523,6 +1536,9 @@ impl Demo {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
             Command::GroupCallInvite { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::ConferenceResolve { reply, .. } | Command::ConferenceCreate { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
         }

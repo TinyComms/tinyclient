@@ -473,9 +473,9 @@ pub enum CallSupport {
     Restricted,
 }
 
-/// Camera and screen share run in this client on a Tiny, Discord, or Telegram call.
+/// Camera and screen share run in this client on Tiny, Discord, Signal, and Telegram calls.
 pub fn call_pictures(network: Network) -> bool {
-    matches!(network, Network::Tiny | Network::Discord | Network::Telegram)
+    matches!(network, Network::Tiny | Network::Discord | Network::Signal | Network::Telegram)
 }
 
 /// How a conversation kind is called, as the adapter that builds its row decides.
@@ -2189,6 +2189,9 @@ pub enum Request {
     Meetings {
         account: AccountKey,
     },
+    MeetingTranscript { conversation: Key, message_id: String },
+    MeetingInvitees { conversation: Key },
+    CreateMeeting { conversation: Key, draft: MeetingDraft },
     /// Accept, decline, or tentatively accept one meeting. `propose` is a new start, Unix
     /// seconds, sent with a tentative answer.
     MeetingRsvp {
@@ -2349,6 +2352,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before: Option<String>,
         limit: u32,
+    },
+    Voicemails {
+        account: AccountKey,
+        before: Option<String>,
+    },
+    VoicemailAudio {
+        account: AccountKey,
+        id: String,
+        attachment: String,
+    },
+    ChangeVoicemail {
+        account: AccountKey,
+        id: String,
+        action: VoicemailAction,
     },
     /// Delete one or more entries from an account's recent calls list. `revoke` removes for both
     /// sides when the network supports it.
@@ -3263,6 +3280,45 @@ pub enum Request {
     CallStart {
         conversation: Key,
     },
+    /// Places an outgoing 1:1 video call (`video: true` on `phone.requestCall`).
+    CallStartVideo {
+        conversation: Key,
+    },
+    /// Resolves a Telegram encrypted conference link (`t.me/call/<slug>`) via `phone.getGroupCall`
+    /// with `inputGroupCallSlug` without joining, returning who is in the call.
+    ConferenceResolve {
+        account: AccountKey,
+        slug: String,
+    },
+    /// Creates an encrypted Telegram conference call via `phone.createConferenceCall`, returning
+    /// its shareable `t.me/call/<slug>` link (and joining when `join` is true).
+    ConferenceCreate {
+        account: AccountKey,
+        #[serde(default)]
+        video: bool,
+        #[serde(default)]
+        join: bool,
+    },
+    /// Joins an encrypted Telegram conference call by `slug` (`t.me/call/<slug>`), `call_id`,
+    /// or incoming invite `msg_id`.
+    ConferenceJoin {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slug: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<i32>,
+        #[serde(default)]
+        video: bool,
+    },
+    /// Removes participants from the active encrypted Telegram conference call
+    /// (`phone.deleteConferenceCallParticipants`).
+    ConferenceRemove {
+        people: Vec<String>,
+        #[serde(default)]
+        kick: bool,
+    },
     /// Answers the incoming ring. Starts mediad.
     CallAccept,
     /// Stops the incoming ring for both sides. mediad never starts.
@@ -3303,6 +3359,14 @@ pub enum Request {
     /// and rings them.
     CallAddPeople {
         people: Vec<String>,
+    },
+    /// Raises or lowers our hand in the active group call (Signal group calls).
+    CallRaiseHand {
+        raised: bool,
+    },
+    /// Sends a transient emoji reaction in the active group call (Signal group calls).
+    CallReact {
+        emoji: String,
     },
     /// Where the official app takes this conversation's call.
     Handoff {
@@ -4822,6 +4886,10 @@ pub enum Response {
     },
     /// Answers `GroupCallRtmpUrl` (#454).
     GroupCallRtmpUrl(GroupCallRtmpUrl),
+    Voicemails {
+        entries: Vec<Voicemail>,
+        next: Option<String>,
+    },
     Privacy {
         key: PrivacyKey,
         policy: PrivacyPolicy,
@@ -4867,12 +4935,24 @@ pub enum Response {
     Meetings {
         events: Vec<MeetingEvent>,
     },
+    MeetingTranscript { text: String },
+    MeetingInvitees { emails: Vec<String> },
+    MeetingCreated {
+        event: MeetingEvent,
+        /// The meeting exists even when posting its link failed.
+        posted: bool,
+    },
     SpaceInfo {
         info: Box<SpaceInfo>,
     },
     /// Answers `InvitePreview`: metadata and member counts for an invite code.
     InvitePreview {
         preview: InvitePreview,
+    },
+    /// Answers `ConferenceResolve` and `ConferenceCreate`: encrypted conference metadata,
+    /// current participants, and shareable `t.me/call/<slug>` link.
+    ConferenceInfo {
+        info: ConferenceCallInfo,
     },
     /// Answers `InviteJoin`: the joined Space and landing conversation, when reported.
     InviteJoined {

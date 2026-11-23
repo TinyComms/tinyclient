@@ -894,7 +894,34 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let kind = if stream.share { PictureKind::Share } else { PictureKind::Camera };
+        let asked = call.is_some_and(|call| watching(call, &stream.user_id));
+        let pausing = stream.share
+            && !stream.mine
+            && call.is_some_and(|call| call.stream_paused)
+            && (asked || self.call_state.watch_asked.as_ref().is_some_and(|(id, _)| id == &stream.user_id));
         if let Some(frame) = self.call_frame(call, &stream.user_id, kind) {
+            if pausing {
+                return div()
+                    .size_full()
+                    .relative()
+                    .child(img(frame).size_full().object_fit(ObjectFit::Contain))
+                    .child(
+                        div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().child(
+                            div()
+                                .h(px(30.))
+                                .px(px(14.))
+                                .rounded_full()
+                                .bg(theme::overlay())
+                                .flex()
+                                .items_center()
+                                .type_small()
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(theme::text_soft())
+                                .child(stage::watch_words(true, true)),
+                        ),
+                    )
+                    .into_any_element();
+            }
             return img(frame).size_full().object_fit(ObjectFit::Contain).into_any_element();
         }
         let small = size == Size::Strip;
@@ -941,6 +968,22 @@ impl Shell {
                                     .rounded(px(10.))
                                     .bg(theme::overlay())
                                     .child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())),
+                            ),
+                        )
+                    })
+                    .when_some(stream.share.then(|| call.and_then(|call| stage::viewer_line(&call.viewers))).flatten(), |tile, line| {
+                        tile.child(
+                            div().absolute().top(px(8.)).left(px(8.)).child(
+                                div()
+                                    .h(px(22.))
+                                    .px(px(8.))
+                                    .rounded_full()
+                                    .bg(theme::overlay())
+                                    .flex()
+                                    .items_center()
+                                    .type_micro()
+                                    .text_color(theme::text())
+                                    .child(line),
                             ),
                         )
                     })
@@ -999,6 +1042,9 @@ impl Shell {
                             .child(line),
                     )
                 })
+                .when_some(stream.share.then(|| call.and_then(|call| stage::viewer_line(&call.viewers))).flatten(), |body, line| {
+                    body.child(div().text_center().whitespace_normal().type_small().text_color(theme::text_soft()).child(line))
+                })
                 .when(!small, |body| {
                     body.child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))
                 })
@@ -1017,7 +1063,6 @@ impl Shell {
                 .child(div().type_small().text_color(theme::text_soft()).child("Camera on"))
                 .into_any_element();
         }
-        let asked = call.is_some_and(|call| watching(call, &stream.user_id));
         let since = self
             .call_state
             .watch_asked
@@ -1025,7 +1070,7 @@ impl Shell {
             .filter(|(id, _)| *id == stream.user_id)
             .map(|(_, at)| at.elapsed())
             .unwrap_or_default();
-        let trouble = asked
+        let trouble = (asked && !pausing)
             .then(|| call.and_then(|c| stage::watch_trouble(c, &stream.user_id, |id| people.name(id), since)))
             .flatten();
         if let Some(trouble) = trouble {
@@ -1084,19 +1129,25 @@ impl Shell {
             .h(px(if small { 22. } else { 30. }))
             .px(px(if small { 8. } else { 14. }))
             .rounded_full()
-            .bg(if asked { theme::overlay() } else { theme::accent() })
+            .bg(if asked || pausing { theme::overlay() } else { theme::accent() })
             .flex()
             .items_center()
             .gap(px(6.))
-            .when(!asked && !small, |pill| pill.child(glyph("icons/play.svg", 12., theme::on_accent())))
+            .when(!asked && !pausing && !small, |pill| pill.child(glyph("icons/play.svg", 12., theme::on_accent())))
             .child(
                 div()
                     .map(|words| if small { words.type_micro() } else { words.type_small() })
                     .font_weight(theme::SEMIBOLD)
-                    .text_color(if asked { theme::text_soft() } else { theme::on_accent() })
-                    .child(if asked { "Connecting…" } else { "Watch stream" }),
+                    .text_color(if asked || pausing { theme::text_soft() } else { theme::on_accent() })
+                    .child(stage::watch_words(asked, pausing)),
             );
-        body.when(!small, |body| {
+        let preview = (!asked && !pausing && stream.share).then(|| {
+            call.and_then(|call| call.participants.iter().find(|person| person.id == stream.user_id && !person.preview.is_empty()).map(|person| person.preview.clone()))
+        }).flatten();
+        body.when_some(preview, |body, path| {
+            body.child(img(std::path::PathBuf::from(path)).absolute().top_0().left_0().size_full().object_fit(ObjectFit::Cover))
+        })
+        .when(!small, |body| {
             body.child(
                 Avatar::new(&people.key(&stream.user_id), &name, if large { 72. } else { 40. })
                     .image_at(people.picture(&stream.user_id))
@@ -1629,6 +1680,20 @@ impl Shell {
                 .when(!small, |tile| tile.child(state_row))
         };
         tile.children(link)
+            .children(seat.reaction.as_ref().filter(|r| !r.is_empty()).map(|emoji| {
+                div()
+                    .absolute()
+                    .top(px(8.))
+                    .left(px(8.))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded_full()
+                    .bg(theme::overlay())
+                    .border_1()
+                    .border_color(theme::border())
+                    .text_size(px(14.))
+                    .child(emoji.clone())
+            }))
             .child(
                 div()
                     .absolute()
@@ -1900,6 +1965,48 @@ impl Shell {
                 .tooltip(tip(if popout_open { "Bring video back" } else { "Pop out video" }, Some("⇧⌘O")))
                 .on_click(cx.listener(|this, _, _, cx| this.call_toggle_popout(cx)))
         });
+        let signal_group = joined
+            && call.is_some_and(|c| c.conversation.network == Network::Signal && c.conversation.id.starts_with("g."));
+        let hand_raised = call.is_some_and(|c| c.hand_raised);
+        let raise_hand = signal_group.then(|| {
+            bar_button(
+                "tiny-bar-hand",
+                "icons/hand.svg",
+                if hand_raised { BarLook::On } else { BarLook::Rest },
+            )
+            .aria_label(if hand_raised { "Lower hand" } else { "Raise hand" })
+            .tooltip(tip(if hand_raised { "Lower hand" } else { "Raise hand" }, None))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.call_ask(Request::CallRaiseHand { raised: !hand_raised }, cx);
+            }))
+        });
+        let react_bar = signal_group.then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .px(px(4.))
+                .h(px(36.))
+                .rounded_full()
+                .bg(theme::selected())
+                .children(["👍", "❤️", "😂", "👏"].into_iter().enumerate().map(|(ix, emoji)| {
+                    div()
+                        .id(("call-react", ix))
+                        .size(px(28.))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(14.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(tip(format!("React with {emoji}"), None))
+                        .child(emoji)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_ask(Request::CallReact { emoji: emoji.to_owned() }, cx);
+                        }))
+                }))
+        });
         let refused = self
             .call_refused()
             .map(str::to_owned)
@@ -1981,6 +2088,8 @@ impl Shell {
                     .child(deafen)
                     .children(share)
                     .children(camera)
+                    .children(raise_hand)
+                    .children(react_bar)
                     .children(popout)
                     .child(devices)
                     .children(health)

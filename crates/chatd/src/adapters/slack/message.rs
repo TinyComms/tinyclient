@@ -4,7 +4,7 @@ use super::emoji;
 use super::text::{emoji_end, Custom, Names, Rich};
 use super::{fnv, seconds, thread_id, Slack};
 use protocol::{
-    Attachment, Card, ConfirmDialog, ControlKind, ControlOption, ControlStyle, Forwarded,
+    Attachment, CallNote, CallOutcome, Card, ConfirmDialog, ControlKind, ControlOption, ControlStyle, Forwarded,
     MediaFile, MediaKind, Message, MessageControl, MessageKind, Preview, Reaction, Sender, Span,
     Style, ThreadSummary, Transcript, CARD_FIELDS, CONTROL_OPTIONS_LIMIT, MESSAGE_CONTROLS_LIMIT,
     THREAD_FACES, WAVEFORM_LIMIT,
@@ -689,16 +689,54 @@ pub(super) fn prove_custom_emoji() -> Result<(), String> {
     Ok(())
 }
 
-/// A huddle's one line. Slack keeps the same message and marks the room ended.
-fn huddle(room: &Value) -> String {
-    let (start, end) = (room["date_start"].as_i64().unwrap_or(0), room["date_end"].as_i64().unwrap_or(0));
-    if room["has_ended"] == true || end > 0 {
-        match (end - start) / 60 {
-            minutes if start > 0 && minutes > 0 => format!("A huddle happened · {minutes} min"),
-            _ => "A huddle happened".to_owned(),
-        }
+/// Slack updates the same room message when the huddle ends. The active list may then
+/// be empty, so the history is what tells us who joined.
+fn huddle_note(room: &Value) -> CallNote {
+    let start = room["date_start"].as_i64().filter(|&at| at > 0);
+    let end = room["date_end"].as_i64().filter(|&at| at > 0);
+    let outcome = if room["is_dm_call"] == true && room["was_missed"] == true {
+        CallOutcome::Missed
+    } else if room["has_ended"] == true || end.is_some() {
+        CallOutcome::Ended
     } else {
-        "A huddle started".to_owned()
+        CallOutcome::Live
+    };
+    let active = room["participants"].as_array();
+    let history = room["participant_history"].as_array();
+    let (primary, rest) = match outcome {
+        CallOutcome::Live => (active.or(history), None),
+        _ => (history, active),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let participants = primary.into_iter().chain(rest).flatten()
+        .filter_map(huddle_user_id)
+        .filter(|id| seen.insert(*id))
+        .map(str::to_owned)
+        .collect();
+    let seconds = end.zip(start).and_then(|(end, start)| u32::try_from(end - start).ok()).filter(|&span| span > 0);
+    CallNote {
+        outcome,
+        caller_id: huddle_user_id(&room["created_by"]).unwrap_or_default().to_owned(),
+        seconds,
+        participants,
+        video: false,
+        call_id: None,
+    }
+}
+
+fn huddle_user_id(person: &Value) -> Option<&str> {
+    person.as_str().or_else(|| first(&[&person["user_id"], &person["id"]])).filter(|id| !id.is_empty())
+}
+
+/// The fallback for inbox previews and clients that only read a message's text.
+fn huddle_line(note: &CallNote) -> String {
+    match note.outcome {
+        CallOutcome::Missed => "Missed huddle".to_owned(),
+        CallOutcome::Live => "A huddle started".to_owned(),
+        _ => match note.seconds.map(|span| span / 60).unwrap_or(0) {
+            0 => "A huddle happened".to_owned(),
+            minutes => format!("A huddle happened · {minutes} min"),
+        },
     }
 }
 
@@ -839,7 +877,7 @@ pub(super) fn prove_call_cards() -> Result<(), String> {
     if line != "A call happened · 25 min" {
         return Err(format!("an old call said {line}"));
     }
-    if huddle(&room) != "A huddle happened · 25 min" {
+    if huddle_line(&huddle_note(&room)) != "A huddle happened · 25 min" {
         return Err("a huddle was renamed".to_owned());
     }
     Ok(())
@@ -1602,6 +1640,48 @@ impl Slack {
         Some(framed)
     }
 
+    /// A huddle can carry a Canvas file or just name it. `canvas_thread_ts` is a timestamp,
+    /// so it is never used as a file id. The workspace's document URL works for a bare id.
+    fn huddle_notes(&self, event: &Value, files: &[Value]) -> (Option<usize>, Option<Card>) {
+        let room = &event["room"];
+        let references = [&room["canvas"], &room["notes_canvas"], &event["canvas"], &event["notes_canvas"]];
+        let valid_id = |id: &str| id.starts_with('F') && id.len() > 1 && id.bytes().all(|byte| byte.is_ascii_alphanumeric());
+        let reference = references.into_iter().find(|entry| {
+            first(&[&entry["file_id"], &entry["id"], entry]).is_some_and(valid_id)
+        });
+        let file_id = reference
+            .and_then(|entry| first(&[&entry["file_id"], &entry["id"], entry]))
+            .or_else(|| first(&[
+                &room["canvas_file_id"], &room["canvas_id"], &room["notes_canvas_id"],
+                &event["canvas_file_id"], &event["canvas_id"], &event["notes_canvas_id"],
+            ]).filter(|id| valid_id(id)));
+        let slot = match file_id {
+            Some(id) => files.iter().position(|file| file["id"] == id),
+            None => files.iter().position(|file| file["is_huddle_notes"] == true || is_canvas(file)),
+        };
+        let file = slot.map(|index| &files[index]).or(reference).unwrap_or(&Value::Null);
+        if matches!(file["mode"].as_str(), Some("tombstone" | "hidden_by_limit")) {
+            return (None, None);
+        }
+        let link = file_id.or_else(|| file["id"].as_str().filter(|id| valid_id(id)))
+            .map(|id| format!("{}docs/{}/{id}", self.session.url, self.session.team_id))
+            .unwrap_or_default();
+        let mut card = self.canvas_card(file, &link);
+        if card.title_link.is_empty() {
+            return (None, None);
+        }
+        if first(&[&file["title"], &file["name"]]).is_some() {
+            card.author = "Huddle notes".to_owned();
+        } else {
+            card.title = "Huddle notes".to_owned();
+            card.author.clear();
+        }
+        if matches!(card.text.as_str(), "Shared Slack canvas" | "Huddle notes canvas") {
+            card.text.clear();
+        }
+        (slot, Some(card))
+    }
+
     /// Maps a Slack Canvas file (`filetype` `quip` / `canvas` / `slack_canvas`) into a structured
     /// readable card with an "Open in Slack" link instead of a bare download chip.
     fn canvas_card(&self, file: &Value, fallback_link: &str) -> Card {
@@ -1964,9 +2044,25 @@ impl Slack {
 
         let mut rich = Rich::new(self);
         let system = subtype.is_some_and(|subtype| SYSTEM.contains(&subtype));
-        if event["room"].is_object() {
-            // `sh_room_created` is an old Slack call. A huddle uses the same room object.
-            rich.text = if subtype == Some("sh_room_created") { legacy_call(&event["room"]) } else { huddle(&event["room"]) };
+        let room = &event["room"];
+        // Slack's old calls have a room object too. Only huddles get its summary card.
+        let huddle = (room.is_object() && subtype != Some("sh_room_created")
+            && (subtype == Some("huddle_thread") || room["call_family"] == "huddle"))
+            .then(|| huddle_note(room));
+        if let Some(note) = &huddle {
+            let people = std::iter::once(&note.caller_id)
+                .chain(note.participants.iter().take(THREAD_FACES))
+                .filter(|id| !id.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            self.users(&people);
+            rich.text = huddle_line(note);
+        } else if room.is_object() {
+            rich.text = if subtype == Some("sh_room_created") {
+                legacy_call(room)
+            } else {
+                huddle_line(&huddle_note(room))
+            };
         } else if !event["blocks"].as_array().is_some_and(|blocks| rich.blocks(blocks)) {
             rich.mrkdwn(event["text"].as_str().unwrap_or(""));
         }
@@ -2011,7 +2107,20 @@ impl Slack {
                 }
             }
         }
-        for file in event["files"].as_array().into_iter().flatten() {
+        let files = event["files"].as_array().map_or(&[][..], Vec::as_slice);
+        let notes_file = if huddle.is_some() {
+            let (file, card) = self.huddle_notes(event, files);
+            if let Some(card) = card {
+                push_card(&mut framed, &mut extra_cards, card);
+            }
+            file
+        } else {
+            None
+        };
+        for (index, file) in files.iter().enumerate() {
+            if notes_file == Some(index) {
+                continue;
+            }
             let name = first(&[&file["name"], &file["title"]]).unwrap_or("file");
             match file["mode"].as_str() {
                 // Deleted since.
@@ -2104,7 +2213,8 @@ impl Slack {
         // ones are at its end. Slack documents the field and not its order.
         let repliers = event["reply_users"].as_array().into_iter().flatten().filter_map(Value::as_str);
         let repliers: Vec<protocol::Key> = repliers.rev().take(THREAD_FACES).map(|id| self.ctx.key(id)).collect();
-        let summary = (thread == Some(ts) && replies > 0).then(|| ThreadSummary {
+        let root = thread.is_none_or(|root| root == ts);
+        let summary = ((root && huddle.is_some()) || (thread == Some(ts) && replies > 0)).then(|| ThreadSummary {
             participants: repliers,
             // Slack says how many only for a thread the user follows, and only where it sends
             // the thread's own state (`conversations.replies`). 0 otherwise.
@@ -2146,6 +2256,7 @@ impl Slack {
         message.previews = previews;
         message.reactions = reactions;
         message.thread = summary;
+        message.call = huddle;
         message.card = framed;
         message.cards = extra_cards;
         message.controls = controls;

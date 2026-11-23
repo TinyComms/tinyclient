@@ -2052,6 +2052,8 @@ fn heard_frame(
                                 screen: None,
                                 quality: None,
                                 show_cursor: None,
+                                sound: None,
+                                preview: None,
                             },
                         );
                     }
@@ -2917,6 +2919,8 @@ fn direct_state(ctx: &Context, seat: &mut Seat, direct_id: &str, user: &str, fra
                 screen: None,
                 quality: None,
                 show_cursor: None,
+                sound: None,
+                preview: None,
             },
         );
     }

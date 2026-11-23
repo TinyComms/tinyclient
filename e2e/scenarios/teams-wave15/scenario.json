@@ -1,0 +1,12 @@
+{
+  "id": "teams-wave15",
+  "title": "Read Teams call history, voicemail and transcripts, then share instant and scheduled meetings",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "This driver uses desktop window input and OCR. It needs a touch driver with a Teams fixture.",
+    "ios": "This driver uses desktop window input and OCR. It needs a touch driver with a Teams fixture."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}

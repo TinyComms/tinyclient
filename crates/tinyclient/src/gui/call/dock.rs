@@ -936,12 +936,12 @@ impl Shell {
     }
 
     /// Share and camera belong on a joined call that allows video (`Call::video_allowed`) on a
-    /// network that carries it (Tiny, Discord, or Telegram — excluding RTMP viewer streams).
+    /// network that carries it (Tiny, Discord, Signal, or Telegram — excluding RTMP viewer streams).
     fn call_pictures(&self, call: &Call) -> bool {
         call.state == CallState::Joined
             && call.video_allowed
             && !call.rtmp_stream
-            && matches!(call.conversation.network, Network::Discord | Network::Tiny | Network::Telegram)
+            && protocol::call_pictures(call.conversation.network)
     }
 
     /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,
@@ -1163,7 +1163,23 @@ impl Shell {
         } else {
             theme::text_soft()
         };
-        let words = if talking { format!("You're muted. Press {} to talk", crate::gui::shortcuts::label("⌘⇧M")) } else { words };
+        let peer_note = live.then(|| {
+            let paused = call.participants.iter().any(|p| p.camera_paused);
+            let low_bat = call.participants.iter().any(|p| p.low_battery);
+            match (paused, low_bat) {
+                (true, true) => Some("Camera paused · Low battery".to_owned()),
+                (true, false) => Some("Camera paused".to_owned()),
+                (false, true) => Some("Peer battery low".to_owned()),
+                (false, false) => None,
+            }
+        }).flatten();
+        let words = if talking {
+            format!("You're muted. Press {} to talk", crate::gui::shortcuts::label("⌘⇧M"))
+        } else if let Some(note) = peer_note {
+            note
+        } else {
+            words
+        };
         let counter = if refused.is_some() || notice.is_some() { None } else { self.call_counter(call, cx) };
         let refused = refused.or(notice);
         // Give the server name or notice the full line; status and clock have their own row.
@@ -1443,11 +1459,12 @@ impl Shell {
                 }))
             })
         });
-        let ring_again = (call.conversation.network == Network::Discord
-            && subject.kind.is_direct()
-            && joined
+        let ring_again = (joined
             && enabled
-            && alone.is_some())
+            && ((matches!(call.conversation.network, Network::Discord | Network::Signal)
+                && subject.kind.is_direct()
+                && alone.is_some())
+                || (call.conversation.network == Network::Signal && subject.kind == ConversationKind::Group)))
         .then(|| {
             control("call-ring-again", "icons/phone-outgoing.svg", Look::Rest, true)
                 .aria_label("Ring again")
@@ -1457,6 +1474,25 @@ impl Shell {
                     this.call_ask(Request::CallRing { people: None }, cx);
                 }))
         });
+        let hand_raised = call.hand_raised;
+        let raise_hand = (call.conversation.network == Network::Signal
+            && subject.kind == ConversationKind::Group
+            && joined
+            && enabled)
+        .then(|| {
+            control(
+                "call-raise-hand",
+                "icons/hand.svg",
+                if hand_raised { Look::On } else { Look::Rest },
+                true,
+            )
+            .aria_label(if hand_raised { "Lower hand" } else { "Raise hand" })
+            .tooltip(tip(if hand_raised { "Lower hand" } else { "Raise hand" }, None))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_ask(Request::CallRaiseHand { raised: !hand_raised }, cx);
+            }))
+        });
         let picker = self.call_add_picker(call, subject.kind);
         let discord_add = !picker
             && call.conversation.network == Network::Discord
@@ -1464,7 +1500,12 @@ impl Shell {
             && joined
             && enabled
             && (call.participants.len() + 1) < 10;
-        let add_people = (picker || discord_add).then(|| {
+        let telegram_add = !picker
+            && call.conversation.network == Network::Telegram
+            && (subject.kind.is_direct() || call.conversation.id.starts_with("conf:"))
+            && joined
+            && enabled;
+        let add_people = (picker || discord_add || telegram_add).then(|| {
             control(
                 "call-add-people",
                 "icons/user-plus.svg",
@@ -1484,6 +1525,15 @@ impl Shell {
                     }
                 }
             }))
+        });
+        let copy_link = call.invite_link.clone().filter(|link| !link.is_empty() && joined && enabled).map(|link| {
+            control("call-copy-link", "icons/link.svg", Look::Rest, true)
+                .aria_label("Copy call link")
+                .tooltip(tip("Copy call link", None))
+                .on_click(cx.listener(move |_this, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(link.clone()));
+                }))
         });
         let devices = control(
             "call-devices",
@@ -1554,9 +1604,11 @@ impl Shell {
             .when(in_live_call, |row| row.child(deafen.flex_1().min_w_0()))
             .children(share.map(|button| button.flex_1().min_w_0()))
             .children(camera.map(|button| button.flex_1().min_w_0()))
+            .children(raise_hand.map(|button| button.flex_1().min_w_0()))
             .children(ring_again.map(|button| button.flex_1().min_w_0()))
             .children(add_people.map(|button| button.flex_1().min_w_0()))
             .children(tg_actions.map(|button| button.flex_1().min_w_0()))
+            .children(copy_link.map(|button| button.flex_1().min_w_0()))
             .child(devices.when(in_live_call, |button| button.flex_1().min_w_0()))
             .child(
                 end.when(in_live_call, |button| button.flex_1().min_w_0())
@@ -1783,7 +1835,12 @@ mod tests {
         move_notice: None,
         incoming_video: false,
         title: String::new(),
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
         hand_raised: false,
+        reaction: None,
+        invite_link: None,
         join_muted: false,
         can_change_join_muted: false,
         participants_count: 0,

@@ -1361,6 +1361,8 @@ impl Audio {
 
     /// 20 ms of the mix, to the speaker.
     pub fn play(&mut self, frame: &[i16; FRAME_SAMPLES]) {
+        // A share's loopback hears this. It is subtracted there, so the call is not sent back.
+        crate::share_audio::note_played(frame);
         match &mut self.sink {
             Sink::Null | Sink::Device(None) => {}
             Sink::File(file) => {

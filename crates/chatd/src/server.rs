@@ -353,6 +353,15 @@ impl Chat {
                 adapter.command(Command::Tiny(adapters::tiny::live::Ask::Offer { sdp }));
             }
         });
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_ice(move |conversation, candidate| {
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::CallIce {
+                    conversation_id: conversation.id.clone(),
+                    candidate,
+                });
+            }
+        });
         // Tiny media dropped, or came back, while the call is still up. The live socket joins
         // again, or notes that the link held. A Discord call does this inside mediad.
         let adapters = chat.adapters.clone();
@@ -4154,6 +4163,34 @@ impl Chat {
         self.status()
     }
 
+    /// Places a 1:1 video call (`video: true` on `phone.requestCall`).
+    fn call_start_video(&self, conversation: Key) -> Response {
+        if conversation.network == Network::Tiny {
+            return self.tiny_call_start(conversation);
+        }
+        match self.hub.store().conversation(&conversation) {
+            Ok(Some(row)) if row.call == CallSupport::Native => {}
+            Ok(Some(row)) if row.call == CallSupport::Handoff => {
+                return error(ErrorCode::Unsupported, format!("{} calls open in its own app.", conversation.network.label()))
+            }
+            Ok(Some(row)) if row.call == CallSupport::Restricted => {
+                return error(ErrorCode::Refused, "This person's privacy settings don't allow calls.")
+            }
+            Ok(Some(_)) => return error(ErrorCode::Unsupported, "This conversation has no calls tinyclient can join."),
+            Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
+            Err(err) => return internal(err),
+        }
+        if let Err(err) = self.hub.calls.start(&self.hub, conversation.clone()) {
+            return call_error(err);
+        }
+        let account = conversation.account();
+        self.command(&account, Command::CallJoinVideo(conversation.id));
+        if self.hub.settings().on(settings::JOIN_MUTED) {
+            self.command(&account, Command::CallAudio { muted: true, deafened: false });
+        }
+        self.status()
+    }
+
     /// A Tiny voice room is joined as before. A direct message the server can ring is a ring,
     /// with no mediad until it is accepted. An id this client has never stored is still joined
     /// as a room, which is how a room call is started.
@@ -5930,6 +5967,18 @@ impl Chat {
             }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::CallHistory { account, missed, before, limit } => self.call_history(account, missed, before, limit),
+            Request::Voicemails { account, before } => match self.ask(&account, |reply| Command::Voicemails { before, reply }) {
+                Ok((entries, next)) => Response::Voicemails { entries, next },
+                Err(refused) => *refused,
+            },
+            Request::VoicemailAudio { account, id, attachment } => match self.ask(&account, |reply| Command::VoicemailAudio { id, attachment, reply }) {
+                Ok(file) => Response::Media { files: vec![file] },
+                Err(refused) => *refused,
+            },
+            Request::ChangeVoicemail { account, id, action } => match self.ask(&account, |reply| Command::ChangeVoicemail { id, action, reply }) {
+                Ok(()) => Response::Ok,
+                Err(refused) => *refused,
+            },
             Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
@@ -6581,6 +6630,40 @@ impl Chat {
                 }
             }
             Request::CallStart { conversation } => self.call_start(conversation),
+            Request::CallStartVideo { conversation } => self.call_start_video(conversation),
+            Request::ConferenceResolve { account, slug } => {
+                match self.ask(&account, |reply| Command::ConferenceResolve { slug, reply }) {
+                    Ok(info) => Response::ConferenceInfo { info },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ConferenceCreate { account, video, join } => {
+                match self.ask(&account, |reply| Command::ConferenceCreate { video, join, reply }) {
+                    Ok(info) => Response::ConferenceInfo { info },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ConferenceJoin { account, slug, call_id, msg_id, video } => {
+                match self.ask(&account, |reply| Command::ConferenceJoin { slug, call_id, msg_id, video, reply }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ConferenceRemove { people, kick } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::ConferenceRemove {
+                    conversation_id,
+                    people,
+                    kick,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CallAccept => self.call_accept(),
             // A ring waiting beside a call is declined on its own. Ending the call does not
             // take that ring into the slot, so the next call the user places is not that ring.
@@ -6649,6 +6732,34 @@ impl Chat {
                         Ok(None) => Response::Ok,
                         Err(err) => error(ErrorCode::Internal, err.to_string()),
                     },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallRaiseHand { raised } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallRaiseHand {
+                    conversation_id,
+                    raised,
+                    reply,
+                }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallReact { emoji } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallReact {
+                    conversation_id,
+                    emoji,
+                    reply,
+                }) {
+                    Ok(()) => self.status(),
                     Err(refused) => *refused,
                 }
             }
@@ -6913,7 +7024,7 @@ impl Chat {
                 }
                 let picture = match &request {
                     MediaRequest::Camera { on } => Some(Picture::Camera(*on)),
-                    MediaRequest::ShareSend { on, .. } => Some(Picture::Share(*on)),
+                    MediaRequest::ShareSend { on, preview, .. } => Some(Picture::Share { on: *on, preview: *preview == Some(true) }),
                     MediaRequest::ShareWatch { source } => Some(Picture::Watch(source.clone())),
                     _ => None,
                 };
@@ -6949,11 +7060,11 @@ impl Chat {
                     MediaRequest::Meter { on } => self.hub.calls.meter(&self.hub, on),
                     request => self.hub.calls.request(&self.hub, &request).map(drop),
                 };
-                // A refusal never tells Discord or Telegram we are sending. Other networks ignore the command.
+                // A refusal never tells the network we are sending. Other networks ignore the command.
                 if asked.is_ok() {
                     if let (Some(call), true) = self.hub.calls.describe() {
                         if let Some(picture) = picture {
-                            if matches!(call.conversation.network, Network::Discord | Network::Telegram) {
+                            if matches!(call.conversation.network, Network::Discord | Network::Signal | Network::Telegram) {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
                             }
                         }
@@ -7656,6 +7767,31 @@ impl Chat {
             }),
             Request::TranslateMessages { conversation, message_ids, to } => self.translate(conversation, message_ids, to),
             Request::Meetings { account } => self.meetings(account),
+            Request::MeetingInvitees { conversation } => match self.ask(&conversation.account(), |reply| Command::MeetingInvitees {
+                conversation_id: conversation.id, reply,
+            }) {
+                Ok(emails) => Response::MeetingInvitees { emails },
+                Err(refused) => *refused,
+            },
+            Request::CreateMeeting { conversation, draft } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateMeeting { conversation_id: conversation.id, draft, reply }) {
+                    Ok((mut event, posted)) => {
+                        clip_meeting(&mut event);
+                        Response::MeetingCreated { event, posted }
+                    }
+                    Err(refused) => *refused,
+                }
+            },
+            Request::MeetingTranscript { conversation, message_id } => match self.ask(&conversation.account(), |reply| Command::MeetingTranscript {
+                conversation_id: conversation.id, message_id, reply,
+            }) {
+                Ok(text) => Response::MeetingTranscript { text },
+                Err(refused) => *refused,
+            },
             Request::MeetingRsvp { account, id, response, propose } => self.meeting_rsvp(account, id, response, propose),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {

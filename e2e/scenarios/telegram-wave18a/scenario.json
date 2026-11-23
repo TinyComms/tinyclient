@@ -1,0 +1,12 @@
+{
+  "id": "telegram-wave18a",
+  "title": "Telegram 1:1 video calls, 1:1 screen share with sound, and encrypted group conferences",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. Telegram 1:1 video, screen share with sound, and encrypted conference calls are covered by desktop chatd prove + mediad + integration tests.",
+    "ios": "The phone proof build does not run desktop chatd. Telegram 1:1 video, screen share with sound, and encrypted conference calls are covered by desktop chatd prove + mediad + integration tests."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

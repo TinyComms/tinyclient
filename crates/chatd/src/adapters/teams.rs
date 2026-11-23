@@ -108,6 +108,9 @@ pub fn prove_teams_markdown() -> Result<(), String> {
     html::prove_markdown()
 }
 mod info;
+mod call_log;
+mod meeting_media;
+mod meeting_create;
 mod links;
 pub(crate) mod message;
 
@@ -483,6 +486,8 @@ struct State {
     catalog_meta: HashMap<String, (u32, u32, String)>,
     /// Meeting chats and calendar events remembered this run, by id.
     meetings: HashMap<String, protocol::MeetingEvent>,
+    voicemail_next: Option<String>,
+    transcript_token: Option<(String, Token)>,
 }
 
 /// What a call presents.
@@ -1396,8 +1401,29 @@ impl Teams {
             Command::Translate { conversation_id, message_id, to, reply } => {
                 let _ = reply.send(self.translate(&conversation_id, &message_id, &to).map_err(refuse));
             }
+            Command::CallHistory { missed, before, limit, reply } => {
+                let _ = reply.send(self.call_history(missed, before.as_deref(), limit).map_err(refuse));
+            }
+            Command::Voicemails { before, reply } => {
+                let _ = reply.send(self.voicemails(before.as_deref()).map_err(refuse));
+            }
+            Command::VoicemailAudio { id, attachment, reply } => {
+                let _ = reply.send(self.voicemail_audio(&id, &attachment).map_err(refuse));
+            }
+            Command::ChangeVoicemail { id, action, reply } => {
+                let _ = reply.send(self.change_voicemail(&id, action).map_err(refuse));
+            }
             Command::Meetings { reply } => {
                 let _ = reply.send(self.meetings().map_err(refuse));
+            }
+            Command::MeetingTranscript { conversation_id, message_id, reply } => {
+                let _ = reply.send(self.meeting_transcript(&conversation_id, &message_id).map_err(refuse));
+            }
+            Command::MeetingInvitees { conversation_id, reply } => {
+                let _ = reply.send(self.meeting_invitees(&conversation_id).map_err(refuse));
+            }
+            Command::CreateMeeting { conversation_id, draft, reply } => {
+                let _ = reply.send(self.create_meeting(&conversation_id, &draft).map_err(refuse));
             }
             Command::MeetingRsvp { id, response, propose, reply } => {
                 let _ = reply.send(self.meeting_rsvp(&id, response, propose).map_err(refuse));

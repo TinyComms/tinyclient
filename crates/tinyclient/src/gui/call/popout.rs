@@ -416,12 +416,16 @@ impl Render for CallPopout {
                         if share_on {
                             shell.tiny_stop_share(cx);
                         } else {
+                            let sound = crate::gui::tiny::share_sound_flag(shell.tiny_state.share_sound);
+                            let preview = crate::gui::tiny::share_preview_flag(shell.tiny_state.share_preview);
                             shell.call_ask(
                                 Request::Media(MediaRequest::ShareSend {
                                     on: true,
                                     screen: None,
                                     quality: None,
                                     show_cursor: None,
+                                    sound,
+                                    preview,
                                 }),
                                 cx,
                             );

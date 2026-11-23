@@ -561,6 +561,12 @@ pub(super) fn older_ack_applies(manual: bool) -> bool {
     manual
 }
 
+/// `TINYCLIENT_PROVE=discord-wave15-share`. The preview, the stream key, a named viewer and
+/// the identity post are what this build sends.
+pub(super) fn prove_wave15_share() -> Result<(), String> {
+    voice::prove_wave15_share()
+}
+
 /// `TINYCLIENT_PROVE=discord-mark-unread`. The manual ack body is the one Discord expects, and
 /// an older ack moves the marker only when it is manual.
 pub(super) fn prove_mark_unread() -> Result<(), String> {
@@ -945,6 +951,13 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         message_search: Mutex::new(info::MessageSearch::default()),
         search_turn: Mutex::new(()),
         stream_gate: Mutex::new(()),
+    });
+    let posting = discord.clone();
+    discord.ctx.hub.calls.on_identity(move |conversation, identity| {
+        if conversation.account() != posting.ctx.account || posting.ctx.stopped() {
+            return;
+        }
+        posting.publish_dave_key(identity);
     });
     let socket = discord.clone();
     std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
@@ -3911,7 +3924,14 @@ impl Discord {
         }
         match command {
             // `serve_commands` keeps these two for itself.
-            Command::Backfill(id) | Command::Warm(id) => self.backfill(&id),
+            Command::Backfill(id) => self.backfill(&id),
+            Command::Warm(id) => {
+                self.backfill(&id);
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                unsafe {
+                    libc::malloc_trim(0);
+                }
+            }
             Command::History { conversation_id, before } => {
                 if let Ok(Some(conversation)) = self.ctx.known(&conversation_id) {
                     self.fetch(&conversation, Stretch::Before(&before));

@@ -95,6 +95,12 @@ struct Live {
     room_bitrate: Option<u32>,
     /// How mediad last said the call is protected, before whom the user verified is applied.
     secured: Option<protocol::CallSecurity>,
+    /// The Go Live leg's report, kept apart from the voice call.
+    stream_secured: Option<protocol::CallSecurity>,
+    /// The identity key already given to Discord for this call.
+    posted_identity: Option<String>,
+    /// Set when a new identity should be published, read once outside the call lock.
+    pending_identity: Option<String>,
     /// A call has this mediad (`ActiveCall::adopt`, or a mediad started for one). Until then it
     /// is an engine waiting: what it says (its device list, again at every hot-plug) is learned
     /// but never drawn or announced as a call.
@@ -156,6 +162,9 @@ type Failed = Box<dyn Fn(&Key) + Send + Sync>;
 type Signal = Box<dyn Fn(&Key, String) + Send + Sync>;
 /// Told when our own speaking state changes in a call (for networks like Telegram group calls).
 type SpeakingHook = Box<dyn Fn(&Key, String, bool) + Send + Sync>;
+/// Publishes one account's DAVE identity key. Held in an `Arc` so the list can be called
+/// without keeping this lock across the request.
+type IdentityHook = std::sync::Arc<dyn Fn(&Key, &str) + Send + Sync>;
 
 /// At most one call, across every network.
 #[derive(Default)]
@@ -175,9 +184,13 @@ pub struct Calls {
     speaking: Mutex<Option<SpeakingHook>>,
     /// Who sends a Tiny renegotiation offer. The same shape as `signal`.
     offer: Mutex<Option<Signal>>,
+    /// Who sends a Signal local ICE candidate (`IceUpdate`). The same shape as `signal`.
+    ice: Mutex<Option<Signal>>,
     /// Tiny media dropped, or came back. The live socket resumes the call; the same shape as `failed`.
     tiny_down: Mutex<Option<Failed>>,
     tiny_up: Mutex<Option<Failed>>,
+    /// Discord accounts that publish a DAVE identity key. One hook per signed-in account.
+    identity: Mutex<Vec<IdentityHook>>,
     /// The mediad started for Settings' microphone test or test sound, outside a call.
     tester: Mutex<Option<Tester>>,
     /// A mediad started ahead of the next call (`prewarm`).
@@ -301,7 +314,12 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         move_notice: None,
         incoming_video: false,
         title: String::new(),
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
         hand_raised: false,
+        reaction: None,
+        invite_link: None,
         join_muted: false,
         can_change_join_muted: false,
         participants_count: 0,
@@ -329,6 +347,9 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         push_to_talk: false,
         room_bitrate: None,
         secured: None,
+        stream_secured: None,
+        posted_identity: None,
+        pending_identity: None,
         adopted: false,
         over: false,
     }
@@ -555,18 +576,34 @@ impl Live {
                 self.call.outputs = outputs;
                 self.call.cameras = cameras;
             }
-            // Whom the user verified is chatd's to know; a call that is not a Tiny one never
-            // hears this.
+            // Whom the user verified is chatd's to know. A Discord report uses the same shape:
+            // the voice call on `security`, a Go Live leg on `stream_security`.
             MediaResponse::TinySecurity(security) => {
                 let account = self.call.conversation.account();
-                self.secured = Some(security.clone());
-                let security = Some(crate::verified::trusted(&account, security));
-                if self.call.security == security {
+                let stream = security.stream;
+                let identity = security.identity.clone();
+                let security = crate::verified::trusted(&account, security);
+                let same = if stream { self.call.stream_security.as_ref() == Some(&security) } else { self.call.security.as_ref() == Some(&security) };
+                if stream {
+                    self.stream_secured = Some(security.clone());
+                    self.call.stream_security = Some(security);
+                } else {
+                    self.secured = Some(security.clone());
+                    self.call.security = Some(security);
+                }
+                if !identity.is_empty() && self.posted_identity.as_deref() != Some(identity.as_str()) {
+                    self.posted_identity = Some(identity.clone());
+                    self.pending_identity = Some(identity);
+                }
+                if same {
                     return false;
                 }
-                self.call.security = security;
             }
-            MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } | MediaResponse::TinyRenegotiate { .. } => return false,
+            MediaResponse::Source { .. }
+            | MediaResponse::TinyE2ee { .. }
+            | MediaResponse::TinyRenegotiate { .. }
+            | MediaResponse::SignalIce { .. }
+            | MediaResponse::Answer { .. } => return false,
             MediaResponse::Picture { path, width, height, generation, user_id, kind } => {
                 let mut changed = false;
                 if path.is_empty() {
@@ -648,6 +685,40 @@ impl Live {
                     return false;
                 }
                 self.call.video = video;
+            }
+            MediaResponse::TelegramPeerState { user_id, camera, camera_paused, low_battery, sharing } => {
+                let mut changed = false;
+                if let Some(p) = self.call.participants.iter_mut().find(|p| p.id == user_id) {
+                    if p.camera != camera
+                        || p.camera_paused != camera_paused
+                        || p.low_battery != low_battery
+                        || p.sharing != sharing
+                    {
+                        p.camera = camera;
+                        p.camera_paused = camera_paused;
+                        p.low_battery = low_battery;
+                        p.sharing = sharing;
+                        changed = true;
+                    }
+                } else if !user_id.is_empty() {
+                    self.call.participants.push(Participant {
+                        id: user_id,
+                        name: String::new(),
+                        camera,
+                        camera_paused,
+                        low_battery,
+                        sharing,
+                        ..Participant::default()
+                    });
+                    changed = true;
+                }
+                if self.call.stream_paused != camera_paused {
+                    self.call.stream_paused = camera_paused;
+                    changed = true;
+                }
+                if !changed {
+                    return false;
+                }
             }
             MediaResponse::Notice { detail } => {
                 let notice = Some(detail);
@@ -870,6 +941,11 @@ fn heard(hub: &Hub, seen: &Mutex<Live>, frame: MediaResponse) {
         MediaResponse::Speaking { user_id, speaking } => Some((user_id.clone(), *speaking)),
         _ => None,
     };
+    if let MediaResponse::SignalIce { candidate } = &frame {
+        let conversation = crate::hub::lock(seen).call.conversation.clone();
+        hub.calls.ice(&conversation, candidate.clone());
+        return;
+    }
     let notify = match &frame {
         MediaResponse::Interrupted => Some(false),
         MediaResponse::Connected { .. } => Some(true),
@@ -878,9 +954,13 @@ fn heard(hub: &Hub, seen: &Mutex<Live>, frame: MediaResponse) {
     let mut live = crate::hub::lock(seen);
     let conversation = live.call.conversation.clone();
     let call = live.hear(frame);
+    let identity = live.pending_identity.take();
     let adopted = live.adopted && !live.over;
     let state_now = live.call.state.clone();
     drop(live);
+    if let Some(identity) = identity {
+        hub.calls.tell_identity(&conversation, &identity);
+    }
     // Outside the call lock. A drop while already reconnecting does not redraw, and
     // still has to be resumed; the first connect is not one.
     if adopted && conversation.network == protocol::Network::Tiny {
@@ -1027,6 +1107,11 @@ impl Calls {
         *crate::hub::lock(&self.offer) = Some(Box::new(told));
     }
 
+    /// Who sends a local Signal ICE candidate (`IceUpdate`) for the call's account.
+    pub fn on_ice(&self, told: impl Fn(&Key, String) + Send + Sync + 'static) {
+        *crate::hub::lock(&self.ice) = Some(Box::new(told));
+    }
+
     /// Who hears that a Tiny call's media dropped, so the live socket can join again.
     pub fn on_tiny_down(&self, told: impl Fn(&Key) + Send + Sync + 'static) {
         *crate::hub::lock(&self.tiny_down) = Some(Box::new(told));
@@ -1035,6 +1120,18 @@ impl Calls {
     /// Who hears that a Tiny call's media is flowing again.
     pub fn on_tiny_up(&self, told: impl Fn(&Key) + Send + Sync + 'static) {
         *crate::hub::lock(&self.tiny_up) = Some(Box::new(told));
+    }
+
+    /// One signed-in Discord account publishes the key mediad kept for it.
+    pub fn on_identity(&self, told: impl Fn(&Key, &str) + Send + Sync + 'static) {
+        crate::hub::lock(&self.identity).push(std::sync::Arc::new(told));
+    }
+
+    fn tell_identity(&self, conversation: &Key, key: &str) {
+        let hooks = crate::hub::lock(&self.identity).clone();
+        for hook in hooks {
+            hook(conversation, key);
+        }
     }
 
     fn signal(&self, conversation: &Key, frame: String) {
@@ -1065,23 +1162,15 @@ impl Calls {
         }
     }
 
-    /// Sets explicit call security (e.g. Telegram 1:1 verified emoji after `phone.confirmCall`).
-    pub fn set_security(&self, hub: &Hub, conversation: &Key, security: Option<protocol::CallSecurity>) {
-        let mut changed = false;
-        let known = self.update(hub, conversation, |live| {
-            if live.call.security != security {
-                live.call.security = security.clone();
-                changed = true;
-            }
-        });
-        if known && changed {
-            self.tell(hub);
-        }
-    }
-
     fn offer(&self, conversation: &Key, sdp: String) {
         if let Some(told) = &*crate::hub::lock(&self.offer) {
             told(conversation, sdp);
+        }
+    }
+
+    fn ice(&self, conversation: &Key, candidate: String) {
+        if let Some(told) = &*crate::hub::lock(&self.ice) {
+            told(conversation, candidate);
         }
     }
 
@@ -1104,6 +1193,7 @@ impl Calls {
         };
         let refreshed = self.update(hub, &call.conversation, |live| {
             live.call.security = live.secured.clone().map(|security| crate::verified::trusted(account, security));
+            live.call.stream_security = live.stream_secured.clone().map(|security| crate::verified::trusted(account, security));
         });
         if refreshed {
             self.tell(hub);
@@ -1958,6 +2048,34 @@ impl Calls {
         }
     }
 
+    /// People watching our own share, as the network named them.
+    pub fn set_viewers(&self, hub: &Hub, conversation: &Key, viewers: Vec<Participant>) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.viewers != viewers {
+                live.call.viewers = viewers.clone();
+                changed = true;
+            }
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
+    /// The stream we are watching stopped sending, or started again.
+    pub fn set_stream_paused(&self, hub: &Hub, conversation: &Key, paused: bool) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.stream_paused != paused {
+                live.call.stream_paused = paused;
+                changed = true;
+            }
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
     /// One sentence about a move into a group call, or why that move came back.
     pub fn set_move_notice(&self, hub: &Hub, conversation: &Key, notice: Option<String>) {
         let mut changed = false;
@@ -2112,13 +2230,13 @@ impl Calls {
         }
     }
 
-    /// Asks mediad to build the local ICE/DTLS join params JSON and SSRC for a Telegram group call.
+    /// Asks mediad to build the local ICE/DTLS join params JSON, SSRC, and optional conference E2EE public key.
     pub fn telegram_group_offer(
         &self,
         hub: &Arc<Hub>,
         conversation: &Key,
         mut offer: protocol::TelegramGroupOffer,
-    ) -> Result<(String, u32), String> {
+    ) -> Result<(String, u32, Option<String>), String> {
         let (call, running) = self.describe();
         let here = call.as_ref().is_some_and(|call| call.conversation == *conversation) && running;
         // Rejoining mid-call (e.g. switching join-as identity) requires a fresh mediad WebRTC session.
@@ -2137,16 +2255,27 @@ impl Calls {
                 CallError::Media(err) => err.to_string(),
             })?;
         }
+        let is_conf = offer.conference;
         // Telegram group video chats join muted by default, as official apps do.
-        offer.muted = true;
+        if !is_conf {
+            offer.muted = true;
+        }
         self.update(hub, conversation, |live| {
-            live.call.muted = true;
+            live.call.muted = offer.muted;
             live.call.deafened = offer.deafened;
-            live.call.security = None;
+            live.call.security = if is_conf {
+                Some(protocol::CallSecurity {
+                    mode: protocol::SecurityMode::Pending,
+                    required: true,
+                    ..protocol::CallSecurity::default()
+                })
+            } else {
+                None
+            };
             live.me = offer.user_id.clone();
         });
         match self.request(hub, &MediaRequest::TelegramGroupOffer(offer)) {
-            Ok(MediaResponse::TelegramGroupJoin { params, ssrc }) => Ok((params, ssrc)),
+            Ok(MediaResponse::TelegramGroupJoin { params, ssrc, public_key }) => Ok((params, ssrc, public_key)),
             other => {
                 if !here {
                     self.end_if(hub, conversation);
@@ -2157,6 +2286,33 @@ impl Calls {
                 })
             }
         }
+    }
+
+    /// Passes Telegram conference E2EE chain blocks to mediad for cryptographic verification.
+    pub fn telegram_conference_blocks(
+        &self,
+        hub: &Hub,
+        conversation: &Key,
+        sub_chain_id: i32,
+        blocks: Vec<String>,
+    ) -> Result<(), String> {
+        let (call, running) = self.describe();
+        if !running || !call.is_some_and(|c| c.conversation == *conversation) {
+            return Err("No active conference call.".to_owned());
+        }
+        match self.request(hub, &MediaRequest::TelegramConferenceBlocks { sub_chain_id, blocks }) {
+            Ok(MediaResponse::Done) => Ok(()),
+            Ok(MediaResponse::Refused { detail }) => Err(detail),
+            Err(CallError::Media(err)) => Err(err.to_string()),
+            _ => Err("Conference E2EE verification failed.".to_owned()),
+        }
+    }
+
+    /// Sets or clears the shareable invite link (`https://t.me/call/<slug>`) on the active call.
+    pub fn set_invite_link(&self, hub: &Hub, conversation: &Key, invite_link: Option<String>) {
+        self.update(hub, conversation, |live| {
+            live.call.invite_link = invite_link;
+        });
     }
 
     /// Passes Telegram's server transport JSON (`updateGroupCallConnection`) to mediad.
@@ -2430,6 +2586,112 @@ impl Calls {
         let (call, running) = self.describe();
         if running && call.is_some_and(|call| call.conversation == *conversation) {
             let _ = self.request(hub, &MediaRequest::TinySlots { audio });
+        }
+    }
+
+    /// Builds a pure-Rust `str0m` WebRTC SDP offer for an outgoing Signal 1:1 or group call.
+    pub fn signal_offer(&self, hub: &Hub, conversation: &Key, mut offer: protocol::SignalOffer) -> Result<String, String> {
+        let known = self.update(hub, conversation, |live| {
+            offer.muted = live.call.muted;
+            offer.deafened = live.call.deafened;
+            live.me = offer.user_id.clone();
+        });
+        if !known {
+            return Err("That Signal call is gone.".to_owned());
+        }
+        match self.request(hub, &MediaRequest::SignalOffer(offer)) {
+            Ok(MediaResponse::Offer { sdp }) => Ok(sdp),
+            Ok(other) => Err(format!("mediad answered {} instead of Offer", other.name())),
+            Err(CallError::Media(err)) => Err(err.to_string()),
+            Err(_) => Err(ENGINE_SILENT.to_owned()),
+        }
+    }
+
+    /// Accepts an incoming Signal call SDP offer in `mediad` and returns our SDP answer.
+    pub fn signal_accept(&self, hub: &Hub, conversation: &Key, mut accept: protocol::SignalAccept) -> Result<String, String> {
+        let known = self.update(hub, conversation, |live| {
+            accept.muted = live.call.muted;
+            accept.deafened = live.call.deafened;
+            live.me = accept.user_id.clone();
+            live.joining = true;
+            live.since = Instant::now();
+        });
+        if !known {
+            return Err("That Signal call is gone.".to_owned());
+        }
+        match self.request(hub, &MediaRequest::SignalAccept(accept)) {
+            Ok(MediaResponse::Answer { sdp }) => Ok(sdp),
+            Ok(other) => Err(format!("mediad answered {} instead of Answer", other.name())),
+            Err(CallError::Media(err)) => Err(err.to_string()),
+            Err(_) => Err(ENGINE_SILENT.to_owned()),
+        }
+    }
+
+    /// Supplies the remote peer's SDP answer to our pending Signal offer in `mediad`.
+    pub fn signal_answer(&self, hub: &Hub, conversation: &Key, sdp: String) -> Result<(), String> {
+        let known = self.update(hub, conversation, |live| {
+            live.joining = true;
+            live.since = Instant::now();
+        });
+        if !known {
+            return Err("That Signal call is gone.".to_owned());
+        }
+        match self.request(hub, &MediaRequest::SignalAnswer { sdp }) {
+            Ok(MediaResponse::Done) => Ok(()),
+            Ok(other) => Err(format!("mediad answered {} instead of Done", other.name())),
+            Err(CallError::Media(err)) => Err(err.to_string()),
+            Err(_) => Err(ENGINE_SILENT.to_owned()),
+        }
+    }
+
+    /// Feeds one remote ICE candidate into the active or pending Signal `mediad` session.
+    pub fn signal_ice(&self, hub: &Hub, conversation: &Key, candidate: String) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|call| call.conversation == *conversation) {
+            let _ = self.request(hub, &MediaRequest::SignalIce { candidate });
+        }
+    }
+
+    /// Sets the call's end-to-end encryption indicator (`CallSecurity`), e.g. Signal's safety number.
+    pub fn set_security(&self, hub: &Hub, conversation: &Key, security: Option<protocol::CallSecurity>) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            live.secured = security.clone();
+            if live.call.security != security {
+                live.call.security = security.clone();
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
+        }
+    }
+
+    /// Sets our own raised-hand state in the active group call.
+    pub fn set_hand_raised(&self, hub: &Hub, conversation: &Key, raised: bool) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            if live.call.hand_raised != raised {
+                live.call.hand_raised = raised;
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
+        }
+    }
+
+    /// Sets our own active transient emoji reaction in the active group call.
+    pub fn set_reaction(&self, hub: &Hub, conversation: &Key, emoji: Option<String>) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            if live.call.reaction != emoji {
+                live.call.reaction = emoji.clone();
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
         }
     }
 

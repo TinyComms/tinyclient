@@ -249,6 +249,7 @@ pub struct Shell {
     pub(super) composer_state: composer::State,
     #[allow(dead_code)]
     pub(super) call_state: call::State,
+    pub(super) meeting_form: Option<super::meetings::Form>,
     /// The voice message or audio file playing, across conversations.
     pub(super) playing_state: super::playing::State,
     /// The Tiny server on show.
@@ -345,6 +346,7 @@ impl Shell {
             people_state: people::State::default(),
             composer_state: composer::State::default(),
             call_state: call::State::default(),
+            meeting_form: None,
             playing_state: super::playing::State::default(),
             tiny_state: super::tiny::State::new(cx),
             discord_settings: super::discord_settings::State::default(),

@@ -39,8 +39,11 @@ use crate::process::Processor;
 use crate::rtp::SILENCE;
 use crate::session::Controls;
 use crate::stats::Meter;
-use crate::video::{Received as VideoReceived, Track as VideoTrack, Video as VideoEngine, Wants as VideoWants, Word as VideoWord};
-use crate::{out, rt, tiny, FRAME, FRAME_SAMPLES};
+use crate::video::{
+    Rates, Received, Received as VideoReceived, Track, Track as VideoTrack, Video, Video as VideoEngine, Wants,
+    Wants as VideoWants, Word, Word as VideoWord,
+};
+use crate::{out, rt, share_audio, telegram_e2ee, tiny, FRAME, FRAME_SAMPLES};
 use aes::Aes256;
 use base64::Engine as _;
 use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
@@ -89,6 +92,208 @@ const DIRECT_AUDIO_MAGIC: [u8; 4] = *b"TGOP";
 const DIRECT_KIND_PING: u8 = 1;
 /// Opus audio packet type.
 const DIRECT_KIND_OPUS: u8 = 2;
+/// H.264 camera video chunk packet type (`#458`).
+pub const DIRECT_KIND_VIDEO_CAMERA: u8 = 3;
+/// H.264 screencast video chunk packet type (`#448`).
+pub const DIRECT_KIND_VIDEO_SHARE: u8 = 4;
+/// Keyframe request (PLI) packet type (payload byte: 0 = camera, 1 = share).
+pub const DIRECT_KIND_KEYFRAME_REQ: u8 = 5;
+
+/// Max raw H.264 payload bytes per UDP chunk so each MTProto-sealed packet stays under MTU.
+const VIDEO_CHUNK_MAX: usize = 1050;
+/// Chunk sub-header inside a video packet: `[frame_id: u32 LE, frag_idx: u16 LE, frag_count: u16 LE, flags: u8]`.
+const VIDEO_CHUNK_HDR: usize = 9;
+const VIDEO_FLAG_KEYFRAME: u8 = 1;
+
+/// Parsed remote peer media state from decrypted `updatePhoneCallSignalingData` JSON.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerMediaState {
+    pub camera: bool,
+    pub camera_paused: bool,
+    pub low_battery: bool,
+    pub sharing: bool,
+}
+
+/// Builds the Telegram 1:1 in-call signaling JSON for camera & screencast state.
+pub fn build_media_state_signal(camera: bool, camera_paused: bool, sharing: bool, low_battery: bool) -> Value {
+    let video_num = if !camera { 0 } else if camera_paused { 1 } else { 2 };
+    let video_str = if !camera { "inactive" } else if camera_paused { "paused" } else { "active" };
+    let share_num = if sharing { 2 } else { 0 };
+    let share_str = if sharing { "active" } else { "inactive" };
+    json!({
+        "@type": "mediaState",
+        "type": "media-state",
+        "codecs": ["H264"],
+        "tracks": ["camera", "screencast"],
+        "videoState": video_num,
+        "camera": video_str,
+        "screencastState": share_num,
+        "screencast": share_str,
+        "isBatteryLow": low_battery,
+        "low_battery": low_battery,
+    })
+}
+
+/// Parses remote camera (`active` / `inactive` / `paused`), `low_battery`, and `screencast` state
+/// from either tgcalls-style `mediaState` or `media-state` JSON payloads.
+pub fn parse_peer_signal(val: &Value) -> Option<PeerMediaState> {
+    let kind = val
+        .get("@type")
+        .or_else(|| val.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let has_media_fields = val.get("videoState").is_some()
+        || val.get("camera").is_some()
+        || val.get("screencastState").is_some()
+        || val.get("screencast").is_some()
+        || val.get("isBatteryLow").is_some()
+        || val.get("low_battery").is_some();
+    if !matches!(kind, "mediaState" | "media-state" | "video-state") && !has_media_fields {
+        return None;
+    }
+    let parse_track = |num_key: &str, str_key: &str| -> (bool, bool) {
+        if let Some(s) = val.get(str_key).and_then(Value::as_str) {
+            return match s {
+                "active" => (true, false),
+                "paused" => (true, true),
+                _ => (false, false),
+            };
+        }
+        if let Some(n) = val.get(num_key).and_then(Value::as_i64) {
+            return match n {
+                2 => (true, false),
+                1 => (true, true),
+                _ => (false, false),
+            };
+        }
+        if let Some(b) = val.get(str_key).and_then(Value::as_bool) {
+            return (b, false);
+        }
+        (false, false)
+    };
+    let (camera, camera_paused) = parse_track("videoState", "camera");
+    let (sharing, _) = parse_track("screencastState", "screencast");
+    let low_battery = val
+        .get("isBatteryLow")
+        .or_else(|| val.get("low_battery"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(PeerMediaState { camera, camera_paused, low_battery, sharing })
+}
+
+/// Mixes a 20 ms stereo system/window loopback frame (`share_audio`) into an outgoing 20 ms
+/// microphone frame with saturating clamping so peers hear shared screen sound alongside voice.
+pub fn mix_share_audio(mic: &mut [i16; FRAME_SAMPLES], share: &[i16; FRAME_SAMPLES]) {
+    for (dst, &src) in mic.iter_mut().zip(share.iter()) {
+        let sum = i32::from(*dst) + i32::from(src);
+        *dst = sum.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    }
+}
+
+/// Splits one encoded H.264 access unit into MTU-safe MTProto-encrypted direct UDP packets.
+pub fn pack_video_chunks(
+    key: &[u8; 256],
+    outgoing: bool,
+    peer_tag: Option<&[u8]>,
+    kind: u8,
+    frame_id: u32,
+    rtp: u32,
+    keyframe: bool,
+    h264: &[u8],
+) -> Vec<Vec<u8>> {
+    if h264.is_empty() {
+        return Vec::new();
+    }
+    let chunks: Vec<&[u8]> = h264.chunks(VIDEO_CHUNK_MAX).collect();
+    let count = chunks.len().min(u16::MAX as usize) as u16;
+    let flags = if keyframe { VIDEO_FLAG_KEYFRAME } else { 0 };
+    chunks
+        .into_iter()
+        .take(count as usize)
+        .enumerate()
+        .map(|(idx, part)| {
+            let mut payload = Vec::with_capacity(VIDEO_CHUNK_HDR + part.len());
+            payload.extend_from_slice(&frame_id.to_le_bytes());
+            payload.extend_from_slice(&(idx as u16).to_le_bytes());
+            payload.extend_from_slice(&count.to_le_bytes());
+            payload.push(flags);
+            payload.extend_from_slice(part);
+            pack_direct_frame(key, outgoing, peer_tag, kind, frame_id, rtp, &payload)
+        })
+        .collect()
+}
+
+/// Reassembles fragmented H.264 access units arriving over Telegram 1:1 UDP for one video track.
+#[derive(Default)]
+pub struct VideoReassembler {
+    frame_id: u32,
+    expected: u16,
+    received: u16,
+    keyframe: bool,
+    parts: Vec<Option<Vec<u8>>>,
+}
+
+impl VideoReassembler {
+    pub fn push(&mut self, payload: &[u8]) -> Option<(Vec<u8>, bool)> {
+        if payload.len() <= VIDEO_CHUNK_HDR {
+            return None;
+        }
+        let frame_id = u32::from_le_bytes(payload[0..4].try_into().ok()?);
+        let idx = u16::from_le_bytes(payload[4..6].try_into().ok()?) as usize;
+        let count = u16::from_le_bytes(payload[6..8].try_into().ok()?);
+        let flags = payload[8];
+        if count == 0 || idx >= count as usize || count > 256 {
+            return None;
+        }
+        if frame_id != self.frame_id || count != self.expected {
+            self.frame_id = frame_id;
+            self.expected = count;
+            self.received = 0;
+            self.keyframe = (flags & VIDEO_FLAG_KEYFRAME) != 0;
+            self.parts = vec![None; count as usize];
+        }
+        if self.parts[idx].is_none() {
+            self.parts[idx] = Some(payload[VIDEO_CHUNK_HDR..].to_vec());
+            self.received += 1;
+        }
+        if self.received == self.expected {
+            let mut out = Vec::new();
+            for part in self.parts.drain(..) {
+                out.extend_from_slice(&part?);
+            }
+            let key = self.keyframe;
+            self.expected = 0;
+            self.received = 0;
+            return Some((out, key));
+        }
+        None
+    }
+}
+
+fn is_h264_keyframe(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < data.len() {
+        let start = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            Some(i + 3)
+        } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+            Some(i + 4)
+        } else {
+            None
+        };
+        if let Some(nal_pos) = start {
+            if nal_pos < data.len() {
+                let nal_type = data[nal_pos] & 0x1f;
+                if nal_type == 5 || nal_type == 7 {
+                    return true;
+                }
+            }
+            i = nal_pos;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
 
 const ENGINE: &str = "The call engine could not start. Try again.";
 const NO_AUDIO_PATH: &str = "Couldn't reach Telegram's voice path. A VPN or firewall may be blocking it.";
@@ -345,11 +550,14 @@ pub fn run_direct(join: TelegramCallJoin, controls: Arc<Controls>) {
     let local_addr = socket.local_addr().ok();
 
     // Send an encrypted signaling hello over Telegram's signaling channel (`phone.sendSignalingData`)
-    // so both sides verify the MTProto call key over signaling and exchange capabilities.
+    // so both sides verify the MTProto call key over signaling and negotiate H.264 camera + screencast tracks.
     let hello = json!({
-        "type": "tinyclient-voice-v1",
+        "type": "tinyclient-call-v2",
         "role": if join.outgoing { "caller" } else { "callee" },
         "port": local_addr.map(|a| a.port()).unwrap_or(0),
+        "video": join.video,
+        "codecs": ["H264"],
+        "tracks": ["camera", "screencast"],
     });
     let sealed_hello = seal_mtproto(&key, join.outgoing, hello.to_string().as_bytes());
     out::send(&MediaResponse::TelegramSignal {
@@ -383,6 +591,17 @@ pub fn run_direct(join: TelegramCallJoin, controls: Arc<Controls>) {
     let mut limiter = Limiter::default();
     let mut meter = Meter::new(CallPath::Udp);
     let mut cue: Option<Playing> = None;
+    let mut video = Video::new(controls.clone());
+    let mut sending_camera = false;
+    let mut sending_share = false;
+    let mut share_noted = false;
+    let mut camera_noted = false;
+    let mut share_audio_cap: Option<Box<dyn share_audio::Pull>> = None;
+    let mut share_audio_wanted = false;
+    let mut cam_reasm = VideoReassembler::default();
+    let mut share_reasm = VideoReassembler::default();
+    let mut video_frame_id = 1u32;
+    let rates = Rates::default();
     let mut seq = 1u32;
     let mut ticks = 0u64;
     let mut levels = (0u8, 0u8);
@@ -397,11 +616,26 @@ pub fn run_direct(join: TelegramCallJoin, controls: Arc<Controls>) {
             if let Some(plain) = open_mtproto(&key, expect_from_caller, &sig) {
                 if let Ok(val) = serde_json::from_slice::<Value>(&plain) {
                     tracing::debug!(kind = ?val.get("type"), "mediad: telegram signaling received");
+                    if let Some(peer_state) = parse_peer_signal(&val) {
+                        if !peer_state.camera {
+                            video.clear_slot(0, join.peer_id.clone(), PictureKind::Camera);
+                        }
+                        if !peer_state.sharing {
+                            video.clear_slot(1, join.peer_id.clone(), PictureKind::Share);
+                        }
+                        out::send(&MediaResponse::TelegramPeerState {
+                            user_id: join.peer_id.clone(),
+                            camera: peer_state.camera,
+                            camera_paused: peer_state.camera_paused,
+                            low_battery: peer_state.low_battery,
+                            sharing: peer_state.sharing,
+                        });
+                    }
                 }
             }
         }
 
-        // Drain incoming encrypted UDP packets.
+        // Drain incoming encrypted UDP packets (audio + H.264 camera + H.264 screencast + PLI).
         loop {
             match socket.recv_from(&mut recv_buf) {
                 Ok((n, src)) => {
@@ -412,16 +646,61 @@ pub fn run_direct(join: TelegramCallJoin, controls: Arc<Controls>) {
                         if remote_addr.is_none() {
                             remote_addr = Some(src);
                         }
-                        if kind == DIRECT_KIND_OPUS && !payload.is_empty() {
-                            let now = Instant::now();
-                            let deafened = controls.deafened.load(Ordering::Relaxed);
-                            remote_stream.last_packet = now;
-                            remote_stream.arrivals.arrived(ts, now);
-                            remote_stream.heard |= payload[..] != SILENCE[..];
-                            if !deafened {
-                                remote_stream.took(Duration::ZERO);
-                                remote_stream.jitter.insert(pkt_seq as u16, payload);
+                        match kind {
+                            DIRECT_KIND_OPUS if !payload.is_empty() => {
+                                let now = Instant::now();
+                                let deafened = controls.deafened.load(Ordering::Relaxed);
+                                remote_stream.last_packet = now;
+                                remote_stream.arrivals.arrived(ts, now);
+                                remote_stream.heard |= payload[..] != SILENCE[..];
+                                if !deafened {
+                                    remote_stream.took(Duration::ZERO);
+                                    remote_stream.jitter.insert(pkt_seq as u16, payload);
+                                }
                             }
+                            DIRECT_KIND_VIDEO_CAMERA => {
+                                if let Some((h264, is_key)) = cam_reasm.push(&payload) {
+                                    let frame = Received {
+                                        key: is_key,
+                                        contiguous: true,
+                                        data: Arc::from(h264),
+                                        user: join.peer_id.clone(),
+                                        kind: PictureKind::Camera,
+                                    };
+                                    if !video.picture_slot(0, frame) {
+                                        if let Some(addr) = remote_addr {
+                                            let pli = pack_direct_frame(&key, join.outgoing, peer_tag.as_deref(), DIRECT_KIND_KEYFRAME_REQ, seq, 0, &[0]);
+                                            seq = seq.wrapping_add(1);
+                                            let _ = socket.send_to(&pli, addr);
+                                        }
+                                    }
+                                }
+                            }
+                            DIRECT_KIND_VIDEO_SHARE => {
+                                if let Some((h264, is_key)) = share_reasm.push(&payload) {
+                                    let frame = Received {
+                                        key: is_key,
+                                        contiguous: true,
+                                        data: Arc::from(h264),
+                                        user: join.peer_id.clone(),
+                                        kind: PictureKind::Share,
+                                    };
+                                    if !video.picture_slot(1, frame) {
+                                        if let Some(addr) = remote_addr {
+                                            let pli = pack_direct_frame(&key, join.outgoing, peer_tag.as_deref(), DIRECT_KIND_KEYFRAME_REQ, seq, 0, &[1]);
+                                            seq = seq.wrapping_add(1);
+                                            let _ = socket.send_to(&pli, addr);
+                                        }
+                                    }
+                                }
+                            }
+                            DIRECT_KIND_KEYFRAME_REQ => {
+                                match payload.first().copied() {
+                                    Some(1) => video.ask_key(Track::Share),
+                                    _ => video.ask_key(Track::High),
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -448,14 +727,119 @@ pub fn run_direct(join: TelegramCallJoin, controls: Arc<Controls>) {
             out::fail(reason, detail);
         }
 
+        // Camera & screencast send state + in-call signaling announcement.
+        let want_camera = controls.camera();
+        let want_share = controls.share();
+        if want_camera != sending_camera || want_share != sending_share {
+            sending_camera = want_camera;
+            sending_share = want_share;
+            if !sending_share {
+                share_noted = false;
+            }
+            if !sending_camera {
+                camera_noted = false;
+            }
+            out::send(&MediaResponse::Sending { share: sending_share, camera: sending_camera });
+            let state_sig = build_media_state_signal(sending_camera, false, sending_share, false);
+            let sealed = seal_mtproto(&key, join.outgoing, state_sig.to_string().as_bytes());
+            out::send(&MediaResponse::TelegramSignal {
+                data: base64::engine::general_purpose::STANDARD.encode(&sealed),
+            });
+        }
+
+        // Shared screen/window loopback audio capture (`#448`, WASAPI / ScreenCaptureKit / PipeWire + echo subtraction).
+        let want_share_sound = sending_share && controls.share_sound();
+        if want_share_sound != share_audio_wanted {
+            share_audio_wanted = want_share_sound;
+            if want_share_sound {
+                match share_audio::open(crate::picture::chosen_screen().as_deref()) {
+                    Ok(cap) => share_audio_cap = Some(cap),
+                    Err(detail) => {
+                        tracing::warn!("mediad: telegram share audio unavailable: {detail}");
+                        share_audio_cap = None;
+                        out::send(&MediaResponse::Notice { detail });
+                    }
+                }
+            } else {
+                share_audio_cap = None;
+            }
+        }
+
+        let preview_camera = !want_camera && controls.camera_preview();
+        let keep_camera = want_camera || preview_camera;
+        video.want(Wants {
+            share: sending_share,
+            camera: sending_camera,
+            preview_camera,
+            keep_camera,
+            rates,
+        });
+        while let Some(word) = video.next() {
+            match word {
+                Word::Frame { track, payload, rtp, .. } => {
+                    if let Some(addr) = remote_addr {
+                        let kind = match track {
+                            Track::Share => DIRECT_KIND_VIDEO_SHARE,
+                            Track::High | Track::Low => DIRECT_KIND_VIDEO_CAMERA,
+                        };
+                        let keyframe = is_h264_keyframe(&payload);
+                        let pkts = pack_video_chunks(
+                            &key,
+                            join.outgoing,
+                            peer_tag.as_deref(),
+                            kind,
+                            video_frame_id,
+                            rtp as u32,
+                            keyframe,
+                            &payload,
+                        );
+                        video_frame_id = video_frame_id.wrapping_add(1);
+                        for pkt in pkts {
+                            if socket.send_to(&pkt, addr).is_ok() {
+                                meter.sent(pkt.len());
+                            }
+                        }
+                    }
+                }
+                Word::SelfView { share, painted } => out::send(&match painted {
+                    Some(painted) => MediaResponse::SelfView {
+                        path: painted.path.display().to_string(),
+                        width: painted.width,
+                        height: painted.height,
+                        generation: painted.generation,
+                        share,
+                    },
+                    None => MediaResponse::SelfView { path: String::new(), width: 0, height: 0, generation: 0, share },
+                }),
+                Word::Failed { share: true, words } => {
+                    if !share_noted {
+                        share_noted = true;
+                        controls.set_share(false);
+                        controls.set_share_sound(false);
+                        out::send(&MediaResponse::Notice { detail: words });
+                        out::send(&MediaResponse::Sending { share: false, camera: sending_camera });
+                    }
+                }
+                Word::Failed { share: false, words } => {
+                    if !camera_noted {
+                        camera_noted = true;
+                        controls.set_camera(false);
+                        out::send(&MediaResponse::Notice { detail: words });
+                        out::send(&MediaResponse::Sending { share: sending_share, camera: false });
+                    }
+                }
+            }
+        }
+
         encoder.set_bitrate(controls.bitrate());
 
-        // Capture microphone, gate, encode Opus, encrypt with MTProto 2.0, and transmit.
+        // Capture microphone + optional share_audio loopback, mix, encode Opus, encrypt with MTProto 2.0, and transmit.
         let mut frame = [0i16; FRAME_SAMPLES];
         let (step, input_level) = listen(&controls, &mut audio, &mut processor, &mut gate, &mut frame);
         if let Some(speaking) = step.speaking {
             out::send(&MediaResponse::Speaking { user_id: join.user_id.clone(), speaking });
         }
+        let share_pcm = share_audio_cap.as_mut().and_then(|cap| cap.pull());
         if let Some(addr) = remote_addr {
             for early in step.early {
                 if let Some(len) = encoder.encode(&early, &mut opus_buf) {
@@ -474,7 +858,15 @@ pub fn run_direct(join: TelegramCallJoin, controls: Arc<Controls>) {
                     }
                 }
             }
-            if let Some(send) = step.send {
+            let mixed_frame = match (step.send, share_pcm) {
+                (Some(GateSend::Frame(mut f)), Some(s)) => {
+                    mix_share_audio(&mut f, &s);
+                    Some(GateSend::Frame(f))
+                }
+                (None, Some(s)) | (Some(GateSend::Silence), Some(s)) => Some(GateSend::Frame(s)),
+                (send, None) => send,
+            };
+            if let Some(send) = mixed_frame {
                 let encoded: Option<&[u8]> = match send {
                     GateSend::Frame(f) => encoder.encode(&f, &mut opus_buf).map(|len| &opus_buf[..len]),
                     GateSend::Silence => Some(&SILENCE),
@@ -1351,6 +1743,16 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
                                 continue;
                             }
                             let now = Instant::now();
+                            // Encrypted conference calls: fail closed — drop any frame that fails
+                            // per-frame AEAD decryption under the verified chain epoch key.
+                            let payload = if controls.tg_conference_active() {
+                                match controls.tg_conference_decrypt(&data.data) {
+                                    Ok((_kind, _sender, plain)) => plain,
+                                    Err(_) => continue,
+                                }
+                            } else {
+                                data.data.to_vec()
+                            };
                             let slot_idx = link.recv_mids.iter().position(|m| *m == data.mid).unwrap_or(0);
                             let uid = ssrc_map
                                 .values()
@@ -1370,10 +1772,10 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
                                 let ts = data.time.numer();
                                 stream.last_packet = now;
                                 stream.arrivals.arrived(ts as u32, now);
-                                stream.heard |= data.data[..] != SILENCE[..];
+                                stream.heard |= payload[..] != SILENCE[..];
                                 if !deafened {
                                     stream.took(Duration::ZERO);
-                                    stream.jitter.insert((ts / FRAME as u64) as u16, data.data.to_vec());
+                                    stream.jitter.insert((ts / FRAME as u64) as u16, payload);
                                 }
                             }
                         }
@@ -1460,12 +1862,26 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
         }
 
         if !link.fake_loopback && !controls.muted.load(Ordering::Relaxed) {
+            let conf_e2ee = controls.tg_conference_active();
             let mut send_opus = |data: &[u8], tick: u64| {
+                // Encrypted conference calls: NEVER transmit plaintext if chain is pending or blocked.
+                let sealed_buf;
+                let wire: &[u8] = if conf_e2ee {
+                    match controls.tg_conference_encrypt(telegram_e2ee::FRAME_KIND_AUDIO, data) {
+                        Ok(ct) => {
+                            sealed_buf = ct;
+                            &sealed_buf
+                        }
+                        Err(_) => return,
+                    }
+                } else {
+                    data
+                };
                 if let Some(writer) = link.rtc.writer(link.mic_mid) {
                     let pt = writer.payload_params().next().map(|p| p.pt());
                     if let Some(pt) = pt {
                         let time = MediaTime::new(tick * FRAME as u64, Frequency::FORTY_EIGHT_KHZ);
-                        let _ = writer.write(pt, Instant::now(), time, data);
+                        let _ = writer.write(pt, Instant::now(), time, wire);
                     }
                 }
             };
@@ -1526,33 +1942,6 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
     if let Some(mut audio_ref) = audio {
         finish_cue(&controls, &mut cue, &mut audio_ref);
     }
-}
-
-fn is_h264_keyframe(bytes: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 4 < bytes.len() {
-        if bytes[i] == 0 && bytes[i + 1] == 0 {
-            let nal_idx = if bytes[i + 2] == 1 {
-                Some(i + 3)
-            } else if bytes[i + 2] == 0 && bytes[i + 3] == 1 {
-                Some(i + 4)
-            } else {
-                None
-            };
-            if let Some(idx) = nal_idx {
-                if let Some(&hdr) = bytes.get(idx) {
-                    let nal_type = hdr & 0x1f;
-                    if nal_type == 5 || nal_type == 7 {
-                        return true;
-                    }
-                }
-                i = idx + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1785,6 +2174,7 @@ mod tests {
             user_id: "u7001".to_owned(),
             muted: true,
             deafened: false,
+            conference: false,
         };
         let offer = GroupOffer::new(&spec).expect("group offer");
         assert!(offer.ssrc() > 0 && offer.ssrc() <= i32::MAX as u32);
@@ -1934,5 +2324,87 @@ mod tests {
 
         // Truncated/garbage input never panics.
         assert!(parse_rtmp_segment(&[0, 0, 0, 2, b'b', b'a', b'd']).h264_units.is_empty());
+    }
+
+    #[test]
+    fn direct_h264_camera_and_screencast_chunks_round_trip_independently() {
+        let key = [0x5Au8; 256];
+        let tag = [0x77u8; 16];
+        // Synthetic multi-chunk H.264 IDR keyframe for camera (3500 bytes) + screencast (2600 bytes).
+        let mut cam_au = vec![0x00, 0x00, 0x00, 0x01, 0x65]; // NAL type 5 = IDR
+        cam_au.extend((0..3495).map(|i| (i % 251) as u8));
+        let mut share_au = vec![0x00, 0x00, 0x00, 0x01, 0x67]; // NAL type 7 = SPS
+        share_au.extend((0..2595).map(|i| ((i * 7) % 251) as u8));
+
+        let cam_pkts = pack_video_chunks(&key, true, Some(&tag), DIRECT_KIND_VIDEO_CAMERA, 11, 9000, is_h264_keyframe(&cam_au), &cam_au);
+        let share_pkts = pack_video_chunks(&key, true, Some(&tag), DIRECT_KIND_VIDEO_SHARE, 12, 9000, is_h264_keyframe(&share_au), &share_au);
+        assert!(cam_pkts.len() >= 4);
+        assert!(share_pkts.len() >= 3);
+
+        let mut cam_reasm = VideoReassembler::default();
+        let mut share_reasm = VideoReassembler::default();
+        let mut got_cam = None;
+        let mut got_share = None;
+        for pkt in cam_pkts.iter().chain(share_pkts.iter()) {
+            let (kind, _, _, payload) = unpack_direct_frame(&key, true, Some(&tag), pkt).expect("open");
+            match kind {
+                DIRECT_KIND_VIDEO_CAMERA => {
+                    if let Some(done) = cam_reasm.push(&payload) {
+                        got_cam = Some(done);
+                    }
+                }
+                DIRECT_KIND_VIDEO_SHARE => {
+                    if let Some(done) = share_reasm.push(&payload) {
+                        got_share = Some(done);
+                    }
+                }
+                other => panic!("unexpected kind {other}"),
+            }
+        }
+        assert_eq!(got_cam, Some((cam_au, true)));
+        assert_eq!(got_share, Some((share_au, true)));
+    }
+
+    #[test]
+    fn peer_signal_parses_active_inactive_paused_low_battery_and_screencast() {
+        let sig = build_media_state_signal(true, true, true, true);
+        let parsed = parse_peer_signal(&sig).expect("parsed");
+        assert_eq!(
+            parsed,
+            PeerMediaState { camera: true, camera_paused: true, low_battery: true, sharing: true }
+        );
+
+        let tgcalls_style = json!({
+            "@type": "mediaState",
+            "videoState": 2,
+            "screencastState": 0,
+            "isBatteryLow": false
+        });
+        assert_eq!(
+            parse_peer_signal(&tgcalls_style),
+            Some(PeerMediaState { camera: true, camera_paused: false, low_battery: false, sharing: false })
+        );
+
+        let inactive = json!({ "type": "media-state", "camera": "inactive", "screencast": "active", "low_battery": true });
+        assert_eq!(
+            parse_peer_signal(&inactive),
+            Some(PeerMediaState { camera: false, camera_paused: false, low_battery: true, sharing: true })
+        );
+    }
+
+    #[test]
+    fn mix_share_audio_adds_and_clamps_stereo_frames() {
+        let mut mic = [0i16; FRAME_SAMPLES];
+        let mut share = [0i16; FRAME_SAMPLES];
+        mic[0] = 10_000;
+        share[0] = 5_000;
+        mic[1] = 30_000;
+        share[1] = 10_000;
+        mic[2] = -30_000;
+        share[2] = -10_000;
+        mix_share_audio(&mut mic, &share);
+        assert_eq!(mic[0], 15_000);
+        assert_eq!(mic[1], i16::MAX);
+        assert_eq!(mic[2], i16::MIN);
     }
 }

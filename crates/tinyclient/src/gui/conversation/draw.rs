@@ -524,6 +524,12 @@ pub(crate) fn call_line_spec(message: &Message, peer_title: &str) -> CallRowSpec
                 pill: Some("Join"),
             }
         }
+        (protocol::CallOutcome::Voicemail, _) => CallRowSpec {
+            icon: "icons/phone-incoming.svg",
+            missed: false,
+            label: format!("Voicemail from {other}"),
+            pill: Some("Call back"),
+        },
     }
 }
 
@@ -588,6 +594,31 @@ fn format_ymd(secs: i64) -> String {
     format!("{year:04}-{m:02}-{d:02}")
 }
 
+fn huddle_row_spec(note: &protocol::CallNote, starter: &str) -> CallRowSpec {
+    use protocol::CallOutcome;
+    let (title, pill) = match note.outcome {
+        CallOutcome::Live => ("Huddle in progress", Some("Join")),
+        CallOutcome::Missed => ("Missed huddle", None),
+        _ => ("Huddle ended", None),
+    };
+    let mut label = title.to_owned();
+    if !starter.is_empty() {
+        label.push_str(&format!(" · Started by {starter}"));
+    }
+    if let Some(seconds) = note.seconds.filter(|_| note.outcome == CallOutcome::Ended) {
+        label.push_str(&format!(" · {}", format_call_duration(seconds)));
+    }
+    CallRowSpec { icon: "icons/headphones.svg", missed: note.outcome == CallOutcome::Missed, label, pill }
+}
+
+fn huddle_thread_label(replies: u32) -> String {
+    match replies {
+        0 => "Huddle thread".to_owned(),
+        1 => "Huddle thread · 1 reply".to_owned(),
+        count => format!("Huddle thread · {count} replies"),
+    }
+}
+
 /// A small square button inside a row or a bar.
 fn tool(id: impl Into<ElementId>, which: Icon, size: f32) -> Stateful<Div> {
     div()
@@ -613,11 +644,13 @@ impl Pane {
         let body = match &item {
             Item::Start => self.start_row(window, cx).into_any_element(),
             Item::Older => self.older_row(cx).into_any_element(),
+            Item::Root(message) if self.slack_huddle(message) => self.huddle_card(message, window, cx),
             Item::Root(message) => self.message_row(message, true, true, window, cx),
             Item::Replies(count) => replies_line(*count, metrics).into_any_element(),
             Item::Day(at) => day_line(*at, metrics).into_any_element(),
             Item::New => new_line(metrics).into_any_element(),
             Item::Message { message, head } => self.message_row(message, *head, false, window, cx),
+            Item::System(message) if self.slack_huddle(message) => self.huddle_card(message, window, cx),
             Item::System(message) if message.call.is_some() => self.call_line(message, cx).into_any_element(),
             Item::System(message) => self.system_row(message, cx).into_any_element(),
         };
@@ -694,6 +727,78 @@ impl Pane {
             );
         }
         row
+    }
+
+    fn slack_huddle(&self, message: &Message) -> bool {
+        message.call.is_some() && self.key().is_some_and(|key| key.network == protocol::Network::Slack)
+    }
+
+    fn huddle_card(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let (Some(note), Some(key)) = (&message.call, self.key().cloned()) else {
+            return self.system_row(message, cx).into_any_element();
+        };
+        let account = key.account();
+        let starter = if note.caller_id.is_empty() {
+            String::new()
+        } else {
+            self.who(&Key::new(&account, &note.caller_id), cx).0
+        };
+        let spec = huddle_row_spec(note, &starter);
+        let ink = if spec.missed { theme::danger() } else { theme::text_soft() };
+        let mut faces = div().flex().items_center().gap(px(4.));
+        for (index, id) in note.participants.iter().take(protocol::THREAD_FACES).enumerate() {
+            let person = Key::new(&account, id);
+            let (name, avatar) = self.who(&person, cx);
+            let name = if name.is_empty() { id } else { &name };
+            let face = self.face(Avatar::new(&person, name, 20.), avatar.as_ref(), 20., Shape::Person, window, cx);
+            faces = faces.child(
+                div().id(("huddle-face", index)).aria_label(name.clone()).tooltip(tip(name.clone(), None)).child(face),
+            );
+        }
+        let count = note.participants.len();
+        let thread = message.thread.as_ref().filter(|_| !self.is_thread()).map(|thread| {
+            let root = message.clone();
+            div().flex().items_center().gap(px(6.)).flex_wrap()
+                .child(div().type_small().text_color(theme::text_soft()).child(huddle_thread_label(thread.replies)))
+                .child(button("huddle-thread", ButtonKind::Secondary, "Open thread").on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(PaneEvent::OpenThread(root.clone()));
+                })))
+        });
+        let shell = self.shell.clone();
+        div()
+            .id(SharedString::from(format!("huddle-{}", message.id)))
+            .mx(px(self.metrics.inset))
+            .my(px(4.))
+            .max_w(px(MEASURE))
+            .p(px(10.))
+            .rounded(px(theme::R_CARD))
+            .border_1()
+            .border_color(theme::hairline())
+            .bg(tokens::card())
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div().flex().items_center().gap(px(6.))
+                    .child(glyph(spec.icon, 16., ink))
+                    .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(if spec.missed { ink } else { theme::text() }).child(spec.label))
+                    .child(div().ml_auto().type_micro().text_color(theme::text_faint()).child(time::clock(message.sent))),
+            )
+            .children((count > 0).then(|| {
+                faces.child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(
+                    if count == 1 { "1 participant".to_owned() } else { format!("{count} participants") },
+                ))
+            }))
+            .children(spec.pill.map(|label| {
+                div().flex().child(button("huddle-join", ButtonKind::Secondary, label).on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    let _ = shell.update(cx, |shell, cx| shell.call_handoff(key.clone(), cx));
+                })))
+            }))
+            .children(thread)
+            .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, window, cx)))
+            .into_any_element()
     }
 
     fn call_line(&self, message: &Message, cx: &mut Context<Self>) -> Div {
@@ -1391,6 +1496,15 @@ impl Pane {
                         )
                 }))
                 .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, window, cx)))
+                .children(message.meeting_transcript.as_ref().map(|_| {
+                    let id = message.id.clone();
+                    let title = message.card.as_ref().map(|card| card.title.clone()).unwrap_or_else(|| "Meeting transcript".into());
+                    button(SharedString::from(format!("meeting-transcript-{id}")), ButtonKind::Secondary, "Read transcript")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_meeting_transcript(id.clone(), title.clone(), window, cx);
+                        }))
+                }))
                 .children(message.poll.as_deref().filter(|_| !matches!(message.kind, MessageKind::Unsupported { .. }))
                     .map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
@@ -3537,6 +3651,9 @@ impl Pane {
                     .child(
                         div()
                             .id(SharedString::from(format!("card-open-{}-{ix}", message.id)))
+                            .role(gpui::Role::Link)
+                            .tab_index(0)
+                            .focus_visible(|style| style.shadow(theme::focus_ring()))
                             .cursor_pointer()
                             .type_small()
                             .font_weight(theme::MEDIUM)
@@ -5826,6 +5943,34 @@ mod tests {
     }
 
     #[test]
+    fn slack_huddle_thread_names_itself_before_and_after_replies() {
+        assert_eq!(huddle_thread_label(0), "Huddle thread");
+        assert_eq!(huddle_thread_label(1), "Huddle thread · 1 reply");
+        assert_eq!(huddle_thread_label(3), "Huddle thread · 3 replies");
+    }
+
+    #[test]
+    fn slack_huddle_wording_and_join_follow_room_state() {
+        use protocol::CallOutcome;
+        let note = protocol::CallNote {
+            outcome: CallOutcome::Live, caller_id: "UANA".into(), seconds: None,
+            participants: vec!["UANA".into()], video: false, call_id: None,
+        };
+        let live = huddle_row_spec(&note, "Ana");
+        assert_eq!(live.label, "Huddle in progress · Started by Ana");
+        assert_eq!(live.pill, Some("Join"));
+
+        let ended = huddle_row_spec(&protocol::CallNote { outcome: CallOutcome::Ended, seconds: Some(300), ..note.clone() }, "Ana");
+        assert_eq!(ended.label, "Huddle ended · Started by Ana · 5 min");
+        assert_eq!(ended.pill, None);
+
+        let missed = huddle_row_spec(&protocol::CallNote { outcome: CallOutcome::Missed, ..note }, "");
+        assert_eq!(missed.label, "Missed huddle");
+        assert!(missed.missed);
+        assert_eq!(missed.pill, None);
+    }
+
+    #[test]
     fn call_line_spec_formats_each_outcome_and_direction() {
         let make = |outcome, outgoing, seconds| {
             let mut m = Message::plain("r1", "Bea", "fallback", 100, outgoing);
@@ -5879,6 +6024,14 @@ mod tests {
         let inv = call_line_spec(&invite, "Trail Crew");
         assert_eq!(inv.label, "Odalys invited you to a video chat");
         assert_eq!(inv.pill, Some("Join"));
+
+        let mut conf_live = make(protocol::CallOutcome::Live, false, None);
+        conf_live.call.as_mut().unwrap().participants = vec!["u7002".into(), "u7003".into()];
+        conf_live.call.as_mut().unwrap().call_id = Some("99001".into());
+        let cl = call_line_spec(&conf_live, "Bea");
+        assert!(!cl.missed);
+        assert_eq!(cl.label, "Call in progress with Bea");
+        assert_eq!(cl.pill, Some("Join"));
     }
 
     #[test]

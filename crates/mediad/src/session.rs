@@ -84,8 +84,12 @@ pub struct Controls {
     pub(crate) tiny_link: Mutex<Option<crate::tiny::Link>>,
     /// A Tiny server's newest slot map, not yet applied.
     pub(crate) tiny_slots: Mutex<Option<Vec<TinySlot>>>,
+    /// Remote ICE candidates delivered for an active Signal WebRTC call.
+    pub(crate) signal_ice: Mutex<Vec<String>>,
     /// The camera and the share the user asked for, and whether the one picture is watched.
     share: AtomicBool,
+    /// The share's sound, on the Go Live audio SSRC. Off until a share asks for it.
+    share_sound: AtomicBool,
     camera: AtomicBool,
     camera_preview: AtomicBool,
     watch: AtomicBool,
@@ -130,6 +134,8 @@ pub struct Controls {
     tg_rtmp_segments: Mutex<std::collections::VecDeque<crate::telegram::RtmpSegmentInput>>,
     /// Latest RTMP stream state (#454).
     tg_rtmp_state: Mutex<Option<protocol::RtmpStreamState>>,
+    /// Pure-Rust `tde2e`-compatible E2EE state for an encrypted Telegram conference call.
+    tg_conf_e2ee: Mutex<Option<crate::telegram_e2ee::ConferenceE2ee>>,
 }
 
 impl Controls {
@@ -170,12 +176,28 @@ impl Controls {
         *self.tiny_slots.lock().unwrap() = Some(map);
     }
 
+    pub fn push_signal_ice(&self, candidate: String) {
+        self.signal_ice.lock().unwrap().push(candidate);
+    }
+
+    pub fn take_signal_ice(&self) -> Vec<String> {
+        std::mem::take(&mut *self.signal_ice.lock().unwrap())
+    }
+
     pub fn set_share(&self, on: bool) {
         self.share.store(on, Ordering::Relaxed);
     }
 
     pub fn share(&self) -> bool {
         self.share.load(Ordering::Relaxed)
+    }
+
+    pub fn set_share_sound(&self, on: bool) {
+        self.share_sound.store(on, Ordering::Relaxed);
+    }
+
+    pub fn share_sound(&self) -> bool {
+        self.share_sound.load(Ordering::Relaxed)
     }
 
     pub fn set_camera(&self, on: bool) {
@@ -453,6 +475,52 @@ impl Controls {
     pub fn tg_rtmp_state(&self) -> Option<protocol::RtmpStreamState> {
         *self.tg_rtmp_state.lock().unwrap()
     }
+
+    pub fn init_tg_conference(&self, my_user_id: i64, public_key: [u8; 32]) {
+        *self.tg_conf_e2ee.lock().unwrap() = Some(crate::telegram_e2ee::ConferenceE2ee::new(my_user_id, public_key));
+    }
+
+    pub fn clear_tg_conference(&self) {
+        *self.tg_conf_e2ee.lock().unwrap() = None;
+    }
+
+    pub fn tg_conference_active(&self) -> bool {
+        self.tg_conf_e2ee.lock().unwrap().is_some()
+    }
+
+    pub fn apply_tg_conference_block(
+        &self,
+        sub_chain_id: i32,
+        raw: &[u8],
+    ) -> Result<protocol::CallSecurity, (crate::telegram_e2ee::E2eeError, protocol::CallSecurity)> {
+        let mut guard = self.tg_conf_e2ee.lock().unwrap();
+        let Some(e2ee) = guard.as_mut() else {
+            return Err((
+                crate::telegram_e2ee::E2eeError::NotReady,
+                protocol::CallSecurity::telegram_conference_blocked(),
+            ));
+        };
+        match e2ee.apply_block_bytes(sub_chain_id, raw) {
+            Ok(()) => Ok(e2ee.security()),
+            Err(err) => Err((err, e2ee.security())),
+        }
+    }
+
+    pub fn tg_conference_encrypt(&self, kind: u8, plaintext: &[u8]) -> Result<Vec<u8>, crate::telegram_e2ee::E2eeError> {
+        let mut guard = self.tg_conf_e2ee.lock().unwrap();
+        let Some(e2ee) = guard.as_mut() else {
+            return Err(crate::telegram_e2ee::E2eeError::NotReady);
+        };
+        e2ee.encrypt_frame(kind, plaintext)
+    }
+
+    pub fn tg_conference_decrypt(&self, packet: &[u8]) -> Result<(u8, i64, Vec<u8>), crate::telegram_e2ee::E2eeError> {
+        let guard = self.tg_conf_e2ee.lock().unwrap();
+        let Some(e2ee) = guard.as_ref() else {
+            return Err(crate::telegram_e2ee::E2eeError::NotReady);
+        };
+        e2ee.decrypt_frame(packet)
+    }
 }
 
 /// The cue for going from `was` to `now`, each (muted, deafened). Deafening mutes too, and is
@@ -712,6 +780,7 @@ impl Call {
         let first = self.dave.lock().unwrap().start(version);
         self.deliver(socket, first)?;
         self.dave_version = version;
+        self.dave_report();
         self.ssrc = transport.ssrc;
         let stop = Arc::new(AtomicBool::new(false));
         let setup = media::Setup {
@@ -829,6 +898,7 @@ impl Call {
             dave::EXECUTE_TRANSITION => {
                 if let Some(transition) = number(&d["transition_id"]) {
                     self.dave.lock().unwrap().execute_transition(transition as u16);
+                    self.dave_report();
                     self.encrypted()?;
                 }
             }
@@ -836,6 +906,7 @@ impl Call {
                 if let (Some(epoch), Some(version)) = (number(&d["epoch"]), number(&d["protocol_version"])) {
                     let answer = self.dave.lock().unwrap().prepare_epoch(epoch, version as u16);
                     self.deliver(socket, answer)?;
+                    self.dave_report();
                 }
             }
             // Media sink wants, flags, platform and the rest carry nothing an audio call needs.
@@ -845,6 +916,7 @@ impl Call {
     }
 
     fn binary(&mut self, socket: &mut Socket, op: u8, payload: &[u8]) -> Result<(), End> {
+        let epoch = matches!(op, dave::ANNOUNCE_COMMIT | dave::WELCOME);
         let answer = {
             let mut dave = self.dave.lock().unwrap();
             match op {
@@ -861,7 +933,34 @@ impl Call {
                 _ => Vec::new(),
             }
         };
-        self.deliver(socket, answer)
+        self.deliver(socket, answer)?;
+        if epoch {
+            self.dave_report();
+        }
+        Ok(())
+    }
+
+    /// The privacy code and each pairwise verification code, after a transition or a new epoch.
+    /// Scrypt runs off the dave lock: `encrypt` must not wait on it.
+    fn dave_report(&self) {
+        let wanted = self.dave.lock().unwrap().safety_wanted();
+        let made: Vec<(u64, Vec<u8>, String)> = wanted
+            .into_iter()
+            .map(|(id, key, me, mine)| {
+                let number = crate::e2ee::safety_number(id, &key, me, &mine);
+                (id, key, number)
+            })
+            .collect();
+        let report = {
+            let mut dave = self.dave.lock().unwrap();
+            for (id, key, number) in made {
+                dave.add_safety(id, key, number);
+            }
+            dave.take_report(self.join.stream)
+        };
+        if let Some(security) = report {
+            out::send(&MediaResponse::TinySecurity(security));
+        }
     }
 
     fn converse(&mut self, socket: &mut Socket) -> End {
@@ -881,6 +980,11 @@ impl Call {
                     FromMedia::Dave(outgoing) => self.deliver(socket, outgoing),
                     FromMedia::Fatal(reason, detail) => Err(End::Fatal(reason, detail)),
                     FromMedia::Picture { share, on } => self.announce_video(socket, share, on),
+                    // 2 is Discord's soundshare flag. 0 clears it. The microphone's 1 stays on the voice leg.
+                    FromMedia::Soundshare(on) => {
+                        let d = json!({ "speaking": if on { 2 } else { 0 }, "delay": 0, "ssrc": self.ssrc });
+                        socket.send(gateway::SPEAKING, d).map_err(dropped)
+                    }
                 };
                 if let Err(end) = sent {
                     return end;
@@ -984,14 +1088,17 @@ impl Call {
     }
 
     /// A Go Live leg: the same gateway, and a picture loop instead of the microphone. It sends
-    /// no speaking indication and no `Connected`. A failure here is a notice, not the end of
-    /// the voice call.
+    /// no `Connected`. Sound, when the share asked for it, is Opus on this connection's audio
+    /// SSRC. A failure here is a notice, not the end of the voice call.
     fn start_stream(&mut self, socket: &mut Socket, transport: Transport, seal: Cipher, opener: Cipher, version: u16) -> Result<(), End> {
         let first = self.dave.lock().unwrap().start(version);
         self.deliver(socket, first)?;
         self.dave_version = version;
         self.ssrc = transport.ssrc;
         self.assigned = transport.video;
+        // The picture takes the cipher. The sound, on a sending leg, uses the same key on the
+        // audio SSRC Ready assigned. A watcher only receives.
+        let audio = (!self.join.watch).then(|| rtp::Sender::new(seal.clone(), transport.ssrc, 0, 0));
         let pipe = transport.video.map(|(ssrc, rtx)| discord_video::Pipe::new(seal, ssrc, rtx));
         let stop = Arc::new(AtomicBool::new(false));
         let leg = discord_video::Leg {
@@ -1005,6 +1112,7 @@ impl Call {
             announced: self.announced.clone(),
             user_id: self.join.user_id.clone(),
             pipe,
+            audio,
             watch: self.join.watch,
             stream_owner: self.join.stream_owner.clone(),
             users: self.users.clone(),
@@ -1014,10 +1122,11 @@ impl Call {
             End::Fatal(CallFailure::Engine, ENGINE.to_owned())
         })?;
         self.media = Some(Running::Stream { stop, thread });
-        // Viewers and the sender both say what they want. A stream does not speak.
+        // Viewers and the sender both say what they want. Sound speaks for itself, as flag 2.
         socket.send(gateway::SINK, json!({ "any": 100 })).map_err(dropped)?;
         self.joined = true;
         self.deadline = None;
+        self.dave_report();
         Ok(())
     }
 
@@ -1165,6 +1274,39 @@ pub fn prove_discord_share_quality() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's discord-wave15-share driver. Share sound is a real frame with this process's
+/// playback taken out, and a Go Live report is not the voice call's report. A build from
+/// before this ignores the variable and stays up. The matching 30-digit code is the library test:
+/// it needs the MLS harness, which this binary does not link.
+pub fn prove_discord_wave15_share() -> Result<(), String> {
+    std::env::set_var("TINYCLIENT_SHARE_AUDIO", "tone");
+    let mut pull = crate::share_audio::open(None).map_err(|err| format!("share sound did not open: {err}"))?;
+    let frame = pull.pull().ok_or("share sound produced no frame")?;
+    if frame.iter().all(|sample| *sample == 0) {
+        return Err("share sound is silent".into());
+    }
+    crate::share_audio::note_played(&frame);
+    let mut heard = frame;
+    crate::share_audio::subtract(&mut heard);
+    let energy = |samples: &[i16]| samples.iter().map(|sample| { let value = i64::from(*sample); value * value }).sum::<i64>();
+    if energy(&heard) * 4 > energy(&frame) {
+        return Err("a share leaves out the call's own playback".into());
+    }
+    let mut voice = Dave::new(111, 7);
+    voice.start(1);
+    let report = voice.take_report(false).ok_or("a dave session reports once it has a version")?;
+    if report.stream || report.mode != protocol::SecurityMode::Pending || voice.take_report(false).is_some() {
+        return Err("the voice report is pending, once, and is not the stream".into());
+    }
+    let mut stream = Dave::new(111, 7);
+    stream.start(1);
+    let live = stream.take_report(true).ok_or("a go live leg reports")?;
+    if !live.stream || live.mode != protocol::SecurityMode::Pending {
+        return Err("a go live report is marked as the stream".into());
+    }
+    Ok(())
+}
+
 /// What we can send and receive. One H.264 layer. A watch leg does not encode.
 fn codecs(encode: bool) -> Value {
     json!([
@@ -1257,7 +1399,13 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
         seq_ack: None,
         transport: None,
         ssrc: 0,
-        dave: Arc::new(Mutex::new(Dave::new(user, room))),
+        dave: Arc::new(Mutex::new({
+            let mut dave = Dave::new(user, room);
+            if let Some(key) = dave::account_identity() {
+                dave.use_identity(key);
+            }
+            dave
+        })),
         dave_version: 0,
         users: Arc::default(),
         connected: BTreeSet::from([user]),

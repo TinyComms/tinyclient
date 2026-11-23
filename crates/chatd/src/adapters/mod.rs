@@ -49,6 +49,12 @@ pub fn prove_discord_forward_report() -> Result<(), String> {
 pub fn prove_discord_voice_move() -> Result<(), String> {
     discord::prove_voice_move()
 }
+
+/// `TINYCLIENT_PROVE=discord-wave15-share`. A preview is a jpeg, a named viewer is kept, and
+/// the identity post is the public key.
+pub fn prove_discord_wave15_share() -> Result<(), String> {
+    discord::prove_wave15_share()
+}
 mod recovery;
 pub mod net;
 mod script;
@@ -375,8 +381,8 @@ impl From<Vec<MessageHit>> for SearchPage {
 pub enum Picture {
     /// Our camera, on or off.
     Camera(bool),
-    /// Our screen, on or off.
-    Share(bool),
+    /// Our screen, on or off. `preview` sends Discord a small picture outside the encrypted stream.
+    Share { on: bool, preview: bool },
     /// Whose share to watch. `None` stops watching.
     Watch(Option<String>),
 }
@@ -1571,6 +1577,9 @@ pub enum Command {
         limit: u32,
         reply: Reply<CallHistoryPage>,
     },
+    Voicemails { before: Option<String>, reply: Reply<(Vec<protocol::Voicemail>, Option<String>)> },
+    VoicemailAudio { id: String, attachment: String, reply: Reply<MediaFile> },
+    ChangeVoicemail { id: String, action: protocol::VoicemailAction, reply: Reply<()> },
     /// Delete one or more call log entries by message id (`revoke` for both sides).
     DeleteCallEntries {
         message_ids: Vec<String>,
@@ -1820,6 +1829,9 @@ pub enum Command {
     /// Today's meetings, soonest first. A calendar the account cannot read answers with what
     /// the chat list already remembered.
     Meetings { reply: Reply<Vec<protocol::MeetingEvent>> },
+    MeetingTranscript { conversation_id: String, message_id: String, reply: Reply<String> },
+    MeetingInvitees { conversation_id: String, reply: Reply<Vec<String>> },
+    CreateMeeting { conversation_id: String, draft: protocol::MeetingDraft, reply: Reply<(protocol::MeetingEvent, bool)> },
     /// Accept, decline, or tentatively accept one meeting. `propose` is a new start.
     MeetingRsvp {
         id: String,
@@ -1842,6 +1854,8 @@ pub enum Command {
     CallMove { conversation_id: String, person_id: String, to: Option<String>, reply: Reply<()> },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),
+    /// Place a 1:1 video call (`video: true` on `phone.requestCall`).
+    CallJoinVideo(String),
     /// Leave, cancel or decline on the network. Also sent when the call failed here (mediad
     /// died, a deadline passed), so the network stops showing us in the channel or ringing the
     /// other side. May arrive for a call the adapter already left: then it is nothing.
@@ -1851,6 +1865,8 @@ pub enum Command {
     /// A camera, a screen share, or whose share to watch. Nothing answers: the call's own
     /// events say what the network did.
     CallPicture(Picture),
+    /// A local ICE candidate gathered by `mediad` for a Signal call, to send in `IceUpdate`.
+    CallIce { conversation_id: String, candidate: String },
     /// Rings everyone (`None`) or specific people (`Some`) in the current direct/group call.
     CallRing { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// Stops ringing everyone (`None`) or specific people (`Some`) in the current direct/group call.
@@ -1940,10 +1956,28 @@ pub enum Command {
         quality: u8,
         reply: Reply<()>,
     },
+    /// Resolves a Telegram encrypted conference link (`t.me/call/<slug>`) without joining.
+    ConferenceResolve { slug: String, reply: Reply<protocol::ConferenceCallInfo> },
+    /// Creates an encrypted Telegram conference call (`phone.createConferenceCall`).
+    ConferenceCreate { video: bool, join: bool, reply: Reply<protocol::ConferenceCallInfo> },
+    /// Joins an encrypted Telegram conference call by slug, call_id, or invite msg_id.
+    ConferenceJoin {
+        slug: Option<String>,
+        call_id: Option<String>,
+        msg_id: Option<i32>,
+        video: bool,
+        reply: Reply<()>,
+    },
+    /// Removes participants from an active Telegram encrypted conference call.
+    ConferenceRemove { conversation_id: String, people: Vec<String>, kick: bool, reply: Reply<()> },
     /// In-call signalling bytes from mediad for Telegram `phone.sendSignalingData` (base64).
     TelegramCallSignal { conversation_id: String, data: String },
     /// Local speaking state changed in a Telegram group call (`speakingInGroupCallAction`).
     TelegramCallSpeaking { conversation_id: String, speaking: bool },
+    /// Raises or lowers our hand in the active group call.
+    CallRaiseHand { conversation_id: String, raised: bool, reply: Reply<()> },
+    /// Sends a transient emoji reaction in the active group call.
+    CallReact { conversation_id: String, emoji: String, reply: Reply<()> },
     /// A Tiny server's live socket: take or leave a seat in a room's call, remove someone from
     /// one, or hear that the user opened the server.
     Tiny(tiny::live::Ask),
@@ -2162,7 +2196,12 @@ impl Command {
             | Command::GroupCallDiscard { reply, .. }
             | Command::GroupCallSettings { reply, .. }
             | Command::GroupCallRaiseHand { reply, .. }
-            | Command::GroupCallModerate { reply, .. } => {
+            | Command::GroupCallModerate { reply, .. }
+            | Command::ConferenceJoin { reply, .. }
+            | Command::ConferenceRemove { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::ConferenceResolve { reply, .. } | Command::ConferenceCreate { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::GroupCallJoinAs { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2293,6 +2332,9 @@ impl Command {
             Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Voicemails { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::VoicemailAudio { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChangeVoicemail { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2364,6 +2406,9 @@ impl Command {
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingInvitees { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateMeeting { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
@@ -2393,6 +2438,9 @@ impl Command {
             Command::CallJoin(conversation_id) => {
                 let detail = format!("{} calls are not built yet.", ctx.account.network.label());
                 ctx.call_failed(&conversation_id, CallFailure::Refused, &detail);
+            }
+            Command::CallRaiseHand { reply, .. } | Command::CallReact { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
             }
             _ => {}
         }
@@ -3545,19 +3593,33 @@ impl Context {
         self.hub.calls.any_active()
     }
 
-    /// Sets explicit call security (e.g. Telegram 1:1 confirmed emoji after `phone.confirmCall`).
-    pub fn call_security(&self, conversation_id: &str, security: Option<protocol::CallSecurity>) {
-        self.hub.calls.set_security(&self.hub, &self.key(conversation_id), security);
-    }
-
     /// Hands a confirmed Telegram 1:1 voice call to mediad.
     pub fn telegram_call(&self, conversation_id: &str, join: protocol::TelegramCallJoin) {
         self.hub.calls.telegram_call(&self.hub, &self.key(conversation_id), join);
     }
 
-    /// Asks mediad to build the join params JSON + SSRC for a Telegram group video chat.
-    pub fn telegram_group_offer(&self, conversation_id: &str, offer: protocol::TelegramGroupOffer) -> Result<(String, u32), String> {
+    /// Asks mediad to build the join params JSON + SSRC + optional E2EE public key for a Telegram group/conference call.
+    pub fn telegram_group_offer(
+        &self,
+        conversation_id: &str,
+        offer: protocol::TelegramGroupOffer,
+    ) -> Result<(String, u32, Option<String>), String> {
         self.hub.calls.telegram_group_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    /// Feeds Telegram encrypted conference chain blocks to mediad for verification.
+    pub fn telegram_conference_blocks(
+        &self,
+        conversation_id: &str,
+        sub_chain_id: i32,
+        blocks: Vec<String>,
+    ) -> Result<(), String> {
+        self.hub.calls.telegram_conference_blocks(&self.hub, &self.key(conversation_id), sub_chain_id, blocks)
+    }
+
+    /// Sets or clears the shareable invite link (`https://t.me/call/<slug>`) on the active call.
+    pub fn call_invite_link(&self, conversation_id: &str, invite_link: Option<String>) {
+        self.hub.calls.set_invite_link(&self.hub, &self.key(conversation_id), invite_link);
     }
 
     /// Applies Telegram's server transport JSON (`updateGroupCallConnection`) to mediad.
@@ -3688,6 +3750,28 @@ impl Context {
         self.hub.calls.set_move_notice(&self.hub, &self.key(conversation_id), notice);
     }
 
+    /// People watching our own share.
+    pub fn set_viewers(&self, conversation_id: &str, viewers: Vec<Participant>) {
+        self.hub.calls.set_viewers(&self.hub, &self.key(conversation_id), viewers);
+    }
+
+    /// The stream we are watching stopped sending, or started again.
+    pub fn set_stream_paused(&self, conversation_id: &str, paused: bool) {
+        self.hub.calls.set_stream_paused(&self.hub, &self.key(conversation_id), paused);
+    }
+
+    /// The jpeg mediad painted of our share, when one is on disk. Empty otherwise.
+    pub fn share_frame(&self) -> Option<String> {
+        let (call, _) = self.hub.calls.describe();
+        let call = call?;
+        if call.conversation.account() != self.account {
+            return None;
+        }
+        let path = call.share_view.as_ref()?.path.clone();
+        let lower = path.to_ascii_lowercase();
+        (lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".png")).then_some(path)
+    }
+
     /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).
     pub fn self_moderation(&self, conversation_id: &str, server_muted: bool, server_deafened: bool, suppressed: bool) {
         self.hub.calls.set_self_moderation(&self.hub, &self.key(conversation_id), server_muted, server_deafened, suppressed);
@@ -3716,6 +3800,46 @@ impl Context {
     /// Whose voice each receive slot carries.
     pub fn tiny_slots(&self, conversation_id: &str, audio: Vec<protocol::TinySlot>) {
         self.hub.calls.tiny_slots(&self.hub, &self.key(conversation_id), audio);
+    }
+
+    /// Signal call: ask mediad to build a pure-Rust `str0m` WebRTC SDP offer.
+    pub fn signal_offer(&self, conversation_id: &str, offer: protocol::SignalOffer) -> Result<String, String> {
+        self.hub.calls.signal_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    /// Signal call: ask mediad to accept an incoming SDP offer and return our SDP answer.
+    pub fn signal_accept(&self, conversation_id: &str, accept: protocol::SignalAccept) -> Result<String, String> {
+        self.hub.calls.signal_accept(&self.hub, &self.key(conversation_id), accept)
+    }
+
+    /// Signal call: deliver the remote peer's SDP answer to mediad.
+    pub fn signal_answer(&self, conversation_id: &str, sdp: String) -> Result<(), String> {
+        self.hub.calls.signal_answer(&self.hub, &self.key(conversation_id), sdp)
+    }
+
+    /// Signal call: deliver one remote ICE candidate to mediad.
+    pub fn signal_ice(&self, conversation_id: &str, candidate: String) {
+        self.hub.calls.signal_ice(&self.hub, &self.key(conversation_id), candidate);
+    }
+
+    /// Sets the call's end-to-end encryption indicator (`CallSecurity`) for the shell.
+    pub fn call_security(&self, conversation_id: &str, security: Option<protocol::CallSecurity>) {
+        self.hub.calls.set_security(&self.hub, &self.key(conversation_id), security);
+    }
+
+    /// Updates the call's state directly (e.g., transitioning to `Joined` once a call is established).
+    pub fn call_state(&self, conversation_id: &str, state: CallState) {
+        self.hub.calls.set_state(&self.hub, &self.key(conversation_id), state);
+    }
+
+    /// Updates our own raised-hand state in the active group call.
+    pub fn call_hand_raised(&self, conversation_id: &str, raised: bool) {
+        self.hub.calls.set_hand_raised(&self.hub, &self.key(conversation_id), raised);
+    }
+
+    /// Updates our own active transient emoji reaction in the active group call.
+    pub fn call_reaction(&self, conversation_id: &str, emoji: Option<String>) {
+        self.hub.calls.set_reaction(&self.hub, &self.key(conversation_id), emoji);
     }
 
     /// The call in this room is over and the network already knows. A joined call plays the

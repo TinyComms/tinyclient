@@ -8,13 +8,14 @@
 //!   (`tiny/channel.rs`).
 //!
 //! Each place leaves room for a 24 × 24 element and draws nothing for a call that says nothing
-//! about its protection (every network but a Tiny server). The panel opens beside the indicator
-//! that was clicked: over the dock's card, over the compact bar, or under the top bar.
+//! about its protection. A Tiny server and a Discord call both fill it. The panel opens beside
+//! the indicator that was clicked: over the dock's card, over the compact bar, or under the top bar.
 //!
-//! The panel leads with four emojis derived from the call code (Telegram-style): everyone in
-//! the call sees the same four, so reading them out loud checks that you share one encrypted
-//! group. Pairwise safety numbers and what the server can still see sit under "More about this
-//! call". Each other member can be marked verified.
+//! On a Tiny call the panel leads with four emojis derived from the call code: everyone in the
+//! call sees the same four, so reading them out loud checks that you share one encrypted group.
+//! Discord shows the voice privacy code instead, and a verification code for each person. A Go
+//! Live leg has its own code. Pairwise numbers and what the server can still see sit under
+//! "More about this call". Each other member can be marked verified.
 //!
 //! It never says more than holds. "End-to-end encrypted" and the green lock appear while mediad
 //! says the group has keys, and also when you are the only person in the call: there is nobody
@@ -135,6 +136,20 @@ pub(super) fn security_emojis(security: &CallSecurity) -> Vec<String> {
     call_emojis(&security.code).into_iter().map(str::to_owned).collect()
 }
 
+/// Formats a Signal 60-digit safety number as 3 lines of 4 five-digit groups, or `None` when
+/// the call is not a Signal E2EE call with a safety number.
+pub(super) fn signal_safety_lines(call: &Call) -> Option<Vec<String>> {
+    if call.conversation.network != protocol::Network::Signal {
+        return None;
+    }
+    let security = call.security.as_ref()?;
+    if security.mode != SecurityMode::EndToEnd || security.code.is_empty() {
+        return None;
+    }
+    let lines = grouped_lines(&security.code, 5, 4);
+    (!lines.is_empty()).then_some(lines)
+}
+
 /// Four verification emoji shown inline in the call header for a confirmed Telegram 1:1 E2EE call.
 /// Returns `None` for non-Telegram calls, unconfirmed/non-E2EE calls, or group video chats.
 pub(super) fn telegram_header_emojis(call: &Call) -> Option<String> {
@@ -164,6 +179,15 @@ pub(super) fn member_name(call: &Call, user_id: &str) -> String {
 
 fn first_name(name: &str) -> &str {
     name.split_whitespace().next().unwrap_or(name)
+}
+
+/// Headline and sentence for a Discord call. The privacy code is the group's, not four emojis.
+pub(super) fn discord_line(security: &CallSecurity, alone: bool) -> (&'static str, &'static str) {
+    match badge(security, alone) {
+        Badge::EndToEnd | Badge::Alone => ("End-to-end encrypted", "Only people in this call can hear it. Discord cannot."),
+        Badge::Pending => ("Setting up end-to-end encryption", "Your microphone waits until it's done. Discord cannot hear this call."),
+        _ => summary(security, alone),
+    }
 }
 
 /// The headline and the sentence under it.
@@ -385,10 +409,11 @@ impl Shell {
         let Some(security) = call.security.clone() else {
             return panel;
         };
+        let discord = call.conversation.network == protocol::Network::Discord;
         let alone = call.participants.is_empty();
         let shown = badge(&security, alone);
         let (icon, color) = badge_look(shown);
-        let (headline, sentence) = summary(&security, alone);
+        let (headline, sentence) = if discord { discord_line(&security, alone) } else { summary(&security, alone) };
         panel = panel
             .child(
                 div()
@@ -407,6 +432,9 @@ impl Shell {
             )
             .child(words(sentence.to_owned(), theme::text_soft()))
             .children(why_transport(call, &security).into_iter().map(|line| words(line, theme::text_soft())));
+        if let Some(code) = call.stream_security.as_ref().map(|stream| stream.code.as_str()).filter(|code| !code.is_empty()) {
+            panel = panel.child(label("THIS STREAM'S CODE")).child(digits(grouped_lines(code, 5, 3)));
+        }
         if offers_carry_on(&security) && in_call(call) {
             panel = panel.child(
                 div()
@@ -432,42 +460,72 @@ impl Shell {
             return panel;
         }
         let is_telegram = call.conversation.network == protocol::Network::Telegram && !security.emojis.is_empty();
-        let emojis = security_emojis(&security);
-        if !emojis.is_empty() {
-            let note = if is_telegram {
-                "If these four emoji match on the other person's screen, this call is end-to-end encrypted and nobody sits between you."
-            } else {
-                "Same four on everyone's screen? You're in one encrypted call."
-            };
+        let is_signal = call.conversation.network == protocol::Network::Signal;
+        if discord && !security.code.is_empty() {
+            panel = panel.child(label("VOICE PRIVACY CODE")).child(digits(grouped_lines(&security.code, 5, 3)));
+        } else if let Some(lines) = signal_safety_lines(call) {
             panel = panel
                 .child(
                     div()
                         .flex()
-                        .justify_center()
-                        .gap(px(8.))
+                        .flex_col()
+                        .items_center()
+                        .gap(px(4.))
                         .rounded(px(10.))
                         .bg(theme::hover())
                         .px(px(10.))
-                        .py(px(12.))
-                        .children(emojis.into_iter().enumerate().map(|(ix, glyph)| {
+                        .py(px(10.))
+                        .children(lines.into_iter().map(|line| {
                             div()
-                                .id(("call-emoji", ix))
-                                .size(px(44.))
-                                .rounded(px(10.))
-                                .bg(theme::selected())
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(26.))
-                                .line_height(px(32.))
-                                .child(glyph)
+                                .font_family(theme::MONO)
+                                .text_size(px(12.))
+                                .text_color(theme::text())
+                                .child(line)
                         })),
                 )
-                .child(words(note.to_owned(), theme::text_faint()));
+                .child(words(
+                    "Signal safety number. Compare these 60 digits with the other person to verify end-to-end encryption.".to_owned(),
+                    theme::text_faint(),
+                ));
+        } else if !discord {
+            let emojis = security_emojis(&security);
+            if !emojis.is_empty() {
+                let note = if is_telegram {
+                    "If these four emoji match on the other person's screen, this call is end-to-end encrypted and nobody sits between you."
+                } else {
+                    "Same four on everyone's screen? You're in one encrypted call."
+                };
+                panel = panel
+                    .child(
+                        div()
+                            .flex()
+                            .justify_center()
+                            .gap(px(8.))
+                            .rounded(px(10.))
+                            .bg(theme::hover())
+                            .px(px(10.))
+                            .py(px(12.))
+                            .children(emojis.into_iter().enumerate().map(|(ix, glyph)| {
+                                div()
+                                    .id(("call-emoji", ix))
+                                    .size(px(44.))
+                                    .rounded(px(10.))
+                                    .bg(theme::selected())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(26.))
+                                    .line_height(px(32.))
+                                    .child(glyph)
+                            })),
+                    )
+                    .child(words(note.to_owned(), theme::text_faint()));
+            }
         }
         if is_telegram {
             return panel;
         }
+        let _ = is_signal;
         let in_it = in_call(call);
         if !security.members.is_empty() {
             let mut people = div().flex().flex_col().gap(px(6.));
@@ -538,6 +596,9 @@ impl Shell {
                 if let Some(warning) = changed_warning(call, member) {
                     row = row.child(words(warning, theme::warning()));
                 }
+                if discord && !member.safety.is_empty() {
+                    row = row.child(digits(grouped_lines(&member.safety, 5, 3)));
+                }
                 people = people.child(row);
             }
             panel = panel.child(people);
@@ -581,7 +642,7 @@ impl Shell {
         if security.members.is_empty() {
             return panel;
         }
-        let mut detail = div().flex().flex_col().gap(px(8.)).child(label("SAFETY NUMBERS"));
+        let mut detail = div().flex().flex_col().gap(px(8.)).child(label(if discord { "VERIFICATION CODE" } else { "SAFETY NUMBERS" }));
         for member in &security.members {
             let name = member_name(call, &member.user_id);
             let mut row = div()
@@ -600,11 +661,12 @@ impl Shell {
             }
             detail = detail.child(row);
         }
-        panel.child(detail).child(words(
+        let compare = if discord {
+            "Compare a verification code with that person, in person or on another channel you trust. Both of you see the same number."
+        } else {
             "Compare a safety number with that person, in person or on another channel you trust. Both of you see the same number."
-                .to_owned(),
-            theme::text_faint(),
-        ))
+        };
+        panel.child(detail).child(words(compare.to_owned(), theme::text_faint()))
     }
 }
 
@@ -655,7 +717,12 @@ mod tests {
         move_notice: None,
         incoming_video: false,
         title: String::new(),
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
         hand_raised: false,
+        reaction: None,
+        invite_link: None,
         join_muted: false,
         can_change_join_muted: false,
         participants_count: 0,
@@ -678,6 +745,19 @@ mod tests {
 
     fn secure(members: Vec<SecureMember>) -> CallSecurity {
         CallSecurity { mode: SecurityMode::EndToEnd, code: "123456789012345678901234567890".into(), epoch: 2, members, ..CallSecurity::default() }
+    }
+
+    #[test]
+    fn a_discord_call_names_its_privacy_code_not_four_emoji() {
+        let security = secure(vec![member("bea", Trust::Unverified)]);
+        let (headline, sentence) = discord_line(&security, false);
+        assert_eq!(headline, "End-to-end encrypted");
+        assert!(sentence.contains("Discord cannot"));
+        let pending = CallSecurity { mode: SecurityMode::Pending, ..CallSecurity::default() };
+        assert_eq!(discord_line(&pending, false).0, "Setting up end-to-end encryption");
+        assert!(discord_line(&pending, false).1.contains("Discord cannot hear"));
+        let lines = grouped_lines(&security.code, 5, 3);
+        assert_eq!(lines, vec!["12345 67890 12345".to_owned(), "67890 12345 67890".to_owned()]);
     }
 
     #[test]
@@ -820,5 +900,49 @@ mod tests {
         let mut pending = tg_call;
         pending.security = Some(CallSecurity { mode: SecurityMode::Pending, ..sec });
         assert!(telegram_header_emojis(&pending).is_none());
+    }
+
+    #[test]
+    fn telegram_conference_header_emojis_update_on_membership_change_and_fail_closed() {
+        let ep1 = CallSecurity::telegram_conference_verified(&[0x11; 32], 1, vec![member("u7002", Trust::Unverified)]);
+        let ep2 = CallSecurity::telegram_conference_verified(
+            &[0x22; 32],
+            2,
+            vec![member("u7002", Trust::Unverified), member("u7003", Trust::Unverified)],
+        );
+        let mut conf = call(ep1.clone());
+        conf.conversation.network = protocol::Network::Telegram;
+        conf.conversation.id = "conf:99001".into();
+        let shown1 = telegram_header_emojis(&conf).expect("ep1 4 emoji");
+        assert_eq!(shown1.split(' ').count(), 4);
+
+        conf.security = Some(ep2);
+        let shown2 = telegram_header_emojis(&conf).expect("ep2 4 emoji");
+        assert_eq!(shown2.split(' ').count(), 4);
+        assert_ne!(shown1, shown2, "header emoji must update when conference membership changes");
+
+        let blocked = CallSecurity::telegram_conference_blocked();
+        assert!(!offers_carry_on(&blocked), "fail-closed conference must never allow unencrypted carry-on");
+        conf.security = Some(blocked);
+        assert!(telegram_header_emojis(&conf).is_none());
+    }
+
+    #[test]
+    fn signal_call_security_formats_safety_number_and_shows_e2ee_badge() {
+        let digits: String = (0..60).map(|i| char::from_digit((i % 10) as u32, 10).unwrap()).collect();
+        let sec = CallSecurity {
+            mode: SecurityMode::EndToEnd,
+            code: digits,
+            members: vec![member("grace", Trust::Verified)],
+            required: true,
+            ..CallSecurity::default()
+        };
+        let mut sg_call = call(sec.clone());
+        sg_call.conversation.network = protocol::Network::Signal;
+        assert_eq!(badge(&sec, false), Badge::EndToEnd);
+        let lines = signal_safety_lines(&sg_call).expect("signal call formats 60-digit safety number");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "01234 56789 01234 56789");
+        assert!(telegram_header_emojis(&sg_call).is_none());
     }
 }

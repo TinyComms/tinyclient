@@ -2222,6 +2222,7 @@ impl Render for Shell {
             let root = root.children(self.phone_share_layer(window, cx));
             return root
                 .children(self.telegram_call_modal(window, cx))
+                .children(self.meeting_layer(cx))
                 .children(self.toast_layer(width, cx))
                 .children(super::settings::phone_page(window, cx))
                 .children(self.streamer_mark(window, cx));
@@ -2321,6 +2322,7 @@ impl Render for Shell {
             .children(self.folder_edit_modal(cx))
             .children(self.forum_post_modal(cx))
             .children(self.join_server_modal(cx))
+            .children(self.conference_link_modal(cx))
             .children(self.create_server_modal(cx))
             .children(self.events_modal(cx))
             .children(self.server_gate_modal(cx))
@@ -2334,6 +2336,7 @@ impl Render for Shell {
             .children(self.telegram_call_modal(window, cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
+            .children(self.meeting_layer(cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))
             .children(self.streamer_mark(window, cx));

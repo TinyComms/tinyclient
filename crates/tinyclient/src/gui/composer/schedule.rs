@@ -277,7 +277,7 @@ fn leap(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
-fn unix_at(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> Option<i64> {
+pub(in crate::gui) fn unix_at(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> Option<i64> {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     tm.tm_year = year - 1900;
     tm.tm_mon = month - 1;

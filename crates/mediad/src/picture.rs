@@ -34,11 +34,16 @@ pub(crate) use desktop::{RoundCam, RoundEncoder};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod screens;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub use screens::{choose_screen, screens};
+pub use screens::{choose_screen, chosen_screen, screens};
 /// A phone offers Settings no camera list: its own picker chooses, and `--cameras` prints none.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub fn cameras(_folder: Option<&std::path::Path>) -> Vec<protocol::CameraSource> {
     Vec::new()
+}
+/// A phone's share has no desktop source id. The loopback is not offered there.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn chosen_screen() -> Option<String> {
+    None
 }
 /// A screen through Desktop Duplication, which is what a share at 60 frames a second needs.
 #[cfg(windows)]
@@ -61,7 +66,7 @@ mod portal;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod x11;
 #[cfg(target_os = "macos")]
-mod mac_screen;
+pub(crate) mod mac_screen;
 
 /// The camera the next camera frame comes from, as `settings::CAMERA` stores it (a name, then a
 /// tab and the system's id); `None` is the first one listed. One choice per process.

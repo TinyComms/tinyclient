@@ -53,6 +53,7 @@
 
 mod call;
 mod catalog;
+mod conference;
 mod content;
 mod open_link;
 mod translate;
@@ -85,6 +86,10 @@ pub(crate) fn direct_call_ceiling() -> protocol::CallSupport {
 /// Live group and channel voice chats join natively (`#461`).
 pub(crate) fn group_call_ceiling() -> protocol::CallSupport {
     sync::group_call_ceiling()
+}
+
+pub fn prove_wave18a() -> Result<(), String> {
+    conference::prove_wave18a()
 }
 
 /// Replies or chats without an active live video chat.
@@ -291,6 +296,8 @@ struct Live {
     active_call: Option<call::ActiveCall>,
     /// Live and scheduled group/channel video chats (`#462`, `#465`, `#461`).
     group_calls: group_call::GroupCalls,
+    /// Encrypted Telegram group conferences (`#450`).
+    conferences: conference::Conferences,
     /// The newest post of each broadcast channel told to Telegram as viewed (`sync::viewed`).
     viewed: HashMap<Who, i32>,
     /// What the picker's items send.
@@ -866,13 +873,19 @@ fn offline(ctx: &Context, command: Command) {
         | Command::GroupCallSettings { reply, .. }
         | Command::GroupCallRaiseHand { reply, .. }
         | Command::GroupCallModerate { reply, .. }
-        | Command::GroupCallRtmpQuality { reply, .. } => drop(reply.send(Err(down()))),
+        | Command::GroupCallRtmpQuality { reply, .. }
+        | Command::ConferenceJoin { reply, .. }
+        | Command::ConferenceRemove { reply, .. } => drop(reply.send(Err(down()))),
         Command::GroupCallRecord { reply, .. } => drop(reply.send(Err(down()))),
         Command::GroupCallRtmpUrl { reply, .. } => drop(reply.send(Err(down()))),
         Command::GroupCallJoinAs { reply, .. } => drop(reply.send(Err(down()))),
         Command::GroupCallCreate { reply, .. }
         | Command::GroupCallExportInvite { reply, .. } => drop(reply.send(Err(down()))),
         Command::GroupCallInvite { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ConferenceResolve { reply, .. } | Command::ConferenceCreate { reply, .. } => {
+            drop(reply.send(Err(down())));
+        }
+        Command::CallAddPeople { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
     }
@@ -1381,17 +1394,42 @@ fn serve(account: &Arc<Account>, command: Command) {
             };
             let _ = reply.send(answer);
         }
-        Command::CallJoin(conversation_id) => match Who::parse(&conversation_id) {
-            Some((who @ Who::User(_), None)) => call::join_direct(account, who),
-            Some((who @ (Who::Group(_) | Who::Channel(_)), None)) => group_call::join_group(account, who),
-            _ => ctx.call_failed(&conversation_id, protocol::CallFailure::Refused, "Calls aren't available in this conversation."),
+        Command::CallJoin(conversation_id) => {
+            if conference::is_conference_id(&conversation_id) {
+                let _ = conference::join(account, None, Some(conversation_id), None, false);
+            } else {
+                match Who::parse(&conversation_id) {
+                    Some((who @ Who::User(_), None)) => call::join_direct(account, who, false),
+                    Some((who @ (Who::Group(_) | Who::Channel(_)), None)) => group_call::join_group(account, who),
+                    _ => ctx.call_failed(&conversation_id, protocol::CallFailure::Refused, "Calls aren't available in this conversation."),
+                }
+            }
+        }
+        Command::CallJoinVideo(conversation_id) => match Who::parse(&conversation_id) {
+            Some((who @ Who::User(_), None)) => call::join_direct(account, who, true),
+            _ => ctx.call_failed(&conversation_id, protocol::CallFailure::Refused, "Video calls aren't available in this conversation."),
         },
-        Command::CallLeave(conversation_id) => match Who::parse(&conversation_id) {
-            Some((who @ Who::User(_), None)) => call::leave_direct(account, who),
-            Some((who @ (Who::Group(_) | Who::Channel(_)), None)) => group_call::leave_group(account, who),
-            _ => {}
-        },
+        Command::CallLeave(conversation_id) => {
+            if !conference::leave_or_decline(account, &conversation_id) {
+                match Who::parse(&conversation_id) {
+                    Some((who @ Who::User(_), None)) => call::leave_direct(account, who),
+                    Some((who @ (Who::Group(_) | Who::Channel(_)), None)) => group_call::leave_group(account, who),
+                    _ => {}
+                }
+            }
+        }
         Command::CallAudio { muted, deafened } => group_call::set_group_audio(account, muted, deafened),
+        Command::CallPicture(picture) => {
+            match &picture {
+                crate::adapters::Picture::Camera(on) => group_call::on_camera(account, *on),
+                crate::adapters::Picture::Share { on, .. } => group_call::on_share(account, *on),
+                crate::adapters::Picture::Watch(_) => {}
+            }
+            call::on_call_picture(account, picture);
+        }
+        Command::CallAddPeople { conversation_id, people, reply } => {
+            let _ = reply.send(conference::add_people(account, &conversation_id, &people).map_err(refused));
+        }
         Command::GroupCallSchedule { conversation_id, schedule_date, title, reply } => {
             let _ = reply.send(group_call::schedule(account, &conversation_id, schedule_date, title).map_err(refused));
         }
@@ -1458,11 +1496,18 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::GroupCallRtmpQuality { conversation_id, quality, reply } => {
             let _ = reply.send(group_call::set_rtmp_quality(account, &conversation_id, quality).map_err(refused));
         }
-        Command::CallPicture(picture) => match picture {
-            crate::adapters::Picture::Camera(on) => group_call::on_camera(account, on),
-            crate::adapters::Picture::Share(on) => group_call::on_share(account, on),
-            crate::adapters::Picture::Watch(_) => {}
-        },
+        Command::ConferenceResolve { slug, reply } => {
+            let _ = reply.send(conference::resolve_slug(account, &slug).map_err(refused));
+        }
+        Command::ConferenceCreate { video, join, reply } => {
+            let _ = reply.send(conference::create(account, video, join).map_err(refused));
+        }
+        Command::ConferenceJoin { slug, call_id, msg_id, video, reply } => {
+            let _ = reply.send(conference::join(account, slug, call_id, msg_id, video).map_err(refused));
+        }
+        Command::ConferenceRemove { people, kick, reply, .. } => {
+            let _ = reply.send(conference::remove_participants(account, &people, kick).map_err(refused));
+        }
         Command::TelegramCallSignal { conversation_id, data } => {
             call::send_signal(account, &conversation_id, &data);
         }

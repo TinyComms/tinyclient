@@ -451,6 +451,9 @@ impl Fake {
             "/presence/v1/me/forceavailability/" if bearer("presence") => ok(json!({})),
             "/presence/v1/me/publishnote" if bearer("presence") => ok(json!({})),
             _ if path.starts_with("/msgsearch") && bearer("substrate") => self.search_endpoint(call),
+            _ if path.starts_with("/graph/v1.0/shares/") && path.contains(&format!("u!{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("https://example.sharepoint.com/:t:/s/Ops/fixture"))) && bearer("graph") => {
+                self.graph(call, &path["/graph".len()..])
+            }
             // A shared file's bytes. The cache asks Graph's shares route; this stands in for it.
             _ if call.method == "GET" && path.contains("/shares/u!") && path.ends_with("/driveItem/content") => Reply {
                 status: "200 OK",
@@ -759,6 +762,30 @@ impl Fake {
         let (conversation, tail) = rest.split_once('/').unwrap_or((rest, ""));
         match (call.method.as_str(), tail) {
             ("GET", "messages") => {
+                if conversation == "48:calllogs" {
+                    if call.query.contains("syncState=calls2") {
+                        return ok(json!({"messages": [{
+                            "id": "1760000100000",
+                            "properties": {"call-log": json!({
+                                "threadId": null, "originator": ME, "target": ANA, "callDirection": "outgoing", "callState": "accepted",
+                                "connectTime": "2025-10-09T09:01:00Z", "endTime": "2025-10-09T09:01:43Z"
+                            }).to_string()}
+                        }]}));
+                    }
+                    return ok(json!({
+                        "messages": [{
+                            "id": "1760000200000", "isRead": false,
+                            "properties": {"call-log": json!({"threadId": CHAT_ANA, "originator": ANA, "target": ME, "callState": "missed"}).to_string()}
+                        }, {
+                            "id": "1760000190000",
+                            "properties": {"call-log": json!({
+                                "threadId": CHAT_ANA, "originator": ANA, "target": ME, "callState": "accepted",
+                                "forwardingInfo": {"acceptedBy": {"type": "voicemail"}}
+                            }).to_string()}
+                        }],
+                        "_metadata": {"backwardLink": "/messages?syncState=calls2"}
+                    }));
+                }
                 if let Some(root) = [LONG, JUMP].into_iter().find(|root| conversation == format!("{GENERAL};messageid={root}")) {
                     return ok(long_chain(root, &call.query));
                 }
@@ -930,6 +957,54 @@ impl Fake {
 
     /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, channel SharePoint `filesFolder`, mailbox OOO, and user org/profile.
     fn graph(&self, call: &Call, path: &str) -> Reply {
+        if call.method == "POST" && path == "/v1.0/me/onlineMeetings/createOrGet" {
+            let request = call.json();
+            assert_eq!(request["subject"], "Design huddle");
+            assert_eq!(request["externalId"], "wave15-instant");
+            return ok(json!({
+                "id": "instant", "subject": request["subject"], "startDateTime": request["startDateTime"],
+                "endDateTime": request["endDateTime"], "joinWebUrl": "https://teams.microsoft.com/l/meetup-join/19%3Ameeting_instant%40thread.v2/0"
+            }));
+        }
+        if call.method == "POST" && path == "/v1.0/me/events" {
+            let request = call.json();
+            assert_eq!(request["isOnlineMeeting"], true);
+            assert_eq!(request["onlineMeetingProvider"], "teamsForBusiness");
+            assert_eq!(request["transactionId"], "wave15-scheduled");
+            assert_eq!(request["attendees"][0]["emailAddress"]["address"], "ana@contoso.com");
+            return ok(json!({
+                "id": "scheduled", "subject": request["subject"], "start": request["start"], "end": request["end"],
+                "onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3Ameeting_scheduled%40thread.v2/0"}
+            }));
+        }
+        if call.method == "GET" && path.starts_with("/v1.0/shares/") && path.ends_with("/driveItem/content")
+            && path.contains(&format!("u!{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("https://example.sharepoint.com/:t:/s/Ops/fixture")))
+        {
+            return Reply {
+                status: "200 OK", headers: Vec::new(), kind: "application/json",
+                body: json!({"entries": [{"speakerDisplayName": "Ana Ruiz", "text": "Ready for launch."}]}).to_string().into_bytes(),
+            };
+        }
+        if call.method == "GET" && path == "/v1.0/me/mailFolders/inbox/messages" {
+            assert!(call.query.contains("singleValueExtendedProperties"));
+            return ok(json!({"value": [{
+                "id": "vm-1", "subject": "Voicemail from Ana", "isRead": false,
+                "from": {"emailAddress": {"name": "Ana Ruiz"}},
+                "receivedDateTime": "2025-10-09T09:01:00Z", "bodyPreview": "I'll call back at noon.",
+                "attachments": [{"@odata.type": "#microsoft.graph.fileAttachment", "id": "clip", "contentType": "audio/mpeg"}]
+            }]}));
+        }
+        if path == "/v1.0/me/messages/vm-1" {
+            return match call.method.as_str() {
+                "GET" => ok(json!({"singleValueExtendedProperties": [{"id": "String 0x001A", "value": "IPM.Note.Microsoft.Voicemail.UM"}]})),
+                "PATCH" if call.json() == json!({"isRead": true}) => ok(json!({})),
+                "DELETE" => answer("204 No Content", Value::Null),
+                _ => answer("400 Bad Request", json!({})),
+            };
+        }
+        if call.method == "GET" && path == "/v1.0/me/messages/vm-1/attachments/clip" {
+            return ok(json!({"@odata.type": "#microsoft.graph.fileAttachment", "contentType": "audio/mpeg", "contentBytes": "SUQz"}));
+        }
         if call.method == "GET" && path == "/v1.0/users/00000000-0000-4000-8000-0000000000a1" {
             return ok(json!({
                 "id": "00000000-0000-4000-8000-0000000000a1",
@@ -1537,6 +1612,114 @@ fn key(id: &str) -> Key {
 
 fn chain() -> Key {
     key(&format!("{GENERAL};messageid={ROOT}"))
+}
+
+#[test]
+fn call_history_pages_the_account_stream() {
+    use protocol::CallOutcome;
+    let world = World::start();
+    world.ready();
+    let history = |before, missed| world.ask(Request::CallHistory { account: key("").account(), missed, before, limit: 30 });
+    let Response::CallHistory { entries, next, more } = history(None, false) else {
+        panic!("expected a Teams call log");
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].conversation, key(CHAT_ANA));
+    assert_eq!(entries[0].person_id, ANA);
+    assert_eq!(entries[0].note.outcome, CallOutcome::Missed);
+    assert_eq!(entries[1].note.outcome, CallOutcome::Voicemail);
+    assert_eq!(world.conversation(&key(CHAT_ANA)).unwrap().unread, 2);
+    assert!(more);
+    let Response::CallHistory { entries, more, .. } = history(next, false) else { panic!("expected the older calls") };
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].outgoing);
+    assert_eq!(entries[0].note.seconds, Some(43));
+    assert!(!more);
+    assert!(matches!(history(None, true), Response::CallHistory { entries, .. } if entries.len() == 1));
+}
+
+#[test]
+fn exchange_voicemail_returns_transcript_and_accepts_read_and_delete() {
+    let world = World::start();
+    world.ready();
+    let account = key("").account();
+    let Response::Voicemails { entries, next } = world.ask(Request::Voicemails { account: account.clone(), before: None }) else {
+        panic!("expected mailbox voicemail");
+    };
+    assert!(next.is_none());
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.caller, "Ana Ruiz");
+    assert_eq!(entry.transcript, "I'll call back at noon.");
+    assert!(!entry.read);
+    assert!(entry.audio.is_some());
+    let Response::Media { files } = world.ask(Request::VoicemailAudio {
+        account: account.clone(), id: entry.id.clone(), attachment: entry.audio.clone().unwrap(),
+    }) else { panic!("expected landed audio") };
+    assert_eq!(std::fs::read(files[0].path.as_ref().unwrap()).unwrap(), b"ID3");
+    for action in [protocol::VoicemailAction::MarkRead, protocol::VoicemailAction::Delete] {
+        assert_eq!(world.ask(Request::ChangeVoicemail { account: account.clone(), id: entry.id.clone(), action }), Response::Ok);
+    }
+}
+
+#[test]
+fn recording_card_and_transcript_file_are_readable() {
+    let world = World::start();
+    world.ready();
+    let conversation = key(CHAT_ANA);
+    let recording = r#"<URIObject type="Video.2/CallRecording.1">
+        <Title>Launch &amp; review</Title><RecordingStatus status="Success"/>
+        <Identifiers><Id type="callId" value="call-fixture"/></Identifiers>
+        <RecordingContent timestamp="2025-10-09T09:00:00Z" duration="0.00:42:05">
+            <item type="onedriveForBusinessVideo" uri="https://example.sharepoint.com/:v:/s/Ops/fixture"/>
+            <item type="onedriveForBusinessTranscript" uri="https://example.sharepoint.com/:t:/s/Ops/fixture"/>
+        </RecordingContent></URIObject>"#;
+    let transcript = r#"{"callId":"call-fixture"}"#;
+    let push = |id, label: &str, content: &str| {
+        let mut raw = message(CHAT_ANA, None, id, ANA, "Ana Ruiz", content);
+        raw["messagetype"] = json!(label);
+        world.fake.push("NewMessage", raw, false);
+        world.until(label, || world.message(&conversation, &id.to_string()))
+    };
+    let row = push(1_760_000_930_001, "RichText/Media_CallRecording", recording);
+    let card = row.card.expect("a recording card");
+    assert_eq!(card.title, "Launch & review");
+    assert!(card.fields.contains(&("Duration".into(), "42:05".into())));
+    assert_eq!(card.actions[0].label, "Open recording");
+    let row = push(1_760_000_930_002, "RichText/Media_CallTranscript", transcript);
+    assert_eq!(row.text, "Meeting transcript");
+    assert_eq!(row.card.unwrap().title, "Meeting transcript");
+    let Response::MeetingTranscript { text } = world.ask(Request::MeetingTranscript { conversation, message_id: row.id }) else {
+        panic!("expected the transcript text");
+    };
+    assert_eq!(text, "Ana Ruiz: Ready for launch.");
+}
+
+#[test]
+fn meet_now_and_scheduling_create_and_post_join_cards() {
+    use protocol::{MeetingDraft, MeetingSchedule};
+    let world = World::start();
+    world.ready();
+    let Response::MeetingCreated { event, posted } = world.ask(Request::CreateMeeting {
+        conversation: key(CHAT_ANA),
+        draft: MeetingDraft { title: "Design huddle".into(), request_id: "wave15-instant".into(), schedule: None },
+    }) else { panic!("Meet now did not return a join link") };
+    assert!(posted);
+    assert!(event.join_url.contains("meeting_instant"));
+    let post = world.fake.calls("POST", &format!("/{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(post.json()["content"].as_str().unwrap().contains(&event.join_url));
+    let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+    let Response::MeetingCreated { event, posted } = world.ask(Request::CreateMeeting {
+        conversation: key(GENERAL),
+        draft: MeetingDraft {
+            title: "Design review".into(), request_id: "wave15-scheduled".into(),
+            schedule: Some(MeetingSchedule { start, end: start + 1800, attendees: vec!["ana@contoso.com".into()], weekly: false }),
+        },
+    }) else { panic!("Schedule did not return a join link") };
+    assert!(posted);
+    assert_eq!((event.start, event.end), (start, start + 1800));
+    let post = world.fake.calls("POST", &format!("/{GENERAL}/messages")).pop().unwrap();
+    assert!(post.json()["content"].as_str().unwrap().contains(&event.join_url));
 }
 
 impl World {
