@@ -326,6 +326,8 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
+        hand_raised: false,
+        reaction: None,
     })
 }
 
@@ -485,6 +487,8 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
+        hand_raised: false,
+        reaction: None,
     }
 }
 

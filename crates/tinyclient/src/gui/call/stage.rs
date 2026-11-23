@@ -31,6 +31,8 @@ pub(in crate::gui) struct Seat {
     pub priority: bool,
     pub camera: bool,
     pub sharing: bool,
+    pub hand_raised: bool,
+    pub reaction: Option<String>,
 }
 
 impl Seat {
@@ -52,12 +54,18 @@ impl Seat {
         if self.priority {
             states.push("Priority speaker");
         }
+        if self.hand_raised {
+            states.push("Hand raised");
+        }
         states
     }
 
     /// Small corner glyphs for a tile or roster row.
     pub(in crate::gui) fn glyphs(&self) -> Vec<(&'static str, gpui::Rgba, &'static str)> {
         let mut out = Vec::new();
+        if self.hand_raised {
+            out.push(("icons/hand.svg", theme::warning(), "Hand raised"));
+        }
         if self.priority {
             out.push(("icons/megaphone.svg", theme::accent_text(), "Priority speaker"));
         }
@@ -167,6 +175,8 @@ impl Stage {
                     priority: who.priority,
                     camera: who.camera,
                     sharing: who.sharing,
+                    hand_raised: who.hand_raised,
+                    reaction: who.reaction.clone(),
                 })
                 .collect()
         } else {
@@ -187,9 +197,11 @@ impl Stage {
             priority: false,
             camera: my_camera,
             sharing: my_sharing,
+            hand_raised: call.hand_raised,
+            reaction: call.reaction.clone(),
         });
         let video = call.video_allowed
-            && matches!(call.conversation.network, Network::Tiny | Network::Discord);
+            && protocol::call_pictures(call.conversation.network);
         Stage {
             key: call.conversation.clone(),
             title: subject.title.clone(),
@@ -225,6 +237,8 @@ impl Stage {
                     priority: heard.priority,
                     camera: heard.camera,
                     sharing: heard.sharing,
+                    hand_raised: false,
+                    reaction: None,
                 }
             })
             .collect();
@@ -765,5 +779,49 @@ mod tests {
         assert!(full.is_none() && focus.is_none() && view.is_none());
 
         assert!(!escape_step(&mut full, &mut focus, &mut view));
+    }
+
+    #[test]
+    fn signal_group_call_stage_carries_video_raise_hand_and_reactions() {
+        let mut group_call = sample_call(
+            CallState::Joined,
+            vec![
+                Participant {
+                    id: "grace".into(),
+                    name: "Grace Ombra".into(),
+                    hand_raised: true,
+                    reaction: Some("👏".into()),
+                    camera: true,
+                    ..Participant::default()
+                },
+                Participant {
+                    id: "alan".into(),
+                    name: "Alan Ferro".into(),
+                    sharing: true,
+                    ..Participant::default()
+                },
+            ],
+        );
+        group_call.conversation = Key { network: Network::Signal, account: "me".into(), id: "g.club".into() };
+        group_call.hand_raised = true;
+        group_call.reaction = Some("👍".into());
+        let subject = Subject {
+            title: "Friday club".into(),
+            kind: ConversationKind::Group,
+            avatar: None,
+            space: None,
+            occupied: 3,
+        };
+        let stage = Stage::of_call(&group_call, &subject, "me", "Ada");
+        assert!(stage.video, "Signal group calls allow camera and screen share");
+        assert_eq!(stage.seats.len(), 3);
+        let grace = stage.seats.iter().find(|s| s.id == "grace").unwrap();
+        assert!(grace.hand_raised && grace.reaction.as_deref() == Some("👏") && grace.camera);
+        assert!(grace.states().contains(&"Hand raised"));
+        assert!(grace.glyphs().iter().any(|(icon, _, _)| *icon == "icons/hand.svg"));
+        let alan = stage.seats.iter().find(|s| s.id == "alan").unwrap();
+        assert!(alan.sharing);
+        let me = stage.seats.iter().find(|s| s.me).unwrap();
+        assert!(me.hand_raised && me.reaction.as_deref() == Some("👍"));
     }
 }

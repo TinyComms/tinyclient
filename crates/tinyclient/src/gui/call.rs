@@ -705,6 +705,8 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
+        hand_raised: false,
+        reaction: None,
     }
 }
 

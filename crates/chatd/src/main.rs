@@ -1048,6 +1048,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-wave13:0");
         return Ok(());
     }
+    // The lab's signal-wave19 driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-wave19") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_wave19() {
+            eprintln!("signal-wave19: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-wave19:0");
+        return Ok(());
+    }
 
     // The lab's signal-send-file driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-send-file") {

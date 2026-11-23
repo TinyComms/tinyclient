@@ -1666,6 +1666,20 @@ impl Shell {
                 .when(!small, |tile| tile.child(state_row))
         };
         tile.children(link)
+            .children(seat.reaction.as_ref().filter(|r| !r.is_empty()).map(|emoji| {
+                div()
+                    .absolute()
+                    .top(px(8.))
+                    .left(px(8.))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded_full()
+                    .bg(theme::overlay())
+                    .border_1()
+                    .border_color(theme::border())
+                    .text_size(px(14.))
+                    .child(emoji.clone())
+            }))
             .child(
                 div()
                     .absolute()
@@ -1922,6 +1936,48 @@ impl Shell {
                 .tooltip(tip(if popout_open { "Bring video back" } else { "Pop out video" }, Some("⇧⌘O")))
                 .on_click(cx.listener(|this, _, _, cx| this.call_toggle_popout(cx)))
         });
+        let signal_group = joined
+            && call.is_some_and(|c| c.conversation.network == Network::Signal && c.conversation.id.starts_with("g."));
+        let hand_raised = call.is_some_and(|c| c.hand_raised);
+        let raise_hand = signal_group.then(|| {
+            bar_button(
+                "tiny-bar-hand",
+                "icons/hand.svg",
+                if hand_raised { BarLook::On } else { BarLook::Rest },
+            )
+            .aria_label(if hand_raised { "Lower hand" } else { "Raise hand" })
+            .tooltip(tip(if hand_raised { "Lower hand" } else { "Raise hand" }, None))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.call_ask(Request::CallRaiseHand { raised: !hand_raised }, cx);
+            }))
+        });
+        let react_bar = signal_group.then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .px(px(4.))
+                .h(px(36.))
+                .rounded_full()
+                .bg(theme::selected())
+                .children(["👍", "❤️", "😂", "👏"].into_iter().enumerate().map(|(ix, emoji)| {
+                    div()
+                        .id(("call-react", ix))
+                        .size(px(28.))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(14.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(tip(format!("React with {emoji}"), None))
+                        .child(emoji)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_ask(Request::CallReact { emoji: emoji.to_owned() }, cx);
+                        }))
+                }))
+        });
         let refused = self
             .call_refused()
             .map(str::to_owned)
@@ -2002,6 +2058,8 @@ impl Shell {
                     .child(deafen)
                     .children(share)
                     .children(camera)
+                    .children(raise_hand)
+                    .children(react_bar)
                     .children(popout)
                     .child(devices)
                     .children(health)

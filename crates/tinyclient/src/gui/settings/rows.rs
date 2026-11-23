@@ -97,6 +97,7 @@ pub const ROWS: &[Row] = &[
     row("PF", Privacy, "Links", "Sites that open without asking", &[], &["link", "links", "trusted", "allow", "dont ask again", "forget", "domain"]),
     row("P4", Privacy, "", crate::host::KEEP_MESSAGES, &["7 days", "30 days", "90 days"], &["retention", "history", "delete", "days"]),
     row("PE", Privacy, "Calls", "Only join end-to-end encrypted calls", &[], &["encryption", "encrypted", "e2ee", "end to end", "tiny", "call", "downgrade", "privacy"]),
+    row("P7", Privacy, "Calls", "Always relay Signal calls", &[], &["signal", "relay", "turn", "ip", "address", "call", "privacy"]),
     row("PS1", Privacy, "Streamer mode", "Streamer mode", &["Off", "On", "While sharing"], &["streamer", "stream", "obs", "streamlabs", "broadcast", "screen share", "privacy", "hide", "notifications", "silence"]),
     row("PS2", Privacy, "Streamer mode", "Hide window from screen capture", &[], &["streamer", "capture", "obs", "screen", "window", "exclude", "hide", "privacy"]),
     row("PS3", Privacy, "Streamer mode", "Turn on automatically when OBS or Streamlabs is running", &[], &["streamer", "obs", "streamlabs", "broadcast", "detect", "automatic"]),
@@ -258,7 +259,7 @@ pub fn kept_by_chatd(id: &str) -> bool {
         id,
         "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "NR" | "NF" | "NK" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
             | "M8"
-            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "PS1" | "PS2" | "PS3" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V23" | "V24" | "V25" | "V27" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
+            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "P7" | "PS1" | "PS2" | "PS3" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V23" | "V24" | "V25" | "V27" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
     )
 }
 

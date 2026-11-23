@@ -6,6 +6,9 @@
 //! what comes back into the contract, and the link steps. It proves nothing about presage and
 //! libsignal underneath, which no test can reach without a real account and a phone to link from.
 
+#[path = "support/mediad.rs"]
+mod test_mediad;
+
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ContactKind, Conversation, ConversationKind, ErrorCode, Key, Link, Message,
     MessageKind, Network, Outgoing, OutgoingFile, Page, PollDraft, Relation, Request, Response, SendState, SignInInput, SignInProblem,
@@ -70,6 +73,8 @@ impl World {
         command
             .env("TINYCLIENT_DIR", &dir)
             .env("TINYCLIENT_SIGNAL_FAKE", "1")
+            .env("TINYCLIENT_MEDIAD", test_mediad::path())
+            .env("TINYCLIENT_MEDIAD_AUDIO", "tone")
             .env_remove("TINYCLIENT_SESSION_DISCORD")
             .env_remove("TINYCLIENT_SESSION_SLACK")
             .env_remove("TINYCLIENT_SESSION_TELEGRAM")
@@ -98,6 +103,8 @@ impl World {
         self.child = Command::new(chatd_bin())
             .env("TINYCLIENT_DIR", &self.dir)
             .env("TINYCLIENT_SIGNAL_FAKE", "1")
+            .env("TINYCLIENT_MEDIAD", test_mediad::path())
+            .env("TINYCLIENT_MEDIAD_AUDIO", "tone")
             .env("TINYCLIENT_SESSION_SIGNAL", SESSION)
             .env_remove("TINYCLIENT_SESSION_DISCORD")
             .env_remove("TINYCLIENT_SESSION_SLACK")
@@ -3744,4 +3751,254 @@ fn history_transfer_decline_and_expiry_and_tampered_archive_leave_device_linked(
         assert_eq!(done, Some(account()));
         world.connected();
     }
+}
+
+#[test]
+fn signal_direct_outgoing_call_offer_answer_ice_camera_and_hangup() {
+    let world = World::linked();
+    world.connected();
+
+    // Direct chat row advertises native Signal calls.
+    world.steer(&format!("incoming grace {} Hey, free to talk?", now_ms()));
+    let row = world.until("Grace's row with Native call support", || {
+        world.conversation(GRACE).filter(|r| r.call == protocol::CallSupport::Native)
+    });
+    assert_eq!(row.call, protocol::CallSupport::Native);
+
+    // Place outgoing 1:1 call: generates real str0m SDP offer, sends Offer + IceUpdate, shows E2EE safety number.
+    let resp = world.ask(Request::CallStart { conversation: key(GRACE) });
+    assert!(matches!(resp, Response::Status { .. }), "{resp:?}");
+
+    let offer_line = world.until("Signal OfferMessage sent with SDP", || {
+        world.calls().into_iter().find(|l| l.starts_with(&format!("send {GRACE} call-offer ")) && l.contains("sdp=true"))
+    });
+    assert!(offer_line.contains("relay=false"), "contact call with P7 off uses direct candidate: {offer_line}");
+    let call_id: u64 = offer_line.split_whitespace().nth(3).unwrap().parse().unwrap();
+
+    world.until("Signal local ICE update sent", || {
+        world.calls().into_iter().find(|l| l.starts_with(&format!("send {GRACE} call-ice {call_id}")))
+    });
+
+    let call = world.until("Call RingingOut with E2EE safety number", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE)
+                && c.state == protocol::CallState::RingingOut
+                && c.security.as_ref().is_some_and(|s| s.mode == protocol::SecurityMode::EndToEnd && s.code.len() == 60) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+    assert_eq!(call.security.as_ref().unwrap().members[0].user_id, GRACE);
+
+    // Remote peer sends ICE candidate and answers.
+    world.steer(&format!("call-ice grace {call_id} candidate:1 1 UDP 2130706431 127.0.0.1 45000 typ host"));
+    world.steer(&format!("call-answer grace {call_id}"));
+    let joined = world.until("Call transitions to Joined with Grace in participants", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE)
+                && c.state == protocol::CallState::Joined
+                && c.participants.iter().any(|p| p.id == GRACE) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+    assert_eq!(joined.participants.len(), 1);
+
+    // Hang up sends CallMessage.Hangup (Normal) and clears the call.
+    let end = world.ask(Request::CallEnd);
+    assert!(matches!(end, Response::Status { call: None, .. }), "{end:?}");
+    world.heard(&format!("send {GRACE} call-hangup {call_id} normal"));
+}
+
+#[test]
+fn signal_direct_incoming_call_accept_decline_busy_and_always_relay() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Fresh incoming video call rings natively; accepting sends Answer and joins.
+    let call_id = now_ms();
+    world.steer(&format!("call-video grace {call_id}"));
+    world.until("Call RingingIn from Grace", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE) && matches!(c.state, protocol::CallState::RingingIn { .. }) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+    let accepted = world.ask(Request::CallAccept);
+    assert!(matches!(accepted, Response::Status { .. }), "{accepted:?}");
+    world.until("Answer sent to Grace", || {
+        world.calls().into_iter().find(|l| l.starts_with(&format!("send {GRACE} call-answer {call_id}")))
+    });
+    world.until("Joined incoming Signal call with safety number", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE)
+                && c.state == protocol::CallState::Joined
+                && c.security.as_ref().is_some_and(|s| s.mode == protocol::SecurityMode::EndToEnd) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+
+    // 2. While in a call with Grace, a second incoming call from Alan receives Busy.
+    let second_id = call_id + 10;
+    world.steer(&format!("call alan {second_id}"));
+    world.heard(&format!("send {ALAN} call-busy {second_id}"));
+
+    // Hang up Grace.
+    let _ = world.ask(Request::CallEnd);
+    world.heard(&format!("send {GRACE} call-hangup {call_id} normal"));
+
+    // 3. Incoming call declined sends Hangup(Declined).
+    let third_id = now_ms();
+    world.steer(&format!("call grace {third_id}"));
+    world.until("Second RingingIn from Grace", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(GRACE) && matches!(c.state, protocol::CallState::RingingIn { .. }) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+    let _ = world.ask(Request::CallDecline);
+    world.heard(&format!("send {GRACE} call-hangup {third_id} declined"));
+
+    // 4. Privacy P7 ("Always relay Signal calls"): outgoing offer uses TURN relay candidates only.
+    let set_resp = world.ask(Request::Set {
+        scope: protocol::settings::GLOBAL.into(),
+        key: protocol::settings::SIGNAL_ALWAYS_RELAY.into(),
+        value: Some("on".into()),
+    });
+    assert!(matches!(set_resp, Response::Ok), "{set_resp:?}");
+    let _ = world.ask(Request::CallStart { conversation: key(GRACE) });
+    world.until("Relay-only Signal offer sent", || {
+        world.calls().into_iter().find(|l| {
+            l.starts_with(&format!("send {GRACE} call-offer "))
+                && l.contains("sdp=true")
+                && l.contains("relay=true")
+        })
+    });
+    let _ = world.ask(Request::CallEnd);
+}
+
+#[test]
+fn signal_group_call_banner_join_ring_raise_hand_reactions_screen_share_and_full() {
+    let world = World::linked();
+    world.connected();
+
+    // Group row advertises native Signal group calls.
+    let club = world.until("Friday club group row with Native call support", || {
+        world.conversation(CLUB).filter(|r| r.call == protocol::CallSupport::Native)
+    });
+    assert_eq!(club.call, protocol::CallSupport::Native);
+
+    // 1. Incoming DataMessage.groupCallUpdate populates occupants (live Join banner) and clears on end.
+    world.steer("group-call grace era-100");
+    let live_club = world.until("Group call banner occupants populated", || {
+        world.conversation(CLUB).filter(|r| r.occupants.as_ref().is_some_and(|o| o.total == 1 && o.people[0].person == key(GRACE)))
+    });
+    assert_eq!(live_club.occupants.as_ref().unwrap().total, 1);
+
+    // 2. Join the running Signal group call -> SFU creds, str0m offer, sender key distributed ONLY to members.
+    let joined_resp = world.ask(Request::CallStart { conversation: key(CLUB) });
+    assert!(matches!(joined_resp, Response::Status { .. }), "{joined_resp:?}");
+    world.until("SFU group call joined with SDP offer", || {
+        world.calls().into_iter().find(|l| l.contains("group-call-join ") && l.contains("era=era-100") && l.contains("sdp=true"))
+    });
+    world.until("Joined Signal group call with Grace in participants", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(CLUB)
+                && c.state == protocol::CallState::Joined
+                && c.participants.iter().any(|p| p.id == GRACE)
+                && c.security.as_ref().is_some_and(|s| s.mode == protocol::SecurityMode::EndToEnd) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    });
+    // Sender key was sent over 1:1 CallMessage.opaque to group members (Grace and Alan).
+    assert!(world.calls().iter().any(|l| l.starts_with(&format!("send {GRACE} call-opaque "))));
+    assert!(world.calls().iter().any(|l| l.starts_with(&format!("send {ALAN} call-opaque "))));
+
+    // 3. Raise hand and send emoji reaction (both outgoing and incoming from Grace).
+    let hand = world.ask(Request::CallRaiseHand { raised: true });
+    assert!(matches!(hand, Response::Status { call: Some(ref c), .. } if c.hand_raised), "{hand:?}");
+    world.until("group-call-data raise-hand=true sent", || {
+        world.calls().into_iter().find(|l| l.contains("group-call-data ") && l.contains("raise-hand=true"))
+    });
+    let react = world.ask(Request::CallReact { emoji: "👏".into() });
+    assert!(matches!(react, Response::Status { call: Some(ref c), .. } if c.reaction.as_deref() == Some("👏")), "{react:?}");
+    world.until("group-call-data react=👏 sent", || {
+        world.calls().into_iter().find(|l| l.contains("group-call-data ") && l.contains("react=👏"))
+    });
+
+    // Remote participant raises hand, reacts, and shares screen.
+    world.steer("group-hand grace on");
+    world.steer("group-react grace 🎉");
+    world.steer("group-media grace share on");
+    let seen = world.until("Grace hand_raised, reaction, and sharing reflected in participants", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. } => c
+            .participants
+            .into_iter()
+            .find(|p| p.id == GRACE && p.hand_raised && p.reaction.as_deref() == Some("🎉") && p.sharing),
+        _ => None,
+    });
+    assert!(seen.hand_raised && seen.sharing && seen.reaction.as_deref() == Some("🎉"));
+
+    // 4. Ringing other group members (Alan) and cancelling the ring.
+    let ring_resp = world.ask(Request::CallRing { people: Some(vec![ALAN.into()]) });
+    assert!(matches!(ring_resp, Response::Ok), "{ring_resp:?}");
+    world.until("Alan shown in call.ringing", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. } if c.ringing.iter().any(|r| r.id == ALAN && r.state == "ringing") => Some(()),
+        _ => None,
+    });
+    let stop_resp = world.ask(Request::CallStopRinging { people: Some(vec![ALAN.into()]) });
+    assert!(matches!(stop_resp, Response::Ok), "{stop_resp:?}");
+
+    // 5. Leave group call, then groupCallUpdate(None) clears occupants banner.
+    let _ = world.ask(Request::CallEnd);
+    world.until("group-call-leave sent", || {
+        world.calls().into_iter().find(|l| l.contains("group-call-leave ") && l.contains("era=era-100"))
+    });
+    world.steer("group-call-end grace");
+    world.until("Group call banner cleared on groupCallUpdate(None)", || {
+        world.conversation(CLUB).filter(|r| r.occupants.as_ref().is_none_or(|o| o.total == 0))
+    });
+
+    // 6. Non-member ring is rejected; member ring rings natively and ring cancelled stops it.
+    world.steer("group-ring stranger era-bad ring");
+    sleep(Duration::from_millis(200));
+    assert!(matches!(world.ask(Request::Status), Response::Status { call: None, .. }), "non-member group ring must be ignored");
+
+    world.steer("group-ring grace era-200 ring");
+    world.until("Incoming group call ring from member Grace", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. }
+            if c.conversation == key(CLUB) && matches!(c.state, protocol::CallState::RingingIn { .. }) =>
+        {
+            Some(())
+        }
+        _ => None,
+    });
+    world.steer("group-ring grace era-200 cancel");
+    world.until("Group call ring stopped on cancellation", || match world.ask(Request::Status) {
+        Response::Status { call: None, .. } => Some(()),
+        _ => None,
+    });
+
+    // 7. SFU "call is full" refuses join cleanly with CallFailure::Refused.
+    world.steer("group-call-full era-full");
+    let _ = world.ask(Request::CallStart { conversation: key(CLUB) });
+    let failed = world.until("Call fails with full notice from SFU", || match world.ask(Request::Status) {
+        Response::Status { call: Some(c), .. } => match c.state {
+            protocol::CallState::Failed { reason: protocol::CallFailure::Refused, detail } if detail.contains("full") => Some(detail),
+            _ => None,
+        },
+        _ => None,
+    });
+    assert!(failed.contains("full"), "{failed}");
+    let _ = world.ask(Request::CallEnd);
 }
