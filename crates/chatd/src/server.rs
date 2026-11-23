@@ -5918,6 +5918,18 @@ impl Chat {
             }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::CallHistory { account, missed, before, limit } => self.call_history(account, missed, before, limit),
+            Request::Voicemails { account, before } => match self.ask(&account, |reply| Command::Voicemails { before, reply }) {
+                Ok((entries, next)) => Response::Voicemails { entries, next },
+                Err(refused) => *refused,
+            },
+            Request::VoicemailAudio { account, id, attachment } => match self.ask(&account, |reply| Command::VoicemailAudio { id, attachment, reply }) {
+                Ok(file) => Response::Media { files: vec![file] },
+                Err(refused) => *refused,
+            },
+            Request::ChangeVoicemail { account, id, action } => match self.ask(&account, |reply| Command::ChangeVoicemail { id, action, reply }) {
+                Ok(()) => Response::Ok,
+                Err(refused) => *refused,
+            },
             Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
@@ -7438,6 +7450,31 @@ impl Chat {
             }),
             Request::TranslateMessages { conversation, message_ids, to } => self.translate(conversation, message_ids, to),
             Request::Meetings { account } => self.meetings(account),
+            Request::MeetingInvitees { conversation } => match self.ask(&conversation.account(), |reply| Command::MeetingInvitees {
+                conversation_id: conversation.id, reply,
+            }) {
+                Ok(emails) => Response::MeetingInvitees { emails },
+                Err(refused) => *refused,
+            },
+            Request::CreateMeeting { conversation, draft } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateMeeting { conversation_id: conversation.id, draft, reply }) {
+                    Ok((mut event, posted)) => {
+                        clip_meeting(&mut event);
+                        Response::MeetingCreated { event, posted }
+                    }
+                    Err(refused) => *refused,
+                }
+            },
+            Request::MeetingTranscript { conversation, message_id } => match self.ask(&conversation.account(), |reply| Command::MeetingTranscript {
+                conversation_id: conversation.id, message_id, reply,
+            }) {
+                Ok(text) => Response::MeetingTranscript { text },
+                Err(refused) => *refused,
+            },
             Request::MeetingRsvp { account, id, response, propose } => self.meeting_rsvp(account, id, response, propose),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {

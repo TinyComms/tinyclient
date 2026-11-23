@@ -1,0 +1,76 @@
+{
+  "ok": true,
+  "has_more": false,
+  "messages": [
+    {
+      "type": "message",
+      "subtype": "huddle_thread",
+      "user": "USLACKBOT",
+      "text": "",
+      "ts": "1760000600.000600",
+      "room": {
+        "id": "R0LIVE",
+        "call_family": "huddle",
+        "created_by": "U0ANA",
+        "has_ended": false,
+        "date_start": 1760000600,
+        "participants": [
+          "U0ANA"
+        ],
+        "thread_root_ts": "1760000600.000600"
+      }
+    },
+    {
+      "type": "message",
+      "subtype": "huddle_thread",
+      "user": "USLACKBOT",
+      "text": "",
+      "ts": "1760000200.000200",
+      "room": {
+        "id": "R0ENDED",
+        "call_family": "huddle",
+        "created_by": "U0ANA",
+        "has_ended": true,
+        "date_start": 1760000200,
+        "date_end": 1760000500,
+        "participants": [],
+        "participant_history": [
+          "U0ANA",
+          "U0BEN"
+        ],
+        "thread_root_ts": "1760000200.000200",
+        "canvas": {
+          "file_id": "F0NOTES"
+        }
+      },
+      "reply_count": 3,
+      "reply_users": [
+        "U0BEN",
+        "U0ANA"
+      ],
+      "latest_reply": "1760000320.000320",
+      "files": [
+        {
+          "id": "F0NOTES",
+          "title": "Launch recap",
+          "filetype": "quip",
+          "preview_plain_text": "The team agreed to launch Tuesday."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "subtype": "huddle_thread",
+      "user": "USLACKBOT",
+      "text": "",
+      "ts": "1760000100.000100",
+      "room": {
+        "id": "R0QUIET",
+        "call_family": "huddle",
+        "created_by": "U0ANA",
+        "has_ended": true,
+        "notes_canvas_id": "F0QUIET"
+      }
+    }
+  ]
+}

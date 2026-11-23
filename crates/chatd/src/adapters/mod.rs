@@ -1571,6 +1571,9 @@ pub enum Command {
         limit: u32,
         reply: Reply<CallHistoryPage>,
     },
+    Voicemails { before: Option<String>, reply: Reply<(Vec<protocol::Voicemail>, Option<String>)> },
+    VoicemailAudio { id: String, attachment: String, reply: Reply<MediaFile> },
+    ChangeVoicemail { id: String, action: protocol::VoicemailAction, reply: Reply<()> },
     /// Delete one or more call log entries by message id (`revoke` for both sides).
     DeleteCallEntries {
         message_ids: Vec<String>,
@@ -1820,6 +1823,9 @@ pub enum Command {
     /// Today's meetings, soonest first. A calendar the account cannot read answers with what
     /// the chat list already remembered.
     Meetings { reply: Reply<Vec<protocol::MeetingEvent>> },
+    MeetingTranscript { conversation_id: String, message_id: String, reply: Reply<String> },
+    MeetingInvitees { conversation_id: String, reply: Reply<Vec<String>> },
+    CreateMeeting { conversation_id: String, draft: protocol::MeetingDraft, reply: Reply<(protocol::MeetingEvent, bool)> },
     /// Accept, decline, or tentatively accept one meeting. `propose` is a new start.
     MeetingRsvp {
         id: String,
@@ -2195,6 +2201,9 @@ impl Command {
             Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Voicemails { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::VoicemailAudio { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChangeVoicemail { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2266,6 +2275,9 @@ impl Command {
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingInvitees { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateMeeting { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),

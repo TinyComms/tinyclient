@@ -50,6 +50,7 @@ impl Layer {
             Layer::Profile(_) => "Profile",
             Layer::Details(_) => "Details",
             Layer::Members(_) => "Members",
+            Layer::Thread { conversation, root } if conversation.network == protocol::Network::Slack && root.call.is_some() => "Huddle thread",
             Layer::Thread { .. } => "Thread",
             Layer::Pinned(_) => "Pinned",
             Layer::Threads(_) => "Threads",
