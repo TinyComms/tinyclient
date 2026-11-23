@@ -615,11 +615,8 @@ impl Discord {
                 // in the store, and goes before anything else is done.
                 self.ready(ready)?;
                 drop(text);
-                // glibc keeps what was freed for itself: the megabytes of READY go back to the system.
-                #[cfg(all(target_os = "linux", target_env = "gnu"))]
-                unsafe {
-                    libc::malloc_trim(0);
-                }
+                // Release idle SQLite cache and glibc arena slack so the megabytes of READY go back to the system.
+                self.ctx.shrink_memory();
                 self.refused_sessions.lock().unwrap().0 = 0;
                 beat.ready = true;
                 self.ctx.link(Link::Connected);

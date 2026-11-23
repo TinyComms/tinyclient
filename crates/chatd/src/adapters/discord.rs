@@ -3927,10 +3927,7 @@ impl Discord {
             Command::Backfill(id) => self.backfill(&id),
             Command::Warm(id) => {
                 self.backfill(&id);
-                #[cfg(all(target_os = "linux", target_env = "gnu"))]
-                unsafe {
-                    libc::malloc_trim(0);
-                }
+                self.ctx.shrink_memory();
             }
             Command::History { conversation_id, before } => {
                 if let Ok(Some(conversation)) = self.ctx.known(&conversation_id) {

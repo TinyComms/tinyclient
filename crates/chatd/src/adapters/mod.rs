@@ -3059,6 +3059,15 @@ impl Context {
         }
         Ok(conversations)
     }
+
+    /// Releases idle SQLite page cache and glibc arena slack after large sync payloads.
+    pub fn shrink_memory(&self) {
+        self.hub.store().shrink_memory();
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
     /// Clears `media_unread` on a stored message after it is listened to / played.
     /// Returns true when the flag changed from true to false.
     pub fn mark_media_played(&self, conversation_id: &str, message_id: &str) -> rusqlite::Result<bool> {
