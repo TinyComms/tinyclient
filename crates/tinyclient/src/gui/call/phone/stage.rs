@@ -431,7 +431,8 @@ impl Shell {
     /// Someone's screen on the stage, whole, on black; everyone in a strip under it.
     fn call_phone_share(&self, call: &Call, subject: &Subject, wide: f32, tall: f32, cx: &mut Context<Self>) -> Div {
         let tiles = self.call_phone_tiles(call, subject, cx);
-        let sharer = tiles.iter().find(|tile| tile.sharing && !tile.me);
+        let sharer = tiles.iter().find(|tile| tile.sharing && !tile.me && super::super::watching(call, &tile.id))
+            .or_else(|| tiles.iter().find(|tile| tile.sharing && !tile.me));
         let frame = sharer.and_then(|tile| self.call_phone_frame(call, &tile.id, PictureKind::Share));
         let caption = sharer.map(|tile| format!("{} is sharing", first(&tile.name))).unwrap_or_else(|| "Screen share".into());
         let stage_h = (tall - STRIP_H - 12.).max(120.);
@@ -460,6 +461,9 @@ impl Shell {
             .border_1()
             .border_color(theme::hairline())
             .children(frame.map(|frame| picture(frame, RADIUS, true)))
+            .children(sharer
+                .and_then(|tile| self.call_stream_volume(call, &tile.id, cx))
+                .map(|controls| controls.absolute().bottom(px(10.)).left(px(10.))))
             .child(
                 div()
                     .absolute()

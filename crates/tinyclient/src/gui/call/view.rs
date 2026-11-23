@@ -1245,6 +1245,10 @@ impl Shell {
         } else {
             self.call_stream_body(people, stream, call, Size::Big, cx).into_any_element()
         };
+        let volume = call
+            .filter(|_| stream.share && !mine)
+            .and_then(|call| self.call_stream_volume(call, &user_id, cx))
+            .map(|controls| controls.absolute().top(px(10.)).left(px(10.)));
         div()
             .id(if full { "tiny-stream-whole" } else { "tiny-stream-focused" })
             .relative()
@@ -1261,6 +1265,7 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, window, cx| this.call_open_stream(&user_id, mine, window, cx)))
             })
             .child(body)
+            .children(volume)
             .child(caption(
                 if mine { format!("Your {what}") } else { format!("{name}'s {what}") },
                 false,

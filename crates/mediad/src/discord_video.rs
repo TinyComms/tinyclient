@@ -2,19 +2,19 @@
 //!
 //! A camera is one H.264 layer on the call's own voice connection, driven from the audio loop.
 //! A screen share is a second voice connection (Go Live) and this module's [`run`] is its whole
-//! media loop: no second microphone, no speaking indication. Both seal the access unit with DAVE
-//! before packetizing, and open it only after the access unit is whole again. The decode thread's
+//! media loop. A watcher can receive Opus audio as well as H.264. Both video legs seal the access
+//! unit with DAVE before packetizing, and open it only after the access unit is whole again. The decode thread's
 //! own sealer is transport-only on a Discord call, and it drops a frame that still ends in DAVE's
 //! marker, so the marker has to be gone before the frame is handed over.
 
 use crate::dave::Dave;
 use crate::h264::{self, Assembler};
-use crate::media::FromMedia;
+use crate::media::{FromMedia, Stream};
 use crate::picture::camera_high_bps;
 use crate::rtp::{self, Cipher, VideoSender, H264, RTX};
 use crate::session::Controls;
 use crate::video::{Rates, Received, Video, Wants, Word};
-use crate::{out, rt};
+use crate::{hear::Ear, out, rt, FRAME_SAMPLES};
 use protocol::{MediaResponse, PictureKind};
 use std::collections::{HashMap, VecDeque};
 use std::net::UdpSocket;
@@ -344,14 +344,78 @@ pub struct Leg {
     pub user_id: String,
     pub pipe: Option<Pipe>,
     pub watch: bool,
+    pub stream_owner: Option<String>,
+    pub users: Arc<Mutex<HashMap<u32, String>>>,
 }
 
-/// The picture loop of a stream connection. Returns when the leg is stopped. It does not end
+/// One watched share's audio, buffered by RTP sequence and played on the main call's clock.
+pub(crate) struct WatchAudio {
+    stream: Stream,
+    ssrc: u32,
+    gain_key: String,
+}
+
+impl WatchAudio {
+    pub(crate) fn mix(&mut self, mix: &mut [i32; FRAME_SAMPLES], ear: &Ear, ducked: bool) {
+        if let Some(frame) = self.stream.pull(&format_args!("Go Live audio ssrc {}", self.ssrc)) {
+            self.stream.mix_into(mix, &frame, ear.factor(&self.gain_key, ducked));
+        }
+    }
+}
+
+/// Only the owner of this Go Live leg can contribute sound. The voice connection can have
+/// the same audio SSRC, but it has a different transport cipher and DAVE session.
+fn receive_audio(leg: &Leg, datagram: &[u8], owner: &str, owner_id: u64, gain_key: &str) {
+    if leg.controls.deafened.load(Ordering::Relaxed) || datagram.get(1).is_none_or(|pt| pt & 0x7f != rtp::PAYLOAD_TYPE) {
+        return;
+    }
+    let Ok(packet) = leg.opener.unseal(datagram) else {
+        return;
+    };
+    if leg.users.lock().unwrap().get(&packet.ssrc).map(String::as_str) != Some(owner) {
+        return;
+    }
+    let mut again = Vec::new();
+    let frame = leg.dave.lock().unwrap().open(Some(owner_id), &packet.payload, &mut again);
+    if !again.is_empty() {
+        let _ = leg.report.send(FromMedia::Dave(again));
+    }
+    let Ok(frame) = frame else {
+        return;
+    };
+    // Hold the SSRC map through insertion so a disconnect or remap can clear the old audio.
+    let users = leg.users.lock().unwrap();
+    if users.get(&packet.ssrc).map(String::as_str) != Some(owner) {
+        return;
+    }
+    let mut playing = leg.controls.watched_audio.lock().unwrap();
+    // Stop and deafen can clear the buffer while authentication is in progress.
+    if leg.controls.leg_done(true) || leg.controls.deafened.load(Ordering::Relaxed) {
+        return;
+    }
+    if playing.as_ref().is_none_or(|audio| audio.ssrc != packet.ssrc) {
+        *playing = Stream::new().map(|stream| WatchAudio { stream, ssrc: packet.ssrc, gain_key: gain_key.to_owned() });
+    }
+    if let Some(audio) = playing.as_mut() {
+        let now = Instant::now();
+        audio.stream.last_packet = now;
+        audio.stream.arrivals.arrived(packet.timestamp, now);
+        if frame == rtp::SILENCE {
+            audio.stream.arrivals.paused();
+        }
+        audio.stream.jitter.insert(packet.sequence, frame);
+    }
+}
+
+/// The media loop of a stream connection. Returns when the leg is stopped. It does not end
 /// the process: the voice call's thread is the one that does.
-pub fn run(leg: Leg) {
+pub fn run(mut leg: Leg) {
     let _timer = rt::FineTimer::hold();
     rt::tick_thread();
-    let mut drive = Drive::new(leg.controls.clone(), leg.user_id.clone(), leg.videos, leg.announced, leg.pipe, true, !leg.watch);
+    let mut drive = Drive::new(leg.controls.clone(), leg.user_id.clone(), leg.videos.clone(), leg.announced.clone(), leg.pipe.take(), true, !leg.watch);
+    let owner = leg.stream_owner.as_deref().filter(|_| leg.watch).and_then(|owner| {
+        Some((owner, owner.parse().ok()?, protocol::discord_stream_gain_key(owner)))
+    });
     let mut datagram = [0u8; 2048];
     let mut next = Instant::now();
     let tick = Duration::from_millis(20);
@@ -359,11 +423,13 @@ pub fn run(leg: Leg) {
         let now = Instant::now();
         if now < next {
             let _ = leg.socket.set_read_timeout(Some((next - now).max(Duration::from_micros(200))));
-            match leg.socket.recv(&mut datagram) {
-                Ok(len) => {
-                    drive.take(&datagram[..len], &leg.opener, &leg.dave, &leg.socket);
+            if let Ok(len) = leg.socket.recv(&mut datagram) {
+                let datagram = &datagram[..len];
+                if !drive.take(datagram, &leg.opener, &leg.dave, &leg.socket) {
+                    if let Some((owner, owner_id, gain_key)) = &owner {
+                        receive_audio(&leg, datagram, owner, *owner_id, gain_key);
+                    }
                 }
-                Err(_) => {}
             }
             continue;
         }
@@ -372,6 +438,9 @@ pub fn run(leg: Leg) {
             next = now + tick;
         }
         drive.tick(&leg.dave, &leg.socket, &leg.report);
+    }
+    if owner.is_some() {
+        leg.controls.watched_audio.lock().unwrap().take();
     }
     drive.finish();
 }

@@ -567,10 +567,18 @@ pub struct VoiceJoin {
     /// This Go Live connection only receives. It sends no picture of its own.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub watch: bool,
+    /// The user whose Go Live stream this receive-only leg is watching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_owner: Option<String>,
     /// The MLS group for a stream, the stream server id minus one. Empty on the voice
     /// connection, which uses the channel id.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group_id: String,
+}
+
+/// Gain key for a Discord Go Live stream. Voice gains use the bare user id.
+pub fn discord_stream_gain_key(user_id: &str) -> String {
+    format!("stream:{user_id}")
 }
 
 /// What mediad needs to make an offer to a Tiny server's SFU (tinyserver's `docs/calls.md`).
@@ -1207,6 +1215,29 @@ impl MediaResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_watched_go_live_leg_can_name_its_owner_without_changing_older_joins() {
+        let old = serde_json::json!({
+            "network": "discord", "endpoint": "localhost", "token": "t", "session_id": "s",
+            "user_id": "111", "server_id": "900", "channel_id": "901",
+            "dave": {"max_version": 1, "required": true}, "muted": false, "deafened": false,
+            "stream": true, "watch": true, "group_id": "899"
+        });
+        let mut join: VoiceJoin = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(join.stream_owner, None);
+        assert_eq!(serde_json::to_value(&join).unwrap(), old);
+
+        join.stream_owner = Some("222".into());
+        let wire = serde_json::to_value(&join).unwrap();
+        assert_eq!(wire["stream_owner"], "222");
+        assert_eq!(serde_json::from_value::<VoiceJoin>(wire).unwrap(), join);
+
+        let stream = discord_stream_gain_key("222");
+        let account = crate::settings::account_scope(&crate::AccountKey { network: Network::Discord, account: "111".into() });
+        assert_ne!(stream, "222");
+        assert!(crate::settings::valid(&account, &crate::settings::gain_key(&stream), "50 muted"));
+    }
 
     #[test]
     fn a_self_view_is_my_camera_unless_it_says_it_is_my_share() {
