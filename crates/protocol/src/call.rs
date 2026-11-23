@@ -432,6 +432,24 @@ pub struct Call {
     /// One sentence about that move, or why it came back. The shell shows it once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub move_notice: Option<String>,
+    /// A Discord Activity running in this voice channel. Seen here; the activity itself stays in Discord.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<VoiceActivity>,
+    /// A stage channel's topic. Empty on an ordinary voice channel.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stage_topic: String,
+    /// This call is a Discord stage: audience, raised hands, and speakers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stage: bool,
+    /// We asked to speak and are still in the audience.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_to_speak: bool,
+    /// Person ids with a hand raised.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raised: Vec<String>,
+    /// A soundboard sound just played, so the shell can flash that person's tile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<SoundEffect>,
     /// An incoming ring is a video call (Telegram `phoneCallRequested.video`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub incoming_video: bool,
@@ -451,6 +469,76 @@ pub struct Call {
     /// Our own active transient emoji reaction in the active group call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reaction: Option<String>,
+}
+
+/// A Discord Activity in a voice channel. tinyclient shows it and hands the join to Discord.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceActivity {
+    pub application_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::MediaFile>,
+    /// Person ids in the activity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<String>,
+    /// Opens this channel in the official Discord app.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handoff: String,
+}
+
+/// One soundboard sound, just played in the joined voice channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoundEffect {
+    pub user_id: String,
+    pub sound_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Unix seconds, so the shell can fade the flash.
+    pub at: i64,
+}
+
+/// One sound the soundboard can play.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoundboardSound {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Absent for a default sound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guild_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default: bool,
+    /// Discord's per-sound volume, 0 to 100. 0 means the listing did not say.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub volume: u8,
+}
+
+/// What the user asked of a Discord stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageVoiceAction {
+    /// Raise a hand. The microphone stays closed.
+    RequestToSpeak,
+    /// Take a speaker seat we were offered.
+    Accept,
+    /// Step back into the audience.
+    Audience,
+    /// A moderator invites someone onto the stage.
+    Invite,
+    /// A moderator moves someone back to the audience.
+    ToAudience,
+}
+
+/// Activity, stage, and the latest soundboard flash for one call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoiceFace {
+    pub activity: Option<VoiceActivity>,
+    pub stage: bool,
+    pub stage_topic: String,
+    pub request_to_speak: bool,
+    pub raised: Vec<String>,
+    pub effect: Option<SoundEffect>,
 }
 
 /// Someone rung into a group call, and what the server last said of that ring.
@@ -901,6 +989,9 @@ pub enum MediaRequest {
     /// Plays one cue now, on the call's speaker, under the voices. Outside a call (a test
     /// mediad) it opens the speaker for the cue alone.
     Cue { cue: Cue },
+    /// Play a local sound file once, mixed under the voices at `gain` (0 to 100). 0 is silent.
+    /// Heard only while not deafened. Answered `Done`.
+    PlayFile { path: String, gain: u8 },
     /// A Tiny server call: make an offer. Answered `Offer`. Sent again for a call that is
     /// already up (the server restarted), it is a fresh offer, and the call carries on with it
     /// once its answer arrives.
@@ -1694,6 +1785,7 @@ mod tests {
             scheduled_at: Some(1_800_000_000),
             subscribed: true,
             live: false,
+            ..crate::Occupants::default()
         };
         assert!(sched.active());
         assert!(sched.is_scheduled());

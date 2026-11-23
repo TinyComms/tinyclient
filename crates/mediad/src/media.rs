@@ -1025,6 +1025,8 @@ pub(crate) fn mixdown(mix: &[i32; FRAME_SAMPLES], controls: &Controls, cue: &mut
             *cue = None;
         }
     }
+    // A soundboard clip respects deafen; a cue does not.
+    controls.mix_clips(&mut mixed);
     audio.play(&mixed);
     processor.render(&mixed);
     heard

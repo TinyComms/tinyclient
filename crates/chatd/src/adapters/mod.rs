@@ -50,6 +50,11 @@ pub fn prove_discord_voice_move() -> Result<(), String> {
     discord::prove_voice_move()
 }
 
+/// `TINYCLIENT_PROVE=discord-wave17b`. Stages, activities, and the soundboard are in this build.
+pub fn prove_discord_wave17b() -> Result<(), String> {
+    discord::prove_wave17b()
+}
+
 /// `TINYCLIENT_PROVE=discord-wave15-share`. A preview is a jpeg, a named viewer is kept, and
 /// the identity post is the public key.
 pub fn prove_discord_wave15_share() -> Result<(), String> {
@@ -1902,6 +1907,22 @@ pub enum Command {
     },
     /// The link that opens this conversation's call in the official app.
     Handoff { conversation_id: String, reply: Reply<String> },
+    /// A stage hand, an accepted invite, or a moderator moving someone.
+    StageVoice {
+        conversation_id: String,
+        action: protocol::StageVoiceAction,
+        person_id: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Default and guild soundboard sounds for a voice channel.
+    Soundboard { conversation_id: String, reply: Reply<Vec<protocol::SoundboardSound>> },
+    /// Play one soundboard sound in the joined channel.
+    PlaySoundboard {
+        conversation_id: String,
+        sound_id: String,
+        guild_id: Option<String>,
+        reply: Reply<()>,
+    },
     /// Today's meetings, soonest first. A calendar the account cannot read answers with what
     /// the chat list already remembered.
     Meetings { reply: Reply<Vec<protocol::MeetingEvent>> },
@@ -2140,6 +2161,8 @@ impl Command {
             | Command::EditDiscordVoiceChannel { reply, .. }
             | Command::SetDiscordCallRegion { reply, .. }
             | Command::CallModerate { reply, .. }
+            | Command::StageVoice { reply, .. }
+            | Command::PlaySoundboard { reply, .. }
             | Command::CallMove { reply, .. }
             | Command::MoveChannels { reply, .. }
             | Command::DeleteChannel { reply, .. }
@@ -2168,6 +2191,7 @@ impl Command {
             | Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::Soundboard { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. }
             | Command::GroupCallSchedule { reply, .. }
             | Command::GroupCallStart { reply, .. }
@@ -2665,7 +2689,48 @@ impl Context {
     /// whenever it changes; an empty list when the channel empties. Never stored, and the tree
     /// is not announced: the row is told alone.
     pub fn occupants(&self, conversation_id: &str, people: Vec<Occupant>, total: u32) {
-        self.hub.set_occupants(self.key(conversation_id), Occupants { people, total, ..Occupants::default() });
+        self.hub.set_occupants(self.key(conversation_id), Occupants { people, total, ..Default::default() });
+    }
+
+    /// Occupants plus a stage topic, an activity, and raised hands. An empty stage with a topic
+    /// or an activity is kept, so the row can show it before anyone sits down.
+    pub fn occupants_meta(
+        &self,
+        conversation_id: &str,
+        people: Vec<Occupant>,
+        total: u32,
+        stage: bool,
+        stage_topic: String,
+        activity: Option<protocol::VoiceActivity>,
+        raised: Vec<String>,
+    ) {
+        self.hub.set_occupants(self.key(conversation_id), Occupants { people, total, stage, stage_topic, activity, raised, ..Occupants::default() });
+    }
+
+    pub fn set_voice_face(&self, conversation_id: &str, face: protocol::VoiceFace) {
+        self.hub.calls.set_voice_face(&self.hub, &self.key(conversation_id), face);
+    }
+
+    pub fn set_effect(&self, conversation_id: &str, effect: Option<protocol::SoundEffect>) {
+        self.hub.calls.set_effect(&self.hub, &self.key(conversation_id), effect);
+    }
+
+    /// Soundboard volume, 0 to 100. 0 plays nothing.
+    pub fn soundboard_gain(&self) -> u8 {
+        self.hub.settings().number(protocol::settings::SOUNDBOARD_VOLUME).min(100) as u8
+    }
+
+    /// Our speaker is closed, so a soundboard sound is not played.
+    pub fn ear_closed(&self) -> bool {
+        self.hub.calls.describe().0.is_some_and(|call| call.deafened || call.server_deafened)
+    }
+
+    /// Mix a cached sound file into the call. Gain 0 is nothing.
+    pub fn play_file(&self, path: &str, gain: u8) {
+        if gain == 0 || path.is_empty() {
+            return;
+        }
+        let _ = self.hub.calls.request(&self.hub, &protocol::MediaRequest::PlayFile { path: path.to_owned(), gain });
     }
 
     /// Live or scheduled group call presence (Telegram video chat / live stream).

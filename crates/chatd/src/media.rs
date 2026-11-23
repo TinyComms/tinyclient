@@ -312,6 +312,12 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        activity: None,
+        stage_topic: String::new(),
+        stage: false,
+        request_to_speak: false,
+        raised: Vec::new(),
+        effect: None,
         incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
@@ -1990,6 +1996,40 @@ impl Calls {
         let known = self.update(hub, conversation, |live| {
             if live.call.ringing != next {
                 live.call.ringing = std::mem::take(&mut next);
+                changed = true;
+            }
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
+    /// Activity, stage, and raised hands. A soundboard flash is left as it was.
+    pub fn set_voice_face(&self, hub: &Hub, conversation: &Key, face: protocol::VoiceFace) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.activity != face.activity || live.call.stage != face.stage || live.call.stage_topic != face.stage_topic
+                || live.call.request_to_speak != face.request_to_speak || live.call.raised != face.raised
+            {
+                live.call.activity = face.activity.clone();
+                live.call.stage = face.stage;
+                live.call.stage_topic = face.stage_topic.clone();
+                live.call.request_to_speak = face.request_to_speak;
+                live.call.raised = face.raised.clone();
+                changed = true;
+            }
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
+    /// The soundboard flash on the joined call.
+    pub fn set_effect(&self, hub: &Hub, conversation: &Key, effect: Option<protocol::SoundEffect>) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.effect != effect {
+                live.call.effect = effect.clone();
                 changed = true;
             }
         });

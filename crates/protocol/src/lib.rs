@@ -555,6 +555,18 @@ pub struct Occupants {
     pub people: Vec<Occupant>,
     /// How many are in the channel in all.
     pub total: u32,
+    /// A Discord stage channel. The radio glyph and the live line follow this, not the call button.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stage: bool,
+    /// The stage topic. Empty when this channel is not a live stage.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stage_topic: String,
+    /// A Discord Activity running in this voice channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<VoiceActivity>,
+    /// Person ids with a hand raised.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raised: Vec<String>,
     /// Title of the live or scheduled group video chat / live stream, when set.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
@@ -3322,6 +3334,24 @@ pub enum Request {
     Handoff {
         conversation: Key,
     },
+    /// Stage audience and speaker actions. `person` is set when a moderator acts on someone else.
+    StageVoice {
+        conversation: Key,
+        action: StageVoiceAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        person: Option<Key>,
+    },
+    /// The soundboard for a Discord voice channel. Answered [`Response::Soundboard`].
+    Soundboard {
+        conversation: Key,
+    },
+    /// Play one soundboard sound in that channel.
+    PlaySoundboard {
+        conversation: Key,
+        sound_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guild_id: Option<String>,
+    },
     /// Schedules a group/channel video chat (`phone.createGroupCall` with `schedule_date`).
     GroupCallSchedule {
         conversation: Key,
@@ -4606,6 +4636,8 @@ pub fn language_name(tag: &str) -> String {
 pub enum Response {
     PollVoters { voters: Vec<Reactor>, more: bool },
     DiscordVoiceSettings { settings: DiscordVoiceSettings },
+    /// Sounds the soundboard of one Discord voice channel can play.
+    Soundboard { sounds: Vec<SoundboardSound> },
     Pong,
     /// Done, with nothing to say.
     Ok,

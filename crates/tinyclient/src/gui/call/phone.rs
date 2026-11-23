@@ -22,12 +22,12 @@ mod sheets;
 mod stage;
 
 use super::{in_call, Ended, Subject};
-use crate::gui::components::{glyph, network_icon, Avatar};
+use crate::gui::components::{button, glyph, network_icon, Avatar, ButtonKind};
 use crate::gui::phone::tokens::{self, PhoneType};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme;
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, ElementId, MouseButton, Rgba, Stateful, Window};
-use protocol::{Call, CallState, Content, ConversationKind, Direction, Key, Network};
+use protocol::{Call, CallState, Content, ConversationKind, Direction, Key, Network, Request, StageVoiceAction};
 
 /// The strip under the status bar: minimise, where the call is, the people.
 /// A redraw for my own camera's picture is already on its way.
@@ -85,6 +85,10 @@ pub(in crate::gui) struct State {
     pub back_camera: bool,
     /// Accepted with video: the camera goes on once the call is up.
     pub video_on_join: bool,
+    /// The call's conversation, as a panel over the stage. The header stays.
+    pub chat: bool,
+    /// The soundboard grid, in place of the stage.
+    pub soundboard: bool,
 }
 
 impl State {
@@ -97,12 +101,18 @@ impl State {
                 self.sheet = None;
                 self.drag = None;
                 self.video_on_join = false;
+                self.chat = false;
+                self.soundboard = false;
                 hooks::forget_route();
             }
             Some(call) => {
                 let new = before != Some(&call.conversation);
                 if new || matches!(call.state, CallState::RingingIn { .. } | CallState::Failed { .. }) {
                     self.minimised = false;
+                }
+                if new || !in_call(call) {
+                    self.chat = false;
+                    self.soundboard = false;
                 }
                 if !in_call(call) {
                     self.people = false;
@@ -216,6 +226,36 @@ pub(super) fn round(id: impl Into<ElementId>, icon: &'static str, label: impl In
                 .text_color(words)
                 .child(label.into()),
         )
+}
+
+/// Extra header lines for a stage topic and an activity.
+fn call_phone_header_extra(call: &Call) -> f32 {
+    let lines = u8::from(!call.stage_topic.is_empty()) + u8::from(call.activity.is_some());
+    f32::from(lines) * 16.
+}
+
+/// A mention count, or a dot when something is unread and nobody was mentioned.
+fn phone_chat_mark(count: u32) -> Div {
+    if count == 0 {
+        div().absolute().top(px(8.)).right(px(8.)).size(px(8.)).rounded_full().bg(theme::accent())
+    } else {
+        div()
+            .absolute()
+            .top(px(2.))
+            .right(px(0.))
+            .min_w(px(16.))
+            .h(px(16.))
+            .px(px(4.))
+            .rounded_full()
+            .bg(theme::accent())
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(10.))
+            .font_weight(theme::SEMIBOLD)
+            .text_color(theme::on_accent())
+            .child(count.to_string())
+    }
 }
 
 /// A 44 pt glyph button for a strip.
@@ -437,12 +477,31 @@ impl Shell {
     /// then whatever sheet or page is over them.
     fn call_phone_live(&self, call: &Call, subject: &Subject, wide: f32, tall: f32, cx: &mut Context<Self>) -> Div {
         let rows = self.call_phone_control_rows(call, subject);
-        let controls_h = 16. + rows as f32 * CONTROL_ROW + rows.saturating_sub(1) as f32 * CONTROL_GAP + tokens::safe_bottom() + 10.;
-        let stage_h = (tall - tokens::safe_top() - HEADER - controls_h - 16.).max(120.);
+        let chatting = self.call_state.phone.chat && in_call(call);
+        let hide_controls = super::discord_ux::phone_chat_hides_controls(chatting, tokens::keyboard());
+        let discord = in_call(call) && call.conversation.network == Network::Discord && !chatting;
+        let sound_open = discord && self.call_state.phone.soundboard;
+        let controls_h = if hide_controls {
+            0.
+        } else {
+            16. + rows as f32 * CONTROL_ROW + rows.saturating_sub(1) as f32 * CONTROL_GAP + tokens::safe_bottom() + 10.
+        };
+        let header_extra = call_phone_header_extra(call);
+        let discord_h = if discord { 72. } else { 0. };
+        let stage_h = (tall - tokens::safe_top() - HEADER - header_extra - controls_h - discord_h - 16.).max(120.);
         let stage_w = wide - 20.;
         let layout = self.call_phone_layout(call, subject);
         let hero = matches!(layout, stage::Layout::Hero);
         let sheet = self.call_phone_sheet().filter(|_| in_call(call) || matches!(self.call_phone_sheet(), Some(Sheet::Devices)));
+        let body = if chatting {
+            div().flex_1().min_h_0().child(self.messages_and_composer(&call.conversation, cx))
+        } else if sound_open {
+            div().flex_1().min_h_0().child(
+                div().id("call-phone-soundboard").size_full().overflow_y_scroll().px(px(10.)).child(self.call_soundboard_body(call, cx)),
+            )
+        } else {
+            div().flex_1().min_h_0().px(px(10.)).pt(px(4.)).pb(px(12.)).child(self.call_phone_stage(call, subject, layout, stage_w, stage_h, cx))
+        };
         div()
             .size_full()
             .relative()
@@ -451,9 +510,10 @@ impl Shell {
             .child(div().flex_none().h(px(tokens::safe_top())))
             .child(self.call_phone_header(call, subject, hero, cx))
             .children(self.call_phone_notice(call))
-            .child(div().flex_1().min_h_0().px(px(10.)).pt(px(4.)).pb(px(12.)).child(self.call_phone_stage(call, subject, layout, stage_w, stage_h, cx)))
-            .child(self.call_phone_controls(call, subject, cx))
-            .children(self.call_phone_pip(call, layout, wide, tall, controls_h, cx))
+            .when(discord, |column| column.child(self.call_phone_discord_row(call, cx)))
+            .child(body)
+            .when(!hide_controls, |column| column.child(self.call_phone_controls(call, subject, cx)))
+            .children((!chatting).then(|| self.call_phone_pip(call, layout, wide, tall, controls_h, cx)).flatten())
             .children(self.call_phone_people_open().then(|| self.call_phone_people(call, subject, cx)))
             .children(sheet.map(|sheet| self.call_phone_sheet_view(sheet, call, subject, tall, cx)))
     }
@@ -564,7 +624,13 @@ impl Shell {
             .flex_col()
             .items_center()
             .children((!hero).then(|| div().max_w_full().truncate().phone_title().child(subject.title.clone())))
-            .child(line);
+            .child(line)
+            .children((!call.stage_topic.is_empty()).then(|| {
+                div().max_w_full().truncate().phone_stamp().text_color(theme::text_soft()).child(call.stage_topic.clone())
+            }))
+            .children(call.activity.as_ref().map(|activity| {
+                div().max_w_full().truncate().phone_stamp().child(super::discord_ux::activity_line(&activity.name))
+            }));
         let count = call.participants.len() + 1;
         let group = subject.kind != ConversationKind::Direct && in_call(call);
         let people = group.then(|| {
@@ -595,16 +661,107 @@ impl Shell {
                         .child(count.to_string()),
                 )
         });
+        let offered = super::discord_ux::phone_chat_offered(subject.kind) && in_call(call);
+        let chat_row = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot.open.as_ref().filter(|row| row.key == call.conversation).cloned().or_else(|| self.sidebar_state.find(&self.trees, &call.conversation))
+        });
+        let badge = chat_row.as_ref().and_then(|row| super::discord_ux::phone_chat_badge(row.unread, row.mentions));
+        let chat = offered.then(|| {
+            let key = call.conversation.clone();
+            let title = subject.title.clone();
+            div()
+                .relative()
+                .child(strip_button("call-phone-chat", "icons/message-square.svg").on_click(cx.listener(move |this, _, _, cx| {
+                    this.select(key.clone(), &title, cx);
+                    this.call_state.phone.chat = true;
+                    this.call_state.phone.soundboard = false;
+                    cx.notify();
+                })))
+                .children(badge.map(phone_chat_mark))
+        });
         div()
             .flex_none()
-            .h(px(HEADER))
+            .h(px(HEADER + call_phone_header_extra(call)))
             .px(px(6.))
             .flex()
             .items_center()
             .gap(px(4.))
             .child(strip_button("call-phone-minimise", "icons/chevron-down.svg").on_click(cx.listener(|this, _, _, cx| this.call_phone_minimise(cx))))
             .child(middle)
-            .child(div().flex_none().w(px(tokens::TOUCH)).children(people))
+            .child(div().flex_none().flex().items_center().children(chat).children(people))
+    }
+
+    /// Stage controls and the soundboard, under the header and above the stage.
+    fn call_phone_discord_row(&self, call: &Call, cx: &mut Context<Self>) -> Div {
+        let action = super::discord_ux::stage_button(call.stage, call.request_to_speak, call.suppressed);
+        let lower = super::discord_ux::stage_lower_hand(call.stage, call.request_to_speak, call.suppressed);
+        let key = call.conversation.clone();
+        let sound_on = self.call_state.phone.soundboard;
+        let activity = call.activity.clone();
+        div()
+            .flex_none()
+            .px(px(12.))
+            .pb(px(4.))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .children(activity.map(|activity| {
+                let join = key.clone();
+                let names = activity
+                    .participants
+                    .iter()
+                    .map(|id| call.participants.iter().find(|who| &who.id == id).map(|who| who.name.clone()).unwrap_or_else(|| id.clone()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().phone_stamp().child(super::discord_ux::activity_line(&activity.name)))
+                            .when(!names.is_empty(), |column| column.child(div().truncate().phone_stamp().text_color(theme::text_soft()).child(names))),
+                    )
+                    .child(
+                        button("call-phone-activity-join", ButtonKind::Secondary, "Join in Discord").on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_handoff(join.clone(), cx);
+                        })),
+                    )
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .children(action.map(|action| {
+                        let ask = key.clone();
+                        button("call-phone-stage", ButtonKind::Secondary, super::discord_ux::stage_button_label(action)).on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_ask(Request::StageVoice { conversation: ask.clone(), action, person: None }, cx);
+                        }))
+                    }))
+                    .when(lower, |row| {
+                        let ask = key.clone();
+                        row.child(button("call-phone-stage-lower", ButtonKind::Ghost, "Lower hand").on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_ask(Request::StageVoice { conversation: ask.clone(), action: StageVoiceAction::Audience, person: None }, cx);
+                        })))
+                    })
+                    .child({
+                        let ask = key.clone();
+                        button("call-phone-soundboard", if sound_on { ButtonKind::Primary } else { ButtonKind::Ghost }, "Soundboard").on_click(cx.listener(move |this, _, _, cx| {
+                            let open = !this.call_state.phone.soundboard;
+                            this.call_state.phone.soundboard = open;
+                            this.call_state.phone.chat = false;
+                            if open {
+                                this.call_load_sounds(ask.clone(), cx);
+                            }
+                            cx.notify();
+                        }))
+                    }),
+            )
     }
 
     /// The call, minimised: a bar over every screen with where it is, how long it has run and

@@ -257,6 +257,7 @@ fn publish_occupants(account: &Account, who: Who) {
             scheduled_at: tracked.schedule_date,
             subscribed: tracked.schedule_start_subscribed,
             live: is_live,
+            ..Occupants::default()
         };
 
         let joined_here = live.group_calls.joined.as_ref().is_some_and(|j| j.who == who);

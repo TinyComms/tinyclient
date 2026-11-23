@@ -4298,6 +4298,35 @@ impl Shell {
         }
     }
 
+    /// The open conversation's messages and composer, without the phone strip or the edge swipe.
+    /// Until `snapshot.open` is that conversation, a line says it is opening.
+    pub(in crate::gui) fn messages_and_composer(&self, expect: &Key, cx: &mut Context<Self>) -> Div {
+        let prepared = self.snapshot.as_ref().and_then(|snapshot| {
+            let open = snapshot.open.as_ref().filter(|row| row.key == *expect)?.clone();
+            let link = snapshot.account_link(&open.key);
+            let can = snapshot.account(&open.key.account()).map(|status| status.can).unwrap_or_default();
+            Some((open, link, can))
+        });
+        let Some((open, link, can)) = prepared else {
+            return div().size_full().flex().items_center().justify_center().type_ui().text_color(theme::text_soft()).child("Opening chat…");
+        };
+        let me = self.me(&open.key);
+        let picture = self.conversation_picture(&open, cx);
+        let gated = self.age_gated(&open);
+        let typing = open.special != Special::Service && !gated;
+        let pane = self.pane(cx);
+        pane.update(cx, |pane, cx| pane.show(&open, &me, can, picture, typing, gated, cx));
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h_0().child(pane))
+            .children((!gated).then(|| match open.special {
+                Special::Service => self.no_composer(&open, cx),
+                _ => self.composer(&open, link, cx),
+            }))
+    }
+
     pub(super) fn conversation(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let Some(open) = snapshot.open.as_ref() else {
             return div()
