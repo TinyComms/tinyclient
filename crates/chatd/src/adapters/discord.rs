@@ -595,6 +595,12 @@ pub(super) fn prove_wave15_share() -> Result<(), String> {
     voice::prove_wave15_share()
 }
 
+/// `TINYCLIENT_PROVE=discord-wave15a3`. Multi-stream Go Live watch map keeps multiple streams
+/// active simultaneously and unwatching one preserves the others.
+pub(super) fn prove_wave15a3() -> Result<(), String> {
+    voice::prove_wave15a3()
+}
+
 /// `TINYCLIENT_PROVE=discord-mark-unread`. The manual ack body is the one Discord expects, and
 /// an older ack moves the marker only when it is manual.
 pub(super) fn prove_mark_unread() -> Result<(), String> {

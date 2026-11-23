@@ -5142,7 +5142,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                         }
                     }
                     Picture::Share { on, .. } => active.sharing = on,
-                    Picture::Watch(_) => {}
+                    Picture::Watch(_) | Picture::WatchList(_) => {}
                 }
             }
             let group_update = {
@@ -5151,7 +5151,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                     match &picture {
                         Picture::Camera(on) => g.camera = *on,
                         Picture::Share { on, .. } => g.sharing = *on,
-                        Picture::Watch(_) => {}
+                        Picture::Watch(_) | Picture::WatchList(_) => {}
                     }
                     (g.group_id.clone(), g.era_id.clone(), g.muted, g.camera, g.sharing)
                 })

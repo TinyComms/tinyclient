@@ -86,9 +86,13 @@ pub fn should_auto_popout(
         return false;
     };
     let watching_share = call
-        .picture
-        .as_ref()
-        .is_some_and(|p| !p.path.is_empty() && p.kind == PictureKind::Share)
+        .pictures
+        .iter()
+        .any(|p| !p.path.is_empty() && p.kind == PictureKind::Share)
+        || call
+            .picture
+            .as_ref()
+            .is_some_and(|p| !p.path.is_empty() && p.kind == PictureKind::Share)
         || call
             .video
             .iter()
@@ -97,16 +101,23 @@ pub fn should_auto_popout(
 }
 
 /// Picks which participant's picture or tile the pop-out window should show:
-/// 1. The focused stream if it matches the active decoded picture.
-/// 2. Otherwise the active decoded picture's owner.
+/// 1. The focused stream if it matches an active decoded picture in `call.pictures`.
+/// 2. Otherwise the primary decoded picture's owner.
 /// 3. Otherwise the active speaking participant (or first participant).
 ///
 /// Returns `(user_id, is_share)`.
 pub fn preferred_frame_owner(call: &Call, focused_stream: Option<&str>) -> Option<(String, bool)> {
-    if let Some(picture) = call.picture.as_ref().filter(|p| !p.path.is_empty()) {
-        if focused_stream.is_none_or(|f| f == picture.user_id) {
+    if let Some(foc) = focused_stream {
+        if let Some(picture) = call
+            .pictures
+            .iter()
+            .filter(|p| !p.path.is_empty() && p.user_id == foc)
+            .max_by_key(|p| p.kind == PictureKind::Share)
+        {
             return Some((picture.user_id.clone(), picture.kind == PictureKind::Share));
         }
+    }
+    if let Some(picture) = call.picture.as_ref().filter(|p| !p.path.is_empty()) {
         return Some((picture.user_id.clone(), picture.kind == PictureKind::Share));
     }
     if let Some(foc) = focused_stream {
@@ -566,5 +577,21 @@ mod tests {
             kind: PictureKind::Share,
         });
         assert_eq!(preferred_frame_owner(&call, None), Some(("u1".into(), true)));
+        call.pictures = vec![
+            call.picture.clone().unwrap(),
+            CallPicture {
+                path: "/tmp/share2.jpg".into(),
+                width: 1280,
+                height: 720,
+                generation: 3,
+                user_id: "u2".into(),
+                kind: PictureKind::Share,
+            },
+        ];
+        assert_eq!(
+            preferred_frame_owner(&call, Some("u2")),
+            Some(("u2".into(), true)),
+            "focused stream wins over primary call.picture in multi-stream pop-out"
+        );
     }
 }

@@ -139,11 +139,12 @@ pub(in crate::gui) fn talk(push: bool, held: Option<bool>, key: Option<String>) 
 }
 
 /// A round button over a stream: its own click, never the stream's.
-fn stream_button(id: &'static str, icon: &'static str, words: &'static str) -> Stateful<Div> {
+fn stream_button(id: impl Into<gpui::ElementId>, icon: &'static str, words: impl Into<SharedString>) -> Stateful<Div> {
+    let words: SharedString = words.into();
     div()
         .id(id)
         .role(gpui::Role::Button)
-        .aria_label(words)
+        .aria_label(words.clone())
         .flex_none()
         .size(px(32.))
         .rounded_full()
@@ -1180,6 +1181,11 @@ impl Shell {
         let kind = if stream.share { PictureKind::Share } else { PictureKind::Camera };
         let live = self.call_frame(call, &stream.user_id, kind).is_some();
         let user_id = stream.user_id.clone();
+        let unwatch_id = stream.user_id.clone();
+        let can_unwatch_tile = stream.share
+            && !stream.mine
+            && live
+            && call.is_some_and(|c| c.conversation.network == Network::Discord);
         let mine = stream.mine;
         div()
             .id(SharedString::from(format!("tiny-stream-{}", stream.user_id)))
@@ -1201,6 +1207,25 @@ impl Shell {
             ))
             .on_click(cx.listener(move |this, _, window, cx| this.call_open_stream(&user_id, mine, window, cx)))
             .child(self.call_stream_body(people, stream, call, size, cx))
+            .when(can_unwatch_tile, |tile| {
+                tile.child(
+                    div()
+                        .absolute()
+                        .top(px(6.))
+                        .right(px(6.))
+                        .child(
+                            stream_button(
+                                SharedString::from(format!("discord-stream-unwatch-{unwatch_id}")),
+                                "icons/x.svg",
+                                format!("Stop watching {name}'s screen"),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.call_stop_watching_user(&unwatch_id, window, cx);
+                            })),
+                        ),
+                )
+            })
             .child(caption(
                 if mine { format!("Your {what}") } else { format!("{name}'s {what}") },
                 small,
@@ -1277,12 +1302,13 @@ impl Shell {
                     }),
                 ));
         }
+        let unwatch_id = user_id.clone();
         if !mine {
             tools = tools.child(stream_button("tiny-stream-unwatch", "icons/x.svg", "Stop watching").on_click(
-                cx.listener(|this, _, window, cx| {
+                cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.call_unfull(window, cx);
-                    this.call_stop_watching(window, cx);
+                    this.call_stop_watching_user(&unwatch_id, window, cx);
                 }),
             ));
         }
@@ -2382,8 +2408,34 @@ impl Shell {
 
     pub(in crate::gui) fn call_stop_watching(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.call_keep_keys(window, cx);
-        if matches!(self.call_state.focus, Some(Focus::Stream(_))) {
+        let focused_stream = match &self.call_state.focus {
+            Some(Focus::Stream(uid)) => Some(uid.clone()),
+            _ => None,
+        };
+        if let Some(uid) = focused_stream {
+            self.call_stop_watching_user(&uid, window, cx);
+            return;
+        }
+        self.call_unwatch(cx);
+        self.call_sync_watch_now(cx);
+    }
+
+    /// Stops watching one specific stream. On Discord this removes only `user_id` from the
+    /// watched Go Live streams so every other watched stream and all cameras stay live.
+    pub(in crate::gui) fn call_stop_watching_user(&mut self, user_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.call_keep_keys(window, cx);
+        if self.call_state.focus.as_ref() == Some(&Focus::Stream(user_id.to_owned())) {
             self.call_state.focus = None;
+        }
+        if self.call_now().is_some_and(|call| call.conversation.network == Network::Discord) {
+            self.call_state.discord_watched_shares.retain(|id| id != user_id);
+            if self.call_state.watch_asked.as_ref().is_some_and(|(id, _)| id == user_id) {
+                self.call_state.watch_asked = None;
+                self.call_state.watch_timer = None;
+            }
+            self.call_sync_watch_now(cx);
+            cx.notify();
+            return;
         }
         self.call_unwatch(cx);
         self.call_sync_watch_now(cx);

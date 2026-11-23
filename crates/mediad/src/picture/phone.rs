@@ -154,10 +154,16 @@ impl Outgoing {
     }
 }
 
+enum ActiveDecoder {
+    H264(Box<dyn H264Decoder>),
+    Vp8(crate::vp8::Vp8Decoder),
+    Av1(crate::av1::Av1Decoder),
+}
+
 /// The one decoder a call holds, and the picture it last painted.
 #[derive(Default)]
 pub struct Incoming {
-    decoder: Option<Box<dyn H264Decoder>>,
+    decoder: Option<ActiveDecoder>,
     canvas: Canvas,
     generation: u64,
     /// Painted at once, taken by `painted`.
@@ -170,23 +176,7 @@ impl Incoming {
         self.decoder = None;
     }
 
-    /// Decodes one received Annex B frame, and paints it if `paint`. Every frame goes through the
-    /// decoder, painted or not: the next one is built on it. `Err` means it did not decode;
-    /// `Ok(None)` that there is nothing to paint.
-    #[allow(clippy::result_unit_err)]
-    pub fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
-        if self.decoder.is_none() {
-            self.decoder = platform::get().ok_or(())?.h264_decoder().ok();
-        }
-        let decoder = self.decoder.as_mut().ok_or(())?;
-        let Some(decoded) = decoder.decode(annex_b).map_err(|_| ())? else {
-            return Ok(());
-        };
-        let Some(tag) = paint.filter(|_| decoded.width != 0 && decoded.height != 0) else {
-            return Ok(());
-        };
-        let (mut width, mut height) = (decoded.width & !1, decoded.height & !1);
-        let mut colors = rgb(&planes(&decoded, width, height));
+    fn paint_rgb(&mut self, mut colors: Vec<u8>, mut width: u32, mut height: u32, tag: Tag) {
         if tag.small && (width > SMALL_TILE.0 || height > SMALL_TILE.1) {
             let (tw, th) = fit(width, height, SMALL_TILE.0, SMALL_TILE.1);
             colors = scale_rgb(&colors, width, height, tw, th);
@@ -195,6 +185,59 @@ impl Incoming {
         self.generation = self.generation.wrapping_add(1);
         if let Some(painted) = self.canvas.paint(&colors, width, height, self.generation) {
             self.pending.push((tag, painted));
+        }
+    }
+
+    /// Decodes one received frame (`H264`, `Vp8`, or `Av1`), and paints it if `paint`. Every frame
+    /// goes through the decoder, painted or not: the next one is built on it. `Err` means it did
+    /// not decode; `Ok(())` with no pending entry means there was nothing to paint.
+    #[allow(clippy::result_unit_err)]
+    pub fn decode(&mut self, codec: crate::video::VideoCodec, data: &[u8], paint: Option<Tag>) -> Result<(), ()> {
+        let matches_codec = match (&self.decoder, codec) {
+            (Some(ActiveDecoder::H264(_)), crate::video::VideoCodec::H264) => true,
+            (Some(ActiveDecoder::Vp8(_)), crate::video::VideoCodec::Vp8) => true,
+            (Some(ActiveDecoder::Av1(_)), crate::video::VideoCodec::Av1) => true,
+            _ => false,
+        };
+        if !matches_codec {
+            self.decoder = match codec {
+                crate::video::VideoCodec::H264 => platform::get().ok_or(())?.h264_decoder().ok().map(ActiveDecoder::H264),
+                crate::video::VideoCodec::Vp8 => Some(ActiveDecoder::Vp8(crate::vp8::Vp8Decoder::new())),
+                crate::video::VideoCodec::Av1 => crate::av1::Av1Decoder::new().ok().map(ActiveDecoder::Av1),
+            };
+        }
+        match self.decoder.as_mut().ok_or(())? {
+            ActiveDecoder::H264(decoder) => {
+                let Some(decoded) = decoder.decode(data).map_err(|_| ())? else {
+                    return Ok(());
+                };
+                let Some(tag) = paint.filter(|_| decoded.width != 0 && decoded.height != 0) else {
+                    return Ok(());
+                };
+                let (width, height) = (decoded.width & !1, decoded.height & !1);
+                let colors = rgb(&planes(&decoded, width, height));
+                self.paint_rgb(colors, width, height, tag);
+            }
+            ActiveDecoder::Vp8(decoder) => {
+                let Some(decoded) = decoder.decode(data)? else {
+                    return Ok(());
+                };
+                let Some(tag) = paint else {
+                    return Ok(());
+                };
+                let (width, height) = (decoded.width as u32, decoded.height as u32);
+                self.paint_rgb(rgb(&decoded), width, height, tag);
+            }
+            ActiveDecoder::Av1(decoder) => {
+                let Some(decoded) = decoder.decode(data)? else {
+                    return Ok(());
+                };
+                let Some(tag) = paint else {
+                    return Ok(());
+                };
+                let (width, height) = (decoded.width as u32, decoded.height as u32);
+                self.paint_rgb(rgb(&decoded), width, height, tag);
+            }
         }
         Ok(())
     }
@@ -273,11 +316,11 @@ mod tests {
 
         // What a peer sends back decodes, through the platform's decoder, into a JPEG.
         let tag = Tag { user: "ada".into(), kind: protocol::PictureKind::Camera, small: false };
-        incoming.decode(&high.bytes, Some(tag.clone())).expect("the high layer decodes");
+        incoming.decode(crate::video::VideoCodec::H264, &high.bytes, Some(tag.clone())).expect("the high layer decodes");
         let (_, painted) = incoming.painted().pop().expect("painted");
         assert_eq!((painted.width, painted.height), (640, 360));
         assert!(std::fs::metadata(&painted.path).unwrap().len() > 0);
-        incoming.decode(&low.bytes, Some(tag)).expect("the low layer decodes");
+        incoming.decode(crate::video::VideoCodec::H264, &low.bytes, Some(tag)).expect("the low layer decodes");
         let (_, smaller) = incoming.painted().pop().expect("painted");
         assert_eq!((smaller.width, smaller.height), (320, 180));
         incoming.forget();

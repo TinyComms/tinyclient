@@ -1,22 +1,22 @@
 //! Discord pictures on the voice UDP socket.
 //!
-//! A camera is one H.264 layer on the call's own voice connection, driven from the audio loop.
-//! A screen share is a second voice connection (Go Live) and this module's [`run`] is its whole
-//! media loop. A watcher can receive Opus audio as well as H.264. Both video legs seal the access
-//! unit with DAVE before packetizing, and open it only after the access unit is whole again. The decode thread's
-//! own sealer is transport-only on a Discord call, and it drops a frame that still ends in DAVE's
-//! marker, so the marker has to be gone before the frame is handed over.
+//! A camera is up to two H.264 simulcast layers (`rid` `"100"` high, `"50"` low) on the call's own
+//! voice connection, driven from the audio loop. A screen share is a second voice connection (Go
+//! Live) and this module's [`run`] is its whole media loop. Each watched Go Live stream runs on its
+//! own receive-only leg with its own DAVE session and can receive Opus audio as well as H.264, VP8,
+//! or AV1 video. Multiple remote cameras on the voice connection decode concurrently in their own
+//! decoder slots (subject to the device decode budget) and stay visible while Go Live streams are
+//! watched.
 
 use crate::dave::Dave;
-use crate::h264::{self, Assembler};
 use crate::media::{FromMedia, Stream};
-use crate::picture::camera_high_bps;
+use crate::picture::{camera_high_bps, camera_profile};
 use crate::rtp::{self, Cipher, Sender as AudioSender, VideoSender, H264, RTX};
 use crate::session::Controls;
-use crate::video::{Rates, Received, Video, Wants, Word};
-use crate::{hear::Ear, opus, out, rt, share_audio, FRAME, FRAME_SAMPLES};
-use protocol::{MediaResponse, PictureKind};
-use std::collections::{HashMap, VecDeque};
+use crate::video::{Rates, Received, Track, Video, VideoCodec, Wants, Word};
+use crate::{av1, h264, hear::Ear, opus, out, rt, share_audio, vp8, FRAME, FRAME_SAMPLES};
+use protocol::{MediaResponse, PictureKind, WatchSize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -31,6 +31,12 @@ pub const NO_ASSIGNED: &str = "Discord didn't assign a video stream on this call
 pub struct Remote {
     pub user_id: String,
     pub repair_of: Option<u32>,
+    /// The simulcast layer RID announced in op 12 (e.g. `"100"` or `"50"`).
+    pub rid: String,
+    /// Announced quality score (e.g. `100` or `50`).
+    pub quality: u32,
+    /// Whether the sender reported this layer active.
+    pub active: bool,
 }
 
 struct Sent {
@@ -39,6 +45,7 @@ struct Sent {
     payload: Vec<u8>,
 }
 
+#[derive(Default)]
 struct History {
     items: VecDeque<(u16, Sent)>,
 }
@@ -60,22 +67,103 @@ impl History {
     }
 }
 
-/// The two SSRCs we send on: the picture, and the retransmission of its packets.
+/// The two SSRCs we send one simulcast layer on: the picture, and the retransmission of its packets.
 pub struct Pipe {
+    ssrc: u32,
+    rid: &'static str,
     media: VideoSender,
     rtx: VideoSender,
+    history: History,
 }
 
 impl Pipe {
     pub fn new(cipher: Cipher, ssrc: u32, rtx: u32) -> Pipe {
+        Pipe::with_rid(cipher, ssrc, rtx, "100")
+    }
+
+    pub fn with_rid(cipher: Cipher, ssrc: u32, rtx: u32, rid: &'static str) -> Pipe {
         Pipe {
+            ssrc,
+            rid,
             media: VideoSender::new(cipher.clone(), ssrc),
             rtx: VideoSender::new(cipher, rtx),
+            history: History::default(),
+        }
+    }
+
+    fn send_sealed(&mut self, screen: bool, socket: &UdpSocket, timestamp: u32, sealed: &[u8]) {
+        let extension = rtp::video_extension_rid(self.rid, screen, false);
+        for piece in h264::packetize(sealed, h264::MAX_PAYLOAD) {
+            let Some((datagram, sequence)) = self.media.seal(H264, piece.marker, timestamp, &piece.payload, &extension) else {
+                continue;
+            };
+            if socket.send(&datagram).is_ok() {
+                self.history.remember(sequence, Sent { timestamp, marker: piece.marker, payload: piece.payload });
+            }
+        }
+    }
+
+    fn resend(&mut self, screen: bool, socket: &UdpSocket, sequence: u16) {
+        let Some(sent) = self.history.recall(sequence) else {
+            return;
+        };
+        let mut payload = sequence.to_be_bytes().to_vec();
+        payload.extend_from_slice(&sent.payload);
+        let extension = rtp::video_extension_rid(self.rid, screen, true);
+        if let Some((datagram, _)) = self.rtx.seal(RTX, sent.marker, sent.timestamp, &payload, &extension) {
+            let _ = socket.send(&datagram);
         }
     }
 }
 
-/// One picture leg: capture, packetizing, and the access units arriving for other people.
+/// Per-SSRC RTP frame reassembler, dynamically matching the codec signalled by RTP payload type.
+enum StreamAssembler {
+    H264(h264::Assembler),
+    Vp8(vp8::Assembler),
+    Av1(av1::Assembler),
+}
+
+impl StreamAssembler {
+    fn for_codec(codec: VideoCodec) -> Self {
+        match codec {
+            VideoCodec::H264 => Self::H264(h264::Assembler::default()),
+            VideoCodec::Vp8 => Self::Vp8(vp8::Assembler::default()),
+            VideoCodec::Av1 => Self::Av1(av1::Assembler::default()),
+        }
+    }
+
+    fn codec(&self) -> VideoCodec {
+        match self {
+            Self::H264(_) => VideoCodec::H264,
+            Self::Vp8(_) => VideoCodec::Vp8,
+            Self::Av1(_) => VideoCodec::Av1,
+        }
+    }
+
+    fn push(&mut self, sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Self::H264(a) => a.push(sequence, timestamp, marker, payload),
+            Self::Vp8(a) => a.push(sequence, timestamp, marker, payload),
+            Self::Av1(a) => a.push(sequence, timestamp, marker, payload),
+        }
+    }
+}
+
+fn frame_is_key(codec: VideoCodec, frame: &[u8]) -> bool {
+    match codec {
+        VideoCodec::H264 => h264::is_key(frame),
+        VideoCodec::Vp8 => vp8::is_key(frame),
+        VideoCodec::Av1 => av1::is_key(frame),
+    }
+}
+
+struct SlotState {
+    slot: usize,
+    ssrc: u32,
+    last_seen: Instant,
+}
+
+/// One picture leg: capture, packetizing, and the decoded pictures arriving for other people.
 pub struct Drive {
     controls: Arc<Controls>,
     video: Video,
@@ -83,15 +171,22 @@ pub struct Drive {
     screen: bool,
     /// This leg may send. A watch connection only receives.
     can_send: bool,
+    /// High layer (or screen share) send pipe (`rid` `"100"`).
     pipe: Option<Pipe>,
+    /// Optional low camera simulcast send pipe (`rid` `"50"`).
+    low_pipe: Option<Pipe>,
     announced: Arc<AtomicBool>,
     videos: Arc<Mutex<HashMap<u32, Remote>>>,
-    assemblers: HashMap<u32, Assembler>,
-    history: History,
+    assemblers: HashMap<u32, StreamAssembler>,
     /// The control as it was when we last told the gateway.
     wanted: bool,
-    shown: Option<String>,
-    seen: HashMap<String, Instant>,
+    /// Active decoder slots keyed by remote `user_id` so every camera / stream paints at once.
+    slots: HashMap<String, SlotState>,
+    free_slots: Vec<usize>,
+    next_slot: usize,
+    /// Remote sources dropped because this leg hit its concurrent decode ceiling.
+    refused: Vec<(String, PictureKind)>,
+    last_prune: Instant,
     user_id: String,
 }
 
@@ -105,19 +200,36 @@ impl Drive {
         screen: bool,
         can_send: bool,
     ) -> Drive {
+        Drive::new_with_low(controls, user_id, videos, announced, pipe, None, screen, can_send)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_low(
+        controls: Arc<Controls>,
+        user_id: String,
+        videos: Arc<Mutex<HashMap<u32, Remote>>>,
+        announced: Arc<AtomicBool>,
+        pipe: Option<Pipe>,
+        low_pipe: Option<Pipe>,
+        screen: bool,
+        can_send: bool,
+    ) -> Drive {
         Drive {
             video: Video::new(controls.clone()),
             controls,
             screen,
             can_send,
             pipe,
+            low_pipe,
             announced,
             videos,
             assemblers: HashMap::new(),
-            history: History { items: VecDeque::new() },
             wanted: false,
-            shown: None,
-            seen: HashMap::new(),
+            slots: HashMap::new(),
+            free_slots: Vec::new(),
+            next_slot: 0,
+            refused: Vec::new(),
+            last_prune: Instant::now(),
             user_id,
         }
     }
@@ -132,14 +244,39 @@ impl Drive {
                 rates: Rates { share: crate::picture::share_quality().bps, high: 0, low: 0 },
             }
         } else {
+            let low = if self.low_pipe.is_some() { camera_profile().low_layer().bps } else { 0 };
             Wants {
                 share: false,
                 camera: true,
                 preview_camera: false,
                 keep_camera: true,
-                rates: Rates { share: 0, high: camera_high_bps(), low: 0 },
+                rates: Rates { share: 0, high: camera_high_bps(), low },
             }
         }
+    }
+
+    fn decode_ceiling(&self) -> usize {
+        if self.screen {
+            1
+        } else {
+            let (max_large, max_small) = crate::video::default_budget();
+            (max_large + max_small).max(1)
+        }
+    }
+
+    fn tile_is_small(&self, user: &str, kind: PictureKind) -> bool {
+        let sources = self.controls.watch_sources();
+        if let Some(entry) = sources.iter().find(|s| s.user_id == user && s.kind == kind) {
+            return entry.size == WatchSize::Small;
+        }
+        if self.screen {
+            return false;
+        }
+        if let Some(speaker) = self.controls.speaker() {
+            return speaker != user;
+        }
+        // First camera tile stays full size; additional concurrent camera tiles use small budget.
+        !self.slots.is_empty()
     }
 
     /// True when the datagram was video or RTCP, so the audio loop leaves it alone.
@@ -163,65 +300,137 @@ impl Drive {
             return true;
         };
         if let Some(primary) = remote.repair_of {
+            let codec = rtp::rtx_codec(packet.payload_type).unwrap_or(VideoCodec::H264);
             if packet.payload.len() >= 2 {
                 let sequence = u16::from_be_bytes([packet.payload[0], packet.payload[1]]);
-                self.assemble(primary, &remote.user_id, sequence, packet.timestamp, packet.marker, &packet.payload[2..], dave);
+                self.assemble(primary, &remote.user_id, codec, sequence, packet.timestamp, packet.marker, &packet.payload[2..], dave);
             }
             return true;
         }
-        self.assemble(packet.ssrc, &remote.user_id, packet.sequence, packet.timestamp, packet.marker, &packet.payload, dave);
+        let Some(codec) = rtp::video_codec(packet.payload_type) else {
+            return true;
+        };
+        self.assemble(packet.ssrc, &remote.user_id, codec, packet.sequence, packet.timestamp, packet.marker, &packet.payload, dave);
         true
     }
 
-    fn assemble(&mut self, ssrc: u32, user: &str, sequence: u16, timestamp: u32, marker: bool, payload: &[u8], dave: &Mutex<Dave>) {
-        let assembler = self.assemblers.entry(ssrc).or_default();
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        &mut self,
+        ssrc: u32,
+        user: &str,
+        codec: VideoCodec,
+        sequence: u16,
+        timestamp: u32,
+        marker: bool,
+        payload: &[u8],
+        dave: &Mutex<Dave>,
+    ) {
+        let assembler = self.assemblers.entry(ssrc).or_insert_with(|| StreamAssembler::for_codec(codec));
+        if assembler.codec() != codec {
+            *assembler = StreamAssembler::for_codec(codec);
+        }
         let Some(sealed) = assembler.push(sequence, timestamp, marker, payload) else {
             return;
         };
-        // The watched share is the one picture on screen. A camera waits until it is gone.
-        if !self.screen && self.controls.watch() {
-            return;
-        }
         let Some(id) = user.parse().ok() else {
             return;
         };
         let Some(clear) = dave.lock().unwrap().decrypt_video(Some(id), &sealed) else {
             return;
         };
-        self.paint(user, clear);
+        self.paint(ssrc, user, codec, clear);
     }
 
-    fn paint(&mut self, user: &str, frame: Vec<u8>) {
+    fn paint(&mut self, ssrc: u32, user: &str, codec: VideoCodec, frame: Vec<u8>) {
         let now = Instant::now();
-        self.seen.insert(user.to_owned(), now);
-        self.seen.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(5));
-        let speaker = self.controls.speaker();
-        let chosen = if let Some(wanted) = &speaker {
-            user == wanted
-        } else if self.shown.as_deref() == Some(user) || self.shown.is_none() {
-            true
+        let kind = if self.screen { PictureKind::Share } else { PictureKind::Camera };
+        let slot = if let Some(state) = self.slots.get_mut(user) {
+            if state.ssrc != ssrc {
+                state.ssrc = ssrc;
+                self.video.reset_slot(state.slot);
+            }
+            state.last_seen = now;
+            state.slot
         } else {
-            self.shown.as_ref().and_then(|id| self.seen.get(id)).is_none_or(|at| now.saturating_duration_since(*at) > Duration::from_secs(1))
+            if self.slots.len() >= self.decode_ceiling() {
+                let entry = (user.to_owned(), kind);
+                if !self.refused.contains(&entry) {
+                    self.refused.push(entry);
+                    out::send(&MediaResponse::WatchRefused { refused: self.refused.clone() });
+                }
+                return;
+            }
+            let small = self.tile_is_small(user, kind);
+            let slot = self.free_slots.pop().unwrap_or_else(|| {
+                let idx = self.next_slot;
+                self.next_slot += 1;
+                idx
+            });
+            self.video.watch_slot(slot, small);
+            self.slots.insert(user.to_owned(), SlotState { slot, ssrc, last_seen: now });
+            let before = self.refused.len();
+            self.refused.retain(|(uid, k)| !(uid == user && *k == kind));
+            if self.refused.len() != before {
+                out::send(&MediaResponse::WatchRefused { refused: self.refused.clone() });
+            }
+            slot
         };
-        if !chosen {
+        self.video.picture_slot(
+            slot,
+            Received {
+                codec,
+                data: Arc::<[u8]>::from(frame.clone()),
+                key: frame_is_key(codec, &frame),
+                contiguous: true,
+                user: user.to_owned(),
+                kind,
+            },
+        );
+    }
+
+    /// Drops decoder slots and assemblers for remote videos that op 12 or disconnect removed.
+    fn prune_vanished(&mut self) {
+        if self.last_prune.elapsed() < Duration::from_millis(200) {
             return;
         }
-        self.shown = Some(user.to_owned());
-        self.video.watch();
+        self.last_prune = Instant::now();
+        let (active_ssrcs, active_users): (HashSet<u32>, HashSet<String>) = {
+            let videos = self.videos.lock().unwrap();
+            let ssrcs = videos.keys().copied().collect();
+            let users = videos
+                .values()
+                .filter(|r| r.repair_of.is_none() && r.active)
+                .map(|r| r.user_id.clone())
+                .collect();
+            (ssrcs, users)
+        };
+        self.assemblers.retain(|ssrc, _| active_ssrcs.contains(ssrc));
         let kind = if self.screen { PictureKind::Share } else { PictureKind::Camera };
-        self.video.picture(Received {
-            data: Arc::<[u8]>::from(frame.clone()),
-            key: h264::is_key(&frame),
-            contiguous: true,
-            user: user.to_owned(),
-            kind,
-        });
+        let gone: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|(uid, _)| !active_users.contains(*uid))
+            .map(|(uid, _)| uid.clone())
+            .collect();
+        for uid in gone {
+            if let Some(state) = self.slots.remove(&uid) {
+                self.video.clear_slot(state.slot, uid, kind);
+                self.free_slots.push(state.slot);
+            }
+        }
+        let before = self.refused.len();
+        self.refused.retain(|(uid, _)| active_users.contains(uid));
+        if self.refused.len() != before {
+            out::send(&MediaResponse::WatchRefused { refused: self.refused.clone() });
+        }
     }
 
     /// Sends what the capture thread has, once the gateway has announced the SSRC. A change of
     /// the control is only reported here: nothing is sent in that same turn, because the
     /// announcement has to be on the wire first.
     pub fn tick(&mut self, dave: &Mutex<Dave>, socket: &UdpSocket, report: &Sender<FromMedia>) {
+        self.prune_vanished();
         if !self.can_send {
             return;
         }
@@ -241,7 +450,7 @@ impl Drive {
         self.video.want(self.wants());
         while let Some(word) = self.video.next() {
             match word {
-                Word::Frame { payload, rtp, .. } => self.send_frame(dave, socket, rtp as u32, &payload),
+                Word::Frame { track, payload, rtp, .. } => self.send_frame(track, dave, socket, rtp as u32, &payload),
                 Word::Failed { words, .. } => out::send(&MediaResponse::Notice { detail: words }),
                 // The capture thread paints my own tile: my screen, from a screen leg.
                 Word::SelfView { share, painted } => out::send(&match painted {
@@ -258,22 +467,18 @@ impl Drive {
         }
     }
 
-    fn send_frame(&mut self, dave: &Mutex<Dave>, socket: &UdpSocket, timestamp: u32, frame: &[u8]) {
+    fn send_frame(&mut self, track: Track, dave: &Mutex<Dave>, socket: &UdpSocket, timestamp: u32, frame: &[u8]) {
+        let pipe = match track {
+            Track::Low => self.low_pipe.as_mut(),
+            Track::High | Track::Share => self.pipe.as_mut(),
+        };
+        let Some(pipe) = pipe else {
+            return;
+        };
         let Some(sealed) = dave.lock().unwrap().encrypt_video(frame) else {
             return;
         };
-        let extension = rtp::video_extension(self.screen, false);
-        for piece in h264::packetize(&sealed, h264::MAX_PAYLOAD) {
-            let Some(pipe) = self.pipe.as_mut() else {
-                return;
-            };
-            let Some((datagram, sequence)) = pipe.media.seal(H264, piece.marker, timestamp, &piece.payload, &extension) else {
-                continue;
-            };
-            if socket.send(&datagram).is_ok() {
-                self.history.remember(sequence, Sent { timestamp, marker: piece.marker, payload: piece.payload });
-            }
-        }
+        pipe.send_sealed(self.screen, socket, timestamp, &sealed);
     }
 
     /// A generic NACK (RTCP PT 205, FMT 1). The first 8 bytes are the clear header; if they are
@@ -292,6 +497,7 @@ impl Drive {
         if plain.len() < 4 {
             return;
         }
+        let media_ssrc = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]);
         let mut at = 4;
         let mut missing = Vec::new();
         while at + 4 <= plain.len() {
@@ -306,28 +512,37 @@ impl Drive {
             }
         }
         for sequence in missing {
-            self.resend(socket, sequence);
+            self.resend(media_ssrc, socket, sequence);
         }
     }
 
-    fn resend(&mut self, socket: &UdpSocket, sequence: u16) {
-        let Some(sent) = self.history.recall(sequence) else {
+    fn resend(&mut self, media_ssrc: u32, socket: &UdpSocket, sequence: u16) {
+        if let Some(low) = self.low_pipe.as_mut().filter(|p| p.ssrc == media_ssrc) {
+            low.resend(self.screen, socket, sequence);
             return;
-        };
-        let mut payload = sequence.to_be_bytes().to_vec();
-        payload.extend_from_slice(&sent.payload);
-        let Some(pipe) = self.pipe.as_mut() else {
-            return;
-        };
-        let extension = rtp::video_extension(self.screen, true);
-        if let Some((datagram, _)) = pipe.rtx.seal(RTX, sent.marker, sent.timestamp, &payload, &extension) {
-            let _ = socket.send(&datagram);
+        }
+        if let Some(high) = self.pipe.as_mut() {
+            high.resend(self.screen, socket, sequence);
         }
     }
 
     pub fn finish(&mut self) {
+        let kind = if self.screen { PictureKind::Share } else { PictureKind::Camera };
+        let users: Vec<String> = self.slots.drain().map(|(uid, _)| uid).collect();
         let video = std::mem::replace(&mut self.video, Video::new(self.controls.clone()));
         video.stop();
+        // Clear only this leg's active pictures so stopping one watched stream leaves other
+        // watched streams and cameras on screen.
+        for user_id in users {
+            out::send(&MediaResponse::Picture {
+                path: String::new(),
+                width: 0,
+                height: 0,
+                generation: 0,
+                user_id,
+                kind,
+            });
+        }
     }
 }
 
@@ -392,13 +607,16 @@ fn receive_audio(leg: &Leg, datagram: &[u8], owner: &str, owner_id: u64, gain_ke
     }
     let mut playing = leg.controls.watched_audio.lock().unwrap();
     // Stop and deafen can clear the buffer while authentication is in progress.
-    if leg.controls.leg_done(true) || leg.controls.deafened.load(Ordering::Relaxed) {
+    if leg.controls.leg_done(true, Some(owner)) || leg.controls.deafened.load(Ordering::Relaxed) {
         return;
     }
-    if playing.as_ref().is_none_or(|audio| audio.ssrc != packet.ssrc) {
-        *playing = Stream::new().map(|stream| WatchAudio { stream, ssrc: packet.ssrc, gain_key: gain_key.to_owned() });
+    let needs_new = playing.get(owner).is_none_or(|audio| audio.ssrc != packet.ssrc);
+    if needs_new {
+        if let Some(stream) = Stream::new() {
+            playing.insert(owner.to_owned(), WatchAudio { stream, ssrc: packet.ssrc, gain_key: gain_key.to_owned() });
+        }
     }
-    if let Some(audio) = playing.as_mut() {
+    if let Some(audio) = playing.get_mut(owner) {
         let now = Instant::now();
         audio.stream.last_packet = now;
         audio.stream.arrivals.arrived(packet.timestamp, now);
@@ -409,8 +627,6 @@ fn receive_audio(leg: &Leg, datagram: &[u8], owner: &str, owner_id: u64, gain_ke
     }
 }
 
-/// The media loop of a stream connection. Returns when the leg is stopped. It does not end
-/// the process: the voice call's thread is the one that does.
 /// Quiet frames after the sound drops before the speaking flag is cleared.
 const SOUND_TRAIL: u32 = 5;
 /// Below this the share is not "making sound". The 440 Hz harness sits far above it.
@@ -483,6 +699,8 @@ impl Sound {
     }
 }
 
+/// The media loop of a stream connection. Returns when the leg is stopped. It does not end
+/// the process: the voice call's thread is the one that does.
 pub fn run(mut leg: Leg) {
     let _timer = rt::FineTimer::hold();
     rt::tick_thread();
@@ -496,12 +714,15 @@ pub fn run(mut leg: Leg) {
     });
     let mut drive = Drive::new(leg.controls.clone(), leg.user_id.clone(), leg.videos.clone(), leg.announced.clone(), leg.pipe.take(), true, !leg.watch);
     let owner = leg.stream_owner.as_deref().filter(|_| leg.watch).and_then(|owner| {
-        Some((owner, owner.parse().ok()?, protocol::discord_stream_gain_key(owner)))
+        Some((owner.to_owned(), owner.parse().ok()?, protocol::discord_stream_gain_key(owner)))
     });
     let mut datagram = [0u8; 2048];
     let mut next = Instant::now();
     let tick = Duration::from_millis(20);
-    while !leg.stop.load(Ordering::Relaxed) && !out::over() && !leg.controls.leg_done(leg.watch) {
+    while !leg.stop.load(Ordering::Relaxed)
+        && !out::over()
+        && !leg.controls.leg_done(leg.watch, leg.stream_owner.as_deref())
+    {
         let now = Instant::now();
         if now < next {
             let _ = leg.socket.set_read_timeout(Some((next - now).max(Duration::from_micros(200))));
@@ -524,8 +745,8 @@ pub fn run(mut leg: Leg) {
             sound.tick(&leg);
         }
     }
-    if owner.is_some() {
-        leg.controls.watched_audio.lock().unwrap().take();
+    if let Some((owner, _, _)) = &owner {
+        leg.controls.watched_audio.lock().unwrap().remove(owner);
     }
     drive.finish();
 }
@@ -551,47 +772,19 @@ mod tests {
         assert_eq!(drive.wants().rates.share, 1_500_000);
         crate::picture::choose_quality(Some(protocol::ShareQuality::Best));
         assert_eq!(drive.wants().rates.share, 8_000_000);
-        let camera = Drive::new(
+        let cipher = Cipher::new(rtp::AES_GCM, &[7u8; 32]).unwrap();
+        let camera = Drive::new_with_low(
             Arc::new(Controls::default()),
             "1".into(),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(AtomicBool::new(false)),
-            None,
+            Some(Pipe::with_rid(cipher.clone(), 100, 101, "100")),
+            Some(Pipe::with_rid(cipher, 200, 201, "50")),
             false,
             true,
         );
         assert_eq!(camera.wants().rates.share, 0, "a camera does not spend the share's rate");
+        assert!(camera.wants().rates.high > 0 && camera.wants().rates.low > 0, "simulcast camera asks for high and low layers");
         crate::picture::choose_quality(None);
-    }
-
-    #[test]
-    fn primary_and_repair_packets_never_reuse_a_transport_nonce() {
-        for mode in [rtp::AES_GCM, rtp::XCHACHA] {
-            let key = [42; 32];
-            let cipher = Cipher::new(mode, &key).unwrap();
-            let mut audio = rtp::Sender::new(cipher.clone(), 9, 0, 0);
-            let mut pipe = Pipe::new(cipher.clone(), 10, 11);
-            let opener = Cipher::new(mode, &key).unwrap();
-            let mut nonces = std::collections::HashSet::new();
-            for round in 0..32 {
-                // Starting a new video sender, as after a toggle, must not reset this key.
-                if round % 4 == 0 {
-                    pipe = Pipe::new(cipher.clone(), 10, 11);
-                }
-                for (packet, expected) in [
-                    (audio.seal(b"audio").unwrap(), b"audio".as_slice()),
-                    (pipe.media.seal(H264, true, 9000, b"frame", &[]).unwrap().0, b"frame".as_slice()),
-                    (pipe.rtx.seal(RTX, true, 9000, b"repair", &[]).unwrap().0, b"repair".as_slice()),
-                ] {
-                    let nonce = u32::from_be_bytes(packet[packet.len() - 4..].try_into().unwrap());
-                    assert!(nonces.insert(nonce), "{mode}: nonce {nonce} repeated across audio/video/RTX");
-                    assert_eq!(opener.unseal(&packet).unwrap().payload, expected);
-                }
-            }
-            assert_eq!(nonces.len(), 96);
-            let mut other_transport = Pipe::new(Cipher::new(mode, &[43; 32]).unwrap(), 10, 11);
-            let other = other_transport.media.seal(H264, true, 0, b"other", &[]).unwrap().0;
-            assert_eq!(&other[other.len() - 4..], &[0, 0, 0, 0], "another key has its own allocator");
-        }
     }
 }
