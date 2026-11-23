@@ -184,6 +184,18 @@ impl SettingsWindow {
                     group = group.child(self.active_sessions_rows(account, ix, cx));
                 }
             }
+            if network == Network::Discord && !mine.is_empty() {
+                let action = touch(button(("add-discord", network as usize), ButtonKind::Secondary, "Add another"))
+                    .on_click(cx.listener(|this, _, _, cx| this.sign_in(Network::Discord, cx)))
+                    .into_any_element();
+                group = group.child(rule()).child(account_row(
+                    network,
+                    "Add another Discord account".into(),
+                    "Sign in to another account".into(),
+                    None,
+                    action,
+                ));
+            }
             if network == Network::Teams && !mine.is_empty() {
                 group = group.child(self.teams_sessions_row(cx));
             }

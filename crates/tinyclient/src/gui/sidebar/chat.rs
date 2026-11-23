@@ -365,7 +365,14 @@ impl Shell {
         let tone = row_tone(c, selected, false);
         let surface = theme::row_surface(selected);
         let several = self.snapshot.as_ref().is_some_and(|snapshot| snapshot.accounts_of(c.key.network) > 1);
-        let context = (look.context && (!c.kind.is_direct() || several) && !c.space_title.is_empty()).then(|| c.space_title.clone());
+        let place = (look.context && (!c.kind.is_direct() || several) && !c.space_title.is_empty()).then(|| c.space_title.clone()).unwrap_or_default();
+        let account_name = self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&c.key.account()).map(|account| account.name.clone())).unwrap_or_default();
+        let labeled = if c.key.network == Network::Discord {
+            super::switcher::discord_context(&place, &account_name, several)
+        } else {
+            place
+        };
+        let context = (!labeled.is_empty()).then_some(labeled);
         let stamp = if look.time { row_time(now(), c.updated) } else { String::new() };
         let faint = if selected { theme::text_soft() } else { theme::text_faint() };
         let title = match c.kind {

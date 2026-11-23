@@ -926,6 +926,17 @@ impl Shell {
                                 .into_any_element(),
                         );
                     }
+                    if network == Network::Discord && snapshot.accounts_of(network) > 0 {
+                        items.push(menu_separator().into_any_element());
+                        items.push(
+                            menu_item("add-discord", Some("icons/plus.svg"), "Add another Discord account", None)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.sign_in(Network::Discord, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
                 }
             }
             // CONTRACT: of the Space menu in `02-layout-navigation.md` pinning and mark-as-read
@@ -1992,6 +2003,9 @@ impl Shell {
                 add(network, "Add a Slack workspace", "Sign in to another workspace", true);
             } else if network == Network::Telegram {
                 add(network, "Add another Telegram account", "Sign in to another account", true);
+            } else if network == Network::Discord {
+                let (title, line) = another_account(Network::Discord).unwrap();
+                add(network, title, line, true);
             } else if network == Network::Tiny {
                 add(network, "Add a Tiny server", "Join with a code", true);
             }
@@ -2661,9 +2675,26 @@ impl Shell {
     }
 }
 
+/// An extra sign-in once the usual one exists. Teams is a personal Microsoft account, not a
+/// second work sign-in. Discord is another Discord account.
+pub(crate) fn another_account(network: Network) -> Option<(&'static str, &'static str)> {
+    match network {
+        Network::Discord => Some(("Add another Discord account", "Sign in to another account")),
+        Network::Teams => Some(("Personal Microsoft account", "Teams free, teams.live.com")),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_account_names_discord_and_personal_teams() {
+        assert_eq!(another_account(Network::Discord), Some(("Add another Discord account", "Sign in to another account")));
+        assert_eq!(another_account(Network::Teams), Some(("Personal Microsoft account", "Teams free, teams.live.com")));
+        assert_eq!(another_account(Network::Slack), None);
+    }
 
     #[test]
     fn discord_columns_keep_a_readable_conversation_and_yield_to_narrow_windows() {

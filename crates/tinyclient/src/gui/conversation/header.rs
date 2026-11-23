@@ -257,6 +257,7 @@ impl Shell {
                     .gap(px(8.))
                     .children(mixed.then(|| div().flex_none().self_center().mr(px(-2.)).child(network_icon(open.key.network, 14.))))
                     .child(title)
+                    .children(self.discord_account_label(&open.key).map(|name| div().flex_none().type_small().text_color(theme::text_faint()).child(name)))
                     .children(mark(open))
                     .children(role.map(|role| role_chip(&role.name, role.color)))
                     .children(self.encryption_chip(open, cx))
@@ -270,6 +271,19 @@ impl Shell {
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
             .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).child(search).children(members).children(details).child(windowed))
+    }
+
+    /// The Discord account's name, when two Discord accounts are signed in.
+    fn discord_account_label(&self, key: &Key) -> Option<String> {
+        if key.network != Network::Discord {
+            return None;
+        }
+        let snapshot = self.snapshot.as_ref()?;
+        let signed: Vec<_> = snapshot.accounts.iter().filter(|account| account.key.network == Network::Discord && account.link != Link::SignedOut).collect();
+        if signed.len() < 2 {
+            return None;
+        }
+        signed.iter().find(|account| account.key == key.account()).and_then(|account| (!account.name.is_empty()).then(|| account.name.clone()))
     }
 
     /// Follow button in the header strip for Discord announcement channels.

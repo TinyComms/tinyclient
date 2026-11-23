@@ -108,7 +108,7 @@ Signing out of one account removes that account's session material and its rows.
 | 17 | P1 | I can see how much disk tinyclient uses and clear it without signing out. | Size shown matches the data dir within 5%; after Clear, sessions remain and the list refills from the network. |
 | 18 | P1 | tinyclient updates itself. | An older build offers the new version and relaunches into it with sessions intact. `G4` looks at GitHub's public latest release. |
 | 19 | P1 | I add a Slack workspace that was not in my browser session. | "Add workspace" yields one more Slack account; existing ones do not reconnect. |
-| 20 | P2 | I use two Discord or Telegram accounts, or a Teams account that is a guest in other tenants. | Not in this commit for Discord or Telegram: the keychain item is one per network. Slack workspaces and Tiny servers are the multiple accounts that exist. Teams guest tenants were not re-tested. |
+| 20 | P2 | I use two Discord accounts, or two Telegram accounts, or a Teams account that is a guest in other tenants. | Two Discord accounts stay signed in together; signing out of one leaves the other connected. Each has its own row. Telegram already keeps several accounts in one keychain item. Entra guest verification is separate. |
 | cut | | Creating an account on any network; pasting a token; importing a session from Chrome or the official app; a risk-acknowledgement screen (the README carries it). | |
 
 ## Session lifetime

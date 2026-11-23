@@ -56,16 +56,22 @@ fn navigate(seen: &Mutex<Seen>, url: &str, teams: bool) -> Navigation {
 /// Signs in to `network` (`discord`, `slack`, `teams`) in the platform's web view.
 /// `open` is a Slack workspace address to show instead of the usual sign-in page.
 pub fn sign_in(provider: &dyn WebSignIn, network: &str, open: Option<&str>) -> Result<String, i32> {
-    if let Some(url) = open {
-        if network != "slack" || !slack_page(url) {
-            return Err(USAGE);
-        }
-    }
+    sign_in_in(provider, network, open, network)
+}
+
+/// As [`sign_in`], with `store` naming the web view's persistent data. A second Discord account
+/// passes a fresh store so it does not reuse the first account's cookies.
+pub fn sign_in_in(provider: &dyn WebSignIn, network: &str, open: Option<&str>, store: &str) -> Result<String, i32> {
     let flow = match network {
         "teams" => Some(Flow::new()?),
         "discord" | "slack" => None,
         _ => return Err(USAGE),
     };
+    if let Some(url) = open {
+        if network != "slack" || !slack_page(url) {
+            return Err(USAGE);
+        }
+    }
     let site = match network {
         "slack" => SLACK,
         "discord" => DISCORD,
@@ -76,7 +82,7 @@ pub fn sign_in(provider: &dyn WebSignIn, network: &str, open: Option<&str>) -> R
     let seen = Arc::new(Mutex::new(Seen::default()));
     let teams = flow.is_some();
     let page = WebPage {
-        network: network.to_owned(),
+        network: store.to_owned(),
         title: site.title.to_owned(),
         url: start,
         user_agent: agent.clone(),

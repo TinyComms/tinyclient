@@ -15,7 +15,7 @@
 //! Nothing here acts for the user unasked. A friend request is answered, a presence set, a
 //! message edited, deleted or reacted to only by the command the shell's request became.
 
-mod discord;
+pub(crate) mod discord;
 pub mod parity;
 
 /// `TINYCLIENT_PROVE=discord-nitro-length`. Nitro's 4,000-character limit, shared by every send path.

@@ -59,6 +59,7 @@ fn main() {
         messages::cleanup_worker(&args);
         return;
     }
+    let fresh = args.iter().any(|arg| arg == "--fresh");
     let network = match args.first().map(String::as_str) {
         Some("slack") => "slack",
         Some("discord") => "discord",
@@ -94,8 +95,9 @@ fn main() {
         tracing::warn!("tinyclient-login: {why}");
         std::process::exit(USAGE);
     });
+    let store = if fresh { format!("{network}-fresh-{}", std::process::id()) } else { network.to_owned() };
     #[cfg(target_os = "macos")]
-    macos::run(site, at, start.as_deref());
+    macos::run(site, at, start.as_deref(), fresh);
     #[cfg(not(target_os = "macos"))]
-    desktop::run(site, at, network, start.as_deref());
+    desktop::run(site, at, &store, start.as_deref());
 }
