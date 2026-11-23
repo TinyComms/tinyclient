@@ -32,6 +32,7 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+      - path: ShareSupport
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.tinyclient.app
@@ -74,6 +75,29 @@ targets:
       - sdk: LocalAuthentication.framework
       - target: Broadcast
         embed: true
+      - target: Share
+        embed: true
+  Share:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Share
+        excludes:
+          - Info.plist
+          - Share.entitlements
+      - path: ShareSupport
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.tinyclient.app.share
+        PRODUCT_NAME: Share
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Share/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Share/Share.entitlements
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - sdk: Social.framework
   Broadcast:
     type: app-extension
     platform: iOS
@@ -102,6 +126,7 @@ schemes:
       targets:
         Tiny: all
         Broadcast: all
+        Share: all
     run:
       config: Debug
     archive:

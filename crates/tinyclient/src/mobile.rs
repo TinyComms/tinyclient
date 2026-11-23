@@ -15,7 +15,7 @@
 //! formats) is in `docs/mobile-platform.md` and on the traits themselves.
 
 #[cfg(target_os = "android")]
-mod android;
+pub(crate) mod android;
 
 #[cfg(not(target_os = "android"))]
 use mediad::platform::{CameraRequest, EncoderConfig, FrameSink, H264Decoder, H264Encoder, Permission, Platform};

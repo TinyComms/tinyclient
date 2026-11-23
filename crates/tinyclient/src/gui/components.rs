@@ -307,7 +307,7 @@ fn list_row_in(
     // The face must be stateful: GPUI only keeps `hover_state` and notifies on enter/leave when
     // the hovered element has an id. Hover on an anonymous child painted the fill only when
     // something else happened to redraw, so the highlight lagged and skipped rows (R18).
-    let face = face.id("row-face");
+    let face = face.id("row-face").group("list-row");
     if phone && !selected {
         row.child(face.active(|style| style.bg(theme::pressed())))
     } else if !selected {
@@ -388,7 +388,7 @@ fn opaque(fill: Rgba) -> Rgba {
     theme::over(fill, theme::canvas())
 }
 
-fn button_shell(label: impl Into<SharedString>) -> Div {
+fn button_box() -> Div {
     div()
         .flex_none()
         .h(px(theme::CONTROL))
@@ -400,12 +400,14 @@ fn button_shell(label: impl Into<SharedString>) -> Div {
         .gap(px(6.))
         .type_ui()
         .font_weight(theme::MEDIUM)
-        .child(label.into())
 }
 
-/// A 28 pt button. `.h(px(24.))` makes it small, `.h(px(32.))` a dialog's main action.
-pub fn button(id: impl Into<ElementId>, kind: ButtonKind, label: impl Into<SharedString>) -> Stateful<Div> {
-    let shell = button_shell(label).id(id).cursor_pointer().tab_index(0);
+fn button_shell(label: impl IntoElement) -> Div {
+    button_box().child(label)
+}
+
+fn button_styled(id: impl Into<ElementId>, kind: ButtonKind, label: SharedString, shell: Div) -> Stateful<Div> {
+    let shell = shell.id(id).role(gpui::Role::Button).aria_label(label).cursor_pointer().tab_index(0);
     match kind {
         ButtonKind::Primary => shell
             .bg(theme::accent())
@@ -427,12 +429,19 @@ pub fn button(id: impl Into<ElementId>, kind: ButtonKind, label: impl Into<Share
             .active(|style| style.bg(theme::selected()))
             .focus_visible(|style| style.bg(opaque(theme::hover())).shadow(theme::focus_ring())),
         ButtonKind::Danger => shell
+            .group("danger-btn")
             .bg(theme::danger_soft())
             .text_color(theme::danger())
             .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
             .active(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
             .focus_visible(|style| style.bg(opaque(theme::danger_soft())).shadow(theme::focus_ring())),
     }
+}
+
+/// A 28 pt button. `.h(px(24.))` makes it small, `.h(px(32.))` a dialog's main action.
+pub fn button(id: impl Into<ElementId>, kind: ButtonKind, label: impl Into<SharedString>) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    button_styled(id, kind, label.clone(), button_shell(label))
 }
 
 /// A button led by a 16 pt glyph: 10 on the icon side, 12 on the text side.
@@ -442,24 +451,46 @@ pub fn button_with_icon(
     icon: &'static str,
     label: impl Into<SharedString>,
 ) -> Stateful<Div> {
-    let color = match kind {
-        ButtonKind::Primary => theme::on_accent(),
-        ButtonKind::Danger => theme::danger(),
-        ButtonKind::Secondary | ButtonKind::Ghost => theme::text_soft(),
+    let icon_el: gpui::AnyElement = match kind {
+        ButtonKind::Danger => div()
+            .relative()
+            .size(px(16.))
+            .flex_none()
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .group_hover("danger-btn", |s| s.opacity(0.))
+                    .child(glyph(icon, 16., theme::danger())),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(0.)
+                    .group_hover("danger-btn", |s| s.opacity(1.))
+                    .child(glyph(icon, 16., theme::on_accent())),
+            )
+            .into_any_element(),
+        ButtonKind::Primary => glyph(icon, 16., theme::on_accent()).into_any_element(),
+        ButtonKind::Secondary | ButtonKind::Ghost => glyph(icon, 16., theme::text_soft()).into_any_element(),
     };
     let label: SharedString = label.into();
-    button(id, kind, "").pl(px(10.)).child(glyph(icon, 16., color)).child(label)
+    button_styled(id, kind, label.clone(), button_box().pl(px(10.)).child(icon_el).child(label))
 }
 
 /// Disabled, and also busy: a busy button says so in words ("Sending…") in this look.
 pub fn button_disabled(label: impl Into<SharedString>) -> Div {
-    button_shell(label).bg(theme::hover()).text_color(theme::text_disabled())
+    let label = label.into();
+    button_shell(div().id(label.clone()).role(gpui::Role::Button).aria_label(label.clone()).aria_disabled(true).child(label))
+        .bg(theme::hover()).text_color(theme::text_disabled())
 }
 
 /// A 28 pt square holding a 16 pt glyph; `.size(px(24.))` in a toolbar. Give it a tooltip.
 pub fn icon_button(id: impl Into<ElementId>, icon: &'static str, toggled: bool) -> Stateful<Div> {
     div()
         .id(id)
+        .role(gpui::Role::Button)
         .flex_none()
         .size(px(theme::CONTROL))
         .rounded(px(theme::R_CONTROL))

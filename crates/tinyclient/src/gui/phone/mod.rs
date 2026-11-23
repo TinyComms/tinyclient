@@ -6,6 +6,8 @@
 
 pub mod conversation;
 pub mod tokens;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+mod sharing;
 
 use crate::gui::components::{fade_in, icon_button, scrim};
 use crate::gui::state::{Shell, Snapshot};
@@ -125,6 +127,10 @@ pub fn token(parts: &[&str]) -> u64 {
 
 #[derive(Default)]
 pub struct State {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    share: Option<sharing::State>,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    share_epoch: u64,
     /// Where a left-edge drag began, for the back gesture.
     edge: Option<f32>,
     /// A press on a row that has not yet been released: it acts only if it ends where it began.
@@ -381,6 +387,10 @@ impl Shell {
     /// then up out of a Space or a drilled list. False at the home's root, where the
     /// platform's own back leaves the app.
     pub(in crate::gui) fn phone_back(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) -> bool {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        if self.dismiss_phone_share(cx) {
+            return true;
+        }
         if !active() {
             return false;
         }

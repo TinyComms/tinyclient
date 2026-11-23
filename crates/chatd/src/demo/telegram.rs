@@ -15,6 +15,8 @@ pub const ME: &str = "u7000000";
 pub const SERVICE: &str = "u777000";
 pub const CHANNEL: &str = "c9001";
 pub const FORUM: &str = "c9100";
+pub(super) const FERRY_ORIGINAL: &str = "Cambió el horario del ferry. Ahora salimos a las 7:40.";
+pub(super) const FERRY_ENGLISH: &str = "The ferry schedule changed. We leave at 7:40 now.";
 /// Telegram's own reaction emoji, as `messages.getAvailableReactions` lists them for an account
 /// without Premium: the only ones a chat can allow.
 pub const REACTIONS: &[&str] = &[
@@ -117,7 +119,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     let (ines, said) = talk(s, direct(&cast[INES], Filing { pin: Some(1), folders: folders(&["work"]), ..Filing::default() }), &[
         (usize::MAX, 600, "Did the herbarium send the scans?"),
         (INES, 40, "They did. Uploading them tonight."),
-        (INES, 38, "Also: are you in for Sunday?"),
+        (INES, 38, FERRY_ORIGINAL),
     ])?;
     s.counts(&ines, 2, 0, Some(&said[0]))?;
     // A voice note between the two, as Telegram sends one: Ogg Opus with its waveform.

@@ -73,11 +73,13 @@ fn control(id: &'static str, icon: &'static str, look: Look, enabled: bool) -> S
     div()
         .id(id)
         .group(id)
+        .role(gpui::Role::Button)
+        .aria_disabled(!enabled)
         .flex_none()
         .w(px(40.))
         .h(px(32.))
         .rounded(px(8.))
-        .tab_index(0)
+        .when(enabled, |control| control.tab_index(0))
         .focus_visible(|style| style.shadow(theme::focus_ring()))
         .bg(fill)
         .text_color(color)
@@ -105,6 +107,8 @@ fn leave() -> Stateful<Div> {
     let id = "call-leave";
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label("Leave call")
         .group(id)
         .flex_none()
         .w(px(48.))
@@ -128,6 +132,8 @@ fn worded(id: &'static str, icon: Option<&'static str>, word: &'static str, fill
     let lit = (color == theme::danger()).then(|| (id, theme::on_accent()));
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(word)
         .group(id)
         .h(px(32.))
         .px(px(14.))
@@ -427,7 +433,7 @@ impl Shell {
                 .border_t_1()
                 .border_color(theme::hairline())
                 .children(dock_picture)
-                .child(card),
+                .child(div().id("call-controls").role(gpui::Role::Group).aria_label("Call controls").child(card)),
         )
     }
 
@@ -1280,6 +1286,7 @@ impl Shell {
             if off { Look::Off } else { Look::Rest },
             mute_enabled,
         )
+        .aria_label(mute_tip)
         .tooltip(tip(mute_tip, mute_enabled.then_some("⌘⇧M")))
         .when(mute_enabled, |mute| {
             mute.on_click(cx.listener(|this, _, _, cx| {
@@ -1319,6 +1326,7 @@ impl Shell {
             if deafen_off { Look::Off } else { Look::Rest },
             deafen_enabled,
         )
+        .aria_label(deafen_tip)
         .tooltip(tip(deafen_tip, deafen_enabled.then_some("⌘⇧D")))
         .when(deafen_enabled, |deafen| {
             deafen.on_click(cx.listener(|this, _, _, cx| {
@@ -1336,6 +1344,7 @@ impl Shell {
                 if share_on { Look::On } else { Look::Rest },
                 enabled,
             )
+            .aria_label(if share_on { "Stop sharing" } else { "Share your screen" })
             .when(enabled, |share| {
                 share
                     .tooltip(tip(
@@ -1370,6 +1379,7 @@ impl Shell {
                 },
                 enabled,
             )
+            .aria_label(if camera_on { "Turn camera off" } else { "Turn camera on" })
             .when(enabled, |camera| {
                 camera
                     .tooltip(tip(
@@ -1393,6 +1403,7 @@ impl Shell {
             && alone.is_some())
         .then(|| {
             control("call-ring-again", "icons/phone-outgoing.svg", Look::Rest, true)
+                .aria_label("Ring again")
                 .tooltip(tip("Ring again", None))
                 .on_click(cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
@@ -1413,6 +1424,7 @@ impl Shell {
                 if menu == Some(Menu::AddPeople) { Look::Open } else { Look::Rest },
                 true,
             )
+            .aria_label("Add people")
             .tooltip(tip("Add people", None))
             .on_click(cx.listener({
                 let picker = picker;
@@ -1436,6 +1448,7 @@ impl Shell {
             },
             enabled,
         )
+        .aria_label("Devices")
         .when(enabled, |devices| {
             devices
                 .tooltip(tip("Devices", None))

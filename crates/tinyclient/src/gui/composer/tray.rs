@@ -11,8 +11,8 @@ use crate::gui::anim::{self, Play};
 use crate::gui::input::{InputEvent, InputKey, TextInput};
 use gpui::{anchored, deferred, Anchor, div, point, prelude::*, px, rgba, AnyElement, Context, Div, Focusable, MouseButton, ObjectFit, Rgba, Window};
 
-const THUMB: f32 = 64.;
-const CONTROL: f32 = 20.;
+const THUMB: f32 = 72.;
+const CONTROL: f32 = 18.;
 
 /// Black at 45% over a picture being uploaded or marked spoiler, and 60% under a tag.
 fn media_dim() -> Rgba {
@@ -50,6 +50,9 @@ fn file_icon(kind: Kind) -> &'static str {
 fn corner(id: (&'static str, u64), icon: &'static str) -> gpui::Stateful<Div> {
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .tab_index(0)
+        .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
         .size(px(CONTROL))
         .flex_none()
         .rounded(px(theme::R_CONTROL))
@@ -63,6 +66,24 @@ fn corner(id: (&'static str, u64), icon: &'static str) -> gpui::Stateful<Div> {
         .hover(|style| style.bg(theme::tooltip()))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(glyph(icon, 12., theme::text_soft()))
+}
+
+fn file_tag(words: &'static str) -> Div {
+    div()
+        .flex_none()
+        .h(px(16.))
+        .px(px(5.))
+        .rounded(px(theme::R_CHIP))
+        .bg(theme::selected())
+        .border_1()
+        .border_color(theme::hairline())
+        .flex()
+        .items_center()
+        .text_size(theme::sized(11.))
+        .line_height(theme::line(14.))
+        .font_weight(theme::MEDIUM)
+        .text_color(theme::text_soft())
+        .child(words)
 }
 
 fn tag(words: &'static str) -> Div {
@@ -114,7 +135,7 @@ impl Composer {
         let (can, network) = self.target.as_ref().map(|target| (target.can, target.key.network))?;
         let edge = (THUMB * window.scale_factor()).ceil() as u32;
         let chips: Vec<Staged> = self.tray.clone();
-        let mut row = div().id("tray").px(px(8.)).pt(px(8.)).flex().gap(px(8.)).overflow_x_scroll();
+        let mut row = div().id("tray").px(px(8.)).py(px(8.)).flex().gap(px(8.)).overflow_x_scroll();
         for chip in chips {
             let options = attach::options(&chip, &can, network);
             let picture = match (&chip.converted, chip.pictured()) {
@@ -130,20 +151,28 @@ impl Composer {
             };
             row = row.child(element);
         }
-        Some(div().child(crate::gui::components::scroll::scroll_content("tray-scroll-frame", row.pb(px(16.)))).children(self.alt_row(window, cx)))
+        Some(
+            div()
+                .border_b_1()
+                .border_color(theme::hairline())
+                .child(crate::gui::components::scroll::scroll_content("tray-scroll-frame", row))
+                .children(self.alt_row(window, cx)),
+        )
     }
 
     fn chip_controls(&self, chip: &Staged, options: Options, cx: &mut Context<Self>) -> Div {
         let id = chip.id;
-        let remove = corner(("chip-remove", id), "icons/x.svg").on_click(cx.listener(move |this, _, _, cx| this.remove_chip(id, cx)));
+        let remove = corner(("chip-remove", id), "icons/x.svg")
+            .aria_label(format!("Remove {}", chip.name))
+            .on_click(cx.listener(move |this, _, _, cx| this.remove_chip(id, cx)));
         div()
             .absolute()
             .top(px(4.))
             .right(px(4.))
             .flex()
-            .gap(px(4.))
+            .gap(px(3.))
             .when(options.any(), |controls| {
-                controls.child(corner(("chip-options", id), "icons/ellipsis.svg").on_click(cx.listener(move |this, _, _, cx| {
+                controls.child(corner(("chip-options", id), "icons/ellipsis.svg").aria_label(format!("Options for {}", chip.name)).on_click(cx.listener(move |this, _, _, cx| {
                     this.chip_menu = if this.chip_menu == Some(id) { None } else { Some(id) };
                     cx.notify();
                 })))
@@ -153,12 +182,14 @@ impl Composer {
 
     fn picture_chip(&self, chip: &Staged, picture: Picture, options: Options, cx: &mut Context<Self>) -> AnyElement {
         let shown = match picture {
-            Picture::Ready(image) => div().size(px(THUMB)).child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)).into_any_element(),
+            Picture::Ready(image) => div().size(px(THUMB)).child(anim::picture(image, ObjectFit::Cover, 0., Play::Inline)).into_any_element(),
             _ => div().size(px(THUMB)).bg(theme::raised()).into_any_element(),
         };
         let tags = tags(chip);
         div()
             .id(("chip", chip.id))
+            .role(gpui::Role::Group)
+            .aria_label(format!("Attachment: {}", chip.name))
             .relative()
             .flex_none()
             .size(px(THUMB))
@@ -234,6 +265,8 @@ impl Composer {
         let tags = tags(chip);
         div()
             .id(("chip", chip.id))
+            .role(gpui::Role::Group)
+            .aria_label(format!("Attachment: {}", chip.name))
             .relative()
             .flex_none()
             .h(px(THUMB))
@@ -262,9 +295,16 @@ impl Composer {
                     } else {
                         middle(&chip.name, 24)
                     }))
-                    .child(div().truncate().type_small().text_color(if chip.refused.is_some() { theme::danger() } else { theme::text_soft() }).child(second)),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(div().min_w_0().truncate().type_small().text_color(if chip.refused.is_some() { theme::danger() } else { theme::text_soft() }).child(second))
+                            .children(tags.into_iter().map(file_tag)),
+                    ),
             )
-            .when(!tags.is_empty(), |chip| chip.child(div().absolute().left(px(4.)).bottom(px(4.)).flex().gap(px(2.)).children(tags.into_iter().map(tag))))
             .child(self.chip_controls(chip, options, cx))
             .children(self.chip_menu_layer(chip, options, cx))
             .into_any_element()

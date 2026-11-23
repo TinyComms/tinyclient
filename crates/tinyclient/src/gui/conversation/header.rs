@@ -83,6 +83,7 @@ impl Shell {
         let room = self.conversation_room();
         let compact = room > 0. && room < 600.;
         let search = icon_button("search", "icons/search.svg", self.pane_shows(|layer| matches!(layer, Layer::Search)))
+            .aria_label("Search in conversation")
             .tooltip(tip("Search in conversation", Some("⌘F")))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_conversation_search(window, cx)));
@@ -97,6 +98,7 @@ impl Shell {
             && matches!(open.kind, ConversationKind::Channel | ConversationKind::Announcement))
         .then(|| {
             icon_button("channel-threads", "icons/messages-square.svg", self.pane_shows(|layer| matches!(layer, Layer::Threads(_))))
+                .aria_label("Threads")
                 .tooltip(tip("Threads", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_channel_threads(cx)))
@@ -106,6 +108,7 @@ impl Shell {
             && (open.rights.manage_threads || open.rights.rename))
         .then(|| {
             icon_button("thread-settings", "icons/pencil.svg", false)
+                .aria_label("Thread settings")
                 .tooltip(tip("Thread settings", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.composer_toggle_thread_settings(cx)))
@@ -116,6 +119,10 @@ impl Shell {
             let label = if joined { "Leave thread" } else { "Join thread" };
             div()
                 .id("thread-follow-toggle")
+                .role(gpui::Role::Button)
+                .aria_label(label)
+                .tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                 .h(px(26.))
                 .px(px(8.))
                 .rounded(px(theme::R_CONTROL))
@@ -134,6 +141,7 @@ impl Shell {
         let setup = (open.key.network == Network::Discord && open.space.is_some()).then(|| {
             let space = Key { id: open.space.clone().unwrap_or_default(), ..open.key.clone() };
             icon_button("server-setup", "icons/list.svg", false)
+                .aria_label("Server setup")
                 .tooltip(tip("Server setup", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| this.open_server_gate(space.clone(), cx)))
@@ -149,6 +157,9 @@ impl Shell {
         });
         let travel = |id: &'static str, glyph: &'static str, back: bool, can: bool, words: &'static str, keys: &'static str| {
             icon_button(id, glyph, false)
+                .aria_label(words)
+                .aria_disabled(!can)
+                .tab_stop(can)
                 .size(px(24.))
                 .when(!can, |button| button.opacity(0.35).cursor_default())
                 .tooltip(tip(words, Some(keys)))
@@ -165,6 +176,7 @@ impl Shell {
         // values of one switch; beside a direct conversation Details is the other person.
         let members = (!direct && !teams_channel).then(|| {
             icon_button("members", "icons/users.svg", self.pane_shows(|layer| matches!(layer, Layer::Members(_))))
+                .aria_label("Members")
                 .tooltip(tip("Members", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_member_list(cx)))
@@ -173,12 +185,14 @@ impl Shell {
         // is the way to the person, a link that opens their profile, so no button is drawn there.
         let details = (!direct).then(|| {
             icon_button("details", "icons/info.svg", self.pane_shows(|layer| matches!(layer, Layer::Details(_))))
+                .aria_label("Details")
                 .tooltip(tip("Details", Some("⌘.")))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
         });
         let pop_key = open.key.clone();
         let windowed = icon_button("pop-out-conversation", "icons/picture-in-picture-2.svg", false)
+            .aria_label("Open in New Window")
             .tooltip(tip("Open in New Window", None))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| this.pop_out_conversation(pop_key.clone(), cx)));
@@ -187,6 +201,8 @@ impl Shell {
         let title_tip = if direct { "Open profile".to_owned() } else { open.title.clone() };
         let title = div()
             .id("conversation-title")
+            .role(if direct { gpui::Role::Button } else { gpui::Role::Heading })
+            .aria_label(if direct { format!("Open profile for {}", open.title) } else { open.title.clone() })
             .flex_initial()
             .min_w(title_floor(&open.title, window))
             .truncate()
@@ -196,6 +212,8 @@ impl Shell {
             .child(open.title.clone());
         let title = if direct {
             title
+                .tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                 .cursor_pointer()
                 .hover(|style| style.underline())
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -357,23 +375,31 @@ impl Shell {
     fn disappearing_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
         let secs = open.disappearing.filter(|&s| s > 0)?;
         let label = protocol::format_disappearing(secs);
+        let tip_words = if open.key.network == Network::Telegram {
+            format!("Auto-delete: {label} · Click to manage")
+        } else {
+            format!("Disappearing messages: {label} · Click to manage")
+        };
         Some(
             div()
                 .id("conversation-disappearing")
                 .flex_none()
                 .self_center()
-                .h(px(18.))
-                .px(px(6.))
-                .rounded(px(999.))
-                .bg(theme::raised())
+                .h(px(20.))
+                .px(px(7.))
+                .rounded_full()
+                .bg(theme::hover())
+                .border_1()
+                .border_color(theme::hairline())
                 .flex()
                 .items_center()
                 .gap(px(4.))
                 .cursor_pointer()
-                .type_small()
+                .type_micro()
+                .font_weight(theme::MEDIUM)
                 .text_color(theme::text_soft())
-                .hover(|style| style.text_color(theme::text()))
-                .tooltip(tip(format!("Disappearing messages: {label}"), None))
+                .hover(|style| style.bg(theme::selected()).border_color(theme::border()).text_color(theme::text()))
+                .tooltip(tip(tip_words, None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
                 .child(glyph("icons/clock.svg", 12., theme::text_soft()))
@@ -483,7 +509,7 @@ fn person_line(line: &crate::gui::people::PeerLine) -> Div {
 
 /// The other person's role on this server. One chip, the most senior. No email.
 fn role_chip(name: &str, color: Option<u32>) -> Div {
-    let tone = color.map(gpui::rgb).unwrap_or(theme::text_soft());
+    let tone = color.map(theme::role_color).unwrap_or(theme::text_soft());
     div()
         .flex_none()
         .self_center()

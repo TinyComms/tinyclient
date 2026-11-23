@@ -56,8 +56,14 @@ impl Shell {
         let call_here = matches!(mode, Mode::Network(net) if self.snapshot.as_ref().and_then(|s| s.call.as_ref()).is_some_and(|c| c.conversation.network == net && matches!(c.state, protocol::CallState::Joined | protocol::CallState::Reconnecting)));
         let phone = super::phone::active();
         const KEYS: [&str; 9] = ["⌘1", "⌘2", "⌘3", "⌘4", "⌘5", "⌘6", "⌘7", "⌘8", "⌘9"];
+        let label = format!("{name}{}", waiting(attention, unread));
         div()
             .id(id)
+            .role(gpui::Role::Button)
+            .aria_label(label.clone())
+            .when(lit, |row| row.aria_description("Current place"))
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .relative()
             .size(px(44.))
             .flex_none()
@@ -69,7 +75,7 @@ impl Shell {
             .when(lit, |button| button.bg(theme::selected()))
             .when(!lit && !phone, |button| button.hover(|style| style.bg(theme::hover())))
             .when(phone, |button| button.active(|style| style.bg(theme::pressed())))
-            .tooltip(tip(format!("{name}{}", waiting(attention, unread)), KEYS.get(place).copied()))
+            .tooltip(tip(label, KEYS.get(place).copied()))
             .on_click(cx.listener(move |this, _, window, cx| this.visit(mode.clone(), window, cx)))
             .child(div().when(faint, |content| content.opacity(0.4)).child(content))
             .children(rail_badge(attention, unread, mention, counted))
@@ -102,7 +108,7 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn rail(&self, snapshot: &Snapshot, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+    pub(super) fn rail(&self, snapshot: &Snapshot, _window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let mode = &self.sidebar_state.mode;
         let tint = |lit: bool| if lit { theme::text() } else { theme::text_soft() };
         let rule = || div().w(px(28.)).flex_none().child(divider());
@@ -209,6 +215,11 @@ impl Shell {
             let lit = matches!((&self.layout_state.menu, &menu), (Some(Menu::Add), Menu::Add) | (Some(Menu::Own), Menu::Own));
             div()
                 .id(id)
+                .role(gpui::Role::Button)
+                .aria_label(words)
+                .aria_expanded(lit)
+                .tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                 .size(px(44.))
                 .flex_none()
                 .rounded(px(theme::R_FLOAT))
@@ -224,6 +235,9 @@ impl Shell {
         };
 
         div()
+            .id("places")
+            .role(gpui::Role::Navigation)
+            .aria_label("Places")
             .w(px(rail_width()))
             .h_full()
             .flex_none()
@@ -278,6 +292,10 @@ impl Shell {
     fn settings_cog(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
             .id("rail-settings")
+            .role(gpui::Role::Button)
+            .aria_label("Settings")
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .absolute()
             .bottom(px(1.))
             .left(px(1.))

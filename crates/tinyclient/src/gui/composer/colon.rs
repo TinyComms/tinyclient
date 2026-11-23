@@ -66,7 +66,7 @@ pub fn draw(
     mut custom_image: impl FnMut(&Custom) -> Option<Arc<RenderImage>>,
     pick: impl Fn(usize, &mut Window, &mut App) + Clone + 'static,
 ) -> Div {
-    menu().w(px(WIDTH)).max_w(px(WIDTH)).children(list.cells.iter().enumerate().map(|(ix, cell)| {
+    menu().w_full().max_w(px(WIDTH)).children(list.cells.iter().enumerate().map(|(ix, cell)| {
         let custom = match cell {
             Cell::Custom(at) => customs.get(*at as usize),
             _ => None,
@@ -79,6 +79,7 @@ pub fn draw(
             None => div().w(px(22.)).text_size(px(18.)).line_height(px(22.)).child(emoji::text_of(cell, tone, customs)).into_any_element(),
         };
         let pick = pick.clone();
+        let selected = ix == list.selected;
         div()
             .id(("colon", ix))
             .h(px(ROW))
@@ -88,11 +89,12 @@ pub fn draw(
             .items_center()
             .gap(px(8.))
             .cursor_pointer()
-            .when(ix == list.selected, |row| row.bg(theme::selected()))
-            .hover(|style| style.bg(theme::hover()))
+            .when(selected, |row| row.bg(theme::selected()))
+            .when(!selected, |row| row.hover(|style| style.bg(theme::hover())))
             // Mouse-down, so the field keeps its focus and caret.
             .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
+                window.prevent_default();
                 pick(ix, window, cx);
             })
             .child(face)

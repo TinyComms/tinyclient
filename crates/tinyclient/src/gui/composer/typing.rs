@@ -11,36 +11,38 @@ use protocol::{Compose, Key, Typist};
 use std::time::{Duration, Instant};
 
 /// The slot is always this tall, so messages never move when someone starts typing.
-pub const HEIGHT: f32 = 20.;
-const STEP: Duration = Duration::from_millis(400);
+pub const HEIGHT: f32 = 24.;
+const STEP: Duration = Duration::from_millis(180);
 /// After this long of unbroken typing the dots hold still.
 const MOVING: Duration = Duration::from_secs(30);
 
 /// Present-participle phrasing for one activity: `(singular, plural, bare direct preview)`.
+/// The row verbs omit trailing ellipses because animated dots precede the text; sidebar/header
+/// previews keep the ellipsis.
 fn activity_verbs(activity: Compose) -> (&'static str, &'static str, &'static str) {
     match activity {
-        Compose::Typing | Compose::Cancel => (" is typing…", " are typing…", "typing…"),
+        Compose::Typing | Compose::Cancel => (" is typing", " are typing", "typing…"),
         Compose::RecordingVoice => (
-            " is recording a voice message…",
-            " are recording voice messages…",
+            " is recording a voice message",
+            " are recording voice messages",
             "recording a voice message…",
         ),
         Compose::RecordingVideo => (
-            " is recording a video message…",
-            " are recording video messages…",
+            " is recording a video message",
+            " are recording video messages",
             "recording a video message…",
         ),
-        Compose::UploadingPhoto => (" is sending a photo…", " are sending photos…", "sending a photo…"),
-        Compose::UploadingVideo => (" is sending a video…", " are sending videos…", "sending a video…"),
+        Compose::UploadingPhoto => (" is sending a photo", " are sending photos", "sending a photo…"),
+        Compose::UploadingVideo => (" is sending a video", " are sending videos", "sending a video…"),
         Compose::UploadingAudio => (
-            " is sending a voice message…",
-            " are sending voice messages…",
+            " is sending a voice message",
+            " are sending voice messages",
             "sending a voice message…",
         ),
-        Compose::UploadingFile => (" is sending a file…", " are sending files…", "sending a file…"),
-        Compose::ChoosingSticker => (" is choosing a sticker…", " are choosing stickers…", "choosing a sticker…"),
-        Compose::PlayingGame => (" is playing a game…", " are playing a game…", "playing a game…"),
-        Compose::Speaking => (" is speaking…", " are speaking…", "speaking…"),
+        Compose::UploadingFile => (" is sending a file", " are sending files", "sending a file…"),
+        Compose::ChoosingSticker => (" is choosing a sticker", " are choosing stickers", "choosing a sticker…"),
+        Compose::PlayingGame => (" is playing a game", " are playing a game", "playing a game…"),
+        Compose::Speaking => (" is speaking", " are speaking", "speaking…"),
     }
 }
 
@@ -55,7 +57,7 @@ pub fn wording_for(typists: &[Typist]) -> Option<(String, &'static str)> {
             let verb = if one.activity == two.activity {
                 activity_verbs(one.activity).1
             } else {
-                " are typing…"
+                " are typing"
             };
             Some((format!("{} and {}", one.name, two.name), verb))
         }
@@ -64,7 +66,7 @@ pub fn wording_for(typists: &[Typist]) -> Option<(String, &'static str)> {
             let verb = if many.iter().all(|t| t.activity == first) {
                 activity_verbs(first).1
             } else {
-                " are typing…"
+                " are typing"
             };
             Some(("Several people".to_owned(), verb))
         }
@@ -79,7 +81,7 @@ pub fn preview_for(typists: &[Typist], group: bool) -> Option<String> {
         ([], _) => None,
         ([one], false) => Some(activity_verbs(one.activity).2.to_owned()),
         (_, false) => Some(activity_verbs(active[0].activity).2.to_owned()),
-        (_, true) => wording_for(typists).map(|(names, rest)| format!("{names}{rest}")),
+        (_, true) => wording_for(typists).map(|(names, rest)| format!("{names}{rest}…")),
     }
 }
 
@@ -88,9 +90,9 @@ pub fn preview_for(typists: &[Typist], group: bool) -> Option<String> {
 pub fn wording(names: &[&str]) -> Option<(String, &'static str)> {
     match names {
         [] => None,
-        [one] => Some(((*one).to_owned(), " is typing…")),
-        [one, two] => Some((format!("{one} and {two}"), " are typing…")),
-        _ => Some(("Several people".to_owned(), " are typing…")),
+        [one] => Some(((*one).to_owned(), " is typing")),
+        [one, two] => Some((format!("{one} and {two}"), " are typing")),
+        _ => Some(("Several people".to_owned(), " are typing")),
     }
 }
 
@@ -101,7 +103,7 @@ pub fn preview(names: &[&str], group: bool) -> Option<String> {
     match (names, group) {
         ([], _) => None,
         (_, false) => Some("typing…".to_owned()),
-        (names, true) => wording(names).map(|(names, rest)| format!("{names}{rest}")),
+        (names, true) => wording(names).map(|(names, rest)| format!("{names}{rest}…")),
     }
 }
 
@@ -200,7 +202,7 @@ impl TypingRow {
                 cx.background_executor().timer(wait).await;
                 let stepped = this.update(cx, |this, cx| {
                     if this.epoch == epoch {
-                        this.step = (this.step + 1) % 3;
+                        this.step = (this.step + 1) % 6;
                         cx.notify();
                     }
                 });
@@ -222,21 +224,32 @@ impl TypingRow {
 
     fn dots(&self) -> Div {
         let moving = self.moving();
-        let lit = self.step as usize;
+        let phase = self.step as usize;
+        // A 6-step wave across 3 dots: peak lifts 1.5px and brightens, adjacent steps ease smoothly.
         div()
             .w(px(18.))
-            .h(px(6.))
+            .h(px(10.))
             .flex_none()
             .flex()
             .items_center()
             .gap(px(3.))
             .children((0..3).map(|dot| {
-                let opacity = match (moving, dot == lit) {
-                    (false, _) => 0.6,
-                    (true, true) => 1.,
-                    (true, false) => 0.35,
+                let (opacity, lift) = if !moving {
+                    (0.55, 0.)
+                } else {
+                    let dist = (phase + 6 - dot * 2) % 6;
+                    match dist {
+                        0 => (1.0, -1.5),
+                        1 | 5 => (0.65, -0.5),
+                        _ => (0.3, 0.),
+                    }
                 };
-                div().size(px(4.)).rounded(px(2.)).bg(theme::text_soft()).opacity(opacity)
+                div()
+                    .size(px(4.))
+                    .mt(px(lift))
+                    .rounded(px(2.))
+                    .bg(theme::text_soft())
+                    .opacity(opacity)
             }))
     }
 }
@@ -244,18 +257,18 @@ impl TypingRow {
 impl Render for TypingRow {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let typists = self.typists();
-        let row = div().h(px(HEIGHT)).flex_none().flex().items_center().gap(px(6.));
+        let row = div().h(px(HEIGHT)).pb(px(2.)).flex_none().flex().items_center().gap(px(7.));
         let Some((names, rest)) = wording_for(&typists) else {
             return row;
         };
         row.type_small()
-            .text_color(theme::text_soft())
+            .text_color(theme::text_faint())
             .child(self.dots())
             .child(
                 div()
                     .flex()
                     .min_w_0()
-                    .child(div().truncate().font_weight(theme::MEDIUM).child(names))
+                    .child(div().truncate().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child(names))
                     .child(div().flex_none().child(rest)),
             )
     }
@@ -269,10 +282,10 @@ mod tests {
     fn the_row_names_one_or_two_people_and_counts_nobody() {
         let say = |names: &[&str]| wording(names).map(|(names, rest)| format!("{names}{rest}"));
         assert_eq!(say(&[]), None);
-        assert_eq!(say(&["Ines"]).as_deref(), Some("Ines is typing…"));
-        assert_eq!(say(&["Ines", "Tomasz"]).as_deref(), Some("Ines and Tomasz are typing…"));
-        assert_eq!(say(&["Ines", "Tomasz", "Odile"]).as_deref(), Some("Several people are typing…"));
-        assert_eq!(say(&["a", "b", "c", "d", "e"]).as_deref(), Some("Several people are typing…"));
+        assert_eq!(say(&["Ines"]).as_deref(), Some("Ines is typing"));
+        assert_eq!(say(&["Ines", "Tomasz"]).as_deref(), Some("Ines and Tomasz are typing"));
+        assert_eq!(say(&["Ines", "Tomasz", "Odile"]).as_deref(), Some("Several people are typing"));
+        assert_eq!(say(&["a", "b", "c", "d", "e"]).as_deref(), Some("Several people are typing"));
     }
 
     #[test]
@@ -286,17 +299,17 @@ mod tests {
     fn activity_verbs_show_recording_uploading_sticker_and_speaking() {
         let one = |name: &str, activity: Compose| Typist { id: name.into(), name: name.into(), until: 0, activity };
         let say = |list: &[Typist]| wording_for(list).map(|(n, r)| format!("{n}{r}"));
-        assert_eq!(say(&[one("Odalys", Compose::RecordingVoice)]).as_deref(), Some("Odalys is recording a voice message…"));
-        assert_eq!(say(&[one("Odalys", Compose::RecordingVideo)]).as_deref(), Some("Odalys is recording a video message…"));
-        assert_eq!(say(&[one("Odalys", Compose::UploadingPhoto)]).as_deref(), Some("Odalys is sending a photo…"));
-        assert_eq!(say(&[one("Odalys", Compose::UploadingFile)]).as_deref(), Some("Odalys is sending a file…"));
-        assert_eq!(say(&[one("Odalys", Compose::ChoosingSticker)]).as_deref(), Some("Odalys is choosing a sticker…"));
-        assert_eq!(say(&[one("Odalys", Compose::Speaking)]).as_deref(), Some("Odalys is speaking…"));
+        assert_eq!(say(&[one("Odalys", Compose::RecordingVoice)]).as_deref(), Some("Odalys is recording a voice message"));
+        assert_eq!(say(&[one("Odalys", Compose::RecordingVideo)]).as_deref(), Some("Odalys is recording a video message"));
+        assert_eq!(say(&[one("Odalys", Compose::UploadingPhoto)]).as_deref(), Some("Odalys is sending a photo"));
+        assert_eq!(say(&[one("Odalys", Compose::UploadingFile)]).as_deref(), Some("Odalys is sending a file"));
+        assert_eq!(say(&[one("Odalys", Compose::ChoosingSticker)]).as_deref(), Some("Odalys is choosing a sticker"));
+        assert_eq!(say(&[one("Odalys", Compose::Speaking)]).as_deref(), Some("Odalys is speaking"));
         assert_eq!(preview_for(&[one("Odalys", Compose::RecordingVoice)], false).as_deref(), Some("recording a voice message…"));
         assert_eq!(preview_for(&[one("Odalys", Compose::RecordingVoice)], true).as_deref(), Some("Odalys is recording a voice message…"));
         assert_eq!(
             say(&[one("Odalys", Compose::RecordingVoice), one("Tobin", Compose::RecordingVoice)]).as_deref(),
-            Some("Odalys and Tobin are recording voice messages…")
+            Some("Odalys and Tobin are recording voice messages")
         );
         assert_eq!(say(&[one("Odalys", Compose::Cancel)]), None);
     }

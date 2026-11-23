@@ -444,7 +444,7 @@ impl TextInput {
 
     fn with(multiline: bool, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> TextInput {
         TextInput {
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_index(0).tab_stop(true),
             editor: Editor::new(multiline),
             placeholder: placeholder.into(),
             secret: false,
@@ -792,7 +792,7 @@ impl TextInput {
     fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
         if self.list_open {
             cx.emit(InputList::Complete);
-        } else if !self.editor.is_multiline() {
+        } else {
             cx.propagate();
         }
     }
@@ -1340,11 +1340,10 @@ impl Shaping {
         let mut rows = Vec::new();
         let mut line_start = 0;
         for line in text.split('\n') {
-            // A phone's placeholder is a single line and the field clips it: end it in an
-            // ellipsis rather than a letter cut in half at the edge. The desktop keeps the
-            // clip it has always had, so its fields do not change.
-            let line = match (placeholder && crate::gui::phone::active(), room) {
-                (true, Some(room)) => fitted(line, room, self, window),
+            // A placeholder is a single line and the field clips it: end it in an ellipsis
+            // rather than cutting a letter in half at the edge on both desktop and phone.
+            let line = match (placeholder, room) {
+                (true, Some(room)) if room > px(0.) => fitted(line, room, self, window),
                 _ => line.to_owned(),
             };
             // Cut points where the color or the underline changes. A Discord draft uses the
@@ -1587,7 +1586,14 @@ impl Element for TextElement {
         let line_height = window.line_height();
         let input = self.input.read(cx);
         let multiline = input.editor.is_multiline();
-        let laid = Rc::new(shaping.lay_out(input, Some(bounds.size.width), window));
+        let initial = shaping.lay_out(input, Some(bounds.size.width), window);
+        // When multiline text scrolls, reserve an 8px right gutter so the 4px scrollbar thumb
+        // never paints over wrapped characters.
+        let laid = if multiline && line_height * initial.rows.len() as f32 > bounds.size.height {
+            Rc::new(shaping.lay_out(input, Some((bounds.size.width - px(8.)).max(px(1.))), window))
+        } else {
+            Rc::new(initial)
+        };
         let empty = input.editor.text().is_empty();
         let selection = if empty { 0..0 } else {
             let selected = input.editor.selection();
@@ -1734,6 +1740,14 @@ impl Element for TextElement {
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("text-input")
+            .role(if self.secret { gpui::Role::PasswordInput } else if self.editor.is_multiline() {
+                gpui::Role::MultilineTextInput
+            } else { gpui::Role::TextInput })
+            .aria_label(if self.editor.is_multiline() { "Message".into() } else { self.placeholder.clone() })
+            .aria_placeholder(self.placeholder.clone())
+            .when(!self.secret, |input| input.aria_value(self.editor.text().to_owned()))
+            .focus_visible(|style| style.shadow(crate::gui::theme::focus_ring_inset()))
             .flex()
             .flex_1()
             .min_w_0()
@@ -1814,6 +1828,45 @@ impl Focusable for TextInput {
 #[cfg(all(test, feature = "gui-shot"))]
 mod secret_input_gui_tests {
     use super::*;
+
+    #[test]
+    fn tab_leaves_an_unobstructed_composer_and_shift_tab_returns_to_it() {
+        use crate::gui::{FocusNext, FocusPrevious};
+        use gpui::{Div, ParentElement};
+
+        struct Controls {
+            input: Entity<TextInput>,
+            send: FocusHandle,
+        }
+
+        impl Render for Controls {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> Div {
+                div().key_context("Shell")
+                    .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
+                    .on_action(|_: &FocusPrevious, window, cx| window.focus_prev(cx))
+                    .child(self.input.clone())
+                    .child(crate::gui::components::button("send", crate::gui::components::ButtonKind::Primary, "Send message")
+                        .track_focus(&self.send))
+            }
+        }
+
+        let mut app = gpui::TestApp::new();
+        let mut window = app.open_window(|window, cx| {
+            bind_keys(cx);
+            cx.bind_keys([
+                KeyBinding::new("tab", FocusNext, Some("Shell")),
+                KeyBinding::new("shift-tab", FocusPrevious, Some("Shell")),
+            ]);
+            let input = cx.new(|cx| TextInput::multiline("Write a message", cx));
+            window.focus(&input.focus_handle(cx), cx);
+            Controls { input, send: cx.focus_handle().tab_index(0).tab_stop(true) }
+        });
+        window.draw();
+        window.simulate_keystrokes("tab");
+        window.update(|this, window, _| assert!(this.send.is_focused(window)));
+        window.simulate_keystrokes("shift-tab");
+        window.update(|this, window, cx| assert!(this.input.focus_handle(cx).is_focused(window)));
+    }
 
     #[test]
     fn secret_input_paint_and_composition_never_shape_the_passphrase() {
