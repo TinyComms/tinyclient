@@ -703,6 +703,9 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         moved_from: None,
         move_notice: None,
         incoming_video: false,
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
         hand_raised: false,
         reaction: None,
     }

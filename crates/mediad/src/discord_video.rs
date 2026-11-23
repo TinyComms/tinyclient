@@ -11,10 +11,10 @@ use crate::dave::Dave;
 use crate::h264::{self, Assembler};
 use crate::media::{FromMedia, Stream};
 use crate::picture::camera_high_bps;
-use crate::rtp::{self, Cipher, VideoSender, H264, RTX};
+use crate::rtp::{self, Cipher, Sender as AudioSender, VideoSender, H264, RTX};
 use crate::session::Controls;
 use crate::video::{Rates, Received, Video, Wants, Word};
-use crate::{hear::Ear, out, rt, FRAME_SAMPLES};
+use crate::{hear::Ear, opus, out, rt, share_audio, FRAME, FRAME_SAMPLES};
 use protocol::{MediaResponse, PictureKind};
 use std::collections::{HashMap, VecDeque};
 use std::net::UdpSocket;
@@ -343,6 +343,8 @@ pub struct Leg {
     pub announced: Arc<AtomicBool>,
     pub user_id: String,
     pub pipe: Option<Pipe>,
+    /// Opus on the audio SSRC, when this leg sends. A watcher has none.
+    pub audio: Option<AudioSender>,
     pub watch: bool,
     pub stream_owner: Option<String>,
     pub users: Arc<Mutex<HashMap<u32, String>>>,
@@ -409,9 +411,89 @@ fn receive_audio(leg: &Leg, datagram: &[u8], owner: &str, owner_id: u64, gain_ke
 
 /// The media loop of a stream connection. Returns when the leg is stopped. It does not end
 /// the process: the voice call's thread is the one that does.
+/// Quiet frames after the sound drops before the speaking flag is cleared.
+const SOUND_TRAIL: u32 = 5;
+/// Below this the share is not "making sound". The 440 Hz harness sits far above it.
+const SOUND_GATE: u8 = 8;
+const SOUND_BITRATE: i32 = 128_000;
+
+/// The share's sound on a sending Go Live leg. Opened only once sound is asked for, so a
+/// silent share never touches a loopback device.
+struct Sound {
+    sender: AudioSender,
+    encoder: Option<opus::Encoder>,
+    capture: Option<Box<dyn share_audio::Pull>>,
+    failed: bool,
+    speaking: bool,
+    quiet: u32,
+}
+
+impl Sound {
+    fn tick(&mut self, leg: &Leg) {
+        let wanted = leg.controls.share() && leg.controls.share_sound();
+        if !wanted {
+            self.capture = None;
+            self.failed = false;
+            self.quiet = 0;
+            if self.speaking {
+                let _ = leg.report.send(FromMedia::Soundshare(false));
+                self.speaking = false;
+            }
+            self.sender.advance(FRAME as u32);
+            return;
+        }
+        if self.capture.is_none() && !self.failed {
+            match share_audio::open(crate::picture::chosen_screen().as_deref()) {
+                Ok(pull) => self.capture = Some(pull),
+                Err(words) => {
+                    self.failed = true;
+                    tracing::warn!("mediad: share audio: {words}");
+                    out::send(&MediaResponse::Notice { detail: words });
+                }
+            }
+        }
+        let Some(frame) = self.capture.as_mut().and_then(|capture| capture.pull()) else {
+            self.sender.advance(FRAME as u32);
+            return;
+        };
+        if crate::audio::level(&frame) >= SOUND_GATE {
+            self.quiet = 0;
+            if !self.speaking {
+                let _ = leg.report.send(FromMedia::Soundshare(true));
+                self.speaking = true;
+            }
+            let mut packet = [0u8; 1500];
+            if let Some(len) = self.encoder.as_mut().and_then(|encoder| encoder.encode(&frame, &mut packet)) {
+                let sealed = leg.dave.lock().unwrap().encrypt(&packet[..len]);
+                if let Some(sealed) = sealed {
+                    if let Some(datagram) = self.sender.seal(&sealed) {
+                        let _ = leg.socket.send(&datagram);
+                    }
+                }
+            }
+        } else if self.speaking {
+            self.quiet += 1;
+            if self.quiet > SOUND_TRAIL {
+                let _ = leg.report.send(FromMedia::Soundshare(false));
+                self.speaking = false;
+                self.quiet = 0;
+            }
+        }
+        self.sender.advance(FRAME as u32);
+    }
+}
+
 pub fn run(mut leg: Leg) {
     let _timer = rt::FineTimer::hold();
     rt::tick_thread();
+    let mut sound = leg.audio.take().map(|sender| Sound {
+        sender,
+        encoder: opus::Encoder::at(SOUND_BITRATE),
+        capture: None,
+        failed: false,
+        speaking: false,
+        quiet: 0,
+    });
     let mut drive = Drive::new(leg.controls.clone(), leg.user_id.clone(), leg.videos.clone(), leg.announced.clone(), leg.pipe.take(), true, !leg.watch);
     let owner = leg.stream_owner.as_deref().filter(|_| leg.watch).and_then(|owner| {
         Some((owner, owner.parse().ok()?, protocol::discord_stream_gain_key(owner)))
@@ -438,6 +520,9 @@ pub fn run(mut leg: Leg) {
             next = now + tick;
         }
         drive.tick(&leg.dave, &leg.socket, &leg.report);
+        if let Some(sound) = sound.as_mut() {
+            sound.tick(&leg);
+        }
     }
     if owner.is_some() {
         leg.controls.watched_audio.lock().unwrap().take();

@@ -11,7 +11,7 @@ rm -f "$OUT/app.pid" "$OUT/t0" "$OUT/rec.done"
 
 # The probe records its actual received JPEGs. Its test must compile against exactly the same
 # source as the bundle, so keep the source lock during the probe on the shared Mac checkout.
-if [ "${SCENARIO:-}" = tiny-video-received ]; then
+if [ "${SCENARIO:-}" = tiny-video-received ] || [ "${SCENARIO:-}" = gpu-codecs-wave18 ]; then
     lock
     sync_src "$SRC_TAR"
     export E2E_OUT=$OUT E2E_APP_DIR=$R/tinyclient.app E2E_SRC_DIR=$LAB/src
