@@ -120,6 +120,9 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>) -> 
         moved_from: None,
         move_notice: None,
         incoming_video: false,
+        viewers: Vec::new(),
+        stream_paused: false,
+        stream_security: None,
         hand_raised: false,
         reaction: None,
     }

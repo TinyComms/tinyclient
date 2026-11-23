@@ -544,6 +544,7 @@ fn publish_group(ctx: &Context, seat: &Seat, group_id: &str) {
         camera: who.camera,
         sharing: who.sharing,
         ringing: false,
+        preview: String::new(),
         hand_raised: false,
         reaction: None,
     });

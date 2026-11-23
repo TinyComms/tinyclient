@@ -59,6 +59,7 @@ pub mod rt;
 pub mod rtp;
 pub mod serve;
 pub mod session;
+pub mod share_audio;
 pub mod signal;
 pub mod stats;
 pub mod stretch;

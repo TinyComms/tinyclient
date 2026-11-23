@@ -3236,6 +3236,8 @@ fn signal_call_security(account: &Account, peer_aci: &str) -> CallSecurity {
         unsupported: Vec::new(),
         server_lacks: false,
         required: true,
+        identity: String::new(),
+        stream: false,
     }
 }
 
@@ -4058,6 +4060,8 @@ fn group_call_join(account: &Account, conversation_id: &str, group_id: &str) {
             unsupported: Vec::new(),
             server_lacks: false,
             required: true,
+            identity: String::new(),
+            stream: false,
         }),
     );
     publish_group_call_state(account, conversation_id);
@@ -5137,7 +5141,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                             active.video = true;
                         }
                     }
-                    Picture::Share(on) => active.sharing = on,
+                    Picture::Share { on, .. } => active.sharing = on,
                     Picture::Watch(_) => {}
                 }
             }
@@ -5146,7 +5150,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                 live.active_group_call.as_mut().map(|g| {
                     match &picture {
                         Picture::Camera(on) => g.camera = *on,
-                        Picture::Share(on) => g.sharing = *on,
+                        Picture::Share { on, .. } => g.sharing = *on,
                         Picture::Watch(_) => {}
                     }
                     (g.group_id.clone(), g.era_id.clone(), g.muted, g.camera, g.sharing)

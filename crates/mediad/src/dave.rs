@@ -7,11 +7,26 @@
 //! end-to-end encrypted and frames pass through untouched.
 
 use crate::rtp::SILENCE;
-use davey::{Codec, DaveSession, MediaType, ProposalsOperationType};
+use davey::{Codec, DaveSession, MediaType, ProposalsOperationType, SigningKeyPair};
+use protocol::{CallSecurity, SecureMember, SecurityMode};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU16;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// This account's DAVE identity, made once and kept beside the other account files. Both the
+/// voice call and a Go Live leg use it, so a verification outlives the call. A test that never
+/// sets `TINYCLIENT_DIR` gets no key here: its session makes one for that call alone.
+pub(crate) fn account_identity() -> Option<SigningKeyPair> {
+    static KEY: OnceLock<Option<SigningKeyPair>> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let dir = crate::out::var_os("TINYCLIENT_DIR")?;
+        let path = std::path::PathBuf::from(dir).join("discord-dave.key");
+        Some(crate::e2ee::identity(&path).0)
+    })
+    .clone()
+}
 
 /// The highest version this build speaks.
 pub const MAX_VERSION: u16 = davey::DAVE_PROTOCOL_VERSION;
@@ -111,6 +126,14 @@ pub struct Dave {
     failures: u32,
     /// Seconds a member's unencrypted frames are still accepted after the group changed.
     window: u32,
+    /// The account key, when one was kept. Passed into the MLS session so the signature key
+    /// other people verify is the same one next call.
+    identity: Option<SigningKeyPair>,
+    /// Pairwise verification codes already made. Scrypt stays off the audio path: the session
+    /// thread fills these, `encrypt` never does.
+    safety: HashMap<(u64, Vec<u8>), String>,
+    /// The last report sent, so a roster tick does not repeat it.
+    told: Option<CallSecurity>,
 }
 
 fn ready(transition: u16) -> Outgoing {
@@ -131,7 +154,15 @@ impl Dave {
             last_transition: None,
             failures: 0,
             window: EXPIRY,
+            identity: None,
+            safety: HashMap::new(),
+            told: None,
         }
+    }
+
+    /// A test, or the voice session, names the key before `start`. A later `reinit` keeps it.
+    pub(crate) fn use_identity(&mut self, key: SigningKeyPair) {
+        self.identity = Some(key);
     }
 
     /// For `seconds` from now, members' unencrypted frames are taken as they are. A sender
@@ -160,6 +191,92 @@ impl Dave {
         self.session.as_ref().and_then(DaveSession::voice_privacy_code)
     }
 
+    /// Members whose verification code is not cached yet. The caller hashes them off this
+    /// lock: the pairwise fingerprint is scrypt, and `encrypt` must not wait on it.
+    pub(crate) fn safety_wanted(&self) -> Vec<(u64, Vec<u8>, u64, Vec<u8>)> {
+        let Some((mine, others)) = self.peers() else {
+            return Vec::new();
+        };
+        let me = self.user_id;
+        others
+            .into_iter()
+            .filter(|(id, key)| !self.safety.contains_key(&(*id, key.clone())))
+            .map(|(id, key)| (id, key, me, mine.clone()))
+            .collect()
+    }
+
+    pub(crate) fn add_safety(&mut self, id: u64, key: Vec<u8>, number: String) {
+        if self.safety.len() >= 32 {
+            self.safety.clear();
+        }
+        self.safety.insert((id, key), number);
+    }
+
+    /// How this connection is protected. `stream` marks a Go Live leg.
+    pub(crate) fn security(&self, stream: bool) -> CallSecurity {
+        let identity = self.identity.as_ref().map(|key| crate::e2ee::hex(&key.public)).unwrap_or_default();
+        if !self.encrypting() {
+            return CallSecurity { mode: SecurityMode::Pending, stream, identity, ..CallSecurity::default() };
+        }
+        let mut security = CallSecurity { mode: SecurityMode::EndToEnd, stream, identity, ..CallSecurity::default() };
+        let Some(session) = &self.session else {
+            return security;
+        };
+        security.code = session.voice_privacy_code().unwrap_or_default().to_owned();
+        security.epoch = session.epoch().map_or(0, |epoch| epoch.as_u64());
+        if let Some(group) = session.group() {
+            for member in group.members() {
+                let Ok(bytes) = <[u8; 8]>::try_from(member.credential.serialized_content()) else {
+                    continue;
+                };
+                let id = u64::from_be_bytes(bytes);
+                if id == self.user_id {
+                    continue;
+                }
+                security.members.push(SecureMember {
+                    user_id: id.to_string(),
+                    key: crate::e2ee::hex(&member.signature_key),
+                    safety: self.safety.get(&(id, member.signature_key.clone())).cloned().unwrap_or_default(),
+                    trust: Default::default(),
+                });
+            }
+        }
+        security
+    }
+
+    /// The report, when it changed since it was last taken. Nothing before a protocol version.
+    pub(crate) fn take_report(&mut self, stream: bool) -> Option<CallSecurity> {
+        if self.version == 0 {
+            return None;
+        }
+        let now = self.security(stream);
+        if self.told.as_ref() == Some(&now) {
+            return None;
+        }
+        self.told = Some(now.clone());
+        Some(now)
+    }
+
+    /// Our signature key and everyone else's, once the group can encrypt.
+    fn peers(&self) -> Option<(Vec<u8>, Vec<(u64, Vec<u8>)>)> {
+        let session = self.session.as_ref().filter(|session| session.is_ready())?;
+        let group = session.group()?;
+        let mut mine = None;
+        let mut others = Vec::new();
+        for member in group.members() {
+            let Ok(bytes) = <[u8; 8]>::try_from(member.credential.serialized_content()) else {
+                continue;
+            };
+            let id = u64::from_be_bytes(bytes);
+            if id == self.user_id {
+                mine = Some(member.signature_key.clone());
+            } else {
+                others.push((id, member.signature_key.clone()));
+            }
+        }
+        mine.map(|mine| (mine, others))
+    }
+
     /// The voice server picked `version` in its session description.
     pub fn start(&mut self, version: u16) -> Vec<Outgoing> {
         self.version = version;
@@ -175,9 +292,10 @@ impl Dave {
             }
             return Vec::new();
         };
+        let key = self.identity.clone();
         let made = match &mut self.session {
-            Some(session) => session.reinit(version, self.user_id, self.channel_id, None).map_err(|e| e.to_string()),
-            None => DaveSession::new(version, self.user_id, self.channel_id, None)
+            Some(session) => session.reinit(version, self.user_id, self.channel_id, key.as_ref()).map_err(|e| e.to_string()),
+            None => DaveSession::new(version, self.user_id, self.channel_id, key.as_ref())
                 .map(|session| self.session = Some(session))
                 .map_err(|e| e.to_string()),
         };
@@ -457,8 +575,18 @@ pub(crate) mod tests {
 
     /// The same, up to the commit and the welcome: the transition is announced, not executed.
     fn welcomed(transition: u16) -> (Dave, Dave) {
+        pair(transition, None, None)
+    }
+
+    fn pair(transition: u16, first_key: Option<SigningKeyPair>, second_key: Option<SigningKeyPair>) -> (Dave, Dave) {
         let server = mls::Server::new();
         let (mut first, mut second) = (Dave::new(111, CHANNEL), Dave::new(222, CHANNEL));
+        if let Some(key) = first_key {
+            first.use_identity(key);
+        }
+        if let Some(key) = second_key {
+            second.use_identity(key);
+        }
         binary(first.start(1), KEY_PACKAGE);
         let package = binary(second.start(1), KEY_PACKAGE);
         first.external_sender(&server.package());
@@ -573,6 +701,37 @@ pub(crate) mod tests {
         let mut outsider = Dave::new(333, CHANNEL);
         assert_eq!(outsider.decrypt(Some(111), &sealed, &mut again), None);
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn two_members_share_the_privacy_code_and_the_pairwise_fingerprint() {
+        let (a, b) = (SigningKeyPair::generate(), SigningKeyPair::generate());
+        let (mut first, mut second) = pair(7, Some(a.clone()), Some(b.clone()));
+        first.execute_transition(7);
+        second.execute_transition(7);
+        let fill = |dave: &mut Dave| {
+            let wanted = dave.safety_wanted();
+            for (id, key, me, mine) in wanted {
+                let number = crate::e2ee::safety_number(id, &key, me, &mine);
+                dave.add_safety(id, key, number);
+            }
+        };
+        fill(&mut first);
+        fill(&mut second);
+        let left = first.security(false);
+        let right = second.security(false);
+        assert_eq!(left.mode, SecurityMode::EndToEnd);
+        assert_eq!(left.code, right.code);
+        assert_eq!(left.code.len(), 30);
+        assert_eq!(left.members.len(), 1);
+        assert_eq!(right.members.len(), 1);
+        assert_eq!(left.members[0].user_id, "222");
+        assert_eq!(right.members[0].user_id, "111");
+        assert_eq!(left.members[0].safety, right.members[0].safety);
+        assert_eq!(left.members[0].safety.len(), 45);
+        assert_eq!(left.identity, crate::e2ee::hex(&a.public));
+        assert_eq!(left.members[0].key, crate::e2ee::hex(&b.public));
+        assert_eq!(right.members[0].key, crate::e2ee::hex(&a.public));
     }
 
     #[test]
