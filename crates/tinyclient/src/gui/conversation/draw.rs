@@ -517,6 +517,12 @@ pub(crate) fn call_line_spec(message: &Message, peer_title: &str) -> CallRowSpec
             label: format!("{cap_noun} in progress with {other}"),
             pill: Some("Join"),
         },
+        (protocol::CallOutcome::Voicemail, _) => CallRowSpec {
+            icon: "icons/phone-incoming.svg",
+            missed: false,
+            label: format!("Voicemail from {other}"),
+            pill: Some("Call back"),
+        },
     }
 }
 
@@ -1384,6 +1390,15 @@ impl Pane {
                         )
                 }))
                 .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, window, cx)))
+                .children(message.meeting_transcript.as_ref().map(|_| {
+                    let id = message.id.clone();
+                    let title = message.card.as_ref().map(|card| card.title.clone()).unwrap_or_else(|| "Meeting transcript".into());
+                    button(SharedString::from(format!("meeting-transcript-{id}")), ButtonKind::Secondary, "Read transcript")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_meeting_transcript(id.clone(), title.clone(), window, cx);
+                        }))
+                }))
                 .children(message.poll.as_deref().filter(|_| !matches!(message.kind, MessageKind::Unsupported { .. }))
                     .map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))

@@ -453,7 +453,7 @@ impl Teams {
             members.filter_map(|member| member["mri"].as_str()).filter(|mri| *mri != me).map(str::to_owned).collect()
         };
         // System streams are not conversations, but for the user's own notes. The Activity
-        // stream is read for its mentions (`activity_feed`); the call log is not read.
+        // stream is read for its mentions (`activity_feed`); Calls reads the call log separately.
         let shown = |chat: &&Value| {
             let id = text(chat, "id");
             chat["isConversationDeleted"] != true && !id.is_empty() && (!id.starts_with("48:") || id == NOTES)
