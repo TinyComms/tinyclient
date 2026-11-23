@@ -57,6 +57,9 @@ pub enum FromMedia {
     /// The camera (`share` false) or the screen (`share` true) should be announced, or withdrawn.
     /// Nothing is sent on the same turn: the gateway announces the SSRC first.
     Picture { share: bool, on: bool },
+    /// The Go Live leg started or stopped sending the share's sound. Speaking flag 2, not the
+    /// microphone's 1, and only on that connection.
+    Soundshare(bool),
 }
 
 pub struct Setup {

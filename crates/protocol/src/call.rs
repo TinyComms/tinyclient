@@ -561,7 +561,8 @@ pub struct VoiceJoin {
     pub dave: Dave,
     pub muted: bool,
     pub deafened: bool,
-    /// A Go Live connection, not the call's own voice. Its loop sends pictures and no audio.
+    /// A Go Live connection, not the call's own voice. Its loop sends the screen, and that
+    /// screen's sound when the share asked for it.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub stream: bool,
     /// This Go Live connection only receives. It sends no picture of its own.
@@ -659,6 +660,10 @@ pub enum MediaRequest {
         /// the capture can.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         show_cursor: Option<bool>,
+        /// The sound of the shared screen or window, on the Go Live audio SSRC. `None` is off,
+        /// which is what an older shell asked for, and what a phone sends: it has no loopback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sound: Option<bool>,
     },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
@@ -1266,15 +1271,20 @@ mod tests {
     #[test]
     fn a_share_without_a_screen_is_the_frame_an_older_build_sends() {
         let older: MediaRequest = serde_json::from_str(r#"{"media":"share_send","on":true}"#).unwrap();
-        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None });
+        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None });
         assert_eq!(serde_json::to_string(&older).unwrap(), r#"{"media":"share_send","on":true}"#);
         // The pointer is on when nothing is said, so an older shell gets it like everyone.
-        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false) };
+        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false), sound: None };
         let json = serde_json::to_string(&chosen).unwrap();
         assert!(json.contains(r#""quality":"balanced""#) && json.contains(r#""show_cursor":false"#));
+        assert!(!json.contains("sound"), "{json}");
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), chosen);
-        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true) };
+        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true), sound: None };
         assert_eq!(serde_json::to_string(&shown).unwrap(), r#"{"media":"share_send","on":true,"show_cursor":true}"#);
+        let heard = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: Some(true) };
+        let json = serde_json::to_string(&heard).unwrap();
+        assert_eq!(json, r#"{"media":"share_send","on":true,"sound":true}"#);
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), heard);
     }
 
     #[test]

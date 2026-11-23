@@ -86,6 +86,8 @@ pub struct Controls {
     pub(crate) tiny_slots: Mutex<Option<Vec<TinySlot>>>,
     /// The camera and the share the user asked for, and whether the one picture is watched.
     share: AtomicBool,
+    /// The share's sound, on the Go Live audio SSRC. Off until a share asks for it.
+    share_sound: AtomicBool,
     camera: AtomicBool,
     camera_preview: AtomicBool,
     watch: AtomicBool,
@@ -164,6 +166,14 @@ impl Controls {
 
     pub fn share(&self) -> bool {
         self.share.load(Ordering::Relaxed)
+    }
+
+    pub fn set_share_sound(&self, on: bool) {
+        self.share_sound.store(on, Ordering::Relaxed);
+    }
+
+    pub fn share_sound(&self) -> bool {
+        self.share_sound.load(Ordering::Relaxed)
     }
 
     pub fn set_camera(&self, on: bool) {
@@ -812,6 +822,11 @@ impl Call {
                     FromMedia::Dave(outgoing) => self.deliver(socket, outgoing),
                     FromMedia::Fatal(reason, detail) => Err(End::Fatal(reason, detail)),
                     FromMedia::Picture { share, on } => self.announce_video(socket, share, on),
+                    // 2 is Discord's soundshare flag. 0 clears it. The microphone's 1 stays on the voice leg.
+                    FromMedia::Soundshare(on) => {
+                        let d = json!({ "speaking": if on { 2 } else { 0 }, "delay": 0, "ssrc": self.ssrc });
+                        socket.send(gateway::SPEAKING, d).map_err(dropped)
+                    }
                 };
                 if let Err(end) = sent {
                     return end;
@@ -915,14 +930,17 @@ impl Call {
     }
 
     /// A Go Live leg: the same gateway, and a picture loop instead of the microphone. It sends
-    /// no speaking indication and no `Connected`. A failure here is a notice, not the end of
-    /// the voice call.
+    /// no `Connected`. Sound, when the share asked for it, is Opus on this connection's audio
+    /// SSRC. A failure here is a notice, not the end of the voice call.
     fn start_stream(&mut self, socket: &mut Socket, transport: Transport, seal: Cipher, opener: Cipher, version: u16) -> Result<(), End> {
         let first = self.dave.lock().unwrap().start(version);
         self.deliver(socket, first)?;
         self.dave_version = version;
         self.ssrc = transport.ssrc;
         self.assigned = transport.video;
+        // The picture takes the cipher. The sound, on a sending leg, uses the same key on the
+        // audio SSRC Ready assigned. A watcher only receives.
+        let audio = (!self.join.watch).then(|| rtp::Sender::new(seal.clone(), transport.ssrc, 0, 0));
         let pipe = transport.video.map(|(ssrc, rtx)| discord_video::Pipe::new(seal, ssrc, rtx));
         let stop = Arc::new(AtomicBool::new(false));
         let leg = discord_video::Leg {
@@ -936,6 +954,7 @@ impl Call {
             announced: self.announced.clone(),
             user_id: self.join.user_id.clone(),
             pipe,
+            audio,
             watch: self.join.watch,
             stream_owner: self.join.stream_owner.clone(),
             users: self.users.clone(),
@@ -945,7 +964,7 @@ impl Call {
             End::Fatal(CallFailure::Engine, ENGINE.to_owned())
         })?;
         self.media = Some(Running::Stream { stop, thread });
-        // Viewers and the sender both say what they want. A stream does not speak.
+        // Viewers and the sender both say what they want. Sound speaks for itself, as flag 2.
         socket.send(gateway::SINK, json!({ "any": 100 })).map_err(dropped)?;
         self.joined = true;
         self.deadline = None;

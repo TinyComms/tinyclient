@@ -32,6 +32,7 @@ mod panel;
 pub(super) mod settings;
 mod setup;
 mod share;
+pub(in crate::gui) use share::share_sound_flag;
 
 use super::input::{InputEvent, InputKey, TextInput};
 use super::sidebar::Mode;
@@ -237,6 +238,8 @@ pub struct State {
     share_quality: protocol::ShareQuality,
     /// Whether my share shows my pointer, as the picker has it. Kept for the next share.
     share_cursor: bool,
+    /// Whether my share sends the screen's sound. Kept for the next share. A phone never offers it.
+    pub(in crate::gui) share_sound: bool,
     /// What my share sends, as the picker listed it, for my own stream's tile.
     pub(in crate::gui) shared: Option<protocol::ScreenSource>,
     /// Categories folded, by key ([`model::LOOSE`] for the rooms in none).
@@ -347,6 +350,7 @@ impl State {
             screen_pick: None,
             share_quality: protocol::ShareQuality::default(),
             share_cursor: true,
+            share_sound: true,
             shared: None,
             folded: HashSet::new(),
             expanded_rooms: HashSet::new(),

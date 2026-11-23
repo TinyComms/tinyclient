@@ -36,7 +36,7 @@ A camera is one H.264 layer on the voice connection (rid `100`). Go Live is a se
 
 When you watch a Go Live stream with sound, its Opus audio plays through the call's selected output. The stream tile has its own volume and mute controls. Deafening silences the stream, and muting your microphone leaves it playing. DAVE on the watch connection opens the stream's sound and picture.
 
-DAVE seals the picture as well as the voice. The transport encryption is the same AES-GCM or XChaCha the voice already uses. The client offers H.264 and does not offer another video codec. There is no simulcast, no AV1, VP8 or VP9, no system audio on shares sent by tinyclient, and no clips. A stage is still not joined.
+DAVE seals the picture as well as the voice. The transport encryption is the same AES-GCM or XChaCha the voice already uses. The client offers H.264 and does not offer another video codec. There is no simulcast, no AV1, VP8 or VP9, and no clips. A desktop share can include the sound of that screen or window: stereo Opus on the Go Live connection, with the call's own playback left out. A stage is still not joined.
 
 ## Hand-off
 

@@ -14,6 +14,17 @@ use protocol::{MediaRequest, Request, ScreenSource, ShareQuality, SCREENS_LIMIT}
 const THUMB_W: f32 = 184.;
 const THUMB_H: f32 = 104.;
 
+/// A desktop can loop back a screen or a window. A phone shares through the system picker and
+/// has no mix of its own to send.
+pub(in crate::gui) fn share_sound_offered() -> bool {
+    cfg!(any(windows, target_os = "macos", target_os = "linux")) && !crate::gui::phone::active()
+}
+
+/// `Some` only where the switch is shown, so a phone's share stays the frame an older build sent.
+pub(in crate::gui) fn share_sound_flag(on: bool) -> Option<bool> {
+    share_sound_offered().then_some(on)
+}
+
 /// The picker's qualities, with what each costs in words.
 const QUALITIES: [(ShareQuality, &str, &str); 3] = [
     (ShareQuality::Best, "Best", "Your screen as it is, up to 1440p at 60 fps. About 8 Mb/s."),
@@ -25,7 +36,7 @@ impl Shell {
     /// Share pressed while not sharing: the picker.
     pub(in crate::gui) fn tiny_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if crate::gui::phone::active() {
-            self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None }), cx);
+            self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None }), cx);
             return;
         }
         self.tiny_state.screens = None;
@@ -51,12 +62,13 @@ impl Shell {
         self.close_modal(cx);
         let quality = Some(self.tiny_state.share_quality);
         let show_cursor = Some(self.tiny_state.share_cursor);
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen, quality, show_cursor }), cx);
+        let sound = share_sound_flag(self.tiny_state.share_sound);
+        self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen, quality, show_cursor, sound }), cx);
     }
 
     pub(in crate::gui) fn tiny_stop_share(&mut self, cx: &mut Context<Self>) {
         self.tiny_state.shared = None;
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None }), cx);
+        self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None }), cx);
     }
 
     /// The picker: screens or windows, a picture and a name each, Cancel and Share.
@@ -132,6 +144,24 @@ impl Shell {
                     this.tiny_state.share_cursor = false;
                     cx.notify();
                 }))));
+        // The screen's own sound. Hidden where there is no loopback. The call is left out of it.
+        let sound = share_sound_offered().then(|| {
+            div()
+                .mt(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(div().type_ui().text_color(theme::text_soft()).child("Share sound"))
+                .child(segmented()
+                    .child(segment("tiny-share-sound-on", "On", state.share_sound).tooltip(crate::gui::components::tip("The sound of this screen or window. Your call is left out.", None)).on_click(cx.listener(|this, _, _, cx| {
+                        this.tiny_state.share_sound = true;
+                        cx.notify();
+                    })))
+                    .child(segment("tiny-share-sound-off", "Off", !state.share_sound).on_click(cx.listener(|this, _, _, cx| {
+                        this.tiny_state.share_sound = false;
+                        cx.notify();
+                    }))))
+        });
         let ready = state.screen_pick.is_some();
         let go = if ready && !self.tiny_state.busy {
             button("tiny-share-go", ButtonKind::Primary, "Share").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_share_picked(cx))).into_any_element()
@@ -146,6 +176,7 @@ impl Shell {
             .child(body)
             .child(quality)
             .child(pointer)
+            .children(sound)
             .child(
                 div()
                     .mt(px(20.))
@@ -194,6 +225,23 @@ impl Shell {
 }
 
 /// `mediad --screens`, with its pictures in the support folder.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn share_sound_is_sent_only_where_the_switch_is_shown() {
+        let offered = cfg!(any(windows, target_os = "macos", target_os = "linux")) && !crate::gui::phone::active();
+        assert_eq!(share_sound_offered(), offered);
+        if offered {
+            assert_eq!(share_sound_flag(true), Some(true));
+            assert_eq!(share_sound_flag(false), Some(false));
+        } else {
+            assert_eq!(share_sound_flag(true), None);
+        }
+    }
+}
+
 fn read_screens() -> Vec<ScreenSource> {
     let folder = protocol::support_dir().join("screens");
     let stdout = protocol::media_host::output(protocol::launch::no_console(&mut std::process::Command::new(crate::gui::settings::mediad_path())).arg("--screens").arg(&folder).env("TINYCLIENT_SHARE_PICKER_PID", std::process::id().to_string()).stderr(std::process::Stdio::null())).unwrap_or_default();

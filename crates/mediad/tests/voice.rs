@@ -127,6 +127,7 @@ impl Mediad {
             .env_remove("TINYCLIENT_DIR")
             .env_remove("TINYCLIENT_VOICE_TRUST")
             .env_remove("TINYCLIENT_MEDIAD_SCREEN")
+            .env_remove("TINYCLIENT_SHARE_AUDIO")
             .env(home, tls().dir.join("home"))
             .env("TINYCLIENT_MEDIAD_AUDIO", hears)
             .envs(env.iter().copied())
@@ -1436,14 +1437,14 @@ fn a_picture_on_a_voice_call_is_not_refused_for_being_voice_only() {
     let mut fake = Fake::new();
     let mut mediad = Mediad::start("null", None);
     // Before a join there is no engine in the call and the request is only noted. Nothing is opened.
-    assert!(matches!(mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None }), MediaResponse::Streams { video } if video.len() == 1));
+    assert!(matches!(mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None }), MediaResponse::Streams { video } if video.len() == 1));
     mediad.join(&fake.endpoint(), NO_DAVE);
     let mut peer = fake.accept();
     fake.handshake(&mut peer, &[AES], 0, 30_000);
     mediad.connected();
     assert_eq!(mediad.ask(MediaRequest::Streams), MediaResponse::Streams { video: vec![] }, "joining clears a picture noted before it");
     for request in [
-        MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None },
+        MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None },
         MediaRequest::ShareWatch { source: Some(THEM.into()) },
         MediaRequest::Speaker { source: Some(THEM.into()) },
         MediaRequest::Camera { on: true },
@@ -1455,7 +1456,7 @@ fn a_picture_on_a_voice_call_is_not_refused_for_being_voice_only() {
             other => panic!("a picture request answered {other:?}"),
         }
     }
-    let off = mediad.ask(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None });
+    let off = mediad.ask(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None });
     assert!(matches!(off, MediaResponse::Streams { .. }), "{off:?}");
     assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
@@ -1497,14 +1498,14 @@ fn a_balanced_share_tells_the_voice_server_1080p_at_30_and_a_later_pick_is_told_
     let mut live = fake.accept();
     fake.handshake_kind(&mut live, &[AES], 0, 30_000, Some("screen"));
     assert_eq!(live.expect(15)["any"], 100);
-    let started = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Balanced), show_cursor: None });
+    let started = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Balanced), show_cursor: None, sound: None });
     assert!(matches!(started, MediaResponse::Streams { .. }), "{started:?}");
     let told = live.expect(12);
     assert_eq!(told["streams"][0]["max_resolution"]["width"], 1920);
     assert_eq!(told["streams"][0]["max_resolution"]["height"], 1080);
     assert_eq!(told["streams"][0]["max_framerate"], 30);
     assert_eq!(told["streams"][0]["max_bitrate"], 4_000_000);
-    let again = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Low), show_cursor: None });
+    let again = mediad.ask(MediaRequest::ShareSend { on: true, screen: None, quality: Some(ShareQuality::Low), show_cursor: None, sound: None });
     assert!(matches!(again, MediaResponse::Streams { .. }), "{again:?}");
     let told = live.expect(12);
     assert_eq!(told["streams"][0]["max_resolution"]["width"], 1280);
@@ -1536,6 +1537,51 @@ fn a_go_live_leg_offers_a_screen_and_does_not_speak_or_exit() {
     assert!(mediad.child.try_wait().unwrap().is_none(), "the screen leg ended the process");
     assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false }), MediaResponse::Done);
     assert!(mediad.child.try_wait().unwrap().is_none(), "stopping the screen ended the process");
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
+}
+
+#[test]
+fn a_go_live_leg_with_sound_sends_opus_on_its_audio_ssrc_and_says_it_is_sharing_sound() {
+    let mut fake = Fake::new();
+    let tls = tls();
+    let null_screen = PathBuf::from("null");
+    let tone = PathBuf::from("tone");
+    let mut mediad = Mediad::start_in(
+        "null",
+        None,
+        &[
+            ("TINYCLIENT_DIR", &tls.dir),
+            ("TINYCLIENT_VOICE_TRUST", &tls.certificate),
+            ("TINYCLIENT_MEDIAD_SCREEN", &null_screen),
+            ("TINYCLIENT_SHARE_AUDIO", &tone),
+        ],
+    );
+    mediad.join(&fake.endpoint(), NO_DAVE);
+    let voice = fake.accept();
+    let mut join = session(&fake.endpoint(), "session-1", "voice-token", NO_DAVE);
+    join.stream = true;
+    join.group_id = "899".into();
+    assert_eq!(mediad.ask(MediaRequest::Stream(join)), MediaResponse::Done);
+    fake.video = Some((7, 8));
+    let mut live = fake.accept();
+    fake.handshake_kind(&mut live, &[AES], 0, 30_000, Some("screen"));
+    assert_eq!(live.expect(15)["any"], 100);
+    let started = mediad.ask(MediaRequest::ShareSend {
+        on: true,
+        screen: None,
+        quality: Some(ShareQuality::Low),
+        show_cursor: None,
+        sound: Some(true),
+    });
+    assert!(matches!(started, MediaResponse::Streams { .. }), "{started:?}");
+    assert_eq!(live.expect(5), json!({ "speaking": 2, "delay": 0, "ssrc": OUR_SSRC }));
+    let heard = fake.hear(Duration::from_millis(500));
+    assert!(!heard.is_empty(), "the sound share sent no Opus");
+    assert!(heard.iter().all(|rtp| rtp.ssrc == OUR_SSRC), "sound left the audio SSRC");
+    let frames: Vec<Vec<u8>> = heard.into_iter().map(|rtp| rtp.payload).collect();
+    assert!(is_the_tone(decoded_level(&frames)), "decoded {:?}", decoded_level(&frames));
+    drop(voice);
+    assert_eq!(mediad.ask(MediaRequest::StreamStop { watch: false }), MediaResponse::Done);
     assert_eq!(mediad.hang_up().0.code(), Some(0));
 }
 
