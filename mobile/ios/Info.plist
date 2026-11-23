@@ -22,6 +22,13 @@
 	<string>1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key><string>dev.tinyclient.invite</string>
+			<key>CFBundleURLSchemes</key><array><string>tinyclient</string></array>
+		</dict>
+	</array>
 
 	<!-- Export compliance. An E2EE messenger is normally "uses non-exempt encryption" with an
 	     exemption claim, not "no". This is a PLACEHOLDER: the honest value plus the
@@ -58,9 +65,9 @@
 
 	<!-- Calls (src/mobile/ios/audio.rs asks with AVCaptureDevice.requestAccess). -->
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Tiny uses the microphone for voice and video calls and voice messages.</string>
+	<string>Tiny uses the microphone for calls, voice messages, and videos you record to attach.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Tiny uses the camera for video calls.</string>
+	<string>Tiny uses the camera for video calls and to take photos or videos to attach.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Tiny uses Face ID to confirm that you approve adding a device to your account.</string>
 

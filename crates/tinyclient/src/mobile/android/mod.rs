@@ -16,7 +16,7 @@
 //! method here may block its (mediad or chatd) caller; Java hops to the UI thread itself.
 
 mod codec;
-mod jvm;
+pub(crate) mod jvm;
 mod approval;
 #[cfg(feature = "demo")]
 mod loopback;

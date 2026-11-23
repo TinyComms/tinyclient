@@ -435,7 +435,7 @@ impl State {
     pub fn new(cx: &mut Context<Shell>) -> State {
         #[cfg(feature = "gui-shot")]
         shot::schedule(cx);
-        Self::with_focus(cx.focus_handle())
+        Self::with_focus(cx.focus_handle().tab_index(0).tab_stop(true))
     }
 
     fn with_focus(focus: FocusHandle) -> State {
@@ -2759,6 +2759,10 @@ impl Shell {
             .child(
                 div()
                     .id("jump")
+                    .role(gpui::Role::Button)
+                    .aria_label("Jump to conversation")
+                    .tab_index(0)
+                    .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                     .flex_1()
                     .h(px(field))
                     .px(px(8.))
@@ -2778,6 +2782,7 @@ impl Shell {
             )
             .child(
                 icon_button("compose", "icons/square-pen.svg", false)
+                    .aria_label("New message")
                     .when(phone, |button| button.size(px(field)))
                     .tooltip(tip("New message", Some("⌘N")))
                     .on_click(cx.listener(|this, _, window, cx| this.open_switcher("@", window, cx))),
@@ -6539,6 +6544,8 @@ impl Shell {
             .child(
                 div()
                     .id("sidebar-list")
+                    .role(gpui::Role::List)
+                    .aria_label(if people { "People" } else { "Conversations" })
                     .flex_1()
                     .min_h_0()
                     .track_focus(&self.sidebar_state.focus)

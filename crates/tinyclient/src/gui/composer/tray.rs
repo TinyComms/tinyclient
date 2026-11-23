@@ -50,6 +50,9 @@ fn file_icon(kind: Kind) -> &'static str {
 fn corner(id: (&'static str, u64), icon: &'static str) -> gpui::Stateful<Div> {
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .tab_index(0)
+        .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
         .size(px(CONTROL))
         .flex_none()
         .rounded(px(theme::R_CONTROL))
@@ -135,7 +138,9 @@ impl Composer {
 
     fn chip_controls(&self, chip: &Staged, options: Options, cx: &mut Context<Self>) -> Div {
         let id = chip.id;
-        let remove = corner(("chip-remove", id), "icons/x.svg").on_click(cx.listener(move |this, _, _, cx| this.remove_chip(id, cx)));
+        let remove = corner(("chip-remove", id), "icons/x.svg")
+            .aria_label(format!("Remove {}", chip.name))
+            .on_click(cx.listener(move |this, _, _, cx| this.remove_chip(id, cx)));
         div()
             .absolute()
             .top(px(4.))
@@ -143,7 +148,7 @@ impl Composer {
             .flex()
             .gap(px(4.))
             .when(options.any(), |controls| {
-                controls.child(corner(("chip-options", id), "icons/ellipsis.svg").on_click(cx.listener(move |this, _, _, cx| {
+                controls.child(corner(("chip-options", id), "icons/ellipsis.svg").aria_label(format!("Options for {}", chip.name)).on_click(cx.listener(move |this, _, _, cx| {
                     this.chip_menu = if this.chip_menu == Some(id) { None } else { Some(id) };
                     cx.notify();
                 })))
@@ -159,6 +164,8 @@ impl Composer {
         let tags = tags(chip);
         div()
             .id(("chip", chip.id))
+            .role(gpui::Role::Group)
+            .aria_label(format!("Attachment: {}", chip.name))
             .relative()
             .flex_none()
             .size(px(THUMB))
@@ -234,6 +241,8 @@ impl Composer {
         let tags = tags(chip);
         div()
             .id(("chip", chip.id))
+            .role(gpui::Role::Group)
+            .aria_label(format!("Attachment: {}", chip.name))
             .relative()
             .flex_none()
             .h(px(THUMB))

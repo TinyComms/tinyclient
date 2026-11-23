@@ -3528,13 +3528,33 @@ impl Composer {
         if !self.controls().attach {
             return;
         }
-        let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = asked.await {
-                let _ = this.update(cx, |this, cx| this.stage_files_for(target, paths, false, cx));
-            }
-        })
-        .detach();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            let Some(picked) = crate::mobile_share::pick() else { return };
+            cx.spawn(async move |this, cx| {
+                match picked.await {
+                    Ok(Ok(mut items)) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.stage_files_for(target, std::mem::take(&mut items.files), true, cx);
+                        });
+                    }
+                    Ok(Err(message)) => {
+                        let _ = this.update(cx, |this, cx| this.tell(&target.key, (message.into(), Tone::Refused), cx));
+                    }
+                    Err(_) => {}
+                }
+            }).detach();
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(Some(paths))) = asked.await {
+                    let _ = this.update(cx, |this, cx| this.stage_files_for(target, paths, false, cx));
+                }
+            })
+            .detach();
+        }
     }
 
     /// When a network has no GIF catalog (`!can.gifs`), the button asks for a `.gif` file and stages it like any other attachment.
@@ -5254,6 +5274,9 @@ impl Composer {
         };
         div()
             .id(id)
+            .role(gpui::Role::Button)
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .relative()
             .flex_none()
             .size(px(card_control()))
@@ -5355,16 +5378,19 @@ impl Composer {
         };
         let attach = controls.attach.then(|| {
             self.card_button("attach", Some("icons/paperclip.svg"), false, None)
+                .aria_label("Attach files")
                 .tooltip(tip("Attach files", Some("⌘U")))
                 .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
         });
         let poll_btn = controls.poll.then(|| {
             self.card_button("create-poll", Some("icons/list.svg"), self.poll_composer.is_some(), None)
+                .aria_label("Create poll")
                 .tooltip(tip("Create poll", None))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_poll_composer(cx)))
         });
         let thread_btn = self.can_create_thread().then(|| {
             self.card_button("create-thread", Some("icons/messages-square.svg"), self.thread_composer.is_some(), None)
+                .aria_label("Create thread")
                 .tooltip(tip("Create thread", None))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_thread_composer(cx)))
         });
@@ -5373,13 +5399,14 @@ impl Composer {
             let slot = if catalog { Some(Trigger::Gif) } else { None };
             let button = self.card_button("gif", None, catalog && open_tab == Some(Tab::Gifs), slot);
             if catalog {
-                button.tooltip(tip("GIFs", Some("⇧⌘G"))).on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Gifs, window, cx)))
+                button.aria_label("GIFs").tooltip(tip("GIFs", Some("⇧⌘G"))).on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Gifs, window, cx)))
             } else {
-                button.tooltip(tip("Attach a GIF file", None)).on_click(cx.listener(|this, _, _, cx| this.attach_gif(cx)))
+                button.aria_label("Attach a GIF file").tooltip(tip("Attach a GIF file", None)).on_click(cx.listener(|this, _, _, cx| this.attach_gif(cx)))
             }
         });
         let smile = controls.emoji.then(|| {
             self.card_button("emoji", Some("icons/smile.svg"), open_tab == Some(Tab::Emoji) || open_tab == Some(Tab::Stickers), Some(Trigger::Smile))
+                .aria_label("Emoji")
                 .tooltip(tip("Emoji", Some("⌘E")))
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
         });
@@ -5448,6 +5475,11 @@ impl Composer {
         };
         let send = div()
             .id("send")
+            .role(gpui::Role::Button)
+            .aria_label(if self.editing.is_some() { "Save edited message" } else { "Send message" })
+            .aria_disabled(!ready)
+            .when(ready, |send| send.tab_index(0))
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .relative()
             .h(px(card_control()))
             .min_w(px(card_control()))
@@ -6447,6 +6479,9 @@ impl Render for Composer {
 
         let phone = crate::gui::phone::active();
         let dock = div()
+            .id("composer")
+            .role(gpui::Role::Group)
+            .aria_label("Composer")
             .flex_none()
             // A phone dock keeps the messages' 16 pt gutters, so the card's edges line up with
             // the words above it; its first control starts at 21, past the back-swipe strip's 20.
@@ -6592,6 +6627,33 @@ impl Shell {
             archived: open.archived,
             locked: open.locked,
         }
+    }
+
+    /// Imports the handoff into the chosen draft without initiating a send.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub(in crate::gui) fn stage_phone_share(
+        &self, row: &Conversation, mut items: crate::mobile_share::Items, cx: &mut Context<Self>,
+    ) -> Result<(), crate::mobile_share::Items> {
+        let link = self.snapshot.as_ref().map_or(Link::SignedOut, |snapshot| snapshot.account_link(&row.key));
+        let target = self.target_of(row, link);
+        self.composer_in(false, cx).update(cx, |composer, cx| {
+            if composer.locked_for(&target).is_some()
+                || (!items.files.is_empty() && !controls(&target.can, false).attach)
+            {
+                return Err(items);
+            }
+            composer.aim(target.clone(), &row.draft, cx);
+            composer.end_edit(cx);
+            if !items.text.is_empty() {
+                let merged = crate::mobile_share::draft_with_share(composer.input.read(cx).text(), &items.text);
+                composer.input.update(cx, |input, cx| input.set_text(&merged, cx));
+                composer.follow_text(cx);
+                composer.save_draft(cx);
+            }
+            composer.stage_files_for(target, std::mem::take(&mut items.files), true, cx);
+            cx.notify();
+            Ok(())
+        })
     }
 
     /// The composer dock of the open conversation.

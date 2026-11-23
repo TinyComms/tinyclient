@@ -133,6 +133,21 @@ fn history_failure(purpose: &Purpose, detail: &str) -> String {
     format!("Couldn't load {what}. {detail}")
 }
 
+fn announced_message_words(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => "1 new message since opening this conversation".into(),
+        count => format!("{count} new messages since opening this conversation"),
+    }
+}
+
+#[test]
+fn new_message_status_is_silent_until_there_is_an_arrival() {
+    assert!(announced_message_words(0).is_empty());
+    assert_eq!(announced_message_words(1), "1 new message since opening this conversation");
+    assert_eq!(announced_message_words(2), "2 new messages since opening this conversation");
+}
+
 fn answer_detail(answer: &io::Result<Response>) -> String {
     match answer {
         Ok(Response::Error { detail, .. }) => detail.clone(),
@@ -389,6 +404,7 @@ pub struct Pane {
     away: bool,
     /// Messages that arrived while away.
     unseen: usize,
+    announced_messages: usize,
     read: ReadMark,
     active: bool,
     watching_window: Option<Subscription>,
@@ -623,7 +639,7 @@ impl Pane {
             window: pages::Window::default(),
             items: Vec::new(),
             list: ListState::new(0, alignment, px(AHEAD)),
-            focus: cx.focus_handle(),
+            focus: cx.focus_handle().tab_index(0).tab_stop(true),
             loading_older: false,
             loading_newer: false,
             older_failed: None,
@@ -633,6 +649,7 @@ impl Pane {
             stale: false,
             away: false,
             unseen: 0,
+            announced_messages: 0,
             read: ReadMark::default(),
             active: false,
             watching_window: None,
@@ -1169,6 +1186,7 @@ impl Pane {
         self.stale = false;
         self.away = false;
         self.unseen = 0;
+        self.announced_messages = 0;
         self.read = ReadMark::default();
         self.images_stale = true;
         self.want.clear();
@@ -1469,7 +1487,9 @@ impl Pane {
                 return;
             }
         };
-        let opened = self.open.as_ref().is_some_and(|open| open.marker_known) && !self.window.messages.is_empty();
+        let marker_known = self.open.as_ref().is_some_and(|open| open.marker_known);
+        let was_empty = self.window.messages.is_empty();
+        let opened = marker_known && !was_empty;
         if let Some(open) = self.open.as_mut().filter(|open| !open.marker_known) {
             open.last_read = last_read;
             open.marker_known = true;
@@ -1511,8 +1531,17 @@ impl Pane {
         // What joined the end since: mine sends the view to it, anyone else's is counted.
         let arrived = last.and_then(|last| self.window.position(&last.id)).map(|at| &self.window.messages[at + 1..]);
         let mine = arrived.is_some_and(|new| new.iter().any(|message| message.outgoing && message.state == SendState::Pending));
+        let incoming = arrived.map_or(0, |new| new.iter().filter(|message| !message.outgoing).count());
+        if self.active && matches!(purpose, Purpose::Newest | Purpose::Arrivals) {
+            let count = if marker_known && was_empty {
+                self.window.messages.iter().filter(|message| !message.outgoing).count()
+            } else {
+                incoming
+            };
+            self.announced_messages += count;
+        }
         if !pinned && !mine {
-            self.unseen += arrived.map_or(0, |new| new.iter().filter(|message| !message.outgoing).count());
+            self.unseen += incoming;
         }
         let pin_on_load = pinned || mine || (purpose == Purpose::Open && !self.is_thread());
         self.relay(pin_on_load, top);
@@ -3847,6 +3876,9 @@ impl Render for Pane {
         });
         div()
             .id("messages")
+            .role(gpui::Role::List)
+            .aria_label("Messages")
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .size_full()
             .flex()
             .flex_col()
@@ -3890,6 +3922,7 @@ impl Render for Pane {
             }))
             .children(app_bar)
             .children(pin_bar)
+            .child(super::components::live_status("new-message-status", announced_message_words(self.announced_messages)))
             .child(if showing_app_tab {
                 self.app_tab_body(cx)
             } else {

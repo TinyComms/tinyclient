@@ -388,7 +388,7 @@ fn opaque(fill: Rgba) -> Rgba {
     theme::over(fill, theme::canvas())
 }
 
-fn button_shell(label: impl Into<SharedString>) -> Div {
+fn button_shell(label: impl IntoElement) -> Div {
     div()
         .flex_none()
         .h(px(theme::CONTROL))
@@ -400,12 +400,13 @@ fn button_shell(label: impl Into<SharedString>) -> Div {
         .gap(px(6.))
         .type_ui()
         .font_weight(theme::MEDIUM)
-        .child(label.into())
+        .child(label)
 }
 
 /// A 28 pt button. `.h(px(24.))` makes it small, `.h(px(32.))` a dialog's main action.
 pub fn button(id: impl Into<ElementId>, kind: ButtonKind, label: impl Into<SharedString>) -> Stateful<Div> {
-    let shell = button_shell(label).id(id).cursor_pointer().tab_index(0);
+    let label = label.into();
+    let shell = button_shell(label.clone()).id(id).role(gpui::Role::Button).aria_label(label).cursor_pointer().tab_index(0);
     match kind {
         ButtonKind::Primary => shell
             .bg(theme::accent())
@@ -448,18 +449,21 @@ pub fn button_with_icon(
         ButtonKind::Secondary | ButtonKind::Ghost => theme::text_soft(),
     };
     let label: SharedString = label.into();
-    button(id, kind, "").pl(px(10.)).child(glyph(icon, 16., color)).child(label)
+    button(id, kind, "").aria_label(label.clone()).pl(px(10.)).child(glyph(icon, 16., color)).child(label)
 }
 
 /// Disabled, and also busy: a busy button says so in words ("Sending…") in this look.
 pub fn button_disabled(label: impl Into<SharedString>) -> Div {
-    button_shell(label).bg(theme::hover()).text_color(theme::text_disabled())
+    let label = label.into();
+    button_shell(div().id(label.clone()).role(gpui::Role::Button).aria_label(label.clone()).aria_disabled(true).child(label))
+        .bg(theme::hover()).text_color(theme::text_disabled())
 }
 
 /// A 28 pt square holding a 16 pt glyph; `.size(px(24.))` in a toolbar. Give it a tooltip.
 pub fn icon_button(id: impl Into<ElementId>, icon: &'static str, toggled: bool) -> Stateful<Div> {
     div()
         .id(id)
+        .role(gpui::Role::Button)
         .flex_none()
         .size(px(theme::CONTROL))
         .rounded(px(theme::R_CONTROL))

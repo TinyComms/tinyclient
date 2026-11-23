@@ -63,5 +63,7 @@ pub(super) fn one(account: &Account, conversation_id: &str, message_id: &str, to
     if text.is_empty() {
         return Err(Fault::Refused("Telegram returned an empty translation.".to_owned()));
     }
+    // messages.translateResult contains text and entities only. A chat's language or the
+    // account locale does not identify the language of this particular message.
     Ok(protocol::Translation { text, source_lang: None, target_lang })
 }

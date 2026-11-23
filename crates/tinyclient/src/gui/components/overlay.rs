@@ -115,8 +115,12 @@ fn menu_row(
         icon => glyph(icon, glyph_size, icon_color).into_any_element(),
     });
     let words = crate::gui::phone::tokens::scaled(16.);
+    let label = label.into();
     div()
         .id(id)
+        .role(gpui::Role::MenuItem)
+        .aria_label(label.clone())
+        .tab_index(0)
         .group("menu-item")
         .flex_none()
         .h(px(if phone { (crate::gui::phone::tokens::scaled(22.) + 26.).max(48.) } else { theme::row_height(theme::ROW_ONE) }))
@@ -131,7 +135,7 @@ fn menu_row(
         .when(!phone, |row| row.hover(move |style| style.bg(highlight)))
         .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
         .children(lead)
-        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+        .child(div().flex_1().min_w_0().truncate().child(label))
         // A phone has no keyboard: its menus name no keys.
         .children(shortcut.filter(|_| !crate::gui::phone::active()).map(|keys| {
             div()
@@ -152,6 +156,8 @@ pub fn menu_item_check(
     shortcut: Option<&'static str>,
 ) -> Stateful<Div> {
     menu_item(id, Some(if checked { "icons/check.svg" } else { NO_GLYPH }), label, shortcut)
+        .role(gpui::Role::MenuItemCheckBox)
+        .aria_toggled(if checked { gpui::Toggled::True } else { gpui::Toggled::False })
 }
 
 /// An item that does not apply here: drawn, never hidden, and it takes no click.
@@ -161,7 +167,8 @@ pub fn menu_item_disabled(
     label: impl Into<SharedString>,
     shortcut: Option<&'static str>,
 ) -> Stateful<Div> {
-    menu_row(id, icon, label, shortcut, theme::text_disabled(), theme::text_disabled(), gpui::rgba(0)).cursor_default()
+    menu_row(id, icon, label, shortcut, theme::text_disabled(), theme::text_disabled(), gpui::rgba(0))
+        .cursor_default().aria_disabled(true).tab_stop(false)
 }
 
 /// The highlight is `selected`, never accent.
@@ -252,13 +259,44 @@ pub fn scrim() -> Div {
 
 /// A modal panel: 440 wide, title, then the caller's body and a [`modal_buttons`] row.
 pub fn modal(title: impl Into<SharedString>) -> Div {
+    let title = title.into();
     floating(theme::R_MODAL)
         .w(px(440.))
         .p(px(20.))
         .shadow(theme::shadow_modal())
         .flex()
         .flex_col()
-        .child(div().type_title().child(title.into()))
+        .child(div().id("dialog-title").role(gpui::Role::Heading).aria_label(title.clone()).type_title().child(title))
+}
+
+pub fn accessible_modal(title: impl Into<SharedString>) -> Stateful<Div> {
+    let title = title.into();
+    modal(title.clone()).id("modal").role(gpui::Role::Dialog).aria_label(title).aria_modal(true)
+}
+
+/// Persistent, layout-neutral announcer. Keep the id mounted when there is no update.
+pub fn live_status(id: &'static str, words: impl Into<SharedString>) -> Stateful<Div> {
+    div().id(id).absolute().size_0()
+        .role(gpui::Role::Status)
+        .aria_label(words)
+        .aria_live(gpui::accesskit::Live::Polite)
+        .aria_live_atomic(true)
+}
+
+#[test]
+fn assistive_technology_can_read_modal_titles_and_live_status() {
+    use gpui::Element;
+    let dialog = accessible_modal("Delete message");
+    let mut node = gpui::accesskit::Node::new(dialog.a11y_role().unwrap());
+    dialog.write_a11y_info(&mut node);
+    assert_eq!(node.role(), gpui::Role::Dialog);
+    assert_eq!(node.label(), Some("Delete message"));
+    let status = live_status("test-status", "Call reconnected");
+    let mut node = gpui::accesskit::Node::new(status.a11y_role().unwrap());
+    status.write_a11y_info(&mut node);
+    assert_eq!(node.role(), gpui::Role::Status);
+    assert_eq!(node.live(), Some(gpui::accesskit::Live::Polite));
+    assert_eq!(node.label(), Some("Call reconnected"));
 }
 
 /// A modal's words: 13 / 18 in `text_soft`.

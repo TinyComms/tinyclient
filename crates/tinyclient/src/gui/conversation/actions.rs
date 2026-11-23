@@ -9,7 +9,7 @@ use super::{Pane, PaneEvent};
 use crate::client::ask;
 use crate::gui::components::place::{max_height, placed, Layer, Place};
 use crate::gui::components::{
-    button, fade_in, menu, menu_item, menu_item_danger, menu_item_more, menu_label, menu_separator, menu_step, modal, modal_body,
+    accessible_modal as modal, button, fade_in, menu, menu_item, menu_item_danger, menu_item_more, menu_label, menu_separator, menu_step, modal_body,
     modal_buttons, popover, tip, ButtonKind,
 };
 use crate::gui::theme::{self, Type};
@@ -108,6 +108,7 @@ fn pointed_row(position: Point<Pixels>, viewport: Bounds<Pixels>, seen: &[(usize
 pub struct Menu {
     pub message: Rc<Message>,
     pub at: Point<Pixels>,
+    focus_before: Option<gpui::FocusHandle>,
     /// Which actionable row the keyboard has selected.
     pub cursor: usize,
     /// The reaction whose reactors the menu lists, by its place on the message and whether it is a super reaction.
@@ -1323,7 +1324,7 @@ impl Pane {
         self.hover = Some(message.id.clone());
         self.apps_anchor.set(None);
         self.apps_menu.set(None);
-        self.menu = Some(Menu { message, at, cursor: 0, reactor: None, apps: false });
+        self.menu = Some(Menu { message, at, focus_before: window.focused(cx), cursor: 0, reactor: None, apps: false });
         if let Some(key) = self.key().filter(|key| key.network == Network::Discord).cloned() {
             let _ = self.shell.update(cx, |shell, cx| shell.ask_app_commands(key, CommandKind::Message, cx));
         }
@@ -1381,7 +1382,7 @@ impl Pane {
         }
         self.apps_anchor.set(None);
         self.apps_menu.set(None);
-        self.menu = Some(Menu { message, at, cursor: 0, reactor: Some((reaction, burst)), apps: false });
+        self.menu = Some(Menu { message, at, focus_before: window.focused(cx), cursor: 0, reactor: Some((reaction, burst)), apps: false });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1540,6 +1541,7 @@ impl Pane {
         };
         let message = menu.message.clone();
         let at = menu.at;
+        let focus_before = menu.focus_before.clone();
         let emoji = match act {
             MenuAct::Quick(slot) => emoji::quick(self.rules(), &message.reactions, 6)
                 .get(slot)
@@ -1552,6 +1554,9 @@ impl Pane {
             _ => None,
         };
         self.close_menu(cx);
+        if let Some(focus_before) = focus_before {
+            window.focus(&focus_before, cx);
+        }
         match act {
             MenuAct::Retry => {
                 let (Some(conversation), client_id) = (
@@ -2063,6 +2068,16 @@ impl Pane {
                 }
             }
             if let Some((path, name)) = self.saveable_file(message) {
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                rows.push(
+                    row("sheet-share-file", "icons/external-link.svg", "Share file…".into(), false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            crate::mobile_share::share_file(&path, &name);
+                        }))
+                        .into_any_element(),
+                );
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 rows.push(
                     row("sheet-save-as", "icons/folder-plus.svg", "Save as…".into(), false)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2381,7 +2396,7 @@ impl Pane {
             .menu_state(cx)
             .and_then(|(acts, cursor)| acts.get(cursor).copied());
         let lit = |act: MenuAct| chosen == Some(act);
-        let mut items = menu().w(px(248.));
+        let mut items = menu().id("message-actions-menu").role(gpui::Role::Menu).aria_label("Message actions").w(px(248.));
         let go = |act: MenuAct| {
             cx.listener(move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
                 this.run_act(
@@ -4190,8 +4205,12 @@ impl Pane {
                         cx.notify();
                         return true;
                     }
+                    let focus_before = self.menu.as_ref().and_then(|menu| menu.focus_before.clone());
                     self.close_menu(cx);
                     self.close_picker(cx);
+                    if let Some(focus_before) = focus_before {
+                        window.focus(&focus_before, cx);
+                    }
                     return true;
                 }
                 "up" | "down" | "enter" if bare && self.menu.as_ref().is_some_and(|menu| menu.apps) => {
