@@ -18,7 +18,7 @@ public final class LocationBridge {
      * or {@code "err:<reason>"} if location permission is missing or no fix is available.
      */
     public static String currentLocation() {
-        Context c = TinyActivity.current();
+        Context c = TinyPlatform.context();
         if (c == null) {
             return "err:The app is not active.";
         }
@@ -56,7 +56,7 @@ public final class LocationBridge {
     }
 
     public static String startLiveTracking(String summary) {
-        Context c = TinyActivity.current();
+        Context c = TinyPlatform.context();
         if (c == null) {
             return "The app is not active.";
         }
@@ -65,7 +65,7 @@ public final class LocationBridge {
     }
 
     public static void stopLiveTracking() {
-        Context c = TinyActivity.current();
+        Context c = TinyPlatform.context();
         LocationService.stop(c);
     }
 }
