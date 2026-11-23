@@ -30,7 +30,7 @@ pub enum Drill {
     Drafts(Key),
     /// Telegram's archive.
     Archive,
-    /// Telegram's recent calls across all chats.
+    /// Recent calls across an account's chats.
     Calls,
     /// Discord's message requests.
     Requests,
@@ -51,6 +51,8 @@ pub enum Act {
     Calls,
     CallsMissedToggle,
     CallsMore,
+    CallsAccount(protocol::AccountKey),
+    VoicemailMore,
     Meetings,
     MoreChats,
     /// Mark every unread conversation in the All Unreads view as read (#606).
@@ -100,8 +102,10 @@ pub enum Item {
     Chat(Rc<Conversation>),
     /// A voice channel or DM call with friends in it.
     Voice(Rc<Conversation>),
-    /// A collapsed recent-calls entry in the Telegram Calls list.
+    /// A recent-calls row, optionally collapsed with adjacent entries.
     Call(CollapsedCall),
+    Voicemail(protocol::Voicemail),
+    Status(String),
     /// A 28 row that does something: `words` and the faint words or number after them.
     Action { act: Act, icon: &'static str, words: String, after: String, dot: Option<bool> },
     /// A server or team. `child`: inside a folder, on its spine.
@@ -124,6 +128,7 @@ impl Item {
             Item::UnreadGroupHeader(_) => 32.,
             Item::UnreadMessage { .. } => 44.,
             Item::Chat(_) | Item::Voice(_) | Item::Call(_) => 48.,
+            Item::Voicemail(_) => 78.,
             _ => 28.,
         }
     }
@@ -141,6 +146,7 @@ impl Item {
             Item::UnreadGroupHeader(g) => Some(format!("ug/{}", g.conversation.key.id)),
             Item::UnreadMessage { conversation, message, .. } => Some(format!("um/{}/{}", conversation.id, message.id)),
             Item::Call(c) => Some(format!("call/{}", c.latest.message_id)),
+            Item::Voicemail(v) => Some(format!("voicemail/{}", v.id)),
             Item::Meeting(event) => Some(format!("m/{}", event.id)),
             Item::Folder { key, .. } => Some(format!("f/{}", key.id)),
             Item::Header { label, .. } => Some(format!("h/{label}")),
@@ -174,6 +180,11 @@ pub struct Home {
     pub calls_missed: bool,
     pub calls_next: Option<String>,
     pub calls_more: bool,
+    pub calls_account: Option<protocol::AccountKey>,
+    pub calls_error: String,
+    pub voicemail: Vec<protocol::Voicemail>,
+    pub voicemail_next: Option<String>,
+    pub voicemail_error: String,
     /// The Telegram folder chosen, by id.
     pub folder: Option<String>,
     pub loaded: bool,
@@ -393,7 +404,7 @@ pub fn signal(home: &Home) -> Vec<Item> {
 /// The Teams home: Pinned, Chats (never collapsed, at least eight), the Meetings fold, then the
 /// teams, collapsed, each showing the channels that need me (rule 3) or all when opened.
 pub fn teams(home: &Home, spaces: &[Space], channels: &dyn Fn(&Key) -> Vec<Rc<Conversation>>, open: Option<&Key>, now: i64) -> Vec<Item> {
-    let mut out = Vec::new();
+    let mut out = vec![Item::Action { act: Act::Calls, icon: "icons/phone.svg", words: "Calls".into(), after: String::new(), dot: None }];
     let mut upcoming: Vec<&MeetingEvent> = home.upcoming.iter().filter(|event| event.start > 0 && crate::gui::time::same_day(event.start, now)).collect();
     upcoming.sort_by_key(|event| event.start);
     if !upcoming.is_empty() {
@@ -507,6 +518,8 @@ mod tests {
                 Item::Space { index, child, .. } => format!("{}{}", if child.is_some() { "." } else { "" }, spaces[*index].name),
                 Item::Folder { name, open, lit, .. } => format!("{}{name}{}", if *open { "v" } else { ">" }, if *lit { "*" } else { "" }),
                 Item::Call(c) => format!("call:{}", c.latest.name),
+                Item::Voicemail(v) => format!("voicemail:{}", v.caller),
+                Item::Status(words) => words.clone(),
                 Item::Meeting(event) => format!("meet:{}", event.title),
                 Item::UnreadGroupHeader(group) => format!("[{}]", group.conversation.title),
                 Item::UnreadMessage { title, message, .. } => format!("{title}:{}", message.id),
@@ -652,7 +665,7 @@ mod tests {
         let team = Space { key: Key { network: Network::Teams, ..key("t") }, ..space("Platform", None, 0, true) };
         let channels = |_: &Key| vec![at("general", 1, false, 0), at("releases", 1, false, 3)];
         let got = shape(&teams(&home, std::slice::from_ref(&team), &channels, None, NOW), std::slice::from_ref(&team));
-        assert_eq!(got, ["[Chats]", "ana", "standup", "offsite", "<Meetings>", "[Teams]", "Platform", "releases"]);
+        assert_eq!(got, ["<Calls>", "[Chats]", "ana", "standup", "offsite", "<Meetings>", "[Teams]", "Platform", "releases"]);
     }
 
     #[test]
@@ -673,7 +686,7 @@ mod tests {
         ana.updated = 50;
         let home = Home { chats: vec![Rc::new(notes), Rc::new(ana)], ..Home::for_network(Network::Teams) };
         let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, 100), &[]);
-        assert_eq!(got, ["[Chats]", "ana", "notes"]);
+        assert_eq!(got, ["<Calls>", "[Chats]", "ana", "notes"]);
     }
 
     fn local_noon() -> i64 {
@@ -701,7 +714,7 @@ mod tests {
             ..Home::for_network(Network::Teams)
         };
         let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, noon), &[]);
-        assert_eq!(got, ["[Upcoming]", "meet:Standup", "meet:Design review"]);
+        assert_eq!(got, ["<Calls>", "[Upcoming]", "meet:Standup", "meet:Design review"]);
     }
 
     #[test]
@@ -712,7 +725,7 @@ mod tests {
             ..Home::for_network(Network::Teams)
         };
         let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, 100), &[]);
-        assert_eq!(got, ["<Message requests>", "[Chats]", "ana"]);
+        assert_eq!(got, ["<Calls>", "<Message requests>", "[Chats]", "ana"]);
     }
 
     #[test]

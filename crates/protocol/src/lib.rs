@@ -2311,6 +2311,20 @@ pub enum Request {
         before: Option<String>,
         limit: u32,
     },
+    Voicemails {
+        account: AccountKey,
+        before: Option<String>,
+    },
+    VoicemailAudio {
+        account: AccountKey,
+        id: String,
+        attachment: String,
+    },
+    ChangeVoicemail {
+        account: AccountKey,
+        id: String,
+        action: VoicemailAction,
+    },
     /// Delete one or more entries from an account's recent calls list. `revoke` removes for both
     /// sides when the network supports it.
     DeleteCallEntries {
@@ -4638,6 +4652,10 @@ pub enum Response {
         next: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         more: bool,
+    },
+    Voicemails {
+        entries: Vec<Voicemail>,
+        next: Option<String>,
     },
     Privacy {
         key: PrivacyKey,

@@ -1309,6 +1309,9 @@ impl Demo {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Voicemails { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::VoicemailAudio { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChangeVoicemail { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

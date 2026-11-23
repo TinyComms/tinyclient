@@ -5860,6 +5860,18 @@ impl Chat {
             }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::CallHistory { account, missed, before, limit } => self.call_history(account, missed, before, limit),
+            Request::Voicemails { account, before } => match self.ask(&account, |reply| Command::Voicemails { before, reply }) {
+                Ok((entries, next)) => Response::Voicemails { entries, next },
+                Err(refused) => *refused,
+            },
+            Request::VoicemailAudio { account, id, attachment } => match self.ask(&account, |reply| Command::VoicemailAudio { id, attachment, reply }) {
+                Ok(file) => Response::Media { files: vec![file] },
+                Err(refused) => *refused,
+            },
+            Request::ChangeVoicemail { account, id, action } => match self.ask(&account, |reply| Command::ChangeVoicemail { id, action, reply }) {
+                Ok(()) => Response::Ok,
+                Err(refused) => *refused,
+            },
             Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),

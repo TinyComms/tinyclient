@@ -1571,6 +1571,9 @@ pub enum Command {
         limit: u32,
         reply: Reply<CallHistoryPage>,
     },
+    Voicemails { before: Option<String>, reply: Reply<(Vec<protocol::Voicemail>, Option<String>)> },
+    VoicemailAudio { id: String, attachment: String, reply: Reply<MediaFile> },
+    ChangeVoicemail { id: String, action: protocol::VoicemailAction, reply: Reply<()> },
     /// Delete one or more call log entries by message id (`revoke` for both sides).
     DeleteCallEntries {
         message_ids: Vec<String>,
@@ -2189,6 +2192,9 @@ impl Command {
             Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Voicemails { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::VoicemailAudio { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChangeVoicemail { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

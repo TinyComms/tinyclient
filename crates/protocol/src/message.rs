@@ -1603,6 +1603,7 @@ pub enum CallOutcome {
     Busy,
     Ended,
     Live,
+    Voicemail,
 }
 
 /// Structured call metadata attached to a `MessageKind::System` call row.

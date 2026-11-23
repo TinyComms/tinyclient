@@ -752,6 +752,30 @@ impl Fake {
         let (conversation, tail) = rest.split_once('/').unwrap_or((rest, ""));
         match (call.method.as_str(), tail) {
             ("GET", "messages") => {
+                if conversation == "48:calllogs" {
+                    if call.query.contains("syncState=calls2") {
+                        return ok(json!({"messages": [{
+                            "id": "1760000100000",
+                            "properties": {"call-log": json!({
+                                "threadId": null, "originator": ME, "target": ANA, "callDirection": "outgoing", "callState": "accepted",
+                                "connectTime": "2025-10-09T09:01:00Z", "endTime": "2025-10-09T09:01:43Z"
+                            }).to_string()}
+                        }]}));
+                    }
+                    return ok(json!({
+                        "messages": [{
+                            "id": "1760000200000", "isRead": false,
+                            "properties": {"call-log": json!({"threadId": CHAT_ANA, "originator": ANA, "target": ME, "callState": "missed"}).to_string()}
+                        }, {
+                            "id": "1760000190000",
+                            "properties": {"call-log": json!({
+                                "threadId": CHAT_ANA, "originator": ANA, "target": ME, "callState": "accepted",
+                                "forwardingInfo": {"acceptedBy": {"type": "voicemail"}}
+                            }).to_string()}
+                        }],
+                        "_metadata": {"backwardLink": "/messages?syncState=calls2"}
+                    }));
+                }
                 if let Some(root) = [LONG, JUMP].into_iter().find(|root| conversation == format!("{GENERAL};messageid={root}")) {
                     return ok(long_chain(root, &call.query));
                 }
@@ -923,6 +947,26 @@ impl Fake {
 
     /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, channel SharePoint `filesFolder`, mailbox OOO, and user org/profile.
     fn graph(&self, call: &Call, path: &str) -> Reply {
+        if call.method == "GET" && path == "/v1.0/me/mailFolders/inbox/messages" {
+            assert!(call.query.contains("singleValueExtendedProperties"));
+            return ok(json!({"value": [{
+                "id": "vm-1", "subject": "Voicemail from Ana", "isRead": false,
+                "from": {"emailAddress": {"name": "Ana Ruiz"}},
+                "receivedDateTime": "2025-10-09T09:01:00Z", "bodyPreview": "I'll call back at noon.",
+                "attachments": [{"@odata.type": "#microsoft.graph.fileAttachment", "id": "clip", "contentType": "audio/mpeg"}]
+            }]}));
+        }
+        if path == "/v1.0/me/messages/vm-1" {
+            return match call.method.as_str() {
+                "GET" => ok(json!({"singleValueExtendedProperties": [{"id": "String 0x001A", "value": "IPM.Note.Microsoft.Voicemail.UM"}]})),
+                "PATCH" if call.json() == json!({"isRead": true}) => ok(json!({})),
+                "DELETE" => answer("204 No Content", Value::Null),
+                _ => answer("400 Bad Request", json!({})),
+            };
+        }
+        if call.method == "GET" && path == "/v1.0/me/messages/vm-1/attachments/clip" {
+            return ok(json!({"@odata.type": "#microsoft.graph.fileAttachment", "contentType": "audio/mpeg", "contentBytes": "SUQz"}));
+        }
         if call.method == "GET" && path == "/v1.0/users/00000000-0000-4000-8000-0000000000a1" {
             return ok(json!({
                 "id": "00000000-0000-4000-8000-0000000000a1",
@@ -1532,6 +1576,54 @@ fn chain() -> Key {
     key(&format!("{GENERAL};messageid={ROOT}"))
 }
 
+#[test]
+fn call_history_pages_the_account_stream() {
+    use protocol::CallOutcome;
+    let world = World::start();
+    world.ready();
+    let history = |before, missed| world.ask(Request::CallHistory { account: key("").account(), missed, before, limit: 30 });
+    let Response::CallHistory { entries, next, more } = history(None, false) else {
+        panic!("expected a Teams call log");
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].conversation, key(CHAT_ANA));
+    assert_eq!(entries[0].person_id, ANA);
+    assert_eq!(entries[0].note.outcome, CallOutcome::Missed);
+    assert_eq!(entries[1].note.outcome, CallOutcome::Voicemail);
+    assert_eq!(world.conversation(&key(CHAT_ANA)).unwrap().unread, 2);
+    assert!(more);
+    let Response::CallHistory { entries, more, .. } = history(next, false) else { panic!("expected the older calls") };
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].outgoing);
+    assert_eq!(entries[0].note.seconds, Some(43));
+    assert!(!more);
+    assert!(matches!(history(None, true), Response::CallHistory { entries, .. } if entries.len() == 1));
+}
+
+#[test]
+fn exchange_voicemail_returns_transcript_and_accepts_read_and_delete() {
+    let world = World::start();
+    world.ready();
+    let account = key("").account();
+    let Response::Voicemails { entries, next } = world.ask(Request::Voicemails { account: account.clone(), before: None }) else {
+        panic!("expected mailbox voicemail");
+    };
+    assert!(next.is_none());
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.caller, "Ana Ruiz");
+    assert_eq!(entry.transcript, "I'll call back at noon.");
+    assert!(!entry.read);
+    assert!(entry.audio.is_some());
+    let Response::Media { files } = world.ask(Request::VoicemailAudio {
+        account: account.clone(), id: entry.id.clone(), attachment: entry.audio.clone().unwrap(),
+    }) else { panic!("expected landed audio") };
+    assert_eq!(std::fs::read(files[0].path.as_ref().unwrap()).unwrap(), b"ID3");
+    for action in [protocol::VoicemailAction::MarkRead, protocol::VoicemailAction::Delete] {
+        assert_eq!(world.ask(Request::ChangeVoicemail { account: account.clone(), id: entry.id.clone(), action }), Response::Ok);
+    }
+}
+
 impl World {
     fn start() -> World {
         World::start_with_cloud(None)
@@ -1556,7 +1648,7 @@ impl World {
             session["cloud"] = json!(cloud);
         }
         let log = if std::env::var_os("TINYCLIENT_TEST_LOG").is_some() { Stdio::inherit() } else { Stdio::null() };
-        let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
+        let child = Command::new(std::env::var("CHATD_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_chatd").to_owned()))
             .env("TINYCLIENT_DIR", &dir)
             .env("TINYCLIENT_SESSION_TEAMS", session.to_string())
             .env("TINYCLIENT_TEAMS_LOGIN", &fake.base)

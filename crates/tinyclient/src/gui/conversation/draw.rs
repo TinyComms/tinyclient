@@ -512,6 +512,12 @@ pub(crate) fn call_line_spec(message: &Message, peer_title: &str) -> CallRowSpec
             label: format!("{cap_noun} in progress with {other}"),
             pill: Some("Join"),
         },
+        (protocol::CallOutcome::Voicemail, _) => CallRowSpec {
+            icon: "icons/phone-incoming.svg",
+            missed: false,
+            label: format!("Voicemail from {other}"),
+            pill: Some("Call back"),
+        },
     }
 }
 

@@ -4916,6 +4916,7 @@ fn record_call(
             None => format!("Call with {other}"),
         },
         (protocol::CallOutcome::Live, _) => "Call in progress".to_owned(),
+        (protocol::CallOutcome::Voicemail, _) => "Voicemail".to_owned(),
     };
     let mut message = Message::plain(
         ring_id,
