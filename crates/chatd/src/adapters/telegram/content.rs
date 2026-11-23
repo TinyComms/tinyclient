@@ -2452,6 +2452,27 @@ fn forwarded(dir: &Directory, header: &tl::enums::MessageFwdHeader) -> Forwarded
     }
 }
 
+fn local_schedule_time(unix: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    if unix <= 0 {
+        return String::new();
+    }
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    let unix = unix as libc::time_t;
+    unsafe {
+        #[cfg(unix)]
+        libc::localtime_r(&unix, &mut local);
+        #[cfg(windows)]
+        {
+            if libc::localtime_s(&mut local, &unix) != 0 {
+                return String::new();
+            }
+        }
+    }
+    let month = MONTHS[local.tm_mon.clamp(0, 11) as usize];
+    format!("{month} {}, {:02}:{:02}", local.tm_mday, local.tm_hour, local.tm_min)
+}
+
 fn duration_words(seconds: i32) -> String {
     match seconds {
         ..=59 => format!("{seconds} s"),
@@ -2656,7 +2677,14 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
             [] => format!("{who} invited you to the video chat"),
             users => format!("{who} invited {} to the video chat", names(users)),
         }),
-        A::GroupCallScheduled(_) => named(format!("{who} scheduled a video chat")),
+        A::GroupCallScheduled(scheduled) => {
+            let when = local_schedule_time(i64::from(scheduled.schedule_date));
+            if when.is_empty() {
+                named(format!("{who} scheduled a video chat"))
+            } else {
+                named(format!("{who} scheduled a video chat for {when}"))
+            }
+        }
         A::ConferenceCall(conf) => {
             let (text, _) = call_action(&A::ConferenceCall(conf.clone()), false, who, String::new())
                 .unwrap_or_else(|| (format!("{who} started a group call"), protocol::CallNote { outcome: protocol::CallOutcome::Live, caller_id: String::new(), seconds: None, participants: Vec::new(), video: conf.video, call_id: None }));
@@ -5879,7 +5907,11 @@ mod tests {
             "Ada invited Unknown to the video chat"
         );
         let call = tl::types::InputGroupCall { id: 1, access_hash: 2 }.into();
-        assert_eq!(said(tl::types::MessageActionGroupCallScheduled { call, schedule_date: 1_700_000_000 }.into()), "Ada scheduled a video chat");
+        let sched_text = said(tl::types::MessageActionGroupCallScheduled { call, schedule_date: 1_700_000_000 }.into());
+        assert!(
+            sched_text.starts_with("Ada scheduled a video chat for "),
+            "expected local scheduled date/time, got: {sched_text}"
+        );
         assert_eq!(said(tl::types::MessageActionGameScore { game_id: 1, score: 40 }.into()), "Ada scored 40 in a game");
         assert_eq!(
             said(tl::types::MessageActionRequestedPeer { button_id: 1, peers: vec![Who::User(9).peer()] }.into()),

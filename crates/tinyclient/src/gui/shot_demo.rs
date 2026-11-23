@@ -501,6 +501,7 @@ fn build() -> Fixture {
             .map(|id| Occupant { person: Key::new(&d, id), name: who(id).map_or(id, |w| w.name).into(), avatar: None, muted: id == "ines", deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: id == "yusuf" })
             .collect(),
         total: 2,
+        ..Occupants::default()
     });
     let mut random = in_space(row(&s, "c-random", ConversationKind::Channel, "random", on_day(1, 12, 0)), harbor, "Harbor Labs", "eng", "Engineering", 1);
     said(&mut random, "theo", "who left the oat milk out");
@@ -1017,6 +1018,7 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,

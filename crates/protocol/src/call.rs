@@ -432,6 +432,9 @@ pub struct Call {
     /// One sentence about that move, or why it came back. The shell shows it once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub move_notice: Option<String>,
+    /// An incoming ring is a video call (Telegram `phoneCallRequested.video`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub incoming_video: bool,
     /// People watching our own share, named from the ids the network sent. Not inferred from
     /// who is merely in the voice channel.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -688,6 +691,91 @@ pub struct TinyPicture {
     pub kind: PictureKind,
 }
 
+/// One Telegram 1:1 call endpoint (`phoneConnection` reflector or `phoneConnectionWebrtc` STUN/TURN).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramEndpoint {
+    pub id: i64,
+    pub ip: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ipv6: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub webrtc: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tcp: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stun: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub turn: bool,
+    /// Base64 of the 16-byte reflector `peer_tag` (for `phoneConnection`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub peer_tag: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password: String,
+}
+
+impl std::fmt::Debug for TelegramEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramEndpoint")
+            .field("id", &self.id)
+            .field("ip", &self.ip)
+            .field("port", &self.port)
+            .field("webrtc", &self.webrtc)
+            .field("tcp", &self.tcp)
+            .field("stun", &self.stun)
+            .field("turn", &self.turn)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Everything mediad needs to carry a confirmed Telegram 1:1 voice call.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramCallJoin {
+    pub user_id: String,
+    pub peer_id: String,
+    pub outgoing: bool,
+    /// Base64 of the 256-byte Diffie-Hellman shared key. Redacted in Debug.
+    pub key: String,
+    pub connections: Vec<TelegramEndpoint>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub p2p_allowed: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub config_json: String,
+    pub muted: bool,
+    pub deafened: bool,
+}
+
+impl std::fmt::Debug for TelegramCallJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramCallJoin")
+            .field("user_id", &self.user_id)
+            .field("peer_id", &self.peer_id)
+            .field("outgoing", &self.outgoing)
+            .field("connections", &self.connections.len())
+            .field("p2p_allowed", &self.p2p_allowed)
+            .field("muted", &self.muted)
+            .field("deafened", &self.deafened)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What mediad needs to build Telegram's `phone.joinGroupCall` `params` JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramGroupOffer {
+    pub user_id: String,
+    pub muted: bool,
+    pub deafened: bool,
+}
+
+/// Maps a Telegram group call audio SSRC (`source`) to its participant id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramGroupSource {
+    pub ssrc: u32,
+    pub user_id: String,
+}
+
 /// One TURN relay server handed out by Signal's calling relay endpoint (`/v1/accounts/turn`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalRelay {
@@ -844,6 +932,19 @@ pub enum MediaRequest {
     /// off ([`SecurityMode::Blocked`]). Answered `Done`, or `Refused` in words when the call is
     /// not blocked or may not carry on unencrypted ([`CallSecurity::required`]).
     TinyTransport,
+    /// A confirmed Telegram 1:1 voice call: connect media over the negotiated endpoints using the
+    /// DH shared key. Answered `Done`; then `Connected` once media flows.
+    TelegramCall(TelegramCallJoin),
+    /// In-call signalling payload received via Telegram `updatePhoneCallSignalingData` (base64).
+    TelegramSignal { data: String },
+    /// A Telegram group video chat: build local ICE/DTLS join JSON and audio SSRC.
+    /// Answered `TelegramGroupJoin`.
+    TelegramGroupOffer(TelegramGroupOffer),
+    /// Telegram's server transport JSON from `updateGroupCallConnection` for a group video chat.
+    /// Answered `Done`; then `Connected` once media flows.
+    TelegramGroupAnswer { params: String },
+    /// Current SSRC -> participant id mapping for a Telegram group video chat.
+    TelegramGroupSources { sources: Vec<TelegramGroupSource> },
     /// A Signal 1:1 or group call: build a pure-Rust `str0m` WebRTC SDP offer. Answered `Offer`.
     SignalOffer(SignalOffer),
     /// Accept an incoming Signal call SDP offer and start media. Answered `Answer`.
@@ -1210,6 +1311,8 @@ pub enum MediaResponse {
     Done,
     /// The SDP offer for a Tiny or Signal call, in answer to `TinyOffer` or `SignalOffer`.
     Offer { sdp: String },
+    /// The join JSON and local audio SSRC for a Telegram group video chat, in answer to `TelegramGroupOffer`.
+    TelegramGroupJoin { params: String, ssrc: u32 },
     /// The SDP answer for an incoming Signal call, in answer to `SignalAccept`.
     Answer { sdp: String },
     /// The connection as it is now, in answer to `Stats`.
@@ -1296,6 +1399,8 @@ pub enum MediaResponse {
     Notice { detail: String },
     /// Sources dropped because the requested watch list exceeded this device's decode budget.
     WatchRefused { refused: Vec<(String, PictureKind)> },
+    /// In-call signalling bytes for Telegram `phone.sendSignalingData` (base64).
+    TelegramSignal { data: String },
     /// A local ICE candidate gathered for an active Signal call, for chatd to send in `IceUpdate`.
     SignalIce { candidate: String },
 }
@@ -1308,6 +1413,7 @@ impl MediaResponse {
             MediaResponse::Streams { .. } => "Streams",
             MediaResponse::Done => "Done",
             MediaResponse::Offer { .. } => "Offer",
+            MediaResponse::TelegramGroupJoin { .. } => "TelegramGroupJoin",
             MediaResponse::Answer { .. } => "Answer",
             MediaResponse::Stats(_) => "Stats",
             MediaResponse::Refused { .. } => "Refused",
@@ -1329,6 +1435,7 @@ impl MediaResponse {
             MediaResponse::SelfView { .. } => "SelfView",
             MediaResponse::Notice { .. } => "Notice",
             MediaResponse::WatchRefused { .. } => "WatchRefused",
+            MediaResponse::TelegramSignal { .. } => "TelegramSignal",
             MediaResponse::SignalIce { .. } => "SignalIce",
         }
     }
@@ -1340,6 +1447,7 @@ impl MediaResponse {
             MediaResponse::Streams { .. }
                 | MediaResponse::Done
                 | MediaResponse::Offer { .. }
+                | MediaResponse::TelegramGroupJoin { .. }
                 | MediaResponse::Answer { .. }
                 | MediaResponse::Stats(_)
                 | MediaResponse::Refused { .. }
@@ -1522,6 +1630,79 @@ mod tests {
         for q in [CameraQuality::Auto, CameraQuality::Hd, CameraQuality::Standard, CameraQuality::DataSaver] {
             assert_eq!(CameraQuality::parse(q.word()), Some(q));
         }
+    }
+
+    #[test]
+    fn telegram_call_and_group_media_frames_round_trip_and_redact_secrets() {
+        let endpoint = TelegramEndpoint {
+            id: 7,
+            ip: "127.0.0.1".into(),
+            ipv6: String::new(),
+            port: 1400,
+            webrtc: false,
+            tcp: false,
+            stun: false,
+            turn: false,
+            peer_tag: "AQIDBA==".into(),
+            username: "u".into(),
+            password: "super-secret-password".into(),
+        };
+        let join = TelegramCallJoin {
+            user_id: "u7001".into(),
+            peer_id: "u7002".into(),
+            outgoing: true,
+            key: "SECRET_BASE64_KEY".into(),
+            connections: vec![endpoint],
+            p2p_allowed: true,
+            config_json: r#"{"audio_max_bitrate":64000}"#.into(),
+            muted: false,
+            deafened: false,
+        };
+        let debug = format!("{join:?}");
+        assert!(!debug.contains("SECRET_BASE64_KEY"), "DH key must not leak in Debug: {debug}");
+        assert!(!debug.contains("super-secret-password"), "TURN password must not leak in Debug: {debug}");
+        let req = MediaRequest::TelegramCall(join);
+        let wire = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&wire).unwrap(), req);
+
+        let sig = MediaRequest::TelegramSignal { data: "aGVsbG8=".into() };
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&sig).unwrap()).unwrap(), sig);
+        let offer = MediaRequest::TelegramGroupOffer(TelegramGroupOffer { user_id: "u7001".into(), muted: true, deafened: false });
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&offer).unwrap()).unwrap(), offer);
+        let ans = MediaRequest::TelegramGroupAnswer { params: r#"{"transport":{}}"#.into() };
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&ans).unwrap()).unwrap(), ans);
+        let srcs = MediaRequest::TelegramGroupSources { sources: vec![TelegramGroupSource { ssrc: 42, user_id: "u7002".into() }] };
+        assert_eq!(serde_json::from_str::<MediaRequest>(&serde_json::to_string(&srcs).unwrap()).unwrap(), srcs);
+
+        let join_resp = MediaResponse::TelegramGroupJoin { params: r#"{"ufrag":"a"}"#.into(), ssrc: 99 };
+        assert!(join_resp.is_reply());
+        assert_eq!(join_resp.name(), "TelegramGroupJoin");
+        assert_eq!(serde_json::from_str::<MediaResponse>(&serde_json::to_string(&join_resp).unwrap()).unwrap(), join_resp);
+
+        let sig_resp = MediaResponse::TelegramSignal { data: "d29ybGQ=".into() };
+        assert!(!sig_resp.is_reply());
+        assert_eq!(sig_resp.name(), "TelegramSignal");
+        assert_eq!(serde_json::from_str::<MediaResponse>(&serde_json::to_string(&sig_resp).unwrap()).unwrap(), sig_resp);
+    }
+
+    #[test]
+    fn occupants_live_and_scheduled_round_trip_and_manage_call_bit_persists() {
+        let sched = crate::Occupants {
+            people: Vec::new(),
+            total: 0,
+            title: "Weekly standup".into(),
+            scheduled_at: Some(1_800_000_000),
+            subscribed: true,
+            live: false,
+        };
+        assert!(sched.active());
+        assert!(sched.is_scheduled());
+        let json = serde_json::to_string(&sched).unwrap();
+        assert_eq!(serde_json::from_str::<crate::Occupants>(&json).unwrap(), sched);
+        assert!(!crate::Occupants::default().active());
+
+        let rights = crate::ConversationRights { manage_call: true, ..crate::ConversationRights::default() };
+        assert!(crate::ConversationRights::from_bits(rights.to_bits()).manage_call);
     }
 
     #[test]

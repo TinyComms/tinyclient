@@ -594,10 +594,22 @@ pub(super) fn apply(account: &Account, update: &Update) {
             let from = Who::User(typed.user_id);
             typing(account, from.text(), from, &typed.action);
         }
-        Update::ChatUserTyping(typed) => typing(account, Who::Group(typed.chat_id).text(), Who::of(&typed.from_id), &typed.action),
+        Update::ChatUserTyping(typed) => {
+            let who = Who::Group(typed.chat_id);
+            let from = Who::of(&typed.from_id);
+            if matches!(typed.action, tl::enums::SendMessageAction::SpeakingInGroupCallAction) {
+                super::group_call::on_speaking_typing(account, who, from);
+            }
+            typing(account, who.text(), from, &typed.action);
+        }
         Update::ChannelUserTyping(typed) => {
-            let conversation = place(account, Who::Channel(typed.channel_id), typed.top_msg_id);
-            typing(account, conversation, Who::of(&typed.from_id), &typed.action);
+            let who = Who::Channel(typed.channel_id);
+            let from = Who::of(&typed.from_id);
+            if matches!(typed.action, tl::enums::SendMessageAction::SpeakingInGroupCallAction) {
+                super::group_call::on_speaking_typing(account, who, from);
+            }
+            let conversation = place(account, who, typed.top_msg_id);
+            typing(account, conversation, from, &typed.action);
         }
         Update::UserStatus(status) => {
             let who = Who::User(status.user_id);
@@ -818,63 +830,18 @@ pub(super) fn apply(account: &Account, update: &Update) {
         Update::Config => {
             account.live().default_reaction = None;
         }
-        // Call lifecycle updates: remember `(id, access_hash, peer)` for rating, and when Telegram
-        // asks for feedback on `phoneCallDiscarded` (`need_rating`), surface the rating prompt.
-        // `need_debug` is intentionally ignored: tinyclient's media stack is not tgcalls, so we do
-        // not upload incompatible call debug logs via `phone.saveCallDebug`.
-        Update::PhoneCall(phone) => phone_call(account, &phone.phone_call),
+        // Call lifecycle updates (`#451`, `#469`): incoming rings, DH handshake, discard & rating.
+        Update::PhoneCall(phone) => super::call::on_phone_call(account, &phone.phone_call),
+        Update::PhoneCallSignalingData(sig) => super::call::on_signaling_data(account, sig),
+        // Group / channel video chat updates (`#462`, `#465`, `#461`).
+        Update::GroupCall(gc) => super::group_call::on_group_call(account, gc),
+        Update::GroupCallParticipants(gp) => super::group_call::on_participants(account, gp),
+        Update::GroupCallConnection(conn) => super::group_call::on_connection(account, conn),
         Update::Story(story) => super::stories::apply_story(account, story),
         Update::ReadStories(read) => super::stories::apply_read(account, read),
         // A chat joined, left or changed: what changed came with the update's chats, which
         // `learn` has already written.
         _ => {}
-    }
-}
-
-fn remember_phone_call(account: &Account, id: i64, access_hash: i64, admin_id: i64, participant_id: i64) {
-    let peer_id = if admin_id == account.me { participant_id } else { admin_id };
-    let peer = (peer_id != 0).then_some(Who::User(peer_id));
-    let mut live = account.live();
-    live.phone_calls.retain(|(known_id, _, _)| *known_id != id);
-    if live.phone_calls.len() >= 64 {
-        live.phone_calls.pop_front();
-    }
-    live.phone_calls.push_back((id, access_hash, peer));
-}
-
-fn phone_call(account: &Account, call: &tl::enums::PhoneCall) {
-    match call {
-        tl::enums::PhoneCall::Waiting(c) => remember_phone_call(account, c.id, c.access_hash, c.admin_id, c.participant_id),
-        tl::enums::PhoneCall::Requested(c) => remember_phone_call(account, c.id, c.access_hash, c.admin_id, c.participant_id),
-        tl::enums::PhoneCall::Accepted(c) => remember_phone_call(account, c.id, c.access_hash, c.admin_id, c.participant_id),
-        tl::enums::PhoneCall::Call(c) => remember_phone_call(account, c.id, c.access_hash, c.admin_id, c.participant_id),
-        tl::enums::PhoneCall::Discarded(discarded) => {
-            if discarded.need_debug {
-                tracing::debug!("chatd: Telegram: phoneCallDiscarded {} asked for debug stats; skipped (non-tgcalls stack)", discarded.id);
-            }
-            if !discarded.need_rating {
-                return;
-            }
-            let known = account
-                .live()
-                .phone_calls
-                .iter()
-                .rev()
-                .find(|(id, _, _)| *id == discarded.id)
-                .cloned();
-            let Some((_, _, Some(peer))) = known else {
-                return;
-            };
-            account.ctx.hub.changed(protocol::Change::CallRating {
-                prompt: protocol::CallRatingPrompt {
-                    conversation: account.ctx.key(&peer.text()),
-                    call_id: discarded.id.to_string(),
-                    video: discarded.video,
-                    seconds: discarded.duration.filter(|&d| d > 0).map(|d| d as u32),
-                },
-            });
-        }
-        tl::enums::PhoneCall::Empty(_) => {}
     }
 }
 

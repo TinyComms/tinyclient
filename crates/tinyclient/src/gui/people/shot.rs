@@ -207,7 +207,7 @@ impl Shell {
         // Kofi is in a voice channel, so his corner is the call badge wherever he is drawn.
         let kofi = Occupant { person: named("Kofi Mensah-Boyd"), name: "Kofi".into(), avatar: None, muted: false, deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: false };
         let voice = Key { network: Network::Discord, account: "demo".into(), id: "voice".into() };
-        hub.set_occupants(&voice, &Occupants { people: vec![kofi], total: 1 });
+        hub.set_occupants(&voice, &Occupants { people: vec![kofi], total: 1, ..Occupants::default() });
         if wants("open0") {
             self.open_listed(0, cx);
         }

@@ -213,6 +213,7 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
             let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
             account.learn(&full.users, &full.chats);
             if let tl::enums::ChatFull::Full(chat) = full.full_chat {
+                super::group_call::note_full_call(account, who, chat.call.as_ref());
                 about.description = chat.about;
                 about.disappearing = chat.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
                 let _ = account.ctx.disappearing(conversation, about.disappearing);
@@ -246,6 +247,7 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
             let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::channels::GetFullChannel { channel })?;
             account.learn(&full.users, &full.chats);
             if let tl::enums::ChatFull::ChannelFull(channel) = full.full_chat {
+                super::group_call::note_full_call(account, who, channel.call.as_ref());
                 about.description = channel.about;
                 about.members = channel.participants_count.map(|count| count.max(0) as u32);
                 about.online = channel.online_count.map(|count| count.max(0) as u32);

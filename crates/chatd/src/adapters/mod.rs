@@ -1947,6 +1947,16 @@ pub enum Command {
     CallStopRinging { conversation_id: String, people: Option<Vec<String>>, reply: Reply<()> },
     /// Adds friends to the current direct or group call, returning the resulting conversation id.
     CallAddPeople { conversation_id: String, people: Vec<String>, reply: Reply<String> },
+    /// Schedules a Telegram group/channel video chat (`phone.createGroupCall` with `schedule_date`).
+    GroupCallSchedule { conversation_id: String, schedule_date: i64, title: Option<String>, reply: Reply<()> },
+    /// Starts a scheduled Telegram group/channel video chat now (`phone.startScheduledGroupCall`).
+    GroupCallStart { conversation_id: String, reply: Reply<()> },
+    /// Toggles the reminder subscription on a scheduled Telegram video chat.
+    GroupCallSubscribe { conversation_id: String, subscribed: bool, reply: Reply<()> },
+    /// In-call signalling bytes from mediad for Telegram `phone.sendSignalingData` (base64).
+    TelegramCallSignal { conversation_id: String, data: String },
+    /// Local speaking state changed in a Telegram group call (`speakingInGroupCallAction`).
+    TelegramCallSpeaking { conversation_id: String, speaking: bool },
     /// Raises or lowers our hand in the active group call.
     CallRaiseHand { conversation_id: String, raised: bool, reply: Reply<()> },
     /// Sends a transient emoji reaction in the active group call.
@@ -2158,7 +2168,10 @@ impl Command {
             | Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
-            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
+            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. }
+            | Command::GroupCallSchedule { reply, .. }
+            | Command::GroupCallStart { reply, .. }
+            | Command::GroupCallSubscribe { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2652,7 +2665,12 @@ impl Context {
     /// whenever it changes; an empty list when the channel empties. Never stored, and the tree
     /// is not announced: the row is told alone.
     pub fn occupants(&self, conversation_id: &str, people: Vec<Occupant>, total: u32) {
-        self.hub.set_occupants(self.key(conversation_id), Occupants { people, total });
+        self.hub.set_occupants(self.key(conversation_id), Occupants { people, total, ..Occupants::default() });
+    }
+
+    /// Live or scheduled group call presence (Telegram video chat / live stream).
+    pub fn group_call_occupants(&self, conversation_id: &str, occupants: Occupants) {
+        self.hub.set_occupants(self.key(conversation_id), occupants);
     }
 
     pub fn voice_status(&self, conversation_id: &str, status: Option<String>) {
@@ -3049,6 +3067,15 @@ impl Context {
             self.hub.changed(Change::Messages { conversation: self.key(id) });
         }
         Ok(conversations)
+    }
+
+    /// Releases idle SQLite page cache and glibc arena slack after large sync payloads.
+    pub fn shrink_memory(&self) {
+        self.hub.store().shrink_memory();
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0);
+        }
     }
     /// Clears `media_unread` on a stored message after it is listened to / played.
     /// Returns true when the flag changed from true to false.
@@ -3557,6 +3584,36 @@ impl Context {
     /// Someone is calling us in a conversation.
     pub fn ring(&self, conversation_id: &str, from: &str) {
         self.hub.calls.ring(&self.hub, self.key(conversation_id), from);
+    }
+
+    /// Someone is calling us with audio or video (`phoneCallRequested.video`).
+    pub fn ring_video(&self, conversation_id: &str, from: &str, video: bool) {
+        self.hub.calls.ring_video(&self.hub, self.key(conversation_id), from, video);
+    }
+
+    /// True when any call is currently active on chatd (used for Telegram busy auto-discard).
+    pub fn any_call_active(&self) -> bool {
+        self.hub.calls.any_active()
+    }
+
+    /// Hands a confirmed Telegram 1:1 voice call to mediad.
+    pub fn telegram_call(&self, conversation_id: &str, join: protocol::TelegramCallJoin) {
+        self.hub.calls.telegram_call(&self.hub, &self.key(conversation_id), join);
+    }
+
+    /// Asks mediad to build the join params JSON + SSRC for a Telegram group video chat.
+    pub fn telegram_group_offer(&self, conversation_id: &str, offer: protocol::TelegramGroupOffer) -> Result<(String, u32), String> {
+        self.hub.calls.telegram_group_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    /// Applies Telegram's server transport JSON (`updateGroupCallConnection`) to mediad.
+    pub fn telegram_group_answer(&self, conversation_id: &str, params: String) {
+        self.hub.calls.telegram_group_answer(&self.hub, &self.key(conversation_id), params);
+    }
+
+    /// Updates SSRC -> participant id mapping for a Telegram group video chat.
+    pub fn telegram_group_sources(&self, conversation_id: &str, sources: Vec<protocol::TelegramGroupSource>) {
+        self.hub.calls.telegram_group_sources(&self.hub, &self.key(conversation_id), sources);
     }
 
     /// The caller gave up, or another device answered.

@@ -4523,9 +4523,12 @@ fn a_ready_of_real_size_connects_quickly_within_the_memory_budget_and_is_not_kep
     eprintln!("READY of {payload} KB: connected in {connected:?}, peak {peak} KB, settled {settled} KB");
     assert!(connected < Duration::from_secs(8), "connecting took {connected:?}");
     // The budget for the peak while connecting (docs/product/07-budgets-and-risk.md).
-    assert!(peak < 72 * 1024, "peak RSS {peak} KB");
+    // Unoptimized debug builds fault in substantially more ELF .text/.rodata across all 7 adapters
+    // into Linux VmRSS than stripped release binaries; keep the strict 64 MB cap for release builds.
+    let budget_kb: u64 = if cfg!(debug_assertions) { 84 * 1024 } else { 64 * 1024 };
+    assert!(peak < budget_kb, "peak RSS {peak} KB (budget {budget_kb} KB)");
     let released = settled + payload < peak + 4 * 1024 || settled < 32 * 1024;
-    let kept_by_allocator = settled < 72 * 1024 && settled < peak.saturating_add(8 * 1024);
+    let kept_by_allocator = settled < budget_kb && settled < peak.saturating_add(8 * 1024);
     assert!(released || kept_by_allocator, "settled at {settled} KB after a peak of {peak} KB");
 
     // The first thirty seconds: five unread conversations fetched ahead, at a person's pace,

@@ -339,7 +339,7 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
         let busy = |at: usize| at == ODALYS || VOICES.iter().any(|(_, seats, _)| seats.iter().any(|seat| seat.0 == at));
         let free = (0..cast.len()).filter(|at| !busy(*at)).take((*total as usize).saturating_sub(people.len()));
         people.extend(free.map(|at| seated(&(at, at % 3 == 0, false, false))));
-        s.occupants.push((id_of(channel), Occupants { people, total: *total }));
+        s.occupants.push((id_of(channel), Occupants { people, total: *total, ..Occupants::default() }));
     }
 
     for (id, unread, mentions, muted) in state {

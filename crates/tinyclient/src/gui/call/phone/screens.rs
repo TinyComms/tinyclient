@@ -59,7 +59,13 @@ impl Shell {
         let direct = subject.kind == ConversationKind::Direct;
         let face = self.call_phone_face(call, subject, call.participants.first().map_or("", |peer| peer.id.as_str()), cx);
         let lead = halo(self.call_phone_lead(&call.conversation, subject, face, 144., false), 144., false);
-        let kind = if pictures_network(call) { "Incoming call" } else { "Incoming voice call" };
+        let kind = if call.incoming_video {
+            "Incoming video call"
+        } else if pictures_network(call) {
+            "Incoming call"
+        } else {
+            "Incoming voice call"
+        };
         let line = if direct { kind.to_owned() } else { format!("{from} is calling") };
         let decline = round("call-phone-decline", "icons/phone-off.svg", "Decline", Look::End, 72.).on_click(cx.listener(|this, _, _, cx| this.call_decline(cx)));
         let video = pictures_network(call).then(|| {
@@ -236,6 +242,7 @@ mod tests {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,

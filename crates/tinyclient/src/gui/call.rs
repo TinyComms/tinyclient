@@ -779,6 +779,7 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        incoming_video: false,
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
@@ -3151,6 +3152,27 @@ impl Shell {
         }
     }
 
+    /// Toggles the reminder subscription on a scheduled Telegram video chat (`#465`).
+    pub(in crate::gui) fn group_call_subscribe(&mut self, conversation: Key, subscribed: bool, cx: &mut Context<Self>) {
+        self.call_ask(Request::GroupCallSubscribe { conversation, subscribed }, cx);
+    }
+
+    /// Starts a scheduled Telegram video chat now (or starts a fresh one) (`#465`).
+    pub(in crate::gui) fn group_call_start(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        self.call_ask(Request::GroupCallStart { conversation }, cx);
+    }
+
+    /// Schedules a Telegram group/channel video chat (`#465`).
+    pub(in crate::gui) fn group_call_schedule(
+        &mut self,
+        conversation: Key,
+        schedule_date: i64,
+        title: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.call_ask(Request::GroupCallSchedule { conversation, schedule_date, title }, cx);
+    }
+
     /// ⌘⇧J: opens the conversation the call is in.
     pub(super) fn call_jump(&mut self, cx: &mut Context<Self>) {
         let Some(snapshot) = &self.snapshot else {
@@ -3414,12 +3436,31 @@ impl Shell {
         }
         let network = key.network;
         match open.call {
-            CallSupport::None => None,
+            CallSupport::None => {
+                if network == Network::Telegram
+                    && matches!(open.kind, ConversationKind::Group | ConversationKind::Channel)
+                    && open.rights.manage_call
+                    && open.occupants.as_ref().is_none_or(|o| !o.active())
+                {
+                    let label = if open.kind == ConversationKind::Channel { "Live stream" } else { "Video chat" };
+                    return Some(
+                        pill.when(!phone, |pill| pill.bg(theme::raised()))
+                            .border_color(theme::hairline())
+                            .text_color(theme::text())
+                            .hover(|style| style.bg(theme::selected()))
+                            .tooltip(tip(format!("Start a {label} in {}", open.title), None))
+                            .on_click(cx.listener(move |this, _, _, cx| this.group_call_start(key.clone(), cx)))
+                            .child(icon("icons/phone.svg", glyph(14.), if phone { theme::text_soft() } else { theme::text() }, None))
+                            .children(words(label.into())),
+                    );
+                }
+                None
+            }
             CallSupport::Native => {
                 let voice = open.kind == ConversationKind::Voice;
                 // A direct or group conversation whose call is already running: joining it
                 // rings nobody. The adapter lists who is in it as the row's occupants.
-                let running = open.occupants.as_ref().filter(|there| !voice && there.total > 0);
+                let running = open.occupants.as_ref().filter(|there| !voice && (there.total > 0 || there.live));
                 #[cfg(feature = "gui-shot")]
                 let shot = shot::running();
                 #[cfg(feature = "gui-shot")]
@@ -3509,6 +3550,17 @@ mod tests {
     use super::*;
     use protocol::Occupant;
 
+    #[test]
+    fn incoming_telegram_call_labels_distinguish_video_and_handoff() {
+        let tg_key = Key::new(&protocol::AccountKey { network: Network::Telegram, account: "7001".into() }, "u7002");
+        let mut call = bare_call(tg_key, CallState::RingingIn { from: "Odalys".into() }, false, false);
+        assert_eq!(dock::incoming_subtitle(&call, ConversationKind::Direct, "Odalys", 0), "Incoming call");
+        assert_eq!(dock::incoming_accept_label(&call, CallSupport::Native), "Accept");
+        assert_eq!(dock::incoming_accept_label(&call, CallSupport::Handoff), "Answer in Telegram");
+        call.incoming_video = true;
+        assert_eq!(dock::incoming_subtitle(&call, ConversationKind::Direct, "Odalys", 0), "Incoming video call");
+    }
+
     fn key(id: &str) -> Key {
         Key { network: Network::Tiny, account: "me".into(), id: id.into() }
     }
@@ -3596,7 +3648,7 @@ mod tests {
             camera: false,
             speaking: false,
         };
-        Occupants { people: names.iter().map(person).collect(), total }
+        Occupants { people: names.iter().map(person).collect(), total, ..Occupants::default() }
     }
 
     #[test]

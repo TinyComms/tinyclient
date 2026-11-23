@@ -1215,6 +1215,11 @@ fn column(db: &Connection, table: &str, name: &str) -> rusqlite::Result<bool> {
 }
 
 impl Store {
+    /// Asks SQLite to release idle page-cache memory back to the allocator after bulk syncs.
+    pub fn shrink_memory(&self) {
+        let _ = self.db.execute_batch("PRAGMA shrink_memory;");
+    }
+
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         // Owner-only before SQLite creates it, so it never exists with wider rights (Unix), and
         // narrowed if an older build made it wide. SQLite gives `-wal` and `-shm` the file's

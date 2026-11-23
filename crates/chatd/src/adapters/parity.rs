@@ -73,7 +73,7 @@ fn offer(network: Network, kind: Audio) -> CallOffer {
         (Network::Slack, Stage) => CallOffer::Absent,
         (Network::Slack, _) => super::slack::call_support().into(),
         (Network::Telegram, Direct) => super::telegram::direct_call_ceiling().into(),
-        (Network::Telegram, Group | Room) => super::telegram::other_call().into(),
+        (Network::Telegram, Group | Room) => super::telegram::group_call_ceiling().into(),
         (Network::Telegram, Stage) => CallOffer::Absent,
         (Network::Teams, Direct | Group) => super::teams::chat_call(false, false).into(),
         (Network::Teams, Room) => super::teams::channel_call().into(),

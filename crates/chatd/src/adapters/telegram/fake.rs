@@ -233,12 +233,14 @@ fn searched_public(query: &str) -> Vec<tl::enums::Chat> {
 }
 
 fn chats() -> Vec<tl::enums::Chat> {
+    let is_admin = std::env::var("TINYCLIENT_TELEGRAM_ADMIN").ok().as_deref() == Some("1");
+    let crew_call = std::env::var("TINYCLIENT_TELEGRAM_CREW_CALL").ok();
     let crew = tl::types::Chat {
-        creator: false,
+        creator: is_admin,
         left: false,
         deactivated: false,
-        call_active: false,
-        call_not_empty: false,
+        call_active: matches!(crew_call.as_deref(), Some("live" | "scheduled")),
+        call_not_empty: crew_call.as_deref() == Some("live"),
         noforwards: false,
         id: CREW,
         title: "Trail crew".to_owned(),
@@ -255,15 +257,19 @@ fn chats() -> Vec<tl::enums::Chat> {
         tl::enums::Chat::Channel({
             let mut notes = a_channel(NOTES, "Field Notes", true, false, "fieldnotes");
             notes.verified = true;
+            if is_admin {
+                notes.creator = true;
+            }
             notes
         }),
         tl::enums::Chat::Channel({
             let mut workshop = a_channel(WORKSHOP, "Workshop", false, true, "");
-            if std::env::var("TINYCLIENT_TELEGRAM_ADMIN").ok().as_deref() == Some("1") {
+            if is_admin {
                 let mut rights: tl::types::ChatAdminRights = blank(&[&put(0u32)]);
                 rights.delete_messages = true;
                 rights.pin_messages = true;
                 rights.manage_topics = true;
+                rights.manage_call = true;
                 workshop.admin_rights = Some(rights.into());
             }
             workshop
@@ -810,10 +816,101 @@ struct World {
     transcribe_mode: String,
     /// Remaining free trial transcriptions reported by `messages.transcribeAudio`.
     transcribe_trial: Option<i32>,
+    /// Scripted 1:1 call state for `#451` and `#469`.
+    phone_call_id: i64,
+    phone_call_hash: i64,
+    phone_call_peer_secret: Option<[u8; 256]>,
+    phone_call_g_a: Option<Vec<u8>>,
+    phone_call_busy_next: bool,
+    /// Scripted group/channel video chats for `#462`, `#465`, `#461`.
+    group_calls: HashMap<Who, FakeGroupCall>,
+    next_group_call_id: i64,
     /// Active stories per peer: `(max_read_id, items)` for Wave 15C (#540).
     stories: HashMap<Who, (i32, Vec<tl::types::StoryItem>)>,
     /// Story reply header pending for the current `messages.sendMessage` with `InputReplyTo::Story`.
     pending_reply_story: Option<(Who, i32)>,
+}
+
+#[derive(Clone)]
+struct FakeGroupCall {
+    id: i64,
+    access_hash: i64,
+    title: String,
+    schedule_date: Option<i32>,
+    subscribed: bool,
+    /// `(user_id, ssrc, muted, speaking)`
+    participants: Vec<(i64, i32, bool, bool)>,
+}
+
+impl FakeGroupCall {
+    fn to_tl(&self) -> tl::enums::GroupCall {
+        tl::types::GroupCall {
+            join_muted: true,
+            can_change_join_muted: true,
+            join_date_asc: false,
+            schedule_start_subscribed: self.subscribed,
+            can_start_video: true,
+            record_video_active: false,
+            rtmp_stream: false,
+            listeners_hidden: false,
+            conference: false,
+            creator: false,
+            messages_enabled: false,
+            can_change_messages_enabled: false,
+            min: false,
+            id: self.id,
+            access_hash: self.access_hash,
+            participants_count: if self.schedule_date.is_some() { 0 } else { self.participants.len() as i32 },
+            title: (!self.title.is_empty()).then(|| self.title.clone()),
+            stream_dc_id: Some(2),
+            record_start_date: None,
+            schedule_date: self.schedule_date,
+            unmuted_video_count: None,
+            unmuted_video_limit: 0,
+            version: 1,
+            invite_link: None,
+            send_paid_messages_stars: None,
+            default_send_as: None,
+        }
+        .into()
+    }
+
+    fn participant_tl(user_id: i64, ssrc: i32, muted: bool, speaking: bool, left: bool) -> tl::enums::GroupCallParticipant {
+        tl::types::GroupCallParticipant {
+            muted,
+            left,
+            can_self_unmute: true,
+            just_joined: false,
+            versioned: false,
+            min: false,
+            muted_by_you: false,
+            volume_by_admin: false,
+            is_self: user_id == ME,
+            video_joined: false,
+            peer: Who::User(user_id).peer(),
+            date: t0(),
+            active_date: speaking.then(|| t0() + 10),
+            source: ssrc,
+            volume: None,
+            about: None,
+            raise_hand_rating: None,
+            video: None,
+            presentation: None,
+            paid_stars_total: None,
+        }
+        .into()
+    }
+}
+
+fn fake_dh_prime() -> [u8; 256] {
+    let bytes = unhex(PRIME);
+    bytes.try_into().expect("256-byte prime")
+}
+
+fn fake_dh_pub(secret: &[u8; 256]) -> [u8; 256] {
+    let mut base = [0u8; 256];
+    base[255] = 3;
+    super::call::modpow_2048(&base, secret, &fake_dh_prime())
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -985,6 +1082,48 @@ impl World {
             paid_stars: HashMap::new(),
             transcribe_mode: String::new(),
             transcribe_trial: Some(2),
+            phone_call_id: 91_000,
+            phone_call_hash: 55_001,
+            phone_call_peer_secret: None,
+            phone_call_g_a: None,
+            phone_call_busy_next: false,
+            group_calls: {
+                let mut map = HashMap::new();
+                match std::env::var("TINYCLIENT_TELEGRAM_CREW_CALL").ok().as_deref() {
+                    Some("live") => {
+                        map.insert(
+                            Who::Group(CREW),
+                            FakeGroupCall {
+                                id: 88_001,
+                                access_hash: 77_001,
+                                title: "Trail planning".to_owned(),
+                                schedule_date: None,
+                                subscribed: false,
+                                participants: vec![
+                                    (ODALYS, 1001, false, true),
+                                    (TOBIN, 1002, true, false),
+                                ],
+                            },
+                        );
+                    }
+                    Some("scheduled") => {
+                        map.insert(
+                            Who::Group(CREW),
+                            FakeGroupCall {
+                                id: 88_002,
+                                access_hash: 77_002,
+                                title: "Weekly route check".to_owned(),
+                                schedule_date: Some(t0() + 3_600),
+                                subscribed: false,
+                                participants: Vec::new(),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+                map
+            },
+            next_group_call_id: 88_100,
             stories: HashMap::new(),
             pending_reply_story: None,
         };
@@ -3402,8 +3541,685 @@ impl World {
                 let chat = tl::types::EncryptedChatDiscarded { history_deleted: false, id: 42 };
                 vec![update(tl::types::UpdateEncryption { chat: chat.into(), date: t0() }.into())]
             }
-            _ => Vec::new(),
+            _ => self.steer_calls(line).unwrap_or_default(),
         }
+    }
+
+    #[inline(never)]
+    fn steer_calls(&mut self, line: &str) -> Option<Vec<Event>> {
+        let out = match line.split_whitespace().next().unwrap_or("") {
+            "call-ring-in" | "call-ring-in-video" => {
+                let video = line == "call-ring-in-video";
+                let secret = [0x33u8; 256];
+                let g_a = fake_dh_pub(&secret);
+                let g_a_hash = Sha256::digest(&g_a).to_vec();
+                self.phone_call_id = 91_010;
+                self.phone_call_hash = 55_010;
+                self.phone_call_peer_secret = Some(secret);
+                self.phone_call_g_a = Some(g_a.to_vec());
+                let req = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallRequested {
+                        video,
+                        id: self.phone_call_id,
+                        access_hash: self.phone_call_hash,
+                        date: t0() + 100,
+                        admin_id: ODALYS,
+                        participant_id: ME,
+                        g_a_hash,
+                        protocol: super::call::phone_call_protocol(),
+                    }
+                    .into(),
+                };
+                vec![update(req.into())]
+            }
+            "call-ring-in-second" => {
+                let g_a_hash = Sha256::digest(&[0x55u8; 256]).to_vec();
+                let req = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallRequested {
+                        video: false,
+                        id: 91_099,
+                        access_hash: 55_099,
+                        date: t0() + 101,
+                        admin_id: TOBIN,
+                        participant_id: ME,
+                        g_a_hash,
+                        protocol: super::call::phone_call_protocol(),
+                    }
+                    .into(),
+                };
+                vec![update(req.into())]
+            }
+            "call-accept-out" => {
+                let secret = [0x44u8; 256];
+                let g_b = fake_dh_pub(&secret);
+                self.phone_call_peer_secret = Some(secret);
+                let acc = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallAccepted {
+                        video: false,
+                        id: self.phone_call_id,
+                        access_hash: self.phone_call_hash,
+                        date: t0() + 102,
+                        admin_id: ME,
+                        participant_id: ODALYS,
+                        g_b: g_b.to_vec(),
+                        protocol: super::call::phone_call_protocol(),
+                    }
+                    .into(),
+                };
+                vec![update(acc.into())]
+            }
+            "call-answer-elsewhere" => {
+                let g_a = self.phone_call_g_a.clone().unwrap_or_else(|| vec![0x77u8; 256]);
+                let answered = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCall {
+                        p2p_allowed: true,
+                        video: false,
+                        conference_supported: false,
+                        id: self.phone_call_id,
+                        access_hash: self.phone_call_hash,
+                        date: t0() + 103,
+                        admin_id: ODALYS,
+                        participant_id: ME,
+                        g_a_or_b: g_a,
+                        key_fingerprint: 12345,
+                        protocol: super::call::phone_call_protocol(),
+                        connections: Vec::new(),
+                        start_date: t0() + 103,
+                        custom_parameters: None,
+                    }
+                    .into(),
+                };
+                vec![update(answered.into())]
+            }
+            "call-discard-in" => {
+                let disc = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallDiscarded {
+                        need_rating: false,
+                        need_debug: false,
+                        video: false,
+                        id: self.phone_call_id,
+                        reason: Some(tl::enums::PhoneCallDiscardReason::Missed),
+                        duration: None,
+                    }
+                    .into(),
+                };
+                vec![update(disc.into())]
+            }
+            "call-busy-next" => {
+                self.phone_call_busy_next = true;
+                Vec::new()
+            }
+            "call-signal" => {
+                let sig = tl::types::UpdatePhoneCallSignalingData {
+                    phone_call_id: self.phone_call_id,
+                    data: b"fake-signal-bytes".to_vec(),
+                };
+                vec![update(sig.into())]
+            }
+            "group-call-live" | "group-call-live-channel" => {
+                let who = if line == "group-call-live-channel" { Who::Channel(NOTES) } else { Who::Group(CREW) };
+                let id = self.next_group_call_id;
+                self.next_group_call_id += 1;
+                let gc = FakeGroupCall {
+                    id,
+                    access_hash: id * 10 + 3,
+                    title: if line == "group-call-live-channel" { "Field broadcast".to_owned() } else { "Trail planning".to_owned() },
+                    schedule_date: None,
+                    subscribed: false,
+                    participants: vec![
+                        (ODALYS, 1001, false, true),
+                        (TOBIN, 1002, true, false),
+                    ],
+                };
+                let upd = tl::types::UpdateGroupCall {
+                    live_story: false,
+                    peer: Some(who.peer()),
+                    call: gc.to_tl(),
+                };
+                self.group_calls.insert(who, gc);
+                vec![update(upd.into())]
+            }
+            "group-call-participant-join" => {
+                let who = Who::Group(CREW);
+                if let Some(gc) = self.group_calls.get_mut(&who) {
+                    gc.participants.push((NIA, 1003, false, true));
+                    let mut p = FakeGroupCall::participant_tl(NIA, 1003, false, true, false);
+                    let tl::enums::GroupCallParticipant::Participant(ref mut inner) = p;
+                    inner.just_joined = true;
+                    let upd = tl::types::UpdateGroupCallParticipants {
+                        call: tl::types::InputGroupCall { id: gc.id, access_hash: gc.access_hash }.into(),
+                        participants: vec![p],
+                        version: 2,
+                    };
+                    vec![Event::Update {
+                        update: Box::new(upd.into()),
+                        users: vec![user(NIA, "Nia", "Pell", "").into()],
+                        chats: Vec::new(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            "group-call-participant-leave" => {
+                let who = Who::Group(CREW);
+                if let Some(gc) = self.group_calls.get_mut(&who) {
+                    gc.participants.retain(|(uid, ..)| *uid != TOBIN);
+                    let upd = tl::types::UpdateGroupCallParticipants {
+                        call: tl::types::InputGroupCall { id: gc.id, access_hash: gc.access_hash }.into(),
+                        participants: vec![FakeGroupCall::participant_tl(TOBIN, 1002, true, false, true)],
+                        version: 3,
+                    };
+                    vec![update(upd.into())]
+                } else {
+                    Vec::new()
+                }
+            }
+            "group-call-discard" => {
+                let who = Who::Group(CREW);
+                if let Some(gc) = self.group_calls.remove(&who) {
+                    let upd = tl::types::UpdateGroupCall {
+                        live_story: false,
+                        peer: Some(who.peer()),
+                        call: tl::enums::GroupCall::Discarded(tl::types::GroupCallDiscarded {
+                            id: gc.id,
+                            access_hash: gc.access_hash,
+                            duration: 120,
+                        }),
+                    };
+                    vec![update(upd.into())]
+                } else {
+                    Vec::new()
+                }
+            }
+            "group-call-scheduled" => {
+                let who = Who::Group(CREW);
+                let id = self.next_group_call_id;
+                self.next_group_call_id += 1;
+                let schedule_date = t0() + 3_600;
+                let gc = FakeGroupCall {
+                    id,
+                    access_hash: id * 10 + 3,
+                    title: "Route kickoff".to_owned(),
+                    schedule_date: Some(schedule_date),
+                    subscribed: false,
+                    participants: Vec::new(),
+                };
+                let upd = tl::types::UpdateGroupCall {
+                    live_story: false,
+                    peer: Some(who.peer()),
+                    call: gc.to_tl(),
+                };
+                let svc = tl::types::MessageService {
+                    out: false,
+                    mentioned: false,
+                    media_unread: false,
+                    reactions_are_possible: false,
+                    silent: false,
+                    post: false,
+                    legacy: false,
+                    id: self.next,
+                    from_id: Some(Who::User(ODALYS).peer()),
+                    peer_id: who.peer(),
+                    saved_peer_id: None,
+                    reply_to: None,
+                    date: t0() + 105,
+                    action: tl::types::MessageActionGroupCallScheduled {
+                        call: tl::types::InputGroupCall { id: gc.id, access_hash: gc.access_hash }.into(),
+                        schedule_date,
+                    }
+                    .into(),
+                    reactions: None,
+                    ttl_period: None,
+                };
+                self.next += 1;
+                self.messages.entry(key(who, None)).or_default().insert(svc.id, svc.clone().into());
+                self.group_calls.insert(who, gc);
+                vec![
+                    update(upd.into()),
+                    update(tl::types::UpdateNewMessage { message: svc.into(), pts: 0, pts_count: 0 }.into()),
+                ]
+            }
+            "group-call-start" => {
+                let who = Who::Group(CREW);
+                if let Some(gc) = self.group_calls.get_mut(&who) {
+                    gc.schedule_date = None;
+                    gc.participants = vec![(ODALYS, 1001, false, true)];
+                    let upd = tl::types::UpdateGroupCall {
+                        live_story: false,
+                        peer: Some(who.peer()),
+                        call: gc.to_tl(),
+                    };
+                    vec![update(upd.into())]
+                } else {
+                    Vec::new()
+                }
+            }
+            "group-call-speaking" => {
+                let upd = tl::types::UpdateChatUserTyping {
+                    chat_id: CREW,
+                    from_id: Who::User(ODALYS).peer(),
+                    action: tl::enums::SendMessageAction::SpeakingInGroupCallAction,
+                };
+                vec![update(upd.into())]
+            }
+            _ => return None,
+        };
+        Some(out)
+    }
+
+    #[inline(never)]
+    fn handle_phone_calls(&mut self, body: &[u8]) -> Option<Result<Vec<u8>, Fault>> {
+        use tl::functions as f;
+        if let Some(_request) = asked::<f::messages::GetDhConfig>(body) {
+            self.log("GetDhConfig");
+            return Some(answer(tl::enums::messages::DhConfig::Config(tl::types::messages::DhConfig {
+                g: 3,
+                p: unhex(PRIME),
+                version: 1,
+                random: vec![7u8; 256],
+            })));
+        }
+        if asked::<f::phone::GetCallConfig>(body).is_some() {
+            self.log("GetCallConfig");
+            return Some(answer(tl::enums::DataJson::Json(tl::types::DataJson {
+                data: r#"{"audio_max_bitrate":64000}"#.to_owned(),
+            })));
+        }
+        if let Some(request) = asked::<f::phone::ReceivedCall>(body) {
+            let tl::enums::InputPhoneCall::Call(peer) = request.peer;
+            self.log(&format!("ReceivedCall {}", peer.id));
+            return Some(answer(true));
+        }
+        if let Some(request) = asked::<f::phone::RequestCall>(body) {
+            let uid = match &request.user_id {
+                tl::enums::InputUser::User(u) => u.user_id,
+                _ => ODALYS,
+            };
+            self.log(&format!("RequestCall u{uid}"));
+            self.phone_call_id += 1;
+            self.phone_call_hash = 55_000 + self.phone_call_id % 1000;
+            if std::mem::take(&mut self.phone_call_busy_next) {
+                let disc = tl::types::phone::PhoneCall {
+                    phone_call: tl::types::PhoneCallDiscarded {
+                        need_rating: false,
+                        need_debug: false,
+                        video: request.video,
+                        id: self.phone_call_id,
+                        reason: Some(tl::enums::PhoneCallDiscardReason::Busy),
+                        duration: None,
+                    }
+                    .into(),
+                    users: users(),
+                };
+                return Some(answer(tl::enums::phone::PhoneCall::Call(disc)));
+            }
+            let waiting = tl::types::phone::PhoneCall {
+                phone_call: tl::types::PhoneCallWaiting {
+                    video: request.video,
+                    id: self.phone_call_id,
+                    access_hash: self.phone_call_hash,
+                    date: t0() + 100,
+                    admin_id: ME,
+                    participant_id: uid,
+                    protocol: request.protocol,
+                    receive_date: None,
+                }
+                .into(),
+                users: users(),
+            };
+            return Some(answer(tl::enums::phone::PhoneCall::Call(waiting)));
+        }
+        if let Some(request) = asked::<f::phone::AcceptCall>(body) {
+            let tl::enums::InputPhoneCall::Call(peer) = request.peer;
+            self.log(&format!("AcceptCall {}", peer.id));
+            let secret = self.phone_call_peer_secret.unwrap_or([0x33u8; 256]);
+            let g_a = self.phone_call_g_a.clone().unwrap_or_else(|| fake_dh_pub(&secret).to_vec());
+            let g_b_arr: [u8; 256] = request.g_b.as_slice().try_into().unwrap_or([1u8; 256]);
+            let key = super::call::modpow_2048(&g_b_arr, &secret, &fake_dh_prime());
+            let fp = super::call::key_fingerprint(&key);
+            let conn: tl::enums::PhoneConnection = tl::types::PhoneConnection {
+                tcp: false,
+                id: 700_001,
+                ip: "127.0.0.1".to_owned(),
+                ipv6: String::new(),
+                port: 59_777,
+                peer_tag: vec![0x11; 16],
+            }
+            .into();
+            let call = tl::types::PhoneCall {
+                p2p_allowed: true,
+                video: false,
+                conference_supported: false,
+                id: peer.id,
+                access_hash: peer.access_hash,
+                date: t0() + 101,
+                admin_id: ODALYS,
+                participant_id: ME,
+                g_a_or_b: g_a,
+                key_fingerprint: fp,
+                protocol: request.protocol,
+                connections: vec![conn],
+                start_date: t0() + 101,
+                custom_parameters: None,
+            };
+            let res = tl::types::phone::PhoneCall {
+                phone_call: call.into(),
+                users: users(),
+            };
+            return Some(answer(tl::enums::phone::PhoneCall::Call(res)));
+        }
+        if let Some(request) = asked::<f::phone::ConfirmCall>(body) {
+            let tl::enums::InputPhoneCall::Call(peer) = request.peer;
+            let secret = self.phone_call_peer_secret.unwrap_or([0x44u8; 256]);
+            let g_a_arr: [u8; 256] = request.g_a.as_slice().try_into().unwrap_or([1u8; 256]);
+            let key = super::call::modpow_2048(&g_a_arr, &secret, &fake_dh_prime());
+            let fp = super::call::key_fingerprint(&key);
+            self.log(&format!("ConfirmCall {} fp={} match={}", peer.id, request.key_fingerprint, fp == request.key_fingerprint));
+            let conn: tl::enums::PhoneConnection = tl::types::PhoneConnection {
+                tcp: false,
+                id: 700_002,
+                ip: "127.0.0.1".to_owned(),
+                ipv6: String::new(),
+                port: 59_778,
+                peer_tag: vec![0x22; 16],
+            }
+            .into();
+            let call = tl::types::PhoneCall {
+                p2p_allowed: true,
+                video: false,
+                conference_supported: false,
+                id: peer.id,
+                access_hash: peer.access_hash,
+                date: t0() + 103,
+                admin_id: ME,
+                participant_id: ODALYS,
+                g_a_or_b: fake_dh_pub(&secret).to_vec(),
+                key_fingerprint: fp,
+                protocol: request.protocol,
+                connections: vec![conn],
+                start_date: t0() + 103,
+                custom_parameters: None,
+            };
+            let res = tl::types::phone::PhoneCall {
+                phone_call: call.into(),
+                users: users(),
+            };
+            return Some(answer(tl::enums::phone::PhoneCall::Call(res)));
+        }
+        if let Some(request) = asked::<f::phone::DiscardCall>(body) {
+            let tl::enums::InputPhoneCall::Call(peer) = request.peer;
+            let reason = match request.reason {
+                tl::enums::PhoneCallDiscardReason::Busy => "busy",
+                tl::enums::PhoneCallDiscardReason::Hangup => "hangup",
+                tl::enums::PhoneCallDiscardReason::Missed => "missed",
+                tl::enums::PhoneCallDiscardReason::Disconnect => "disconnect",
+                _ => "other",
+            };
+            self.log(&format!("DiscardCall {} reason={reason}", peer.id));
+            return Some(answer(updates(Vec::new())));
+        }
+        if let Some(request) = asked::<f::phone::SendSignalingData>(body) {
+            let tl::enums::InputPhoneCall::Call(peer) = request.peer;
+            self.log(&format!("SendSignalingData {} len={}", peer.id, request.data.len()));
+            return Some(answer(true));
+        }
+        None
+    }
+
+    #[inline(never)]
+    fn handle_group_calls(&mut self, body: &[u8]) -> Option<Result<Vec<u8>, Fault>> {
+        use tl::functions as f;
+        if let Some(request) = asked::<f::phone::GetGroupCall>(body) {
+            let call_id = match &request.call {
+                tl::enums::InputGroupCall::Call(c) => c.id,
+                _ => 0,
+            };
+            self.log(&format!("GetGroupCall {call_id}"));
+            let Some((_, gc)) = self.group_calls.iter().find(|(_, c)| c.id == call_id) else {
+                return Some(Err(rpc(400, "GROUPCALL_INVALID", None)));
+            };
+            let parts = gc
+                .participants
+                .iter()
+                .map(|&(uid, ssrc, muted, speaking)| FakeGroupCall::participant_tl(uid, ssrc, muted, speaking, false))
+                .collect();
+            let res = tl::types::phone::GroupCall {
+                call: gc.to_tl(),
+                participants: parts,
+                participants_next_offset: String::new(),
+                chats: chats(),
+                users: users(),
+            };
+            return Some(answer(tl::enums::phone::GroupCall::Call(res)));
+        }
+        if let Some(request) = asked::<f::phone::GetGroupParticipants>(body) {
+            let call_id = match &request.call {
+                tl::enums::InputGroupCall::Call(c) => c.id,
+                _ => 0,
+            };
+            self.log(&format!("GetGroupParticipants {call_id} offset={}", request.offset));
+            let Some((_, gc)) = self.group_calls.iter().find(|(_, c)| c.id == call_id) else {
+                return Some(Err(rpc(400, "GROUPCALL_INVALID", None)));
+            };
+            let (slice, next_offset) = if request.offset.is_empty() && gc.participants.len() > 2 {
+                (&gc.participants[..2], "p2".to_owned())
+            } else if request.offset == "p2" && gc.participants.len() > 2 {
+                (&gc.participants[2..], String::new())
+            } else {
+                (gc.participants.as_slice(), String::new())
+            };
+            let parts = slice
+                .iter()
+                .map(|&(uid, ssrc, muted, speaking)| FakeGroupCall::participant_tl(uid, ssrc, muted, speaking, false))
+                .collect();
+            let mut people = users();
+            people.push(user(NIA, "Nia", "Pell", "").into());
+            let res = tl::types::phone::GroupParticipants {
+                count: gc.participants.len() as i32,
+                participants: parts,
+                next_offset,
+                chats: chats(),
+                users: people,
+                version: 1,
+            };
+            return Some(answer(tl::enums::phone::GroupParticipants::Participants(res)));
+        }
+        if let Some(request) = asked::<f::phone::CreateGroupCall>(body) {
+            let who = input_who(&request.peer);
+            self.log(&format!("CreateGroupCall {} schedule={:?}", who.text(), request.schedule_date));
+            if let Some(date) = request.schedule_date {
+                if date <= 0 {
+                    return Some(Err(rpc(400, "SCHEDULE_DATE_INVALID", None)));
+                }
+            }
+            let id = self.next_group_call_id;
+            self.next_group_call_id += 1;
+            let gc = FakeGroupCall {
+                id,
+                access_hash: id * 10 + 3,
+                title: request.title.unwrap_or_default(),
+                schedule_date: request.schedule_date,
+                subscribed: false,
+                participants: if request.schedule_date.is_some() { Vec::new() } else { vec![(ME, 2001, true, false)] },
+            };
+            let mut upds: Vec<tl::enums::Update> = vec![tl::types::UpdateGroupCall {
+                live_story: false,
+                peer: Some(who.peer()),
+                call: gc.to_tl(),
+            }
+            .into()];
+            if let Some(schedule_date) = request.schedule_date {
+                let svc = tl::types::MessageService {
+                    out: true,
+                    mentioned: false,
+                    media_unread: false,
+                    reactions_are_possible: false,
+                    silent: false,
+                    post: false,
+                    legacy: false,
+                    id: self.next,
+                    from_id: Some(Who::User(ME).peer()),
+                    peer_id: who.peer(),
+                    saved_peer_id: None,
+                    reply_to: None,
+                    date: t0() + 110,
+                    action: tl::types::MessageActionGroupCallScheduled {
+                        call: tl::types::InputGroupCall { id: gc.id, access_hash: gc.access_hash }.into(),
+                        schedule_date,
+                    }
+                    .into(),
+                    reactions: None,
+                    ttl_period: None,
+                };
+                self.next += 1;
+                self.messages.entry(key(who, None)).or_default().insert(svc.id, svc.clone().into());
+                upds.push(tl::types::UpdateNewMessage { message: svc.into(), pts: 0, pts_count: 0 }.into());
+            }
+            self.group_calls.insert(who, gc);
+            return Some(answer(updates(upds)));
+        }
+        if let Some(request) = asked::<f::phone::StartScheduledGroupCall>(body) {
+            let call_id = match &request.call {
+                tl::enums::InputGroupCall::Call(c) => c.id,
+                _ => 0,
+            };
+            self.log(&format!("StartScheduledGroupCall {call_id}"));
+            let Some((&who, gc)) = self.group_calls.iter_mut().find(|(_, c)| c.id == call_id) else {
+                return Some(Err(rpc(400, "GROUPCALL_INVALID", None)));
+            };
+            gc.schedule_date = None;
+            if gc.participants.is_empty() {
+                gc.participants.push((ME, 2001, true, false));
+            }
+            let upd = tl::types::UpdateGroupCall {
+                live_story: false,
+                peer: Some(who.peer()),
+                call: gc.to_tl(),
+            };
+            return Some(answer(updates(vec![upd.into()])));
+        }
+        if let Some(request) = asked::<f::phone::ToggleGroupCallStartSubscription>(body) {
+            let call_id = match &request.call {
+                tl::enums::InputGroupCall::Call(c) => c.id,
+                _ => 0,
+            };
+            self.log(&format!("ToggleGroupCallStartSubscription {call_id} subscribed={}", request.subscribed));
+            let Some((&who, gc)) = self.group_calls.iter_mut().find(|(_, c)| c.id == call_id) else {
+                return Some(Err(rpc(400, "GROUPCALL_INVALID", None)));
+            };
+            gc.subscribed = request.subscribed;
+            let upd = tl::types::UpdateGroupCall {
+                live_story: false,
+                peer: Some(who.peer()),
+                call: gc.to_tl(),
+            };
+            return Some(answer(updates(vec![upd.into()])));
+        }
+        if let Some(request) = asked::<f::phone::JoinGroupCall>(body) {
+            let call_id = match &request.call {
+                tl::enums::InputGroupCall::Call(c) => c.id,
+                _ => 0,
+            };
+            let tl::enums::DataJson::Json(params) = &request.params;
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&params.data) else {
+                return Some(Err(rpc(400, "JOIN_PARAMS_INVALID", None)));
+            };
+            let ssrc = parsed["ssrc"].as_i64().unwrap_or(0) as i32;
+            let fp = parsed["fingerprints"][0]["fingerprint"].as_str().unwrap_or("").to_owned();
+            if parsed["ufrag"].as_str().unwrap_or("").is_empty()
+                || parsed["pwd"].as_str().unwrap_or("").is_empty()
+                || fp.is_empty()
+                || ssrc <= 0
+            {
+                return Some(Err(rpc(400, "JOIN_PARAMS_INVALID", None)));
+            }
+            self.log(&format!("JoinGroupCall {call_id} muted={} ssrc={ssrc}", request.muted));
+            let Some((_, gc)) = self.group_calls.iter_mut().find(|(_, c)| c.id == call_id) else {
+                return Some(Err(rpc(400, "GROUPCALL_INVALID", None)));
+            };
+            gc.participants.retain(|(uid, ..)| *uid != ME);
+            gc.participants.push((ME, ssrc, request.muted, false));
+            let server_params = serde_json::json!({
+                "fake_loopback": true,
+                "transport": {
+                    "ufrag": "tgfakeufrag",
+                    "pwd": "tgfakepasswordlongenough1234",
+                    "fingerprints": [
+                        { "hash": "sha-256", "setup": "passive", "fingerprint": fp }
+                    ],
+                    "candidates": [
+                        {
+                            "generation": "0",
+                            "component": "1",
+                            "protocol": "udp",
+                            "port": "59601",
+                            "ip": "127.0.0.1",
+                            "foundation": "1",
+                            "id": "1",
+                            "priority": "2130706431",
+                            "type": "host"
+                        }
+                    ]
+                },
+                "audio": {
+                    "payload-types": [
+                        { "id": 111, "name": "opus", "clockrate": 48000, "channels": 2 }
+                    ]
+                }
+            })
+            .to_string();
+            let conn_upd = tl::types::UpdateGroupCallConnection {
+                presentation: false,
+                params: tl::types::DataJson { data: server_params }.into(),
+            };
+            let part_upd = tl::types::UpdateGroupCallParticipants {
+                call: tl::types::InputGroupCall { id: gc.id, access_hash: gc.access_hash }.into(),
+                participants: vec![FakeGroupCall::participant_tl(ME, ssrc, request.muted, false, false)],
+                version: 4,
+            };
+            return Some(answer(updates(vec![conn_upd.into(), part_upd.into()])));
+        }
+        if let Some(request) = asked::<f::phone::LeaveGroupCall>(body) {
+            let call_id = match &request.call {
+                tl::enums::InputGroupCall::Call(c) => c.id,
+                _ => 0,
+            };
+            self.log(&format!("LeaveGroupCall {call_id} source={}", request.source));
+            if let Some((_, gc)) = self.group_calls.iter_mut().find(|(_, c)| c.id == call_id) {
+                gc.participants.retain(|(uid, ..)| *uid != ME);
+                let part_upd = tl::types::UpdateGroupCallParticipants {
+                    call: tl::types::InputGroupCall { id: gc.id, access_hash: gc.access_hash }.into(),
+                    participants: vec![FakeGroupCall::participant_tl(ME, request.source, true, false, true)],
+                    version: 5,
+                };
+                return Some(answer(updates(vec![part_upd.into()])));
+            }
+            return Some(answer(updates(Vec::new())));
+        }
+        if let Some(request) = asked::<f::phone::CheckGroupCall>(body) {
+            let call_id = match &request.call {
+                tl::enums::InputGroupCall::Call(c) => c.id,
+                _ => 0,
+            };
+            self.log(&format!("CheckGroupCall {call_id} sources={:?}", request.sources));
+            return Some(answer(Vec::<i32>::new()));
+        }
+        if let Some(request) = asked::<f::phone::EditGroupCallParticipant>(body) {
+            let call_id = match &request.call {
+                tl::enums::InputGroupCall::Call(c) => c.id,
+                _ => 0,
+            };
+            self.log(&format!("EditGroupCallParticipant {call_id} muted={:?}", request.muted));
+            if let Some((_, gc)) = self.group_calls.iter_mut().find(|(_, c)| c.id == call_id) {
+                if let Some(muted) = request.muted {
+                    if let Some(p) = gc.participants.iter_mut().find(|(uid, ..)| *uid == ME) {
+                        p.2 = muted;
+                    }
+                }
+            }
+            return Some(answer(updates(Vec::new())));
+        }
+        None
     }
 
     fn handle(&mut self, body: &[u8], events: &Sender<Event>) -> Result<Vec<u8>, Fault> {
@@ -4029,6 +4845,12 @@ impl World {
             let tl::enums::InputPhoneCall::Call(peer) = request.peer;
             self.log(&format!("SaveCallDebug {}", peer.id));
             return answer(true);
+        }
+        if let Some(result) = self.handle_phone_calls(body) {
+            return result;
+        }
+        if let Some(result) = self.handle_group_calls(body) {
+            return result;
         }
         // Who reacted, and who read: Odalys and Tobin reacted in the group and Odalys read it.
         // Odalys shares when she read a private message, and Tobin's chat needs mine shared.
@@ -5022,6 +5844,9 @@ impl World {
             ]);
             full.about = "Weekend routes.".to_owned();
             full.ttl_period = self.ttl_periods.get(&Who::Group(request.chat_id)).copied().filter(|&p| p > 0);
+            if let Some(gc) = self.group_calls.get(&Who::Group(request.chat_id)) {
+                full.call = Some(tl::types::InputGroupCall { id: gc.id, access_hash: gc.access_hash }.into());
+            }
             // Its admins allow three reactions.
             let three = ["👍", "❤", "🔥"].map(|emoticon| tl::types::ReactionEmoji { emoticon: emoticon.to_owned() }.into());
             full.available_reactions = Some(tl::types::ChatReactionsSome { reactions: three.to_vec() }.into());
@@ -6143,6 +6968,9 @@ impl World {
             ]);
             full.about = "Notes from the high country.".to_owned();
             full.ttl_period = self.ttl_periods.get(&Who::Channel(channel.channel_id)).copied().filter(|&p| p > 0);
+            if let Some(gc) = self.group_calls.get(&Who::Channel(channel.channel_id)) {
+                full.call = Some(tl::types::InputGroupCall { id: gc.id, access_hash: gc.access_hash }.into());
+            }
             // The channel turned reactions off; the forum allows all of them, two different
             // ones a message.
             if channel.channel_id == NOTES {
