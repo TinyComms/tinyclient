@@ -561,6 +561,12 @@ pub(super) fn older_ack_applies(manual: bool) -> bool {
     manual
 }
 
+/// `TINYCLIENT_PROVE=discord-wave15-share`. The preview, the stream key, a named viewer and
+/// the identity post are what this build sends.
+pub(super) fn prove_wave15_share() -> Result<(), String> {
+    voice::prove_wave15_share()
+}
+
 /// `TINYCLIENT_PROVE=discord-mark-unread`. The manual ack body is the one Discord expects, and
 /// an older ack moves the marker only when it is manual.
 pub(super) fn prove_mark_unread() -> Result<(), String> {

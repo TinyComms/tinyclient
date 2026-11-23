@@ -49,6 +49,12 @@ pub fn prove_discord_forward_report() -> Result<(), String> {
 pub fn prove_discord_voice_move() -> Result<(), String> {
     discord::prove_voice_move()
 }
+
+/// `TINYCLIENT_PROVE=discord-wave15-share`. A preview is a jpeg, a named viewer is kept, and
+/// the identity post is the public key.
+pub fn prove_discord_wave15_share() -> Result<(), String> {
+    discord::prove_wave15_share()
+}
 mod recovery;
 pub mod net;
 mod script;

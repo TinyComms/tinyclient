@@ -100,6 +100,15 @@ fn main() -> ExitCode {
         eprintln!("prove-discord-share-quality:0");
         return ExitCode::SUCCESS;
     }
+    // The lab's discord-wave15-share driver. A build without this opens the audio engine below and stays up.
+    if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-wave15-share") {
+        if let Err(err) = mediad::session::prove_discord_wave15_share() {
+            eprintln!("discord-wave15-share: {err}");
+            return ExitCode::from(1);
+        }
+        eprintln!("prove-discord-wave15-share:0");
+        return ExitCode::SUCCESS;
+    }
     // The lab's isolation-bounded driver.
     if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("isolation-bounded") {
         if let Err(err) = mediad::process::prove_isolation_limit() {

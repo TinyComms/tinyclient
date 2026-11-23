@@ -1147,6 +1147,39 @@ pub fn prove_discord_share_quality() -> Result<(), String> {
     Ok(())
 }
 
+/// The lab's discord-wave15-share driver. Share sound is a real frame with this process's
+/// playback taken out, and a Go Live report is not the voice call's report. A build from
+/// before this ignores the variable and stays up. The matching 30-digit code is the library test:
+/// it needs the MLS harness, which this binary does not link.
+pub fn prove_discord_wave15_share() -> Result<(), String> {
+    std::env::set_var("TINYCLIENT_SHARE_AUDIO", "tone");
+    let mut pull = crate::share_audio::open(None).map_err(|err| format!("share sound did not open: {err}"))?;
+    let frame = pull.pull().ok_or("share sound produced no frame")?;
+    if frame.iter().all(|sample| *sample == 0) {
+        return Err("share sound is silent".into());
+    }
+    crate::share_audio::note_played(&frame);
+    let mut heard = frame;
+    crate::share_audio::subtract(&mut heard);
+    let energy = |samples: &[i16]| samples.iter().map(|sample| { let value = i64::from(*sample); value * value }).sum::<i64>();
+    if energy(&heard) * 4 > energy(&frame) {
+        return Err("a share leaves out the call's own playback".into());
+    }
+    let mut voice = Dave::new(111, 7);
+    voice.start(1);
+    let report = voice.take_report(false).ok_or("a dave session reports once it has a version")?;
+    if report.stream || report.mode != protocol::SecurityMode::Pending || voice.take_report(false).is_some() {
+        return Err("the voice report is pending, once, and is not the stream".into());
+    }
+    let mut stream = Dave::new(111, 7);
+    stream.start(1);
+    let live = stream.take_report(true).ok_or("a go live leg reports")?;
+    if !live.stream || live.mode != protocol::SecurityMode::Pending {
+        return Err("a go live report is marked as the stream".into());
+    }
+    Ok(())
+}
+
 /// What we can send and receive. One H.264 layer. A watch leg does not encode.
 fn codecs(encode: bool) -> Value {
     json!([

@@ -1,0 +1,12 @@
+{
+  "id": "discord-wave15-share",
+  "title": "A Discord share sends its sound and a preview, and the call keeps its own privacy report",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not start desktop mediad. The same checks are in the libraries the phone links.",
+    "ios": "The phone proof build does not start desktop mediad. The same checks are in the libraries the phone links."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 45
+}

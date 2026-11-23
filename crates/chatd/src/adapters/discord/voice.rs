@@ -1805,6 +1805,27 @@ fn identity_body(hex_key: &str) -> Option<Value> {
     (bytes.len() == 65).then(|| json!({ "public_key": base64::engine::general_purpose::STANDARD.encode(bytes) }))
 }
 
+/// `TINYCLIENT_PROVE=discord-wave15-share`. A preview is a jpeg, a viewer Discord names is
+/// kept, and the identity post is the 65-byte point in standard base64.
+pub(super) fn prove_wave15_share() -> Result<(), String> {
+    if stream_key(Some("4000"), "4201", "1000") != "guild:4000:4201:1000" || stream_key(None, "4201", "1000") != "call:4201:1000" {
+        return Err("a stream key names the guild when there is one, and the channel and user".to_owned());
+    }
+    let viewer = named_viewer("2002", &super::State::default());
+    if viewer.id != "2002" || viewer.name != "2002" {
+        return Err("a viewer discord names is kept when no profile is loaded".to_owned());
+    }
+    if !tiny_jpeg().starts_with("data:image/jpeg;base64,") {
+        return Err("a preview is a jpeg data uri".to_owned());
+    }
+    let body = identity_body(&"04".repeat(65)).ok_or("a 65-byte point")?;
+    let encoded = body["public_key"].as_str().unwrap_or("");
+    if encoded.len() < 80 || identity_body("abcd").is_some() {
+        return Err("the identity post is standard base64 of the point, and a short key is not posted".to_owned());
+    }
+    Ok(())
+}
+
 fn hex_bytes(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
