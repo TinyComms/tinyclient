@@ -448,6 +448,7 @@ fn publish_occupants(account: &Account, who: Who) {
             record_start_date: tracked.record_start_date,
             record_video_active: tracked.record_video_active,
             rtmp_stream: tracked.rtmp_stream,
+            ..Occupants::default()
         };
 
         let joined_here = live.group_calls.joined.as_ref().is_some_and(|j| j.who == who);

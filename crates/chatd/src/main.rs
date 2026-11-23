@@ -328,6 +328,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-discord-voice-move:0");
         return Ok(());
     }
+    // The lab's discord-wave17b driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-wave17b") {
+        if let Err(err) = chatd::adapters::prove_discord_wave17b() {
+            eprintln!("discord-wave17b: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-discord-wave17b:0");
+        return Ok(());
+    }
     // The lab's discord-wave15-share driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("discord-wave15-share") {
         if let Err(err) = chatd::adapters::prove_discord_wave15_share() {

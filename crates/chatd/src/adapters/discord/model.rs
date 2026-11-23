@@ -57,6 +57,9 @@ pub const READ_MESSAGE_HISTORY: u64 = 1 << 16;
 pub const CONNECT: u64 = 1 << 20;
 pub const SPEAK: u64 = 1 << 21;
 pub const MUTE_MEMBERS: u64 = 1 << 22;
+pub const REQUEST_TO_SPEAK: u64 = 1 << 32;
+pub const USE_SOUNDBOARD: u64 = 1 << 42;
+pub const USE_EXTERNAL_SOUNDS: u64 = 1 << 45;
 pub const DEAFEN_MEMBERS: u64 = 1 << 23;
 pub const MOVE_MEMBERS: u64 = 1 << 24;
 #[allow(dead_code)]
@@ -1566,6 +1569,9 @@ pub struct VoiceState {
     /// so it is only read for stages.
     #[serde(default, deserialize_with = "nullable")]
     pub suppress: bool,
+    /// Set when this person has asked to speak on a stage. Absent means they have not.
+    #[serde(default)]
+    pub request_to_speak_timestamp: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
     pub self_stream: bool,
     #[serde(default, deserialize_with = "nullable")]

@@ -1,6 +1,6 @@
 //! Discord server emoji and sticker management (#411).
 //!
-//! Soundboard sounds are intentionally deferred until calls play soundboard audio.
+//! Soundboard playback lives with the voice call. This module is emoji and stickers only.
 //! Files are validated locally (path safety via `upload::allowed`, byte size, format, and
 //! image dimensions) before any upload is sent to Discord. Uploads use one-shot HTTP calls so
 //! Discord's 429 rate-limit wait surfaces directly instead of retrying silently.

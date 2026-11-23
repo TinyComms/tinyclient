@@ -427,6 +427,32 @@ impl Playing {
     }
 }
 
+/// A soundboard clip: 48 kHz interleaved stereo, mixed at `gain` (0 to 1) into the call.
+pub struct Clip {
+    samples: Vec<f32>,
+    at: usize,
+    gain: f32,
+}
+
+impl Clip {
+    pub fn new(samples: Vec<f32>, gain: f32) -> Clip {
+        Clip { samples, at: 0, gain }
+    }
+
+    /// Adds the next frame. False once the clip is over.
+    pub fn mix(&mut self, frame: &mut [i16]) -> bool {
+        for out in frame.iter_mut() {
+            let Some(&sample) = self.samples.get(self.at) else {
+                return false;
+            };
+            self.at += 1;
+            let add = (sample * self.gain * 32767.) as i32;
+            *out = (i32::from(*out) + add).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        }
+        self.at < self.samples.len()
+    }
+}
+
 /// A mono WAV of 16-bit samples: what `examples/sounds.rs` writes for `afconvert`.
 pub fn wav(samples: &[f32], rate: u32) -> Vec<u8> {
     let data = (samples.len() * 2) as u32;

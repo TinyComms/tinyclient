@@ -1,0 +1,8 @@
+{
+  "id": "discord-wave17b",
+  "title": "Discord activities, stages, and the soundboard are in this build",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

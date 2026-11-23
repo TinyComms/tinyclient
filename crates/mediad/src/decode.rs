@@ -239,6 +239,20 @@ impl Source {
     }
 }
 
+/// The whole file as 48 kHz interleaved stereo, capped at ten seconds.
+pub fn load_stereo(path: &Path) -> Result<Vec<f32>, String> {
+    const CAP: usize = 960_000;
+    let mut source = Source::open(path)?;
+    let mut out = Vec::new();
+    while source.read(&mut out)? {
+        if out.len() >= CAP {
+            out.truncate(CAP);
+            break;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

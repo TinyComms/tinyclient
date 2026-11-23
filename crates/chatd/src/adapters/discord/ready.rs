@@ -411,7 +411,8 @@ impl GuildInfo {
             manage_permissions: timed_out.is_none() && (perms & MANAGE_ROLES != 0),
             ..protocol::ConversationRights::default()
         };
-        let call = if timed_out.is_some() || (channel.kind == model::VOICE && !can_connect) {
+        let voice_room = channel.kind == model::VOICE || channel.kind == model::STAGE;
+        let call = if timed_out.is_some() || (voice_room && !can_connect) {
             CallSupport::None
         } else {
             super::voice::support(channel.kind)
@@ -420,13 +421,13 @@ impl GuildInfo {
             group: parent.filter(|_| category.is_some()).map(str::to_owned),
             position: place(category, channel.is_voice(), channel.position),
             call,
-            // A voice channel's occupant limit, for the tree's `4/12`.
-            limit: (channel.kind == model::VOICE).then_some(channel.user_limit).unwrap_or(0),
+            // A voice or stage channel's occupant limit, for the tree's `4/12`.
+            limit: voice_room.then_some(channel.user_limit).unwrap_or(0),
             topic: one_line(channel.topic.as_deref()),
             read_only,
             read_only_reason,
             rights,
-            private: self.private(guild, channel) || (channel.kind == model::VOICE && !can_connect),
+            private: self.private(guild, channel) || (voice_room && !can_connect),
             opted_out: self.quiet.opted_out(&channel.id, parent, &self.onboarding_defaults),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
             slowmode_seconds: channel.rate_limit_per_user,
@@ -673,6 +674,10 @@ impl Discord {
     /// Writes one server's tree, with each row's unread state and mute, and keeps what is needed
     /// to work the tree out again when a role or our own membership changes.
     fn plant(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> rusqlite::Result<()> {
+        // Before voice states: a stage is known from the rows the tree is about to plant.
+        for channel in &guild.channels {
+            self.note_channel_kind(&channel.id, channel.kind);
+        }
         let tree = self.tree(guild, info, me, read);
         self.ctx.tree(&guild.id, &tree.groups, &tree.rows)?;
         for group in &tree.groups {
@@ -1786,6 +1791,7 @@ impl Discord {
 
     /// A channel created, moved, renamed or given new permissions.
     pub(super) fn channel_changed(&self, channel: Channel) -> Result<(), Failure> {
+        self.note_channel_kind(&channel.id, channel.kind);
         let Some(guild) = channel.guild_id.clone() else {
             return Ok(self.direct(&channel, &HashMap::new())?);
         };
@@ -1887,6 +1893,7 @@ impl Discord {
     }
 
     pub(super) fn channel_deleted(&self, channel: Channel) -> Result<(), Failure> {
+        self.note_channel_kind(&channel.id, 0);
         let (category, had_invite) = {
             let mut state = self.state.lock().unwrap();
             state.privates.remove(&channel.id);

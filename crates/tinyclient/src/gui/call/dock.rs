@@ -17,7 +17,7 @@ use gpui::{
     deferred, div, prelude::*, px, relative, AnyElement, Context, Div, FontWeight, Rgba, Stateful,
 };
 use protocol::{
-    Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, MediaRequest, Network,
+    Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, Network,
     Request,
 };
 
@@ -1080,6 +1080,9 @@ impl Shell {
             (Place::Dock, Menu::Security) if self.call_security_open(Place::Dock) => {
                 (320., div().child(self.call_security_panel(call, cx)))
             }
+            (Place::Dock, Menu::Soundboard) if joined && call.conversation.network == Network::Discord => {
+                (320., self.call_soundboard_body(call, cx).p(px(8.)))
+            }
             (_, Menu::Person { account, user_id, name }) if joined => {
                 (260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.)))
             }
@@ -1535,6 +1538,24 @@ impl Shell {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(link.clone()));
                 }))
         });
+        let soundboard = (in_call(call) && call.conversation.network == Network::Discord).then(|| {
+            let sound_key = call.conversation.clone();
+            control(
+                "call-soundboard",
+                "icons/audio-lines.svg",
+                if menu == Some(Menu::Soundboard) { Look::Open } else { Look::Rest },
+                enabled,
+            )
+            .aria_label("Soundboard")
+            .when(enabled, |button| {
+                button
+                    .tooltip(tip("Soundboard", None))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_soundboard_toggle(sound_key.clone(), cx);
+                    }))
+            })
+        });
         let devices = control(
             "call-devices",
             "icons/settings.svg",
@@ -1609,6 +1630,7 @@ impl Shell {
             .children(add_people.map(|button| button.flex_1().min_w_0()))
             .children(tg_actions.map(|button| button.flex_1().min_w_0()))
             .children(copy_link.map(|button| button.flex_1().min_w_0()))
+            .children(soundboard.map(|button| button.flex_1().min_w_0()))
             .child(devices.when(in_live_call, |button| button.flex_1().min_w_0()))
             .child(
                 end.when(in_live_call, |button| button.flex_1().min_w_0())
@@ -1833,6 +1855,12 @@ mod tests {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        activity: None,
+        stage_topic: String::new(),
+        stage: false,
+        request_to_speak: false,
+        raised: Vec::new(),
+        effect: None,
         incoming_video: false,
         title: String::new(),
         viewers: Vec::new(),

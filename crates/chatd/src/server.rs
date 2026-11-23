@@ -6866,6 +6866,46 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::StageVoice { conversation, action, person } => {
+                let account = conversation.account();
+                if person.as_ref().is_some_and(|person| person.account() != account) {
+                    return error(ErrorCode::Refused, "That participant belongs to a different account.");
+                }
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::StageVoice {
+                    conversation_id: conversation.id,
+                    action,
+                    person_id: person.map(|person| person.id),
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::Soundboard { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::Soundboard { conversation_id: conversation.id, reply }) {
+                    Ok(sounds) => Response::Soundboard { sounds },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::PlaySoundboard { conversation, sound_id, guild_id } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::PlaySoundboard {
+                    conversation_id: conversation.id, sound_id, guild_id, reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CallRaiseHand { raised } => {
                 let Some(call) = self.hub.calls.describe().0 else {
                     return error(ErrorCode::NoCall, "There is no active call.");

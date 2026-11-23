@@ -1305,7 +1305,19 @@ impl Shell {
                     .call
                     .as_ref()
                     .is_some_and(|call| call.conversation == conversation.key && !matches!(call.state, CallState::Failed { .. }));
-                // A native voice channel joins from its menu too; a stage never does (07 §1).
+                // A native voice channel joins from its menu, including a Discord stage.
+                if super::call::discord_ux::open_chat_item(super::phone::active(), conversation.kind) {
+                    let chat_key = conversation.key.clone();
+                    let chat_title = conversation.title.clone();
+                    items.push(
+                        menu_item("open-chat", Some("icons/message-square.svg"), "Open chat", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.select(chat_key.clone(), &chat_title, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 if super::sidebar::joins_from_list(&**conversation) && !ours {
                     items.push(
                         menu_item("join", Some("icons/volume-2.svg"), "Join voice", None)

@@ -138,12 +138,12 @@ const DECLINED: &str = "They declined the call.";
 const REMOVED: &str = "Discord took you out of the call. You were removed, or the channel is gone.";
 const NO_SESSION: &str = "No reply from Discord after 15 seconds.";
 
-/// What pressing the call button of a server channel does. A voice channel is joined here. A
-/// stage is not: a listener there cannot simply speak, so it opens in Discord.
+/// What pressing the call button of a server channel does. A voice channel and a stage are
+/// joined here. A stage starts in the audience: the microphone stays closed until Discord
+/// stops suppressing it.
 pub(super) fn support(kind: u8) -> CallSupport {
     match kind {
-        model::VOICE => CallSupport::Native,
-        model::STAGE => CallSupport::Handoff,
+        model::VOICE | model::STAGE => CallSupport::Native,
         _ => CallSupport::None,
     }
 }
@@ -290,6 +290,8 @@ pub struct Heard {
     /// On a stage's platform (`suppress` false there): who the channel hears. A voice
     /// channel's states never have it true, whatever `suppress` says there.
     live: bool,
+    /// Asked to speak on a stage and still in the audience.
+    raised: bool,
 }
 
 impl Heard {
@@ -390,6 +392,16 @@ pub struct Voice {
     share: Option<StreamSlot>,
     /// The Go Live shares we are watching simultaneously, keyed by `stream_key`.
     watches: HashMap<String, StreamSlot>,
+    /// Stage channel ids. Not cleared on a new gateway session: the channels are still stages.
+    pub stages: HashSet<String>,
+    /// Stage topic by channel, with the server it belongs to.
+    topics: HashMap<String, (Option<String>, String)>,
+    /// The activity in a voice channel, with the server it belongs to.
+    activities: HashMap<String, (Option<String>, protocol::VoiceActivity)>,
+    /// Application id to (name, icon hash). Looked up once.
+    apps: HashMap<String, (String, Option<String>)>,
+    /// Guild soundboard sounds seen this session.
+    sounds: Vec<protocol::SoundboardSound>,
     /// A stream preview fetched while this call is up: when, and the file if one landed.
     /// Not filled at sign-in. Asked once, then left alone for [`PREVIEW_FOR`].
     previews: HashMap<String, (Instant, String)>,
@@ -544,22 +556,32 @@ impl Discord {
             let state = &mut *state;
             for channel in channels {
                 let mut there: Vec<(&String, &Heard)> = state.voice.states.iter().filter(|(_, heard)| heard.channel == channel).collect();
-                let guild = there.first().map(|(_, heard)| heard.guild.clone()).or_else(|| state.voice.told.get(&channel).cloned());
+                let guild = there.first().and_then(|(_, heard)| heard.guild.clone())
+                    .or_else(|| state.voice.told.get(&channel).and_then(|guild| guild.clone()))
+                    .or_else(|| state.voice.topics.get(&channel).and_then(|(guild, _)| guild.clone()))
+                    .or_else(|| state.voice.activities.get(&channel).and_then(|(guild, _)| guild.clone()));
                 let Some(guild) = guild else {
                     continue;
                 };
+                let stage = state.voice.stages.contains(&channel);
+                let topic = state.voice.topics.get(&channel).map(|(_, topic)| topic.clone()).unwrap_or_default();
+                let activity = state.voice.activities.get(&channel).map(|(_, activity)| activity.clone());
+                let keep = stage && (!topic.is_empty() || activity.is_some());
                 if there.is_empty() {
-                    if state.voice.told.remove(&channel).is_some() {
-                        reports.push((channel, Vec::new(), 0));
+                    if keep && state.voice.watched(&channel, Some(guild.as_str())) {
+                        state.voice.told.insert(channel.clone(), Some(guild));
+                        reports.push((channel, Vec::new(), 0, stage, topic, activity, Vec::new()));
+                    } else if state.voice.told.remove(&channel).is_some() {
+                        reports.push((channel, Vec::new(), 0, false, String::new(), None, Vec::new()));
                     }
                     continue;
                 }
                 // A channel with a friend in it is told wherever it is: the home's "In voice".
                 let friend = there.iter().any(|(id, _)| state.relations.get(*id) == Some(&Relation::Friend));
-                if !friend && !state.voice.watched(&channel, guild.as_deref()) {
+                if !friend && !state.voice.watched(&channel, Some(guild.as_str())) {
                     // No longer on screen and not our call any more: chatd lets it go.
                     if state.voice.told.remove(&channel).is_some() {
-                        reports.push((channel, Vec::new(), 0));
+                        reports.push((channel, Vec::new(), 0, false, String::new(), None, Vec::new()));
                     }
                     continue;
                 }
@@ -569,6 +591,7 @@ impl Discord {
                     (!heard.live, state.relations.get(*id) != Some(&Relation::Friend), heard.name.to_lowercase(), (*id).clone())
                 });
                 let total = there.len() as u32;
+                let raised: Vec<String> = there.iter().filter(|(_, heard)| heard.raised).map(|(id, _)| (*id).clone()).collect();
                 let people = there.into_iter().take(protocol::OCCUPANTS_LIMIT).map(|(id, heard)| Occupant {
                     person: self.ctx.key(id),
                     name: heard.name.clone(),
@@ -585,12 +608,12 @@ impl Discord {
                     is_channel: false,
                 });
                 let people: Vec<Occupant> = people.collect();
-                state.voice.told.insert(channel.clone(), guild);
-                reports.push((channel, people, total));
+                state.voice.told.insert(channel.clone(), Some(guild));
+                reports.push((channel, people, total, stage, topic, activity, raised));
             }
         }
-        for (channel, people, total) in reports {
-            self.ctx.occupants(&channel, people, total);
+        for (channel, people, total, stage, topic, activity, raised) in reports {
+            self.ctx.occupants_meta(&channel, people, total, stage, topic, activity, raised);
         }
     }
 
@@ -624,7 +647,18 @@ impl Discord {
                 voice.told.remove(channel);
             }
             let entered = voice.states.values().filter(|heard| shown.is_some() && heard.guild == shown);
-            let enter: BTreeSet<String> = entered.map(|heard| heard.channel.clone()).collect();
+            let mut enter: BTreeSet<String> = entered.map(|heard| heard.channel.clone()).collect();
+            let shown_id = shown.as_deref();
+            for (channel, (guild, topic)) in &voice.topics {
+                if guild.as_deref() == shown_id && !topic.is_empty() {
+                    enter.insert(channel.clone());
+                }
+            }
+            for (channel, (guild, _)) in &voice.activities {
+                if guild.as_deref() == shown_id {
+                    enter.insert(channel.clone());
+                }
+            }
             (leave, enter)
         };
         for channel in leave {
@@ -642,10 +676,10 @@ impl Discord {
         // platform. In a voice channel it is Discord's server mute instead, and nobody in one
         // is ever counted as on stage.
         let touched: HashSet<&str> = states.iter().filter_map(|voice| voice.channel_id.as_deref()).collect();
-        let stages: HashSet<&str> = touched
-            .into_iter()
-            .filter(|channel| self.ctx.known(channel).ok().flatten().is_some_and(|row| row.call == CallSupport::Handoff))
-            .collect();
+        let stages: HashSet<String> = {
+            let state = self.state.lock().unwrap();
+            touched.into_iter().filter(|channel| state.voice.stages.contains(*channel)).map(str::to_owned).collect()
+        };
         let mut changed = BTreeSet::new();
         let emptied;
         let mut media_files: Vec<(MediaFile, String)> = Vec::new();
@@ -677,6 +711,7 @@ impl Discord {
                     })
                     .or_else(|| before.as_ref().and_then(|before| before.avatar.clone()));
                 let is_stage = stages.contains(channel.as_str());
+                let asked = voice.request_to_speak_timestamp.as_ref().is_some_and(|stamp| !stamp.is_empty());
                 let heard = Heard {
                     guild: voice_guild,
                     channel: channel.clone(),
@@ -686,10 +721,11 @@ impl Discord {
                     deafened: voice.self_deaf,
                     server_muted: voice.mute,
                     server_deafened: voice.deaf,
-                    suppressed: !is_stage && voice.suppress,
+                    suppressed: voice.suppress,
                     camera: voice.self_video,
                     sharing: voice.self_stream,
                     live: is_stage && !voice.suppress,
+                    raised: is_stage && voice.suppress && asked,
                 };
                 changed.insert(channel.clone());
                 state.voice.states.insert(voice.user_id.clone(), heard);
@@ -705,6 +741,7 @@ impl Discord {
         }
         self.roster();
         self.occupancy(changed);
+        self.publish_face();
         self.friends_moved(states.iter().map(|voice| voice.user_id.as_str()));
     }
 
@@ -951,6 +988,12 @@ impl Discord {
             self.ctx.ringing_out(conversation_id);
         }
         self.tell(4, voice_state(guild.as_deref(), Some(conversation_id), start_muted, false, false));
+        let stage = self.state.lock().unwrap().voice.stages.contains(conversation_id);
+        if stage {
+            // The audience does not transmit. Discord's own suppress arrives a moment later.
+            self.ctx.self_moderation(conversation_id, false, false, true);
+        }
+        self.publish_face();
         // Whoever is already there, before anyone's state changes.
         self.roster();
         self.occupancy(BTreeSet::from([conversation_id.to_owned()]));
@@ -1991,6 +2034,236 @@ struct StreamGone {
     reason: String,
 }
 
+impl Discord {
+    /// A channel's kind, so a stage is still a stage after its call button becomes native.
+    pub(super) fn note_channel_kind(&self, id: &str, kind: u8) {
+        let mut state = self.state.lock().unwrap();
+        if kind == model::STAGE {
+            state.voice.stages.insert(id.to_owned());
+        } else {
+            state.voice.stages.remove(id);
+        }
+    }
+
+    /// Activity, stage topic, and raised hands on the call we are in.
+    fn publish_face(&self) {
+        let (channel, face) = {
+            let state = self.state.lock().unwrap();
+            let Some(call) = state.voice.call.as_ref() else {
+                return;
+            };
+            let channel = call.conversation.clone();
+            let stage = state.voice.stages.contains(&channel);
+            let stage_topic = state.voice.topics.get(&channel).map(|(_, topic)| topic.clone()).unwrap_or_default();
+            let activity = state.voice.activities.get(&channel).map(|(_, activity)| activity.clone());
+            let raised: Vec<String> = state.voice.states.iter().filter(|(_, heard)| heard.channel == channel && heard.raised).map(|(id, _)| id.clone()).collect();
+            let request_to_speak = state.voice.states.get(&state.me).is_some_and(|heard| heard.channel == channel && heard.raised);
+            (channel, protocol::VoiceFace { activity, stage, stage_topic, request_to_speak, raised, effect: None })
+        };
+        self.ctx.set_voice_face(&channel, face);
+    }
+
+    pub(super) fn activity_updated(&self, data: &str) {
+        let Some(update) = super::voice_ux::parse_activity(data) else {
+            return;
+        };
+        let activity = update.application_id.as_deref().map(|app| {
+            let (name, icon) = self.application(app);
+            let handoff = handoff_link(update.guild_id.as_deref(), &update.channel_id);
+            let icon = icon.as_deref().and_then(|hash| self.activity_icon(app, hash));
+            super::voice_ux::activity_of(&update, &name, icon, handoff).unwrap_or_default()
+        });
+        {
+            let mut state = self.state.lock().unwrap();
+            match &activity {
+                Some(activity) if !activity.application_id.is_empty() => {
+                    state.voice.activities.insert(update.channel_id.clone(), (update.guild_id.clone(), activity.clone()));
+                }
+                _ => {
+                    state.voice.activities.remove(&update.channel_id);
+                }
+            }
+        }
+        self.occupancy(BTreeSet::from([update.channel_id]));
+        self.publish_face();
+    }
+
+    pub(super) fn stage_updated(&self, data: &str, ended: bool) {
+        let Some(update) = super::voice_ux::parse_stage(data, ended) else {
+            return;
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            state.voice.stages.insert(update.channel_id.clone());
+            if ended {
+                state.voice.topics.remove(&update.channel_id);
+            } else {
+                state.voice.topics.insert(update.channel_id.clone(), (update.guild_id.clone(), update.topic));
+            }
+        }
+        self.occupancy(BTreeSet::from([update.channel_id]));
+        self.publish_face();
+    }
+
+    pub(super) fn voice_effect(&self, data: &str) {
+        let Some(effect) = super::voice_ux::parse_effect(data) else {
+            return;
+        };
+        let ours = self.state.lock().unwrap().voice.call.as_ref().is_some_and(|call| call.conversation == effect.channel_id);
+        if !ours {
+            return;
+        }
+        self.ctx.set_effect(&effect.channel_id, Some(protocol::SoundEffect {
+            user_id: effect.user_id,
+            sound_id: effect.sound_id.clone(),
+            emoji: effect.emoji,
+            at: crate::hub::now(),
+        }));
+        if self.ctx.ear_closed() {
+            return;
+        }
+        let gain = super::voice_ux::effect_gain(self.ctx.soundboard_gain(), effect.volume);
+        if gain == 0 {
+            return;
+        }
+        if let Some(path) = self.cached_sound(&effect.sound_id) {
+            self.ctx.play_file(&path, gain);
+        }
+    }
+
+    pub(super) fn soundboard_listed(&self, data: &str) {
+        let sounds = super::voice_ux::parse_soundboard(data);
+        let mut state = self.state.lock().unwrap();
+        for sound in sounds {
+            super::voice_ux::upsert_sound(&mut state.voice.sounds, sound);
+        }
+    }
+
+    pub(super) fn soundboard_removed(&self, data: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        let Some(id) = value.get("sound_id").and_then(Value::as_str).filter(|id| !id.is_empty()) else {
+            return;
+        };
+        super::voice_ux::delete_sound(&mut self.state.lock().unwrap().voice.sounds, id);
+    }
+
+    pub(super) fn stage_voice(&self, conversation_id: &str, action: protocol::StageVoiceAction, person: Option<&str>) -> Result<(), Refusal> {
+        let row = self.ctx.known(conversation_id).ok().flatten().ok_or_else(|| Refusal::Refused("This channel is gone.".to_owned()))?;
+        let guild = row.space.clone().ok_or_else(|| Refusal::Refused("A stage belongs to a server.".to_owned()))?;
+        if !self.state.lock().unwrap().voice.stages.contains(conversation_id) {
+            return Err(Refusal::Refused("This is not a stage.".to_owned()));
+        }
+        let moderating = matches!(action, protocol::StageVoiceAction::Invite | protocol::StageVoiceAction::ToAudience);
+        let path = if moderating {
+            let person = person.filter(|id| !id.is_empty()).ok_or_else(|| Refusal::Refused("Choose who to move.".to_owned()))?;
+            self.require_channel_perm(&guild, conversation_id, model::MUTE_MEMBERS, "invite or move someone on this stage")?;
+            format!("/guilds/{guild}/voice-states/{person}")
+        } else {
+            if person.is_some() {
+                return Err(Refusal::Refused("That action is only for you.".to_owned()));
+            }
+            if action == protocol::StageVoiceAction::RequestToSpeak {
+                self.require_channel_perm(&guild, conversation_id, model::REQUEST_TO_SPEAK, "request to speak")?;
+            }
+            format!("/guilds/{guild}/voice-states/@me")
+        };
+        let body = super::voice_ux::stage_body(conversation_id, action, &model::iso_timestamp(crate::hub::now()));
+        self.call("PATCH", &path, Some(body)).map(drop).map_err(super::refusal)
+    }
+
+    pub(super) fn soundboard(&self, conversation_id: &str) -> Result<Vec<protocol::SoundboardSound>, Refusal> {
+        let row = self.ctx.known(conversation_id).ok().flatten().ok_or_else(|| Refusal::Refused("This channel is gone.".to_owned()))?;
+        let Some(guild) = row.space.clone() else {
+            return Err(Refusal::Unsupported);
+        };
+        let defaults = self.call("GET", "/soundboard-default-sounds", None).map(|body| super::voice_ux::parse_default_sounds(&body)).unwrap_or_default();
+        self.tell(31, json!({ "guild_ids": [guild.clone()] }));
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let mut guild_sounds = Vec::new();
+        while Instant::now() < deadline {
+            guild_sounds = self.state.lock().unwrap().voice.sounds.iter().filter(|sound| sound.guild_id.as_deref() == Some(guild.as_str())).cloned().collect();
+            if !guild_sounds.is_empty() || self.ctx.pause(Duration::from_millis(40)) {
+                break;
+            }
+        }
+        let mut sounds = defaults;
+        sounds.extend(guild_sounds);
+        Ok(sounds)
+    }
+
+    pub(super) fn play_soundboard(&self, conversation_id: &str, sound_id: &str, source_guild: Option<&str>) -> Result<(), Refusal> {
+        if sound_id.is_empty() {
+            return Err(Refusal::Refused("Choose a sound.".to_owned()));
+        }
+        let row = self.ctx.known(conversation_id).ok().flatten().ok_or_else(|| Refusal::Refused("This channel is gone.".to_owned()))?;
+        let guild = row.space.clone().ok_or_else(|| Refusal::Unsupported)?;
+        let joined = self.state.lock().unwrap().voice.call.as_ref().is_some_and(|call| call.conversation == conversation_id);
+        if !joined {
+            return Err(Refusal::Refused("Join the voice channel before playing a sound.".to_owned()));
+        }
+        self.require_channel_perm(&guild, conversation_id, model::USE_SOUNDBOARD, "use the soundboard")?;
+        if source_guild.is_some_and(|source| source != guild) {
+            self.require_channel_perm(&guild, conversation_id, model::USE_EXTERNAL_SOUNDS, "use sounds from another server")?;
+        }
+        let body = super::voice_ux::send_sound_body(sound_id, source_guild);
+        self.call("POST", &format!("/channels/{conversation_id}/send-soundboard-sound"), Some(body)).map(drop).map_err(super::refusal)
+    }
+
+    fn application(&self, id: &str) -> (String, Option<String>) {
+        if let Some(known) = self.state.lock().unwrap().voice.apps.get(id).cloned() {
+            return known;
+        }
+        let body = self.call("GET", &format!("/applications/public?application_ids={id}"), None).unwrap_or_default();
+        let found = super::voice_ux::parse_applications(&body).into_iter().find(|app| app.0 == id)
+            .map(|(_, name, icon)| (name, icon));
+        if let Some(found) = found.clone() {
+            self.state.lock().unwrap().voice.apps.insert(id.to_owned(), found.clone());
+            found
+        } else {
+            ("Activity".to_owned(), None)
+        }
+    }
+
+    fn activity_icon(&self, id: &str, hash: &str) -> Option<MediaFile> {
+        let path = std::env::temp_dir().join("tinyclient-sounds").join(format!("app-{}-{}", super::voice_ux::sound_file_name(id), super::voice_ux::sound_file_name(hash)));
+        let url = format!("{}/app-icons/{id}/{hash}.png", model::cdn());
+        if !cache_file(&url, &path) {
+            return None;
+        }
+        let mut file = MediaFile::new(format!("app-icon:{id}:{hash}"), protocol::MediaKind::Image);
+        file.path = Some(path.display().to_string());
+        Some(file)
+    }
+
+    fn cached_sound(&self, id: &str) -> Option<String> {
+        let path = std::env::temp_dir().join("tinyclient-sounds").join(super::voice_ux::sound_file_name(id));
+        let url = format!("{}/soundboard-sounds/{id}", model::cdn());
+        cache_file(&url, &path).then(|| path.display().to_string())
+    }
+}
+
+/// Saves a public Discord file. A miss is silence, not an error, and the address is not logged.
+fn cache_file(url: &str, path: &std::path::Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    let config = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(3))).build();
+    let agent = ureq::Agent::new_with_config(config);
+    let Ok(mut response) = agent.get(url).call() else {
+        return false;
+    };
+    let bytes = response.body_mut().read_to_vec().unwrap_or_default();
+    if bytes.is_empty() || bytes.len() > 2_000_000 {
+        return false;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(path, &bytes).is_ok()
+}
+
 /// `STREAM_UPDATE`: who is watching, and whether the stream stopped sending.
 #[derive(Deserialize)]
 struct StreamUpdate {
@@ -2062,9 +2335,9 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_is_never_joined_here_and_a_voice_channel_is() {
+    fn a_stage_is_joined_here_and_a_voice_channel_is() {
         assert_eq!(support(model::VOICE), CallSupport::Native);
-        assert_eq!(support(model::STAGE), CallSupport::Handoff, "a stage opens in Discord");
+        assert_eq!(support(model::STAGE), CallSupport::Native, "a stage is joined here");
         assert_eq!(support(model::TEXT), CallSupport::None);
         assert_eq!(support(model::FORUM), CallSupport::None);
     }
@@ -2155,6 +2428,7 @@ mod tests {
             camera: true,
             sharing: false,
             live: false,
+            raised: false,
         };
         let share_only = Heard { camera: false, sharing: true, ..cam_only };
         assert!(!share_only.camera && share_only.sharing);

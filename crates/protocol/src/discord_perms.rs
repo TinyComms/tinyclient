@@ -258,6 +258,13 @@ pub const DISCORD_PERMISSIONS: &[PermissionDef] = &[
         section: PermissionSection::Voice,
     },
     PermissionDef {
+        bit: 1 << 45,
+        key: "USE_EXTERNAL_SOUNDS",
+        label: "Use External Sounds",
+        description: "Play soundboard sounds from another server.",
+        section: PermissionSection::Voice,
+    },
+    PermissionDef {
         bit: 1 << 32,
         key: "REQUEST_TO_SPEAK",
         label: "Request to Speak",
