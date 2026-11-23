@@ -110,6 +110,7 @@ pub fn prove_teams_markdown() -> Result<(), String> {
 mod info;
 mod call_log;
 mod meeting_media;
+mod meeting_create;
 mod links;
 pub(crate) mod message;
 
@@ -1312,6 +1313,12 @@ impl Teams {
             }
             Command::MeetingTranscript { conversation_id, message_id, reply } => {
                 let _ = reply.send(self.meeting_transcript(&conversation_id, &message_id).map_err(refuse));
+            }
+            Command::MeetingInvitees { conversation_id, reply } => {
+                let _ = reply.send(self.meeting_invitees(&conversation_id).map_err(refuse));
+            }
+            Command::CreateMeeting { conversation_id, draft, reply } => {
+                let _ = reply.send(self.create_meeting(&conversation_id, &draft).map_err(refuse));
             }
             Command::MeetingRsvp { id, response, propose, reply } => {
                 let _ = reply.send(self.meeting_rsvp(&id, response, propose).map_err(refuse));

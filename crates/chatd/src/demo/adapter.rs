@@ -1471,6 +1471,8 @@ impl Demo {
             Command::SharePhone { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingInvitees { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateMeeting { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)

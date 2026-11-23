@@ -950,6 +950,26 @@ impl Fake {
 
     /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, channel SharePoint `filesFolder`, mailbox OOO, and user org/profile.
     fn graph(&self, call: &Call, path: &str) -> Reply {
+        if call.method == "POST" && path == "/v1.0/me/onlineMeetings/createOrGet" {
+            let request = call.json();
+            assert_eq!(request["subject"], "Design huddle");
+            assert_eq!(request["externalId"], "wave15-instant");
+            return ok(json!({
+                "id": "instant", "subject": request["subject"], "startDateTime": request["startDateTime"],
+                "endDateTime": request["endDateTime"], "joinWebUrl": "https://teams.microsoft.com/l/meetup-join/19%3Ameeting_instant%40thread.v2/0"
+            }));
+        }
+        if call.method == "POST" && path == "/v1.0/me/events" {
+            let request = call.json();
+            assert_eq!(request["isOnlineMeeting"], true);
+            assert_eq!(request["onlineMeetingProvider"], "teamsForBusiness");
+            assert_eq!(request["transactionId"], "wave15-scheduled");
+            assert_eq!(request["attendees"][0]["emailAddress"]["address"], "ana@contoso.com");
+            return ok(json!({
+                "id": "scheduled", "subject": request["subject"], "start": request["start"], "end": request["end"],
+                "onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3Ameeting_scheduled%40thread.v2/0"}
+            }));
+        }
         if call.method == "GET" && path.starts_with("/v1.0/shares/") && path.ends_with("/driveItem/content")
             && path.contains(&format!("u!{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("https://example.sharepoint.com/:t:/s/Ops/fixture")))
         {
@@ -1666,6 +1686,33 @@ fn recording_card_and_transcript_file_are_readable() {
         panic!("expected the transcript text");
     };
     assert_eq!(text, "Ana Ruiz: Ready for launch.");
+}
+
+#[test]
+fn meet_now_and_scheduling_create_and_post_join_cards() {
+    use protocol::{MeetingDraft, MeetingSchedule};
+    let world = World::start();
+    world.ready();
+    let Response::MeetingCreated { event, posted } = world.ask(Request::CreateMeeting {
+        conversation: key(CHAT_ANA),
+        draft: MeetingDraft { title: "Design huddle".into(), request_id: "wave15-instant".into(), schedule: None },
+    }) else { panic!("Meet now did not return a join link") };
+    assert!(posted);
+    assert!(event.join_url.contains("meeting_instant"));
+    let post = world.fake.calls("POST", &format!("/{CHAT_ANA}/messages")).pop().unwrap();
+    assert!(post.json()["content"].as_str().unwrap().contains(&event.join_url));
+    let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+    let Response::MeetingCreated { event, posted } = world.ask(Request::CreateMeeting {
+        conversation: key(GENERAL),
+        draft: MeetingDraft {
+            title: "Design review".into(), request_id: "wave15-scheduled".into(),
+            schedule: Some(MeetingSchedule { start, end: start + 1800, attendees: vec!["ana@contoso.com".into()], weekly: false }),
+        },
+    }) else { panic!("Schedule did not return a join link") };
+    assert!(posted);
+    assert_eq!((event.start, event.end), (start, start + 1800));
+    let post = world.fake.calls("POST", &format!("/{GENERAL}/messages")).pop().unwrap();
+    assert!(post.json()["content"].as_str().unwrap().contains(&event.join_url));
 }
 
 impl World {

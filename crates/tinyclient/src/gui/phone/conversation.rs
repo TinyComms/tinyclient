@@ -132,6 +132,7 @@ impl Shell {
                     }),
             )
             .children(call)
+            .children(self.meeting_button(open, link, true, cx))
             .children(add_people)
             .children(members)
             .child(details);

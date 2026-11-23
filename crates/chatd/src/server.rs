@@ -7364,6 +7364,25 @@ impl Chat {
             }),
             Request::TranslateMessages { conversation, message_ids, to } => self.translate(conversation, message_ids, to),
             Request::Meetings { account } => self.meetings(account),
+            Request::MeetingInvitees { conversation } => match self.ask(&conversation.account(), |reply| Command::MeetingInvitees {
+                conversation_id: conversation.id, reply,
+            }) {
+                Ok(emails) => Response::MeetingInvitees { emails },
+                Err(refused) => *refused,
+            },
+            Request::CreateMeeting { conversation, draft } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateMeeting { conversation_id: conversation.id, draft, reply }) {
+                    Ok((mut event, posted)) => {
+                        clip_meeting(&mut event);
+                        Response::MeetingCreated { event, posted }
+                    }
+                    Err(refused) => *refused,
+                }
+            },
             Request::MeetingTranscript { conversation, message_id } => match self.ask(&conversation.account(), |reply| Command::MeetingTranscript {
                 conversation_id: conversation.id, message_id, reply,
             }) {

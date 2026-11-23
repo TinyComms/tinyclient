@@ -1824,6 +1824,8 @@ pub enum Command {
     /// the chat list already remembered.
     Meetings { reply: Reply<Vec<protocol::MeetingEvent>> },
     MeetingTranscript { conversation_id: String, message_id: String, reply: Reply<String> },
+    MeetingInvitees { conversation_id: String, reply: Reply<Vec<String>> },
+    CreateMeeting { conversation_id: String, draft: protocol::MeetingDraft, reply: Reply<(protocol::MeetingEvent, bool)> },
     /// Accept, decline, or tentatively accept one meeting. `propose` is a new start.
     MeetingRsvp {
         id: String,
@@ -2268,6 +2270,8 @@ impl Command {
             Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingInvitees { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateMeeting { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),

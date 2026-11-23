@@ -2151,6 +2151,8 @@ pub enum Request {
         account: AccountKey,
     },
     MeetingTranscript { conversation: Key, message_id: String },
+    MeetingInvitees { conversation: Key },
+    CreateMeeting { conversation: Key, draft: MeetingDraft },
     /// Accept, decline, or tentatively accept one meeting. `propose` is a new start, Unix
     /// seconds, sent with a tentative answer.
     MeetingRsvp {
@@ -4704,6 +4706,12 @@ pub enum Response {
         events: Vec<MeetingEvent>,
     },
     MeetingTranscript { text: String },
+    MeetingInvitees { emails: Vec<String> },
+    MeetingCreated {
+        event: MeetingEvent,
+        /// The meeting exists even when posting its link failed.
+        posted: bool,
+    },
     SpaceInfo {
         info: Box<SpaceInfo>,
     },

@@ -28,6 +28,7 @@ mod layout;
 // `pub(crate)` so the mobile layer can read `lock::hides_switcher()`.
 pub(crate) mod lock;
 mod logs;
+mod meetings;
 mod pane;
 mod people;
 mod phone;

@@ -1232,6 +1232,9 @@ impl Teams {
             message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         }
         message.client_id = echoed_client_id(raw, message.outgoing, &id);
+        if message.card.is_none() {
+            message.card = self.meeting_invite_card(&props["tinyclientMeeting"]).map(Box::new);
+        }
         Read::Message(Box::new(message))
     }
 }
@@ -1851,7 +1854,7 @@ pub(super) fn invoke_card_action(
 
     // Acting on messages.
 
-    fn own_name(&self) -> String {
+    pub(super) fn own_name(&self) -> String {
         if !self.session.user.is_empty() {
             return self.session.user.clone();
         }
