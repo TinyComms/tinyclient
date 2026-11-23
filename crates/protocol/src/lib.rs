@@ -473,9 +473,9 @@ pub enum CallSupport {
     Restricted,
 }
 
-/// Camera and screen share run in this client on a Tiny or Discord call.
+/// Camera and screen share run in this client on a Tiny, Discord, or Signal call.
 pub fn call_pictures(network: Network) -> bool {
-    matches!(network, Network::Tiny | Network::Discord)
+    matches!(network, Network::Tiny | Network::Discord | Network::Signal)
 }
 
 /// How a conversation kind is called, as the adapter that builds its row decides.
@@ -2174,6 +2174,9 @@ pub enum Request {
     Meetings {
         account: AccountKey,
     },
+    MeetingTranscript { conversation: Key, message_id: String },
+    MeetingInvitees { conversation: Key },
+    CreateMeeting { conversation: Key, draft: MeetingDraft },
     /// Accept, decline, or tentatively accept one meeting. `propose` is a new start, Unix
     /// seconds, sent with a tentative answer.
     MeetingRsvp {
@@ -2334,6 +2337,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before: Option<String>,
         limit: u32,
+    },
+    Voicemails {
+        account: AccountKey,
+        before: Option<String>,
+    },
+    VoicemailAudio {
+        account: AccountKey,
+        id: String,
+        attachment: String,
+    },
+    ChangeVoicemail {
+        account: AccountKey,
+        id: String,
+        action: VoicemailAction,
     },
     /// Delete one or more entries from an account's recent calls list. `revoke` removes for both
     /// sides when the network supports it.
@@ -3288,6 +3305,14 @@ pub enum Request {
     /// and rings them.
     CallAddPeople {
         people: Vec<String>,
+    },
+    /// Raises or lowers our hand in the active group call (Signal group calls).
+    CallRaiseHand {
+        raised: bool,
+    },
+    /// Sends a transient emoji reaction in the active group call (Signal group calls).
+    CallReact {
+        emoji: String,
     },
     /// Where the official app takes this conversation's call.
     Handoff {
@@ -4685,6 +4710,10 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "is_false")]
         more: bool,
     },
+    Voicemails {
+        entries: Vec<Voicemail>,
+        next: Option<String>,
+    },
     Privacy {
         key: PrivacyKey,
         policy: PrivacyPolicy,
@@ -4729,6 +4758,13 @@ pub enum Response {
     /// Answers `Meetings`.
     Meetings {
         events: Vec<MeetingEvent>,
+    },
+    MeetingTranscript { text: String },
+    MeetingInvitees { emails: Vec<String> },
+    MeetingCreated {
+        event: MeetingEvent,
+        /// The meeting exists even when posting its link failed.
+        posted: bool,
     },
     SpaceInfo {
         info: Box<SpaceInfo>,

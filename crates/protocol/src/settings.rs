@@ -113,6 +113,9 @@ pub const GAIN_PREFIX: &str = "gain:";
 /// Local switch: always relay Telegram calls through Telegram servers, never offering a direct
 /// peer-to-peer path regardless of the account's peer-to-peer setting.
 pub const TELEGRAM_ALWAYS_RELAY: &str = "telegram_always_relay";
+/// P7. Always relay Signal calls through Signal's TURN servers to hide the IP address.
+/// Calls with people not in contacts are always relayed regardless of this switch.
+pub const SIGNAL_ALWAYS_RELAY: &str = "signal_always_relay";
 /// Local gates beside Telegram's auto-download presets. Off until the account turns them on.
 pub const TELEGRAM_DOWNLOAD_PHOTOS: &str = "telegram_download_photos";
 pub const TELEGRAM_DOWNLOAD_PRIVATE: &str = "telegram_download_private";
@@ -124,6 +127,12 @@ pub const TELEGRAM_DOWNLOAD_CHANNELS: &str = "telegram_download_channels";
 /// switch (`always_relay == true`).
 pub fn telegram_relay_only(p2p_allowed: bool, always_relay: bool) -> bool {
     !p2p_allowed || always_relay
+}
+
+/// Whether a Signal call's media must run relay-only (TURN only, no direct peer IP exposure).
+/// Defaults to relay for people not in contacts (as Signal does), and obeys P7 (`SIGNAL_ALWAYS_RELAY`).
+pub fn signal_relay_only(is_contact: bool, always_relay: bool) -> bool {
+    !is_contact || always_relay
 }
 
 /// P1, per account. Off: the adapter sends no typing signal.
@@ -308,7 +317,7 @@ fn kind(key: &str) -> Option<Kind> {
         CAMERA_QUALITY => Kind::Word(&CAMERA_QUALITY_CHOICES, "auto"),
         CAMERA_MIRROR => Kind::Switch(true),
         CAMERA_BLUR => Kind::Switch(false),
-        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | LINK_PREVIEWS_UNKNOWN | STREAMER_HIDE_WINDOW | STREAMER_DETECT_OBS => Kind::Switch(false),
+        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | SIGNAL_ALWAYS_RELAY | LINK_PREVIEWS_UNKNOWN | STREAMER_HIDE_WINDOW | STREAMER_DETECT_OBS => Kind::Switch(false),
         STREAMER_MODE => Kind::Word(&STREAMER_MODE_CHOICES, "while_sharing"),
         MUTED_TALK | AUTO_WATCH_SHARE => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
@@ -1361,6 +1370,19 @@ mod tests {
         assert!(telegram_relay_only(false, true));
         assert!(telegram_relay_only(true, true));
         assert!(!telegram_relay_only(true, false));
+    }
+
+    #[test]
+    fn signal_always_relay_setting_and_non_contact_default() {
+        assert!(!Values::default().on(SIGNAL_ALWAYS_RELAY));
+        assert!(valid(GLOBAL, SIGNAL_ALWAYS_RELAY, "on") && valid(GLOBAL, SIGNAL_ALWAYS_RELAY, "off"));
+        assert!(!valid(GLOBAL, SIGNAL_ALWAYS_RELAY, "yes"));
+        assert!(known(GLOBAL, SIGNAL_ALWAYS_RELAY));
+        // Non-contacts are always relayed; contacts obey P7 (`always_relay`).
+        assert!(signal_relay_only(false, false));
+        assert!(signal_relay_only(false, true));
+        assert!(signal_relay_only(true, true));
+        assert!(!signal_relay_only(true, false));
     }
 
     #[test]

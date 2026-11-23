@@ -1019,6 +1019,8 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         moved_from: None,
         move_notice: None,
         incoming_video: false,
+        hand_raised: false,
+        reaction: None,
     }
 }
 

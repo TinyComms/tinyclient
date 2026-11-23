@@ -907,13 +907,34 @@ pub enum Event {
     /// `at` is when this receipt was sent, in milliseconds.
     Receipt { by: String, sent: Vec<u64>, read: bool, viewed: bool, at: u64 },
     Typing { peer: Peer, by: String, name: String, started: bool },
-    /// Someone is calling: an offer for the person (`by`) in a one-to-one conversation. A
-    /// group's ring update is a blob this library cannot open, so a group call stays with the
-    /// phone. `name` is the caller's as the user knows them, `sent` when the offer was sent.
-    Call { peer: Peer, by: String, name: String, video: bool, id: u64, sent: u64 },
+    /// Someone is calling: an offer for the person (`by`) in a one-to-one conversation.
+    /// `name` is the caller's as the user knows them, `sent` when the offer was sent.
+    /// `sdp` is decoded from `CallMessage.offer.opaque` when it carries a UTF-8 SDP offer.
+    Call { peer: Peer, by: String, name: String, video: bool, id: u64, sent: u64, sdp: String, opaque: Vec<u8> },
+    /// The remote peer answered our outgoing 1:1 call (`CallMessage.answer`).
+    CallAnswer { peer: Peer, by: String, id: u64, sdp: String, opaque: Vec<u8> },
+    /// Remote ICE candidates (`CallMessage.iceUpdate`) for an active or incoming 1:1 call.
+    CallIce { peer: Peer, by: String, id: u64, candidates: Vec<String> },
+    /// An opaque calling payload (`CallMessage.opaque`), used for RingRTC / group-call signalling.
+    CallOpaque { peer: Peer, by: String, data: Vec<u8>, urgent: bool },
     /// A call we heard of is over: its hangup, or the other side telling us it was busy.
-    /// `answered` says someone took it on another device; nobody did when it is false.
-    CallEnded { id: u64, answered: bool },
+    /// `answered` says someone took it on another device; `kind` names the Signal hangup reason.
+    CallEnded { id: u64, answered: bool, kind: HangupKind },
+    /// A Signal group call started, updated, or ended (`DataMessage.groupCallUpdate`).
+    /// `era_id` is `Some(non-empty)` while a call is running and `None` when the call ends.
+    GroupCallUpdate { peer: Peer, by: String, era_id: Option<String>, sent: u64 },
+    /// SFU group-call roster snapshot (from peeking or live SFU updates).
+    GroupCallRoster { group_id: String, info: GroupCallInfo },
+    /// One group-call participant's live media, raised-hand, or reaction state.
+    GroupCallParticipantState {
+        group_id: String,
+        aci: String,
+        muted: Option<bool>,
+        camera: Option<bool>,
+        sharing: Option<bool>,
+        hand_raised: Option<bool>,
+        reaction: Option<Option<String>>,
+    },
     /// A call synced from the user's phone (`SyncMessage.callEvent`).
     CallEvent {
         peer: Peer,
@@ -988,6 +1009,123 @@ pub enum CallKind {
     Video,
     Group,
     AdHoc,
+}
+
+/// Signal `CallMessage.Hangup.Type` reasons.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HangupKind {
+    #[default]
+    Normal,
+    Accepted,
+    Declined,
+    Busy,
+    NeedPermission,
+}
+
+impl HangupKind {
+    pub fn word(self) -> &'static str {
+        match self {
+            HangupKind::Normal => "normal",
+            HangupKind::Accepted => "accepted",
+            HangupKind::Declined => "declined",
+            HangupKind::Busy => "busy",
+            HangupKind::NeedPermission => "need_permission",
+        }
+    }
+}
+
+/// One TURN relay server from Signal's `/v1/accounts/turn` endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnServer {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub password: String,
+}
+
+/// Signal 1:1 and group calling signals sent inside `ContentBody::CallMessage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallSignal {
+    Offer { id: u64, video: bool, sdp: String, opaque: Vec<u8> },
+    Answer { id: u64, sdp: String, opaque: Vec<u8> },
+    IceUpdate { id: u64, candidates: Vec<String> },
+    Busy { id: u64 },
+    Hangup { id: u64, kind: HangupKind, device_id: Option<u32> },
+    Opaque { data: Vec<u8>, urgent: bool },
+}
+
+/// Encodes an SDP string into Signal's `opaque` payload bytes when no raw opaque bytes are given.
+pub fn encode_sdp_opaque(sdp: &str, opaque: &[u8]) -> Vec<u8> {
+    if !opaque.is_empty() {
+        return opaque.to_vec();
+    }
+    sdp.as_bytes().to_vec()
+}
+
+/// Extracts a UTF-8 SDP document or ICE candidate line from Signal's `opaque` payload bytes.
+pub fn decode_sdp_opaque(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if text.starts_with("v=0") || text.starts_with("candidate:") || text.starts_with("a=candidate:") => {
+            text.to_owned()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Snapshot of an active Signal group call obtained by peeking the SFU or joining it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupCallInfo {
+    pub era_id: String,
+    /// ACIs currently in the group call.
+    pub members: Vec<String>,
+    pub started_by: Option<String>,
+    /// True when the SFU reports the group call is at capacity.
+    pub full: bool,
+    pub max_devices: u32,
+}
+
+/// Group-call auth credentials (zkgroup credential + SFU endpoint/token).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupCallCredentials {
+    pub sfu_url: String,
+    pub token: String,
+    pub era_id: String,
+    pub group_key: Vec<u8>,
+}
+
+/// Ring action inside a Signal group-call ring `CallMessage.opaque`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRingMode {
+    Ringing,
+    Cancelled,
+    Declined,
+    Busy,
+}
+
+/// Structured Signal group-call payloads exchanged over `CallMessage.opaque` or SFU data channel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GroupCallSignal {
+    Ring { group_id: String, era_id: String, ring_id: i64, mode: GroupRingMode },
+    RaiseHand { group_id: String, era_id: String, raised: bool },
+    Reaction { group_id: String, era_id: String, emoji: String },
+    SenderKey { group_id: String, era_id: String, key_bytes: Vec<u8> },
+    MediaState { group_id: String, era_id: String, muted: bool, camera: bool, sharing: bool },
+}
+
+const GROUP_SIGNAL_PREFIX: &[u8] = b"tgc1:";
+
+pub fn encode_group_call_signal(signal: &GroupCallSignal) -> Vec<u8> {
+    let mut out = GROUP_SIGNAL_PREFIX.to_vec();
+    if let Ok(json) = serde_json::to_vec(signal) {
+        out.extend_from_slice(&json);
+    }
+    out
+}
+
+pub fn decode_group_call_signal(bytes: &[u8]) -> Option<GroupCallSignal> {
+    let body = bytes.strip_prefix(GROUP_SIGNAL_PREFIX)?;
+    serde_json::from_slice(body).ok()
 }
 
 /// Outcome of a synced `CallEvent`.
@@ -1156,6 +1294,10 @@ pub enum Body {
         file: Option<File>,
         allows_replies: bool,
     },
+    /// Send a Signal calling signal (`ContentBody::CallMessage`) over Signal's encrypted path.
+    Call(CallSignal),
+    /// Broadcast a Signal group call update (`DataMessage.groupCallUpdate`) to a group.
+    GroupCallUpdate { era_id: Option<String> },
 }
 
 /// Why something failed.
@@ -1354,6 +1496,30 @@ pub trait Wire: Send + Sync {
         _dest: &std::path::Path,
     ) -> Result<u64, Fault> {
         Err(Fault::Refused("No longer available".to_owned()))
+    }
+    /// Fetches TURN relay credentials from Signal's calling relay endpoint (`/v1/accounts/turn`).
+    fn turn_servers(&self) -> Result<Vec<TurnServer>, Fault> {
+        Ok(Vec::new())
+    }
+    /// Peeks the Signal SFU for a group's current call era and active participants.
+    fn peek_group_call(&self, _group_id: &str) -> Result<GroupCallInfo, Fault> {
+        Ok(GroupCallInfo::default())
+    }
+    /// Fetches zkgroup membership credentials and SFU join info for a Signal group call.
+    fn group_call_credentials(&self, _group_id: &str) -> Result<GroupCallCredentials, Fault> {
+        Err(Fault::Refused("Group call credentials are not available.".to_owned()))
+    }
+    /// Joins a Signal group call on the SFU, returning `(answer_sdp, roster)` or refusing if full.
+    fn group_call_join(&self, _group_id: &str, _era_id: &str, _offer_sdp: &str) -> Result<(String, GroupCallInfo), Fault> {
+        Err(Fault::Refused("Signal group call SFU is not available.".to_owned()))
+    }
+    /// Leaves an active Signal group call on the SFU.
+    fn group_call_leave(&self, _group_id: &str, _era_id: &str) -> Result<(), Fault> {
+        Ok(())
+    }
+    /// Sends a group-call data-channel signal (raise hand, emoji reaction, media state).
+    fn group_call_send_data(&self, _group_id: &str, _signal: GroupCallSignal) -> Result<(), Fault> {
+        Ok(())
     }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);

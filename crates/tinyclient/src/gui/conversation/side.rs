@@ -3304,6 +3304,23 @@ mod tests {
     }
 
     #[test]
+    fn slack_huddle_opens_its_thread_even_before_the_first_reply() {
+        let conversation = Key { network: Network::Slack, account: "T1".into(), id: "C1".into() };
+        let mut root = Message::plain("1760000200.000200", "Slack", "A huddle happened", 1760000200, false);
+        root.kind = protocol::MessageKind::System;
+        root.call = Some(protocol::CallNote {
+            outcome: protocol::CallOutcome::Ended, caller_id: "U1".into(), seconds: None,
+            participants: Vec::new(), video: false, call_id: None,
+        });
+        root.thread = Some(protocol::ThreadSummary {
+            id: "C1:1760000200.000200".into(), replies: 0, unread: 0, last: 1760000200, participants: Vec::new(),
+        });
+        let thread = thread_key(&conversation, ConversationKind::Channel, &root).unwrap();
+        assert_eq!(thread, Key { id: "C1:1760000200.000200".into(), ..conversation.clone() });
+        assert_eq!(Layer::Thread { conversation, root: Rc::new(root) }.title(), "Huddle thread");
+    }
+
+    #[test]
     fn a_thread_posts_under_its_own_key_and_only_beside_its_conversation() {
         let mut root = Message::plain("m1", "Ines", "root", 0, false);
         let channel = ConversationKind::Channel;

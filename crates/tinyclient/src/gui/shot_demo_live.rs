@@ -120,6 +120,8 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>) -> 
         moved_from: None,
         move_notice: None,
         incoming_video: false,
+        hand_raised: false,
+        reaction: None,
     }
 }
 
