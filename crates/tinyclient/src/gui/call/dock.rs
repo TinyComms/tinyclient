@@ -150,12 +150,13 @@ pub(crate) fn incoming_accept_label(call: &Call, support: protocol::CallSupport)
 
 /// A 32 px button with words: Cancel, Decline, Accept.
 fn worded(id: &'static str, icon: Option<&'static str>, word: impl Into<gpui::SharedString>, fill: Rgba, color: Rgba) -> Stateful<Div> {
+    let word: gpui::SharedString = word.into();
     // The red ones fill on hover, and their glyph goes white with the word.
     let lit = (color == theme::danger()).then(|| (id, theme::on_accent()));
     div()
         .id(id)
         .role(gpui::Role::Button)
-        .aria_label(word)
+        .aria_label(word.clone())
         .group(id)
         .h(px(32.))
         .px(px(14.))
@@ -172,7 +173,7 @@ fn worded(id: &'static str, icon: Option<&'static str>, word: impl Into<gpui::Sh
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .children(icon.map(|icon| glyph_in(icon, 14., color, lit)))
-        .child(word.into())
+        .child(word)
 }
 
 /// A button of the failure card. As wide as its words, so a narrow sidebar wraps the row
