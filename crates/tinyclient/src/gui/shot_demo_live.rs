@@ -125,6 +125,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>) -> 
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
     }
 }
 

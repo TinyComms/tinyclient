@@ -329,6 +329,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
     })
 }
 
@@ -491,6 +492,7 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
     }
 }
 

@@ -721,6 +721,7 @@ mod tests {
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
         }
     }
 
@@ -885,6 +886,31 @@ mod tests {
         let mut pending = tg_call;
         pending.security = Some(CallSecurity { mode: SecurityMode::Pending, ..sec });
         assert!(telegram_header_emojis(&pending).is_none());
+    }
+
+    #[test]
+    fn telegram_conference_header_emojis_update_on_membership_change_and_fail_closed() {
+        let ep1 = CallSecurity::telegram_conference_verified(&[0x11; 32], 1, vec![member("u7002", Trust::Unverified)]);
+        let ep2 = CallSecurity::telegram_conference_verified(
+            &[0x22; 32],
+            2,
+            vec![member("u7002", Trust::Unverified), member("u7003", Trust::Unverified)],
+        );
+        let mut conf = call(ep1.clone());
+        conf.conversation.network = protocol::Network::Telegram;
+        conf.conversation.id = "conf:99001".into();
+        let shown1 = telegram_header_emojis(&conf).expect("ep1 4 emoji");
+        assert_eq!(shown1.split(' ').count(), 4);
+
+        conf.security = Some(ep2);
+        let shown2 = telegram_header_emojis(&conf).expect("ep2 4 emoji");
+        assert_eq!(shown2.split(' ').count(), 4);
+        assert_ne!(shown1, shown2, "header emoji must update when conference membership changes");
+
+        let blocked = CallSecurity::telegram_conference_blocked();
+        assert!(!offers_carry_on(&blocked), "fail-closed conference must never allow unencrypted carry-on");
+        conf.security = Some(blocked);
+        assert!(telegram_header_emojis(&conf).is_none());
     }
 
     #[test]

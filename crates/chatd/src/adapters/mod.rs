@@ -1854,6 +1854,8 @@ pub enum Command {
     CallMove { conversation_id: String, person_id: String, to: Option<String>, reply: Reply<()> },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),
+    /// Place a 1:1 video call (`video: true` on `phone.requestCall`).
+    CallJoinVideo(String),
     /// Leave, cancel or decline on the network. Also sent when the call failed here (mediad
     /// died, a deadline passed), so the network stops showing us in the channel or ringing the
     /// other side. May arrive for a call the adapter already left: then it is nothing.
@@ -1877,6 +1879,20 @@ pub enum Command {
     GroupCallStart { conversation_id: String, reply: Reply<()> },
     /// Toggles the reminder subscription on a scheduled Telegram video chat.
     GroupCallSubscribe { conversation_id: String, subscribed: bool, reply: Reply<()> },
+    /// Resolves a Telegram encrypted conference link (`t.me/call/<slug>`) without joining.
+    ConferenceResolve { slug: String, reply: Reply<protocol::ConferenceCallInfo> },
+    /// Creates an encrypted Telegram conference call (`phone.createConferenceCall`).
+    ConferenceCreate { video: bool, join: bool, reply: Reply<protocol::ConferenceCallInfo> },
+    /// Joins an encrypted Telegram conference call by slug, call_id, or invite msg_id.
+    ConferenceJoin {
+        slug: Option<String>,
+        call_id: Option<String>,
+        msg_id: Option<i32>,
+        video: bool,
+        reply: Reply<()>,
+    },
+    /// Removes participants from an active Telegram encrypted conference call.
+    ConferenceRemove { conversation_id: String, people: Vec<String>, kick: bool, reply: Reply<()> },
     /// In-call signalling bytes from mediad for Telegram `phone.sendSignalingData` (base64).
     TelegramCallSignal { conversation_id: String, data: String },
     /// Local speaking state changed in a Telegram group call (`speakingInGroupCallAction`).
@@ -2095,7 +2111,12 @@ impl Command {
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. }
             | Command::GroupCallSchedule { reply, .. }
             | Command::GroupCallStart { reply, .. }
-            | Command::GroupCallSubscribe { reply, .. } => {
+            | Command::GroupCallSubscribe { reply, .. }
+            | Command::ConferenceJoin { reply, .. }
+            | Command::ConferenceRemove { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::ConferenceResolve { reply, .. } | Command::ConferenceCreate { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -3486,9 +3507,28 @@ impl Context {
         self.hub.calls.telegram_call(&self.hub, &self.key(conversation_id), join);
     }
 
-    /// Asks mediad to build the join params JSON + SSRC for a Telegram group video chat.
-    pub fn telegram_group_offer(&self, conversation_id: &str, offer: protocol::TelegramGroupOffer) -> Result<(String, u32), String> {
+    /// Asks mediad to build the join params JSON + SSRC + optional E2EE public key for a Telegram group/conference call.
+    pub fn telegram_group_offer(
+        &self,
+        conversation_id: &str,
+        offer: protocol::TelegramGroupOffer,
+    ) -> Result<(String, u32, Option<String>), String> {
         self.hub.calls.telegram_group_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    /// Feeds Telegram encrypted conference chain blocks to mediad for verification.
+    pub fn telegram_conference_blocks(
+        &self,
+        conversation_id: &str,
+        sub_chain_id: i32,
+        blocks: Vec<String>,
+    ) -> Result<(), String> {
+        self.hub.calls.telegram_conference_blocks(&self.hub, &self.key(conversation_id), sub_chain_id, blocks)
+    }
+
+    /// Sets or clears the shareable invite link (`https://t.me/call/<slug>`) on the active call.
+    pub fn call_invite_link(&self, conversation_id: &str, invite_link: Option<String>) {
+        self.hub.calls.set_invite_link(&self.hub, &self.key(conversation_id), invite_link);
     }
 
     /// Applies Telegram's server transport JSON (`updateGroupCallConnection`) to mediad.

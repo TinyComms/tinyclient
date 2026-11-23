@@ -1024,6 +1024,7 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
     }
 }
 

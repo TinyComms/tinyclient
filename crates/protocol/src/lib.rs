@@ -473,9 +473,9 @@ pub enum CallSupport {
     Restricted,
 }
 
-/// Camera and screen share run in this client on a Tiny, Discord, or Signal call.
+/// Camera and screen share run in this client on Tiny, Discord, Signal, and Telegram calls.
 pub fn call_pictures(network: Network) -> bool {
-    matches!(network, Network::Tiny | Network::Discord | Network::Signal)
+    matches!(network, Network::Tiny | Network::Discord | Network::Signal | Network::Telegram)
 }
 
 /// How a conversation kind is called, as the adapter that builds its row decides.
@@ -3265,6 +3265,45 @@ pub enum Request {
     CallStart {
         conversation: Key,
     },
+    /// Places an outgoing 1:1 video call (`video: true` on `phone.requestCall`).
+    CallStartVideo {
+        conversation: Key,
+    },
+    /// Resolves a Telegram encrypted conference link (`t.me/call/<slug>`) via `phone.getGroupCall`
+    /// with `inputGroupCallSlug` without joining, returning who is in the call.
+    ConferenceResolve {
+        account: AccountKey,
+        slug: String,
+    },
+    /// Creates an encrypted Telegram conference call via `phone.createConferenceCall`, returning
+    /// its shareable `t.me/call/<slug>` link (and joining when `join` is true).
+    ConferenceCreate {
+        account: AccountKey,
+        #[serde(default)]
+        video: bool,
+        #[serde(default)]
+        join: bool,
+    },
+    /// Joins an encrypted Telegram conference call by `slug` (`t.me/call/<slug>`), `call_id`,
+    /// or incoming invite `msg_id`.
+    ConferenceJoin {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slug: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<i32>,
+        #[serde(default)]
+        video: bool,
+    },
+    /// Removes participants from the active encrypted Telegram conference call
+    /// (`phone.deleteConferenceCallParticipants`).
+    ConferenceRemove {
+        people: Vec<String>,
+        #[serde(default)]
+        kick: bool,
+    },
     /// Answers the incoming ring. Starts mediad.
     CallAccept,
     /// Stops the incoming ring for both sides. mediad never starts.
@@ -4772,6 +4811,11 @@ pub enum Response {
     /// Answers `InvitePreview`: metadata and member counts for an invite code.
     InvitePreview {
         preview: InvitePreview,
+    },
+    /// Answers `ConferenceResolve` and `ConferenceCreate`: encrypted conference metadata,
+    /// current participants, and shareable `t.me/call/<slug>` link.
+    ConferenceInfo {
+        info: ConferenceCallInfo,
     },
     /// Answers `InviteJoin`: the joined Space and landing conversation, when reported.
     InviteJoined {

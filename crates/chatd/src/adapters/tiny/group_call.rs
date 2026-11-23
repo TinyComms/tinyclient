@@ -547,6 +547,8 @@ fn publish_group(ctx: &Context, seat: &Seat, group_id: &str) {
         preview: String::new(),
         hand_raised: false,
         reaction: None,
+        camera_paused: false,
+        low_battery: false,
     });
     ctx.participants(group_id, others.collect());
     let ringing = group

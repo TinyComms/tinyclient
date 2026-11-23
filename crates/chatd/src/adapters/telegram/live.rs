@@ -349,6 +349,10 @@ fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, cove
                 }).unwrap_or(1);
                 sync::note_topic_edit(account, forum, topic_id, edited.title.as_deref(), edited.icon_emoji_id, edited.closed, edited.hidden);
             }
+            tl::enums::MessageAction::ConferenceCall(conf) if !svc.out && !covered_by_dialog => {
+                let inviter = svc.from_id.as_ref().map(Who::of).unwrap_or_else(|| Who::of(&svc.peer_id));
+                super::conference::on_invite_message(account, svc.id, inviter, conf);
+            }
             _ => {}
         }
     }
@@ -830,10 +834,19 @@ pub(super) fn apply(account: &Account, update: &Update) {
         // Call lifecycle updates (`#451`, `#469`): incoming rings, DH handshake, discard & rating.
         Update::PhoneCall(phone) => super::call::on_phone_call(account, &phone.phone_call),
         Update::PhoneCallSignalingData(sig) => super::call::on_signaling_data(account, sig),
-        // Group / channel video chat updates (`#462`, `#465`, `#461`).
+        // Group / channel video chat & encrypted conference updates (`#462`, `#465`, `#461`, `#450`).
         Update::GroupCall(gc) => super::group_call::on_group_call(account, gc),
-        Update::GroupCallParticipants(gp) => super::group_call::on_participants(account, gp),
-        Update::GroupCallConnection(conn) => super::group_call::on_connection(account, conn),
+        Update::GroupCallParticipants(gp) => {
+            if !super::conference::on_participants(account, gp) {
+                super::group_call::on_participants(account, gp);
+            }
+        }
+        Update::GroupCallConnection(conn) => {
+            if !super::conference::on_connection(account, conn) {
+                super::group_call::on_connection(account, conn);
+            }
+        }
+        Update::GroupCallChainBlocks(cb) => super::conference::on_chain_blocks(account, cb),
         // A chat joined, left or changed: what changed came with the update's chats, which
         // `learn` has already written.
         _ => {}

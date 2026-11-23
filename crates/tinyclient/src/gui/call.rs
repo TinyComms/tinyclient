@@ -708,6 +708,7 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
     }
 }
 
@@ -3096,6 +3097,12 @@ impl Shell {
             return;
         }
         self.call_begin(vec![Request::CallStart { conversation: conversation.clone() }], conversation, cx);
+    }
+
+    /// Places an outgoing 1:1 video call (`video: true` on `phone.requestCall`).
+    #[allow(dead_code)]
+    pub(in crate::gui) fn call_start_video(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        self.call_begin(vec![Request::CallStartVideo { conversation: conversation.clone() }], conversation, cx);
     }
 
     /// "Leave & call": leaves the call that is up, then starts the one that was asked for.

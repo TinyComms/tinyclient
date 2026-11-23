@@ -2233,6 +2233,8 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             preview: String::new(),
             hand_raised: false,
             reaction: None,
+            camera_paused: false,
+            low_battery: false,
         });
         ctx.participants(room, roster.collect());
     }
@@ -2964,6 +2966,8 @@ fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
             preview: String::new(),
             hand_raised: false,
             reaction: None,
+            camera_paused: false,
+            low_battery: false,
         });
     ctx.participants(direct_id, roster.collect());
 }

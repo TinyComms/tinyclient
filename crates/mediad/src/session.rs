@@ -126,6 +126,8 @@ pub struct Controls {
     tg_signals: Mutex<std::collections::VecDeque<Vec<u8>>>,
     /// Updated Telegram group voice chat SSRC -> participant mapping.
     tg_sources: Mutex<Option<Vec<protocol::TelegramGroupSource>>>,
+    /// Pure-Rust `tde2e`-compatible E2EE state for an encrypted Telegram conference call.
+    tg_conf_e2ee: Mutex<Option<crate::telegram_e2ee::ConferenceE2ee>>,
 }
 
 impl Controls {
@@ -427,6 +429,52 @@ impl Controls {
 
     pub fn take_tg_sources(&self) -> Option<Vec<protocol::TelegramGroupSource>> {
         self.tg_sources.lock().unwrap().take()
+    }
+
+    pub fn init_tg_conference(&self, my_user_id: i64, public_key: [u8; 32]) {
+        *self.tg_conf_e2ee.lock().unwrap() = Some(crate::telegram_e2ee::ConferenceE2ee::new(my_user_id, public_key));
+    }
+
+    pub fn clear_tg_conference(&self) {
+        *self.tg_conf_e2ee.lock().unwrap() = None;
+    }
+
+    pub fn tg_conference_active(&self) -> bool {
+        self.tg_conf_e2ee.lock().unwrap().is_some()
+    }
+
+    pub fn apply_tg_conference_block(
+        &self,
+        sub_chain_id: i32,
+        raw: &[u8],
+    ) -> Result<protocol::CallSecurity, (crate::telegram_e2ee::E2eeError, protocol::CallSecurity)> {
+        let mut guard = self.tg_conf_e2ee.lock().unwrap();
+        let Some(e2ee) = guard.as_mut() else {
+            return Err((
+                crate::telegram_e2ee::E2eeError::NotReady,
+                protocol::CallSecurity::telegram_conference_blocked(),
+            ));
+        };
+        match e2ee.apply_block_bytes(sub_chain_id, raw) {
+            Ok(()) => Ok(e2ee.security()),
+            Err(err) => Err((err, e2ee.security())),
+        }
+    }
+
+    pub fn tg_conference_encrypt(&self, kind: u8, plaintext: &[u8]) -> Result<Vec<u8>, crate::telegram_e2ee::E2eeError> {
+        let mut guard = self.tg_conf_e2ee.lock().unwrap();
+        let Some(e2ee) = guard.as_mut() else {
+            return Err(crate::telegram_e2ee::E2eeError::NotReady);
+        };
+        e2ee.encrypt_frame(kind, plaintext)
+    }
+
+    pub fn tg_conference_decrypt(&self, packet: &[u8]) -> Result<(u8, i64, Vec<u8>), crate::telegram_e2ee::E2eeError> {
+        let guard = self.tg_conf_e2ee.lock().unwrap();
+        let Some(e2ee) = guard.as_ref() else {
+            return Err(crate::telegram_e2ee::E2eeError::NotReady);
+        };
+        e2ee.decrypt_frame(packet)
     }
 }
 

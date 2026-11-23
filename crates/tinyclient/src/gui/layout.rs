@@ -2321,6 +2321,7 @@ impl Render for Shell {
             .children(self.folder_edit_modal(cx))
             .children(self.forum_post_modal(cx))
             .children(self.join_server_modal(cx))
+            .children(self.conference_link_modal(cx))
             .children(self.create_server_modal(cx))
             .children(self.events_modal(cx))
             .children(self.server_gate_modal(cx))

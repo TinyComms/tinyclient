@@ -59,6 +59,17 @@ pub fn telegram_call_emojis(key: &[u8], g_a: &[u8]) -> [&'static str; 4] {
     telegram_call_emojis_from_digest(&digest)
 }
 
+/// Computes the four verification emoji for an encrypted Telegram conference call from its
+/// verified E2EE chain state hash (`tde2e`-compatible 333-emoji mapping).
+/// Recomputed on every membership change so all verified participants see matching emoji.
+pub fn telegram_conference_emojis(state_hash: &[u8; 32]) -> [&'static str; 4] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tde2e-emoji-v1:");
+    hasher.update(state_hash);
+    let digest: [u8; 32] = hasher.finalize().into();
+    telegram_call_emojis_from_digest(&digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +112,18 @@ mod tests {
         assert_eq!(sec.mode, crate::SecurityMode::EndToEnd);
         assert_eq!(sec.emojis.len(), 4);
         assert_eq!(sec.emojis, telegram_call_emojis(&key, &g_a));
+
+        let hash_a = [0x11u8; 32];
+        let hash_b = [0x22u8; 32];
+        let conf_a = crate::CallSecurity::telegram_conference_verified(&hash_a, 1, Vec::new());
+        let conf_b = crate::CallSecurity::telegram_conference_verified(&hash_b, 2, Vec::new());
+        assert_eq!(conf_a.mode, crate::SecurityMode::EndToEnd);
+        assert!(conf_a.required);
+        assert_eq!(conf_a.emojis.len(), 4);
+        assert_ne!(conf_a.emojis, conf_b.emojis);
+        let blocked = crate::CallSecurity::telegram_conference_blocked();
+        assert_eq!(blocked.mode, crate::SecurityMode::Blocked);
+        assert!(blocked.required);
+        assert!(blocked.emojis.is_empty());
     }
 }

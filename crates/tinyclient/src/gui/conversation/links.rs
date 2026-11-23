@@ -214,6 +214,19 @@ impl Pane {
                 });
                 return;
             }
+            if let Some(slug) = protocol::link::telegram_call_link(url) {
+                let preferred = self
+                    .key()
+                    .filter(|k| k.network == protocol::Network::Telegram)
+                    .map(|k| k.account());
+                let opened = self
+                    .shell
+                    .update(cx, |shell, cx| shell.open_telegram_conference(preferred, slug, cx))
+                    .unwrap_or(false);
+                if opened {
+                    return;
+                }
+            }
             if protocol::link::telegram_invite_hash(url).is_some() {
                 let preferred = self
                     .key()

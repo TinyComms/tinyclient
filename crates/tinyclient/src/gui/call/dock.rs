@@ -1159,7 +1159,23 @@ impl Shell {
         } else {
             theme::text_soft()
         };
-        let words = if talking { format!("You're muted. Press {} to talk", crate::gui::shortcuts::label("⌘⇧M")) } else { words };
+        let peer_note = live.then(|| {
+            let paused = call.participants.iter().any(|p| p.camera_paused);
+            let low_bat = call.participants.iter().any(|p| p.low_battery);
+            match (paused, low_bat) {
+                (true, true) => Some("Camera paused · Low battery".to_owned()),
+                (true, false) => Some("Camera paused".to_owned()),
+                (false, true) => Some("Peer battery low".to_owned()),
+                (false, false) => None,
+            }
+        }).flatten();
+        let words = if talking {
+            format!("You're muted. Press {} to talk", crate::gui::shortcuts::label("⌘⇧M"))
+        } else if let Some(note) = peer_note {
+            note
+        } else {
+            words
+        };
         let counter = if refused.is_some() || notice.is_some() { None } else { self.call_counter(call, cx) };
         let refused = refused.or(notice);
         // Give the server name or notice the full line; status and clock have their own row.
@@ -1460,7 +1476,12 @@ impl Shell {
             && joined
             && enabled
             && (call.participants.len() + 1) < 10;
-        let add_people = (picker || discord_add).then(|| {
+        let telegram_add = !picker
+            && call.conversation.network == Network::Telegram
+            && (subject.kind.is_direct() || call.conversation.id.starts_with("conf:"))
+            && joined
+            && enabled;
+        let add_people = (picker || discord_add || telegram_add).then(|| {
             control(
                 "call-add-people",
                 "icons/user-plus.svg",
@@ -1480,6 +1501,15 @@ impl Shell {
                     }
                 }
             }))
+        });
+        let copy_link = call.invite_link.clone().filter(|link| !link.is_empty() && joined && enabled).map(|link| {
+            control("call-copy-link", "icons/link.svg", Look::Rest, true)
+                .aria_label("Copy call link")
+                .tooltip(tip("Copy call link", None))
+                .on_click(cx.listener(move |_this, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(link.clone()));
+                }))
         });
         let devices = control(
             "call-devices",
@@ -1534,6 +1564,7 @@ impl Shell {
             .children(raise_hand.map(|button| button.flex_1().min_w_0()))
             .children(ring_again.map(|button| button.flex_1().min_w_0()))
             .children(add_people.map(|button| button.flex_1().min_w_0()))
+            .children(copy_link.map(|button| button.flex_1().min_w_0()))
             .child(devices.when(in_call(call), |button| button.flex_1().min_w_0()))
             .child(
                 end.when(in_call(call), |button| button.flex_1().min_w_0())
@@ -1760,6 +1791,7 @@ mod tests {
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
         }
     }
 

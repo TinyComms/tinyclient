@@ -6010,6 +6010,14 @@ mod tests {
         assert!(vm.missed);
         assert_eq!(vm.label, "Missed video call from Bea");
         assert_eq!(vm.pill, Some("Call back"));
+
+        let mut conf_live = make(protocol::CallOutcome::Live, false, None);
+        conf_live.call.as_mut().unwrap().participants = vec!["u7002".into(), "u7003".into()];
+        conf_live.call.as_mut().unwrap().call_id = Some("99001".into());
+        let cl = call_line_spec(&conf_live, "Bea");
+        assert!(!cl.missed);
+        assert_eq!(cl.label, "Call in progress with Bea");
+        assert_eq!(cl.pill, Some("Join"));
     }
 
     #[test]

@@ -318,6 +318,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -670,6 +671,40 @@ impl Live {
                     return false;
                 }
                 self.call.video = video;
+            }
+            MediaResponse::TelegramPeerState { user_id, camera, camera_paused, low_battery, sharing } => {
+                let mut changed = false;
+                if let Some(p) = self.call.participants.iter_mut().find(|p| p.id == user_id) {
+                    if p.camera != camera
+                        || p.camera_paused != camera_paused
+                        || p.low_battery != low_battery
+                        || p.sharing != sharing
+                    {
+                        p.camera = camera;
+                        p.camera_paused = camera_paused;
+                        p.low_battery = low_battery;
+                        p.sharing = sharing;
+                        changed = true;
+                    }
+                } else if !user_id.is_empty() {
+                    self.call.participants.push(Participant {
+                        id: user_id,
+                        name: String::new(),
+                        camera,
+                        camera_paused,
+                        low_battery,
+                        sharing,
+                        ..Participant::default()
+                    });
+                    changed = true;
+                }
+                if self.call.stream_paused != camera_paused {
+                    self.call.stream_paused = camera_paused;
+                    changed = true;
+                }
+                if !changed {
+                    return false;
+                }
             }
             MediaResponse::Notice { detail } => {
                 let notice = Some(detail);
@@ -2132,13 +2167,13 @@ impl Calls {
         }
     }
 
-    /// Asks mediad to build the local ICE/DTLS join params JSON and SSRC for a Telegram group call.
+    /// Asks mediad to build the local ICE/DTLS join params JSON, SSRC, and optional conference E2EE public key.
     pub fn telegram_group_offer(
         &self,
         hub: &Arc<Hub>,
         conversation: &Key,
         mut offer: protocol::TelegramGroupOffer,
-    ) -> Result<(String, u32), String> {
+    ) -> Result<(String, u32, Option<String>), String> {
         let (call, running) = self.describe();
         let here = call.as_ref().is_some_and(|call| call.conversation == *conversation) && running;
         if !here {
@@ -2148,16 +2183,27 @@ impl Calls {
                 CallError::Media(err) => err.to_string(),
             })?;
         }
+        let is_conf = offer.conference;
         // Telegram group video chats join muted by default, as official apps do.
-        offer.muted = true;
+        if !is_conf {
+            offer.muted = true;
+        }
         self.update(hub, conversation, |live| {
-            live.call.muted = true;
+            live.call.muted = offer.muted;
             live.call.deafened = offer.deafened;
-            live.call.security = None;
+            live.call.security = if is_conf {
+                Some(protocol::CallSecurity {
+                    mode: protocol::SecurityMode::Pending,
+                    required: true,
+                    ..protocol::CallSecurity::default()
+                })
+            } else {
+                None
+            };
             live.me = offer.user_id.clone();
         });
         match self.request(hub, &MediaRequest::TelegramGroupOffer(offer)) {
-            Ok(MediaResponse::TelegramGroupJoin { params, ssrc }) => Ok((params, ssrc)),
+            Ok(MediaResponse::TelegramGroupJoin { params, ssrc, public_key }) => Ok((params, ssrc, public_key)),
             other => {
                 if !here {
                     self.end_if(hub, conversation);
@@ -2168,6 +2214,33 @@ impl Calls {
                 })
             }
         }
+    }
+
+    /// Passes Telegram conference E2EE chain blocks to mediad for cryptographic verification.
+    pub fn telegram_conference_blocks(
+        &self,
+        hub: &Hub,
+        conversation: &Key,
+        sub_chain_id: i32,
+        blocks: Vec<String>,
+    ) -> Result<(), String> {
+        let (call, running) = self.describe();
+        if !running || !call.is_some_and(|c| c.conversation == *conversation) {
+            return Err("No active conference call.".to_owned());
+        }
+        match self.request(hub, &MediaRequest::TelegramConferenceBlocks { sub_chain_id, blocks }) {
+            Ok(MediaResponse::Done) => Ok(()),
+            Ok(MediaResponse::Refused { detail }) => Err(detail),
+            Err(CallError::Media(err)) => Err(err.to_string()),
+            _ => Err("Conference E2EE verification failed.".to_owned()),
+        }
+    }
+
+    /// Sets or clears the shareable invite link (`https://t.me/call/<slug>`) on the active call.
+    pub fn set_invite_link(&self, hub: &Hub, conversation: &Key, invite_link: Option<String>) {
+        self.update(hub, conversation, |live| {
+            live.call.invite_link = invite_link;
+        });
     }
 
     /// Passes Telegram's server transport JSON (`updateGroupCallConnection`) to mediad.

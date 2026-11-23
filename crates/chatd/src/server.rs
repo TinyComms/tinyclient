@@ -4163,6 +4163,34 @@ impl Chat {
         self.status()
     }
 
+    /// Places a 1:1 video call (`video: true` on `phone.requestCall`).
+    fn call_start_video(&self, conversation: Key) -> Response {
+        if conversation.network == Network::Tiny {
+            return self.tiny_call_start(conversation);
+        }
+        match self.hub.store().conversation(&conversation) {
+            Ok(Some(row)) if row.call == CallSupport::Native => {}
+            Ok(Some(row)) if row.call == CallSupport::Handoff => {
+                return error(ErrorCode::Unsupported, format!("{} calls open in its own app.", conversation.network.label()))
+            }
+            Ok(Some(row)) if row.call == CallSupport::Restricted => {
+                return error(ErrorCode::Refused, "This person's privacy settings don't allow calls.")
+            }
+            Ok(Some(_)) => return error(ErrorCode::Unsupported, "This conversation has no calls tinyclient can join."),
+            Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
+            Err(err) => return internal(err),
+        }
+        if let Err(err) = self.hub.calls.start(&self.hub, conversation.clone()) {
+            return call_error(err);
+        }
+        let account = conversation.account();
+        self.command(&account, Command::CallJoinVideo(conversation.id));
+        if self.hub.settings().on(settings::JOIN_MUTED) {
+            self.command(&account, Command::CallAudio { muted: true, deafened: false });
+        }
+        self.status()
+    }
+
     /// A Tiny voice room is joined as before. A direct message the server can ring is a ring,
     /// with no mediad until it is accepted. An id this client has never stored is still joined
     /// as a room, which is how a room call is started.
@@ -6587,6 +6615,40 @@ impl Chat {
                 }
             }
             Request::CallStart { conversation } => self.call_start(conversation),
+            Request::CallStartVideo { conversation } => self.call_start_video(conversation),
+            Request::ConferenceResolve { account, slug } => {
+                match self.ask(&account, |reply| Command::ConferenceResolve { slug, reply }) {
+                    Ok(info) => Response::ConferenceInfo { info },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ConferenceCreate { account, video, join } => {
+                match self.ask(&account, |reply| Command::ConferenceCreate { video, join, reply }) {
+                    Ok(info) => Response::ConferenceInfo { info },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ConferenceJoin { account, slug, call_id, msg_id, video } => {
+                match self.ask(&account, |reply| Command::ConferenceJoin { slug, call_id, msg_id, video, reply }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ConferenceRemove { people, kick } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::ConferenceRemove {
+                    conversation_id,
+                    people,
+                    kick,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CallAccept => self.call_accept(),
             // A ring waiting beside a call is declined on its own. Ending the call does not
             // take that ring into the slot, so the next call the user places is not that ring.
@@ -6794,11 +6856,11 @@ impl Chat {
                     MediaRequest::Meter { on } => self.hub.calls.meter(&self.hub, on),
                     request => self.hub.calls.request(&self.hub, &request).map(drop),
                 };
-                // A refusal never tells Discord we are sending. Other networks ignore the command.
+                // A refusal never tells the network we are sending. Other networks ignore the command.
                 if asked.is_ok() {
                     if let (Some(call), true) = self.hub.calls.describe() {
                         if let Some(picture) = picture {
-                            if matches!(call.conversation.network, Network::Discord | Network::Signal) {
+                            if matches!(call.conversation.network, Network::Discord | Network::Signal | Network::Telegram) {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
                             }
                         }

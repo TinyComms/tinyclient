@@ -1500,12 +1500,18 @@ impl Demo {
             | Command::WantedSpan { .. }
             | Command::TelegramCallSignal { .. }
             | Command::TelegramCallSpeaking { .. }
+            | Command::CallJoinVideo(_)
             | Command::Played { .. }
             | Command::CallIce { .. }
             | Command::Stop => {}
             Command::GroupCallSchedule { reply, .. }
             | Command::GroupCallStart { reply, .. }
-            | Command::GroupCallSubscribe { reply, .. } => {
+            | Command::GroupCallSubscribe { reply, .. }
+            | Command::ConferenceJoin { reply, .. }
+            | Command::ConferenceRemove { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::ConferenceResolve { reply, .. } | Command::ConferenceCreate { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
         }

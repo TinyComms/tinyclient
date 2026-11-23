@@ -620,15 +620,16 @@ pub(super) fn join_group(account: &Account, who: Who) {
 
     let me_id = Who::User(account.me).text();
     // Always join muted by default (`#461`).
-    let (params_json, ssrc) = match account.ctx.telegram_group_offer(
+    let (params_json, ssrc, _pk) = match account.ctx.telegram_group_offer(
         &conv_id,
         TelegramGroupOffer {
             user_id: me_id,
             muted: true,
             deafened: false,
+            conference: false,
         },
     ) {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(detail) => {
             account.ctx.call_failed(&conv_id, CallFailure::Engine, &detail);
             return;

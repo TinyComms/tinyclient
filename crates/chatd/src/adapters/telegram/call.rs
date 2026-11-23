@@ -70,6 +70,8 @@ pub(super) enum ActiveCall {
         access_hash: i64,
         peer: Who,
         video: bool,
+        camera: bool,
+        sharing: bool,
         started_at: Instant,
         connection_id: i64,
     },
@@ -508,20 +510,34 @@ fn start_direct_media(
     key: [u8; 256],
     g_a: Vec<u8>,
     is_outgoing: bool,
+    requested_video: bool,
 ) {
     let conv_id = peer.text();
+    let peer_name = account.dir().name(peer);
     let connections = map_endpoints(&call.connections);
     let connection_id = connections.first().map_or(0, |e| e.id);
+    let video = call.video || requested_video;
     account.live().active_call = Some(ActiveCall::Active {
         id: call.id,
         access_hash: call.access_hash,
         peer,
-        video: call.video,
+        video,
+        camera: video,
+        sharing: false,
         started_at: Instant::now(),
         connection_id,
     });
     let security = CallSecurity::telegram_verified(&key, &g_a, true, true);
     account.ctx.call_security(&conv_id, security);
+    account.ctx.participants(
+        &conv_id,
+        vec![protocol::Participant {
+            id: conv_id.clone(),
+            name: peer_name,
+            camera: call.video,
+            ..protocol::Participant::default()
+        }],
+    );
     if is_outgoing {
         account.ctx.answered(&conv_id);
     }
@@ -537,6 +553,7 @@ fn start_direct_media(
             config_json: String::new(),
             muted: false,
             deafened: false,
+            video,
         },
     );
 }
@@ -626,13 +643,13 @@ pub(super) fn on_phone_call(account: &Account, call: &tl::enums::PhoneCall) {
             let outgoing = {
                 let live = account.live();
                 match &live.active_call {
-                    Some(ActiveCall::RingingOut { id, access_hash, peer, p, a, g_a, .. }) if *id == acc.id => {
-                        Some((*id, *access_hash, *peer, *p, *a, g_a.clone()))
+                    Some(ActiveCall::RingingOut { id, access_hash, peer, video, p, a, g_a }) if *id == acc.id => {
+                        Some((*id, *access_hash, *peer, *video, *p, *a, g_a.clone()))
                     }
                     _ => None,
                 }
             };
-            let Some((id, access_hash, peer, p, a, g_a)) = outgoing else {
+            let Some((id, access_hash, peer, requested_video, p, a, g_a)) = outgoing else {
                 return;
             };
             let g_b = match validate_dh_public(&acc.g_b, &p) {
@@ -640,7 +657,7 @@ pub(super) fn on_phone_call(account: &Account, call: &tl::enums::PhoneCall) {
                 Err(why) => {
                     tracing::warn!("chatd: Telegram: invalid g_b on call {id}: {why}");
                     account.live().active_call = None;
-                    discard_rpc(account, id, access_hash, acc.video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
+                    discard_rpc(account, id, access_hash, acc.video || requested_video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
                     account.ctx.call_failed(&peer.text(), CallFailure::Encryption, "Telegram's call key check failed.");
                     return;
                 }
@@ -660,11 +677,11 @@ pub(super) fn on_phone_call(account: &Account, call: &tl::enums::PhoneCall) {
                         tl::enums::PhoneCall::Call(confirmed_call) => {
                             if confirmed_call.key_fingerprint != fp {
                                 account.live().active_call = None;
-                                discard_rpc(account, id, access_hash, acc.video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
+                                discard_rpc(account, id, access_hash, acc.video || requested_video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
                                 account.ctx.call_failed(&peer.text(), CallFailure::Encryption, "Call key fingerprint mismatch.");
                                 return;
                             }
-                            start_direct_media(account, &confirmed_call, peer, key, g_a, true);
+                            start_direct_media(account, &confirmed_call, peer, key, g_a, true, requested_video);
                         }
                         other => on_phone_call(account, &other),
                     }
@@ -679,11 +696,11 @@ pub(super) fn on_phone_call(account: &Account, call: &tl::enums::PhoneCall) {
             remember_phone_call(account, call.id, call.access_hash, call.admin_id, call.participant_id);
             let state = account.live().active_call.clone();
             match state {
-                Some(ActiveCall::AcceptedIn { id, access_hash, peer, g_a_hash, p, b, .. }) if id == call.id => {
+                Some(ActiveCall::AcceptedIn { id, access_hash, peer, video, g_a_hash, p, b }) if id == call.id => {
                     if !verify_g_a_hash(&call.g_a_or_b, &g_a_hash) {
                         tracing::warn!("chatd: Telegram: g_a_hash mismatch on call {id}");
                         account.live().active_call = None;
-                        discard_rpc(account, id, access_hash, call.video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
+                        discard_rpc(account, id, access_hash, call.video || video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
                         account.ctx.call_failed(&peer.text(), CallFailure::Encryption, "Call key commitment check failed.");
                         return;
                     }
@@ -692,7 +709,7 @@ pub(super) fn on_phone_call(account: &Account, call: &tl::enums::PhoneCall) {
                         Err(why) => {
                             tracing::warn!("chatd: Telegram: invalid g_a on call {id}: {why}");
                             account.live().active_call = None;
-                            discard_rpc(account, id, access_hash, call.video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
+                            discard_rpc(account, id, access_hash, call.video || video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
                             account.ctx.call_failed(&peer.text(), CallFailure::Encryption, "Telegram's call key check failed.");
                             return;
                         }
@@ -702,11 +719,11 @@ pub(super) fn on_phone_call(account: &Account, call: &tl::enums::PhoneCall) {
                     if fp != call.key_fingerprint {
                         tracing::warn!("chatd: Telegram: key fingerprint mismatch on call {id}");
                         account.live().active_call = None;
-                        discard_rpc(account, id, access_hash, call.video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
+                        discard_rpc(account, id, access_hash, call.video || video, 0, tl::enums::PhoneCallDiscardReason::Hangup, 0);
                         account.ctx.call_failed(&peer.text(), CallFailure::Encryption, "Call key fingerprint mismatch.");
                         return;
                     }
-                    start_direct_media(account, call, peer, key, call.g_a_or_b.clone(), false);
+                    start_direct_media(account, call, peer, key, call.g_a_or_b.clone(), false, video);
                 }
                 Some(ActiveCall::RingingIn { id, peer, .. }) if id == call.id => {
                     // Another Telegram device answered this incoming call: stop ringing here (`#451`).
@@ -779,14 +796,14 @@ pub(super) fn on_phone_call(account: &Account, call: &tl::enums::PhoneCall) {
     }
 }
 
-/// Starts or answers a 1:1 Telegram voice call (`Command::CallJoin` on `u<id>`).
-pub(super) fn join_direct(account: &Account, peer: Who) {
+/// Starts or answers a 1:1 Telegram voice or video call (`Command::CallJoin` / `CallJoinVideo` on `u<id>`).
+pub(super) fn join_direct(account: &Account, peer: Who, requested_video: bool) {
     let conv_id = peer.text();
     let incoming = {
         let live = account.live();
         match &live.active_call {
             Some(ActiveCall::RingingIn { id, access_hash, peer: p, video, g_a_hash }) if *p == peer => {
-                Some((*id, *access_hash, *video, g_a_hash.clone()))
+                Some((*id, *access_hash, *video || requested_video, g_a_hash.clone()))
             }
             _ => None,
         }
@@ -837,7 +854,7 @@ pub(super) fn join_direct(account: &Account, peer: Who) {
         return;
     }
 
-    // Place a new outgoing 1:1 voice call with `phone.requestCall`.
+    // Place a new outgoing 1:1 voice or video call with `phone.requestCall`.
     let Some(user_id) = account.dir().input_user(peer) else {
         account.ctx.call_failed(&conv_id, CallFailure::Refused, "That person can't be called right now.");
         return;
@@ -850,7 +867,7 @@ pub(super) fn join_direct(account: &Account, peer: Who) {
     }
     let g_a_hash = Sha256::digest(&g_a).to_vec();
     match account.ask(&tl::functions::phone::RequestCall {
-        video: false,
+        video: requested_video,
         user_id,
         random_id: random_i32(),
         g_a_hash,
@@ -859,9 +876,9 @@ pub(super) fn join_direct(account: &Account, peer: Who) {
         Ok(tl::enums::phone::PhoneCall::Call(res)) => {
             account.learn(&res.users, &[]);
             let (id, access_hash, video) = match &res.phone_call {
-                tl::enums::PhoneCall::Waiting(c) => (c.id, c.access_hash, c.video),
-                tl::enums::PhoneCall::Requested(c) => (c.id, c.access_hash, c.video),
-                tl::enums::PhoneCall::Accepted(c) => (c.id, c.access_hash, c.video),
+                tl::enums::PhoneCall::Waiting(c) => (c.id, c.access_hash, c.video || requested_video),
+                tl::enums::PhoneCall::Requested(c) => (c.id, c.access_hash, c.video || requested_video),
+                tl::enums::PhoneCall::Accepted(c) => (c.id, c.access_hash, c.video || requested_video),
                 tl::enums::PhoneCall::Discarded(disc) => {
                     let (failure, detail) = match disc.reason {
                         Some(tl::enums::PhoneCallDiscardReason::Busy) => (CallFailure::NoAnswer, "Busy."),
@@ -924,6 +941,30 @@ pub(super) fn leave_direct(account: &Account, peer: Who) {
         ActiveCall::Active { id, access_hash, video, started_at, connection_id, .. } => {
             let duration = started_at.elapsed().as_secs().min(i32::MAX as u64) as i32;
             discard_rpc(account, id, access_hash, video, duration, tl::enums::PhoneCallDiscardReason::Hangup, connection_id);
+        }
+    }
+}
+
+/// Updates camera / screen-share tracking on an active 1:1 Telegram call (`Command::CallPicture`).
+/// Any camera or share activation marks `video = true` so `phone.discardCall` accurately records
+/// a video call service row.
+pub(super) fn on_call_picture(account: &Account, picture: crate::adapters::Picture) {
+    let mut live = account.live();
+    if let Some(ActiveCall::Active { video, camera, sharing, .. }) = live.active_call.as_mut() {
+        match picture {
+            crate::adapters::Picture::Camera(on) => {
+                *camera = on;
+                if on {
+                    *video = true;
+                }
+            }
+            crate::adapters::Picture::Share { on, .. } => {
+                *sharing = on;
+                if on {
+                    *video = true;
+                }
+            }
+            crate::adapters::Picture::Watch(_) => {}
         }
     }
 }
