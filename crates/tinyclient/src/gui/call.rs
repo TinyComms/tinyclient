@@ -15,6 +15,7 @@ pub(in crate::gui) mod popout;
 pub(in crate::gui) mod security;
 #[cfg(feature = "gui-shot")]
 mod shot;
+pub(in crate::gui) mod discord_ux;
 pub(in crate::gui) mod stage;
 pub(in crate::gui) mod view;
 
@@ -116,6 +117,8 @@ pub(super) enum Menu {
     Security,
     /// Per-person volume and local mute for someone in any call.
     Person { account: AccountKey, user_id: String, name: String },
+    /// Discord soundboard for the joined voice channel.
+    Soundboard,
 }
 
 /// What a counter in the dock is counting.
@@ -280,6 +283,12 @@ pub struct State {
     phone_counter: OnceCell<Entity<Counter>>,
     /// What the phone's call screen keeps: minimised or not, its page and sheets, the camera tile.
     pub(in crate::gui) phone: phone::State,
+    /// Sounds listed for the open soundboard, and which conversation they were listed for.
+    pub(in crate::gui) sounds: Vec<protocol::SoundboardSound>,
+    sound_for: Option<Key>,
+    sound_loading: bool,
+    /// The soundboard's search field, made the first time the grid is drawn.
+    sound_query: OnceCell<Entity<super::input::TextInput>>,
     /// Talking while muted: what the meter heard, and the redraw that takes the pill away.
     muted_talk: health::MutedTalk,
     muted_talk_task: Option<Task<()>>,
@@ -702,6 +711,12 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        activity: None,
+        stage_topic: String::new(),
+        stage: false,
+        request_to_speak: false,
+        raised: Vec::new(),
+        effect: None,
     }
 }
 
@@ -3180,6 +3195,59 @@ impl Shell {
         .detach();
     }
 
+    /// Lists the soundboard for this Discord channel once. A later open of the same channel
+    /// keeps the list it already has.
+    pub(in crate::gui) fn call_load_sounds(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if self.call_state.sound_for.as_ref() == Some(&conversation) {
+            return;
+        }
+        self.call_state.sound_for = Some(conversation.clone());
+        self.call_state.sound_loading = true;
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&Request::Soundboard { conversation }) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.call_state.sound_loading = false;
+                match answer {
+                    Ok(Response::Soundboard { sounds }) => this.call_state.sounds = sounds,
+                    Ok(Response::Error { detail, .. }) => {
+                        this.call_state.error = Some(detail.clone());
+                        this.refused = Some(detail);
+                    }
+                    Err(err) => {
+                        let detail = crate::client::trouble_words("call", &err);
+                        this.call_state.error = Some(detail.clone());
+                        this.refused = Some(detail);
+                    }
+                    Ok(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Opens or closes the soundboard popover and loads its sounds the first time.
+    pub(super) fn call_soundboard_toggle(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if self.call_menu() == Some(Menu::Soundboard) {
+            self.call_menu_set(None, cx);
+            return;
+        }
+        self.call_menu_set(Some(Menu::Soundboard), cx);
+        self.call_load_sounds(conversation, cx);
+    }
+
+    /// Stars or unstars a soundboard sound. The list is the same one Settings stores.
+    pub(in crate::gui) fn call_soundboard_favorite(&mut self, id: &str, cx: &mut Context<Self>) {
+        use protocol::settings::{GLOBAL, SOUNDBOARD_FAVORITES};
+        let stored = crate::gui::app::prefs::values().stored(GLOBAL, SOUNDBOARD_FAVORITES).unwrap_or("").to_owned();
+        let next = discord_ux::toggle_favorite(&stored, id);
+        let value = (!next.is_empty()).then_some(next);
+        let mut values = crate::gui::app::prefs::values();
+        values.set(GLOBAL, SOUNDBOARD_FAVORITES, value.clone());
+        crate::gui::app::prefs::set_values(values);
+        self.call_ask(Request::Set { scope: GLOBAL.to_owned(), key: SOUNDBOARD_FAVORITES.to_owned(), value }, cx);
+    }
+
     /// A small header pill while a call is live elsewhere, taking you back to it in one click.
     pub(super) fn call_live_hint(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         if super::phone::active() {
@@ -3480,7 +3548,7 @@ mod tests {
             camera: false,
             speaking: false,
         };
-        Occupants { people: names.iter().map(person).collect(), total }
+        Occupants { people: names.iter().map(person).collect(), total, ..Default::default() }
     }
 
     #[test]

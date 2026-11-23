@@ -18,7 +18,7 @@ use crate::rtp::{self, Cipher, Sender};
 use crate::out;
 use protocol::{AudioProcessing, CallFailure, CallStats, Cue, InputMode, MediaResponse, TinyPicture, TinySlot, Tuning, VoiceJoin, VoiceQuality};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender as Reports};
@@ -79,6 +79,8 @@ pub struct Controls {
     tuning: Mutex<Tuning>,
     /// The cue to play next, taken by whatever plays (the media loop, or a test).
     cue: Mutex<Option<Cue>>,
+    /// Soundboard clips waiting to mix. Cleared while deafened.
+    clips: Mutex<VecDeque<crate::cue::Clip>>,
     /// A Tiny server call's next connection, answered and not yet taken up: the server
     /// restarted and the call joined again.
     pub(crate) tiny_link: Mutex<Option<crate::tiny::Link>>,
@@ -286,6 +288,28 @@ impl Controls {
 
     pub fn take_cue(&self) -> Option<Cue> {
         self.cue.lock().unwrap().take()
+    }
+
+    /// Queues a decoded soundboard clip. Gain 0, an empty clip, or a deafened ear plays nothing.
+    pub fn play_file(&self, samples: Vec<f32>, gain: u8) {
+        if gain == 0 || samples.is_empty() || self.deafened.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut clips = self.clips.lock().unwrap();
+        if clips.len() >= 8 {
+            clips.pop_front();
+        }
+        clips.push_back(crate::cue::Clip::new(samples, f32::from(gain.min(100)) / 100.));
+    }
+
+    /// Mixes queued soundboard clips into this frame. A deafened ear drops them.
+    pub fn mix_clips(&self, frame: &mut [i16]) {
+        let mut clips = self.clips.lock().unwrap();
+        if self.deafened.load(Ordering::Relaxed) {
+            clips.clear();
+            return;
+        }
+        clips.retain_mut(|clip| clip.mix(frame));
     }
 
     /// Mute and deafen as asked, with the cue the change calls for (S8).
@@ -1332,6 +1356,30 @@ mod tests {
         assert_eq!(controls.take_cue(), Some(Cue::Deafened));
         controls.cue(Cue::Left);
         assert_eq!(controls.take_cue(), None, "deafened, nobody is heard leaving");
+    }
+
+    #[test]
+    fn a_soundboard_clip_mixes_until_it_ends_and_deafen_drops_it() {
+        let controls = Controls::default();
+        controls.play_file(vec![], 80);
+        let mut silent = [0i16; crate::FRAME_SAMPLES];
+        controls.mix_clips(&mut silent);
+        assert!(silent.iter().all(|sample| *sample == 0));
+        controls.play_file(vec![0.5; 4], 0);
+        controls.mix_clips(&mut silent);
+        assert!(silent.iter().all(|sample| *sample == 0), "volume 0 plays nothing");
+        controls.play_file(vec![0.5; crate::FRAME_SAMPLES + 2], 100);
+        controls.mix_clips(&mut silent);
+        assert!(silent.iter().any(|sample| *sample != 0));
+        let mut next = [0i16; crate::FRAME_SAMPLES];
+        controls.mix_clips(&mut next);
+        assert_eq!(next.iter().filter(|sample| **sample != 0).count(), 2);
+        controls.mix_clips(&mut next);
+        controls.deafened.store(true, Ordering::Relaxed);
+        controls.play_file(vec![1.0; 8], 100);
+        let mut dropped = [0i16; 8];
+        controls.mix_clips(&mut dropped);
+        assert!(dropped.iter().all(|sample| *sample == 0));
     }
 
     fn sample_join(stream: bool, watch: bool) -> VoiceJoin {

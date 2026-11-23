@@ -376,7 +376,7 @@ mod tests {
         let mut unread = channel("general", Some("text"), Channel);
         unread.unread = 1;
         let mut lounge = channel("lounge", Some("text"), ConversationKind::Voice);
-        lounge.occupants = Some(protocol::Occupants { people: Vec::new(), total: 2 });
+        lounge.occupants = Some(protocol::Occupants { people: Vec::new(), total: 2, ..Default::default() });
         let mut muted = channel("bots", Some("quiet"), Channel);
         (muted.muted, muted.unread) = (true, 9);
         let groups = [group("text", 0, true), group("quiet", 1, true)];

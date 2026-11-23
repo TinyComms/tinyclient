@@ -267,7 +267,10 @@ impl Shell {
         };
         let subject = Subject::of(self, snapshot, &call);
         let (me_id, me_name) = self.call_me(snapshot, &call);
-        let stage = Stage::of_call(&call, &subject, &me_id, &me_name);
+        let mut stage = Stage::of_call(&call, &subject, &me_id, &me_name);
+        if call.stage {
+            super::discord_ux::order_seats(&mut stage.seats, &call.raised, call.request_to_speak);
+        }
         let people = self.call_people_for(&call, &me_id, &me_name, cx);
 
         let phone = crate::gui::phone::active();
@@ -314,10 +317,22 @@ impl Shell {
                 div()
                     .flex_none()
                     .max_w(px(260.))
-                    .truncate()
-                    .type_title()
-                    .text_color(theme::text())
-                    .child(subject.title.clone()),
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .truncate()
+                            .type_title()
+                            .text_color(theme::text())
+                            .child(subject.title.clone()),
+                    )
+                    .children((!call.stage_topic.is_empty()).then(|| {
+                        div().truncate().type_micro().text_color(theme::text_soft()).child(call.stage_topic.clone())
+                    }))
+                    .children(call.activity.as_ref().map(|activity| {
+                        div().truncate().type_micro().text_color(theme::text_soft()).child(super::discord_ux::activity_line(&activity.name))
+                    })),
             )
             .children(place_chip)
             .children(voice_status.map(|status| self.voice_status_line(&call.conversation, &status, cx)))
@@ -390,6 +405,7 @@ impl Shell {
                 .flex_col()
                 .child(bar)
                 .children(banner)
+                .children(self.call_discord_face(&call, &stage.seats, cx))
                 .child(stage_el)
                 .child(controls),
         )
@@ -722,7 +738,10 @@ impl Shell {
                                             glyphs
                                                 .into_iter()
                                                 .map(|(icon, color, _)| glyph(icon, 14., color)),
-                                        ),
+                                        )
+                                        .children(call.and_then(|call| call.effect.as_ref()).filter(|effect| {
+                                            effect.user_id == seat.id && super::discord_ux::effect_visible(effect.at, super::now())
+                                        }).map(|effect| div().type_small().child(super::discord_ux::effect_label(&effect.emoji)))),
                                 ),
                         );
                     }
@@ -1495,6 +1514,9 @@ impl Shell {
                 chip(*words, fg, bg)
             }))
             .when(local_mute && !me, |row| row.child(chip("Muted for you", theme::warning(), theme::warning_soft())))
+            .children(call.and_then(|call| call.effect.as_ref()).filter(|effect| {
+                effect.user_id == seat.id && super::discord_ux::effect_visible(effect.at, super::now())
+            }).map(|effect| chip(super::discord_ux::effect_label(&effect.emoji), theme::accent_text(), theme::accent_soft())))
             .when(percent != 100 && !local_mute && !me, |row| {
                 row.child(chip(format!("{percent} %"), theme::text_soft(), theme::hover()))
             });
@@ -1921,10 +1943,25 @@ impl Shell {
                 crate::gui::settings::open(crate::gui::settings::Section::Audio, cx);
             }
         }));
+        let soundboard = call.filter(|call| joined && call.conversation.network == Network::Discord).map(|call| {
+            let key = call.conversation.clone();
+            bar_button(
+                "call-bar-soundboard",
+                "icons/audio-lines.svg",
+                if menu == Some(Menu::Soundboard) { BarLook::On } else { BarLook::Rest },
+            )
+            .aria_label("Soundboard")
+            .tooltip(tip("Soundboard", None))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_soundboard_toggle(key.clone(), cx);
+            }))
+        });
         let bar_popover = call.and_then(|call| match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
             Some(Menu::CameraPreview) => Some((284., self.call_camera_preview_menu(call, cx).p(px(8.)))),
             Some(Menu::AddPeople) => Some((280., self.call_add_people_menu(call, cx).p(px(6.)))),
+            Some(Menu::Soundboard) => Some((320., self.call_soundboard_body(call, cx).p(px(8.)))),
             Some(Menu::Person { account, user_id, name }) => {
                 Some((260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.))))
             }
@@ -1952,6 +1989,7 @@ impl Shell {
                     .children(share)
                     .children(camera)
                     .children(popout)
+                    .children(soundboard)
                     .child(devices)
                     .children(health)
                     .child(leave),
@@ -2005,6 +2043,205 @@ impl Shell {
                 )
                 .priority(1)
             }))
+    }
+
+    /// Activity tile, stage topic, and stage controls between the banner and the seats.
+    fn call_discord_face(&self, call: &Call, seats: &[Seat], cx: &mut Context<Self>) -> Option<Div> {
+        let action = super::discord_ux::stage_button(call.stage, call.request_to_speak, call.suppressed);
+        let lower = super::discord_ux::stage_lower_hand(call.stage, call.request_to_speak, call.suppressed);
+        if call.activity.is_none() && call.stage_topic.is_empty() && action.is_none() {
+            return None;
+        }
+        let (mut speakers, mut raised, mut audience) = (0usize, 0usize, 0usize);
+        if call.stage {
+            for seat in seats {
+                let hand = if seat.me { call.request_to_speak } else { call.raised.iter().any(|id| id == &seat.id) };
+                match super::discord_ux::stage_place(seat.suppressed, hand) {
+                    super::discord_ux::StageSeat::Speaker => speakers += 1,
+                    super::discord_ux::StageSeat::Raised => raised += 1,
+                    super::discord_ux::StageSeat::Audience => audience += 1,
+                }
+            }
+        }
+        let key = call.conversation.clone();
+        let stage_controls = action.map(|action| {
+            let ask = key.clone();
+            let lower_key = key.clone();
+            div()
+                .flex()
+                .gap(px(8.))
+                .child(
+                    button("call-stage-action", ButtonKind::Secondary, super::discord_ux::stage_button_label(action))
+                        .h(px(28.))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_ask(Request::StageVoice { conversation: ask.clone(), action, person: None }, cx);
+                        })),
+                )
+                .when(lower, |row| {
+                    row.child(
+                        button("call-stage-lower", ButtonKind::Ghost, "Lower hand")
+                            .h(px(28.))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.call_ask(Request::StageVoice {
+                                    conversation: lower_key.clone(),
+                                    action: protocol::StageVoiceAction::Audience,
+                                    person: None,
+                                }, cx);
+                            })),
+                    )
+                })
+        });
+        let activity = call.activity.clone();
+        let topic = (!call.stage_topic.is_empty()).then(|| call.stage_topic.clone());
+        Some(
+            div()
+                .w_full()
+                .px(px(theme::PANE_PAD))
+                .pt(px(8.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(8.))
+                .children(activity.map(|activity| {
+                    let names: Vec<String> = activity.participants.iter().map(|id| {
+                        call.participants.iter().find(|who| &who.id == id).map(|who| who.name.clone()).unwrap_or_else(|| id.clone())
+                    }).collect();
+                    let who = names.join(", ");
+                    let join = key.clone();
+                    div()
+                        .id("call-activity")
+                        .max_w(px(420.))
+                        .w_full()
+                        .p(px(10.))
+                        .rounded(px(theme::R_CARD))
+                        .bg(theme::raised())
+                        .border_1()
+                        .border_color(theme::hairline())
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .children(activity.icon.as_ref().and_then(|file| file.path.clone()).map(|path| {
+                            img(path).size(px(28.)).rounded(px(6.))
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(div().truncate().type_ui().child(super::discord_ux::activity_line(&activity.name)))
+                                .when(!who.is_empty(), |col| {
+                                    col.child(div().truncate().type_small().text_color(theme::text_soft()).child(who))
+                                }),
+                        )
+                        .child(
+                            button_with_icon("call-activity-join", ButtonKind::Secondary, "icons/external-link.svg", "Join in Discord")
+                                .h(px(28.))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(join.clone(), cx))),
+                        )
+                }))
+                .children(topic.map(|topic| div().type_small().text_color(theme::text_soft()).child(topic)))
+                .when(call.stage, |col| {
+                    col.child(
+                        div()
+                            .type_micro()
+                            .text_color(theme::text_faint())
+                            .child(super::discord_ux::stage_roster_line(speakers, raised, audience)),
+                    )
+                })
+                .children(stage_controls),
+        )
+    }
+
+    /// Searchable soundboard grid. Favorites sort first. A star keeps the sound in Settings.
+    pub(in crate::gui) fn call_soundboard_body(&self, call: &Call, cx: &mut Context<Self>) -> Div {
+        use protocol::settings::{GLOBAL, SOUNDBOARD_FAVORITES};
+        let query = self
+            .call_state
+            .sound_query
+            .get_or_init(|| {
+                let input = cx.new(|cx| crate::gui::input::TextInput::new("Search sounds", cx));
+                cx.observe(&input, |_, _, cx| cx.notify()).detach();
+                input
+            })
+            .clone();
+        let words = query.read(cx).text().to_owned();
+        let stored = crate::gui::app::prefs::values().stored(GLOBAL, SOUNDBOARD_FAVORITES).unwrap_or("").to_owned();
+        let favorite_ids = super::discord_ux::favorite_ids(&stored);
+        let shown = super::discord_ux::order_sounds(&self.call_state.sounds, &favorite_ids, &words);
+        let filtered_empty = shown.is_empty();
+        let key = call.conversation.clone();
+        let mut grid = div().w_full().flex().flex_wrap().gap(px(6.));
+        for sound in shown {
+            let id = sound.id.clone();
+            let guild = sound.guild_id.clone();
+            let starred = favorite_ids.iter().any(|known| known == &id);
+            let label = if sound.emoji.is_empty() { sound.name.clone() } else { format!("{} {}", sound.emoji, sound.name) };
+            let play_id = id.clone();
+            let play_key = key.clone();
+            let play_guild = guild;
+            let star_id = id.clone();
+            grid = grid.child(
+                div()
+                    .id(SharedString::from(format!("sound-{id}")))
+                    .w(px(92.))
+                    .min_h(px(64.))
+                    .px(px(6.))
+                    .py(px(6.))
+                    .rounded(px(8.))
+                    .bg(theme::hover())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(2.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::selected()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.call_ask(
+                            Request::PlaySoundboard { conversation: play_key.clone(), sound_id: play_id.clone(), guild_id: play_guild.clone() },
+                            cx,
+                        );
+                    }))
+                    .child(div().max_w_full().truncate().type_small().child(label))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("sound-star-{id}")))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_soundboard_favorite(&star_id, cx);
+                            }))
+                            .child(glyph("icons/star.svg", 12., if starred { theme::accent() } else { theme::text_faint() })),
+                    ),
+            );
+        }
+        let empty = if self.call_state.sound_loading {
+            "Loading sounds…"
+        } else if self.call_state.sounds.is_empty() {
+            "No sounds"
+        } else if filtered_empty {
+            "No matching sounds"
+        } else {
+            ""
+        };
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(div().type_ui().font_weight(theme::SEMIBOLD).child("Soundboard"))
+            .child(query)
+            .child(
+                div()
+                    .id("call-soundboard-grid")
+                    .max_h(px(280.))
+                    .overflow_y_scroll()
+                    .child(if empty.is_empty() { grid.into_any_element() } else {
+                        div().type_small().text_color(theme::text_faint()).child(empty).into_any_element()
+                    }),
+            )
     }
 
     /// A click on a tile: that person large, or everyone alike again.

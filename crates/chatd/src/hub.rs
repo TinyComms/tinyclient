@@ -787,7 +787,9 @@ impl Hub {
         {
             let mut live = lock(&self.live);
             let known = live.occupants.get(&conversation);
-            let empty = occupants.total == 0;
+            // An empty stage keeps its topic or activity so the row can show them.
+            let keep = occupants.stage && (!occupants.stage_topic.is_empty() || occupants.activity.is_some());
+            let empty = occupants.total == 0 && !keep;
             if known == Some(&occupants) || (known.is_none() && (empty || live.occupants.len() >= OCCUPIED)) {
                 return;
             }

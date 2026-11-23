@@ -6,7 +6,7 @@ What tinyclient carries in a call, and what it still hands to the official app. 
 
 Discord calls and Tiny room calls use the same microphone processing. Echo cancellation, noise suppression, and automatic gain are on unless Settings › Voice turns one off. Noise suppression defaults to Enhanced, which turns down other voices and cries as well as fans. Standard and High leave other voices in. The canceller hears the mix that is playing, cues included. The Tiny channel bar says to wear headphones only while echo cancellation is off.
 
-Discord voice is Opus at 48 kHz stereo: voice gateway v8, UDP, and DAVE. DAVE seals Opus, and on a picture it seals the H.264 access unit. Version 1 is required on every Discord call this client joins. A stage is not joined; it opens in Discord. A voice channel joins from the server list: the hover Join pill, a double-click, or Join voice on the row menu. A single click opens the channel and does not join. The Discord home lists friends who are in a voice channel or a DM call under In voice, and that row joins the same way. A DM can be called and can ring. A camera rides that same voice connection. A screen is a separate Go Live connection, described under Pictures on a Discord call.
+Discord voice is Opus at 48 kHz stereo: voice gateway v8, UDP, and DAVE. DAVE seals Opus, and on a picture it seals the H.264 access unit. Version 1 is required on every Discord call this client joins. A stage is joined here: you listen, raise a hand, and speak when a moderator invites you. Hosting an Activity stays a hand-off to Discord. A voice channel joins from the server list: the hover Join pill, a double-click, or Join voice on the row menu. A single click opens the channel and does not join. The Discord home lists friends who are in a voice channel or a DM call under In voice, and that row joins the same way. A DM can be called and can ring. A camera rides that same voice connection. A screen is a separate Go Live connection, described under Pictures on a Discord call.
 
 A Tiny room joins with sound when the server's audio is up: one send-only Opus microphone (mono), one receive slot per other seat, UDP preferred, and ICE-TCP where UDP is blocked. Mute, deafen, speaking, and join and leave cues are part of that call. If the server has no audio, joining only takes a seat.
 
@@ -36,13 +36,13 @@ A camera is one H.264 layer on the voice connection (rid `100`). Go Live is a se
 
 When you watch a Go Live stream with sound, its Opus audio plays through the call's selected output. The stream tile has its own volume and mute controls. Deafening silences the stream, and muting your microphone leaves it playing. DAVE on the watch connection opens the stream's sound and picture.
 
-DAVE seals the picture as well as the voice. The transport encryption is the same AES-GCM or XChaCha the voice already uses. The client offers H.264 and does not offer another video codec. There is no simulcast, no AV1, VP8 or VP9, no system audio on shares sent by tinyclient, and no clips. A stage is still not joined.
+DAVE seals the picture as well as the voice. The transport encryption is the same AES-GCM or XChaCha the voice already uses. The client offers H.264 and does not offer another video codec. There is no simulcast, no AV1, VP8 or VP9, no system audio on shares sent by tinyclient, and no clips. A stage is joined on that same voice connection.
 
 ## Hand-off
 
 Which call control is native, a hand-off, or missing is [the generated table](../parity.md). A control that table does not mark native names the official app and does not start mediad.
 
-A multi-stream video gallery (more than one simultaneous remote video feed), recording, captions, a soundboard, stage channels, activities, a lobby, and breakout rooms are not built on any network.
+A multi-stream video gallery (more than one simultaneous remote video feed), recording, captions, a lobby, and breakout rooms are not built on any network. On Discord, a soundboard is heard and played in a joined voice channel, a stage is joined here, and an Activity is shown with a hand-off into Discord. Hosting an Activity stays in Discord.
 
 ## Still open
 

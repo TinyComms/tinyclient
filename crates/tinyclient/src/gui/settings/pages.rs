@@ -18,7 +18,7 @@ use protocol::settings::{
     self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, AUTO_WATCH_SHARE, CACHE_MB, CAMERA, CAMERA_BLUR, CAMERA_MIRROR, CAMERA_QUALITY, CAMERA_QUALITY_CHOICES,
     CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME, ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS,
     KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, PRESENCE_ACTIVITY, QUALITY_CHOICES,
-    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, STREAMER_DETECT_OBS, STREAMER_HIDE_WINDOW, STREAMER_MODE, STREAMER_MODE_CHOICES, TRANSLATE_TO, TRANSLATE_TO_CHOICES, TYPING, VOICE_QUALITY, VOICE_VOLUME,
+    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, SOUNDBOARD_VOLUME, STREAMER_DETECT_OBS, STREAMER_HIDE_WINDOW, STREAMER_MODE, STREAMER_MODE_CHOICES, TRANSLATE_TO, TRANSLATE_TO_CHOICES, TYPING, VOICE_QUALITY, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
@@ -202,6 +202,7 @@ pub fn slider(id: &str) -> Slider {
         // Narrower than the others: its row also carries the test sound's button.
         "S10" => Slider { range: (0, 100), default: 50, read: || prefs::values().number(CUE_VOLUME), stops: None, width: 160., words: percent },
         "V5" => Slider { range: (0, 100), default: 100, read: || prefs::values().number(VOICE_VOLUME), stops: None, width: controls::TRACK, words: percent },
+        "V28" => Slider { range: (0, 100), default: 100, read: || prefs::values().number(SOUNDBOARD_VOLUME), stops: None, width: controls::TRACK, words: percent },
         "V20" => Slider { range: (0, 100), default: 100, read: || prefs::values().number(INPUT_VOLUME), stops: None, width: controls::TRACK, words: percent },
         // Release delay: one stop for each of the six choices.
         "V14" => Slider { range: (0, 5), default: 2, read: release_stop, stops: Some(6), width: controls::TRACK, words: release_words },
@@ -215,6 +216,7 @@ pub fn store_slider(window: &mut SettingsWindow, id: &'static str, value: u32, c
         "S10" => CUE_VOLUME,
         "SV" => keys::ALERT_VOLUME,
         "V5" => VOICE_VOLUME,
+        "V28" => SOUNDBOARD_VOLUME,
         "V20" => INPUT_VOLUME,
         "V14" => {
             let ms = PTT_RELEASE_CHOICES[(value as usize).min(PTT_RELEASE_CHOICES.len() - 1)];
@@ -453,7 +455,7 @@ impl SettingsWindow {
             }
             Section::Audio => vec![
                 self.group(&["V1"], Some("Microphone"), window, cx).child(caption("How your microphone opens, its level and its processing are in Voice.")),
-                self.group(&["V2", "V5"], Some("Speaker"), window, cx)
+                self.group(&["V2", "V5", "V28"], Some("Speaker"), window, cx)
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
                 self.group(&["V22", "V23", "V24", "V25"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
                 self.group(&["V4", "V26"], Some("Joining"), window, cx),
@@ -987,7 +989,7 @@ impl SettingsWindow {
             }
             "V13" | "V15" | "V16" | "V17" => return self.key_row(id, cx),
             "V6" => wide_row(label, None, self.slider_control(id, cx)),
-            "V5" | "V20" => wide_row(label, None, self.slider_control(id, cx)),
+            "V5" | "V20" | "V28" => wide_row(label, None, self.slider_control(id, cx)),
             "V4" => {
                 let on = values.on(JOIN_MUTED);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, JOIN_MUTED, on, false, cx), cx)
@@ -2705,6 +2707,7 @@ mod tests {
         assert_eq!(slider("V6").default, Values::default_number(SENSITIVITY));
         assert_eq!(slider("S10").default, Values::default_number(CUE_VOLUME));
         assert_eq!(slider("V5").default, Values::default_number(VOICE_VOLUME));
+        assert_eq!(slider("V28").default, Values::default_number(SOUNDBOARD_VOLUME));
     }
 
     #[test]

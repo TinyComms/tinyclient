@@ -36,6 +36,7 @@ mod ready;
 mod rest;
 mod send;
 mod voice;
+mod voice_ux;
 
 use super::{serve_commands, keep_connected, Command, Context, Download, Failure, Refusal, Reply, Signed};
 use crate::blobs::upload;
@@ -88,7 +89,7 @@ pub(crate) fn voice_channel_call() -> protocol::CallSupport {
     voice::support(model::VOICE)
 }
 
-/// A stage opens in Discord.
+/// A stage is joined here: listen, raise a hand, and speak when invited.
 pub(crate) fn stage_channel_call() -> protocol::CallSupport {
     voice::support(model::STAGE)
 }
@@ -146,6 +147,33 @@ pub(super) fn prove_voice_move() -> Result<(), String> {
     }
     if voice::follow(Some("4000"), None, Some("4000"), "4201") != Left {
         return Err("a null channel is a leave".to_owned());
+    }
+    Ok(())
+}
+
+/// The lab's discord-wave17b driver. A stage is joined here, an activity names its application,
+/// soundboard gain is the setting times the sound, and raising a hand stays suppressed.
+pub(super) fn prove_wave17b() -> Result<(), String> {
+    if stage_channel_call() != protocol::CallSupport::Native {
+        return Err("a stage is joined here".to_owned());
+    }
+    let activity = voice_ux::parse_activity(
+        r#"{"channel_id":"4201","guild_id":"4000","embedded_activity":{"application_id":"88","users":[{"id":"2001"}]}}"#,
+    )
+    .ok_or_else(|| "an activity names its application".to_owned())?;
+    if activity.application_id.as_deref() != Some("88") {
+        return Err("an activity names its application".to_owned());
+    }
+    if voice_ux::effect_gain(0, 1.0) != 0 || voice_ux::effect_gain(100, 0.5) != 50 {
+        return Err("soundboard gain is the setting times the sound".to_owned());
+    }
+    let body = voice_ux::stage_body("4202", protocol::StageVoiceAction::RequestToSpeak, "2026-11-22T00:00:00Z");
+    if body.get("suppress").and_then(|value| value.as_bool()) != Some(true) {
+        return Err("raising a hand stays suppressed".to_owned());
+    }
+    let sounds = voice_ux::parse_soundboard(r#"{"guild_id":"4000","soundboard_sounds":[{"sound_id":"q","name":"Quack"}]}"#);
+    if sounds.first().map(|sound| sound.name.as_str()) != Some("Quack") {
+        return Err("a guild soundboard lists the named sound".to_owned());
     }
     Ok(())
 }
@@ -4331,6 +4359,13 @@ impl Discord {
             }
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
+            Command::StageVoice { conversation_id, action, person_id, reply } => {
+                answer(reply, self.stage_voice(&conversation_id, action, person_id.as_deref()))
+            }
+            Command::Soundboard { conversation_id, reply } => answer(reply, self.soundboard(&conversation_id)),
+            Command::PlaySoundboard { conversation_id, sound_id, guild_id, reply } => {
+                answer(reply, self.play_soundboard(&conversation_id, &sound_id, guild_id.as_deref()))
+            }
             Command::Vote { conversation_id, message_id, votes, reply } => {
                 answer(reply, self.vote_poll(&conversation_id, &message_id, votes))
             }

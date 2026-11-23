@@ -592,8 +592,7 @@ pub fn kind_glyph(kind: ConversationKind, private: bool, call: CallSupport) -> &
     }
 }
 
-/// A voice row the server list lets you join from: a native voice channel, never a stage,
-/// which opens in Discord instead (07 §1).
+/// A voice row the server list lets you join from: a native voice channel, including a Discord stage.
 pub fn joins_from_list(c: &Conversation) -> bool {
     c.kind == ConversationKind::Voice && c.call == CallSupport::Native
 }
@@ -2107,8 +2106,11 @@ impl Shell {
         let tone = row_tone(c, selected, true);
         let surface = theme::row_surface(selected);
         let inside = c.occupants.as_ref().filter(|row| row.total > 0);
-        // A stage is Discord's: its row counts who is on stage, not who is in it.
-        let stage = c.key.network == Network::Discord && c.kind == ConversationKind::Voice && c.call == CallSupport::Handoff;
+        // A Discord stage is joined here. Its row still counts who is speaking. A leftover
+        // hand-off keeps the radio glyph through `CallSupport::Handoff`.
+        let stage = c.kind == ConversationKind::Voice
+            && (c.occupants.as_ref().is_some_and(|row| row.stage)
+                || (c.key.network == Network::Discord && c.call == CallSupport::Handoff));
         let live = stage.then(|| inside.and_then(stage_line)).flatten();
         // An empty voice channel rests at a muted row's weight, and a stage with nobody on
         // stage reads as one (`02` §4).
@@ -2119,7 +2121,8 @@ impl Shell {
             ConversationKind::Direct | ConversationKind::Group => self.conversation_avatar(c, 20., surface, cx).into_any_element(),
             kind => {
                 let icon_color = if c.muted || empty_voice { faint } else { theme::text_soft() };
-                let icon = if c.key.network == Network::Teams && kind == ConversationKind::Channel && !c.private { None } else { Some(kind_glyph(kind, c.private, c.call)) };
+                let glyph_call = if c.occupants.as_ref().is_some_and(|row| row.stage) { CallSupport::Handoff } else { c.call };
+                let icon = if c.key.network == Network::Teams && kind == ConversationKind::Channel && !c.private { None } else { Some(kind_glyph(kind, c.private, glyph_call)) };
                 div().size(px(20.)).flex_none().flex().items_center().justify_center().children(icon.map(|icon| glyph(icon, if kind == ConversationKind::Thread { 14. } else { 16. }, icon_color))).into_any_element()
             }
         };
@@ -2152,6 +2155,8 @@ impl Shell {
         let hover_group = if c.kind == ConversationKind::Group { "group-call" } else { "voice" };
         let count_icon = if c.kind == ConversationKind::Group { "icons/phone.svg" } else { "icons/volume-2.svg" };
         let voice_status = discord_voice_status(c);
+        let activity = c.occupants.as_ref().and_then(|row| row.activity.as_ref()).map(|activity| super::call::discord_ux::activity_line(&activity.name));
+        let stage_topic = c.occupants.as_ref().and_then(|row| (!row.stage_topic.is_empty()).then(|| row.stage_topic.clone()));
         let content = div()
             // 16 a level less the gap after it (none at the top), as the tree's other rows.
             .children((depth > 0).then(|| div().flex_none().w(px(16. * f32::from(depth) - 8.))))
@@ -2160,7 +2165,9 @@ impl Shell {
             .child(
                 div().min_w_0().flex().flex_col()
                     .child(div().truncate().type_ui().font_weight(tone.weight).text_color(title_color).child(tree_title(c)))
-                    .children(voice_status.as_ref().map(|status| self.voice_status_line(&c.key, status, cx))),
+                    .children(voice_status.as_ref().map(|status| self.voice_status_line(&c.key, status, cx)))
+                    .children(stage_topic.as_ref().map(|topic| div().truncate().type_micro().text_color(faint).child(topic.clone())))
+                    .children(activity.as_ref().map(|line| div().truncate().type_micro().text_color(faint).child(line.clone()))),
             )
             .children(status.map(|emoji| div().flex_none().type_small().child(emoji)))
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
@@ -2171,7 +2178,12 @@ impl Shell {
             .children(live.map(|line| div().flex_none().type_micro().text_color(faint).child(line)))
             .children(row_badge(c))
             .when(show_join, |row| row.group(hover_group));
-        let height = if voice_status.is_some() { theme::ROW_MID } else { theme::ROW_ONE };
+        let lines = u8::from(voice_status.is_some()) + u8::from(stage_topic.is_some()) + u8::from(activity.is_some());
+        let height = match lines {
+            0 => theme::ROW_ONE,
+            1 => theme::ROW_MID,
+            _ => theme::ROW_TWO,
+        };
         let drop = c.clone();
         list_row(row_id("tree", &c.key), theme::row_height(height), selected, focused, content)
             .when(c.key.network == Network::Discord && joins_from_list(c), |row| row
@@ -5498,6 +5510,21 @@ impl Shell {
                 })).into_any_element());
             }
         }
+        if row.occupants.as_ref().is_some_and(|inside| inside.stage) && row.rights.voice_mute {
+            let suppressed = row.occupants.as_ref().and_then(|inside| inside.people.iter().find(|who| who.person == *person)).is_some_and(|who| who.suppressed);
+            let raised = row.occupants.as_ref().is_some_and(|inside| inside.raised.iter().any(|id| id == &person.id));
+            if let Some(label) = super::call::discord_ux::moderator_stage_action(true, suppressed, raised) {
+                let action = if suppressed || raised { protocol::StageVoiceAction::Invite } else { protocol::StageVoiceAction::ToAudience };
+                let conversation = row.key.clone();
+                let target = person.clone();
+                let icon = if matches!(action, protocol::StageVoiceAction::Invite) { "icons/hand.svg" } else { "icons/arrow-down.svg" };
+                items.push(menu_item("discord-stage-voice", Some(icon), label, None).on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_menu(cx);
+                    this.call_menu_close(cx);
+                    this.call_ask(Request::StageVoice { conversation: conversation.clone(), action, person: Some(target.clone()) }, cx);
+                })).into_any_element());
+            }
+        }
         if row.rights.voice_move {
             let name = row.occupants.as_ref().and_then(|inside| inside.people.iter().find(|who| who.person == *person))
                 .map(|who| who.name.clone()).unwrap_or_default();
@@ -6961,7 +6988,7 @@ pub(crate) mod tests {
             c
         };
         assert!(joins_from_list(&voice(CallSupport::Native)));
-        // A stage opens in Discord instead, and an empty channel's pill cannot join either.
+        // A hand-off still opens in the official app. A Discord stage is native, so it joins.
         assert!(!joins_from_list(&voice(CallSupport::Handoff)));
         assert!(!joins_from_list(&voice(CallSupport::None)));
         // A text channel's click only opens, and a DM call joins from its header.
@@ -6977,6 +7004,7 @@ pub(crate) mod tests {
                 .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), avatar: None, muted: false, deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: *live })
                 .collect(),
             total: speaking.len() as u32,
+            ..Default::default()
         }
     }
 

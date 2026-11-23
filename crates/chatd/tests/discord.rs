@@ -9,7 +9,7 @@ use base64::Engine;
 use protocol::{
     read_frame, write_frame, AccountKey, AutomodAction, AutomodRule, AutomodTrigger, Call, CallState, CallSupport,
     Change, Conversation, ConversationKind, ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind,
-    Network, Occupants, Page, Person, Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response,
+    Network, Occupants, Page, Person, Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response, StageVoiceAction,
     SendState, SpaceSafety, Style, Watching,
 };
 use serde_json::{json, Value};
@@ -1480,7 +1480,7 @@ fn ready_fills_spaces_trees_people_and_unread_state() {
     assert_eq!(row("4201").call, CallSupport::Native);
     assert_eq!(row("4201").limit, 12, "the Lounge's user limit");
     assert_eq!(row("4101").limit, 0, "a channel without a limit has none");
-    assert_eq!(row("4202").call, CallSupport::Handoff, "a stage is handed to Discord");
+    assert_eq!(row("4202").call, CallSupport::Native, "a stage is joined here");
     // #staff is denied to everyone and allowed to a role we lack; #mods-only to one we hold.
     assert!(!ids(&rows).contains(&"4103") && !ids(&rows).contains(&"4301"));
     let state = |id: &str| (row(id).unread, row(id).mentions, row(id).muted);
@@ -3516,7 +3516,7 @@ fn a_stage_channel_lists_who_is_on_it_and_leaves_the_join_to_discord() {
         })
     }
     let (call, on_stage) = stage(&world, |heard| heard.len() == 3, "the stage's occupants");
-    assert_eq!(call, CallSupport::Handoff, "a stage is joined in Discord's own app");
+    assert_eq!(call, CallSupport::Native, "a stage is joined here");
     assert!(on_stage.contains(&("2001".to_owned(), true)), "on stage, though muted: {on_stage:?}");
     assert!(on_stage.contains(&("2003".to_owned(), true)));
     assert!(on_stage.contains(&("2006".to_owned(), false)), "the audience is not on stage: {on_stage:?}");
@@ -3560,7 +3560,7 @@ fn a_stage_arriving_with_a_guild_create_counts_who_is_on_it_at_once() {
     // states are read, so the first report already knows who the platform holds back.
     world.discord.push("GUILD_CREATE", json!({
         "id": "7000", "name": "Stage Place", "icon": null, "owner_id": "2001", "joined_at": "2026-10-13T08:00:00+00:00",
-        "roles": [{"id": "7000", "name": "@everyone", "permissions": "1024", "position": 0}],
+        "roles": [{"id": "7000", "name": "@everyone", "permissions": "1049600", "position": 0}],
         "channels": [{"id": "7002", "type": 13, "name": "Assembly", "position": 0, "parent_id": null, "bitrate": 64000, "user_limit": 0, "permission_overwrites": []}],
         "threads": [],
         "voice_states": [{"user_id": "2001", "channel_id": "7002", "session_id": "voice-mara",
@@ -3579,7 +3579,7 @@ fn a_stage_arriving_with_a_guild_create_counts_who_is_on_it_at_once() {
             other => panic!("{other:?}"),
         }
     });
-    assert_eq!(on_stage, (CallSupport::Handoff, vec![("2001".to_owned(), true)]));
+    assert_eq!(on_stage, (CallSupport::Native, vec![("2001".to_owned(), true)]));
 }
 
 #[test]
@@ -13484,4 +13484,109 @@ fn pinning_takes_either_route_tells_the_pins_list_and_the_list_is_read_in_pages(
     assert_eq!(pages.len(), asked + 2);
     assert!(pages[asked].path.ends_with("pins?limit=50"), "{}", pages[asked].path);
     assert!(pages[asked + 1].path.ends_with("pins?limit=50&before=2026-10-12T09%3A00%3A00.000000%2B00%3A00"), "{}", pages[asked + 1].path);
+}
+
+#[test]
+fn an_activity_a_stage_and_a_soundboard_are_part_of_a_discord_voice_channel() {
+    let world = World::start();
+    world.ask(Request::Watch(Watching { space: Some(world.key("4000")), ..Watching::default() }));
+    world.discord.script("/applications/public", 200, json!([{"id": "88", "name": "Chess", "icon": null}]));
+    world.discord.push("EMBEDDED_ACTIVITY_UPDATE", json!({
+        "channel_id": "4201", "guild_id": "4000",
+        "embedded_activity": {"application_id": "88", "users": [{"id": "2001"}]}
+    }));
+    let activity = wait("the activity on the lounge", || {
+        match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+            Response::Conversations { conversations, .. } => {
+                let row = conversations.iter().find(|row| row.key.id == "4201")?;
+                let activity = row.occupants.as_ref()?.activity.clone()?;
+                (activity.name == "Chess").then_some(activity)
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert!(activity.participants.iter().any(|id| id == "2001"), "{:?}", activity.participants);
+    assert!(activity.handoff.contains("4201"), "{}", activity.handoff);
+    let lookups = world.discord.requests_to("GET", "/applications/public");
+    assert_eq!(lookups.len(), 1, "{:?}", lookups.iter().map(|seen| seen.path.clone()).collect::<Vec<_>>());
+    assert!(lookups[0].path.contains("application_ids=88"), "{}", lookups[0].path);
+
+    world.discord.script("/guilds/4000/voice-states/@me", 204, json!(null));
+    world.discord.script("/guilds/4000/voice-states/2001", 204, json!(null));
+    world.discord.script("/guilds/4000/voice-states/2001", 204, json!(null));
+    world.discord.script("/soundboard-default-sounds", 200, json!([{"sound_id": "b", "name": "Boom"}]));
+    world.discord.script("/channels/4202/send-soundboard-sound", 204, json!(null));
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000", "role_id": "4000",
+        "role": {"id": "4000", "permissions": "39895992176192"}
+    }));
+    world.discord.push("SOUNDBOARD_SOUNDS", json!({
+        "guild_id": "4000",
+        "soundboard_sounds": [{"sound_id": "q", "name": "Quack", "emoji_name": "duck"}]
+    }));
+    world.ask(Request::CallStart { conversation: world.key("4202") });
+    let joined = wait("the stage join", || world.discord.frames_of(4).into_iter().find(|frame| frame["d"]["channel_id"] == "4202"));
+    assert_eq!(joined["d"]["guild_id"], "4000");
+    world.discord.push("STAGE_INSTANCE_CREATE", json!({"channel_id": "4202", "guild_id": "4000", "topic": "Town hall"}));
+    let topic = wait("the stage topic", || {
+        match world.ask(Request::Status) {
+            Response::Status { call: Some(call), .. } if call.conversation.id == "4202" && call.stage_topic == "Town hall" => Some(call.stage),
+            Response::Status { .. } => None,
+            other => panic!("{other:?}"),
+        }
+    });
+    assert!(topic, "the joined call is a stage");
+
+    let raised = wait("the raise-hand request", || {
+        match world.ask(Request::StageVoice { conversation: world.key("4202"), action: StageVoiceAction::RequestToSpeak, person: None }) {
+            Response::Ok => world.discord.requests_to("PATCH", "/guilds/4000/voice-states/@me").into_iter().find(|seen| seen.body["suppress"] == json!(true)),
+            Response::Error { .. } => None,
+            other => panic!("{other:?}"),
+        }
+    });
+    assert!(raised.body["request_to_speak_timestamp"].is_string(), "{:?}", raised.body);
+    world.discord.push("VOICE_STATE_UPDATE", json!({
+        "guild_id": "4000", "channel_id": "4202", "user_id": "1000", "session_id": "voice-1000",
+        "self_mute": false, "self_deaf": false, "mute": false, "deaf": false, "suppress": true,
+        "request_to_speak_timestamp": "2026-11-22T00:00:00.000000+00:00"
+    }));
+    wait("our hand is up", || match world.ask(Request::Status) {
+        Response::Status { call: Some(call), .. } if call.request_to_speak && call.raised.iter().any(|id| id == "1000") => Some(()),
+        Response::Status { .. } => None,
+        other => panic!("{other:?}"),
+    });
+
+    assert!(matches!(
+        world.ask(Request::StageVoice { conversation: world.key("4202"), action: StageVoiceAction::Invite, person: Some(world.key("2001")) }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        world.ask(Request::StageVoice { conversation: world.key("4202"), action: StageVoiceAction::ToAudience, person: Some(world.key("2001")) }),
+        Response::Ok
+    ));
+    assert_eq!(world.discord.requests_to("PATCH", "/guilds/4000/voice-states/2001").len(), 2);
+
+    let sounds = match world.ask(Request::Soundboard { conversation: world.key("4202") }) {
+        Response::Soundboard { sounds } => sounds,
+        other => panic!("{other:?}"),
+    };
+    assert!(sounds.iter().any(|sound| sound.name == "Boom" && sound.default), "{sounds:?}");
+    assert!(sounds.iter().any(|sound| sound.name == "Quack" && sound.guild_id.as_deref() == Some("4000")), "{sounds:?}");
+    assert!(!world.discord.frames_of(31).is_empty(), "the guild soundboard was asked for");
+    assert!(matches!(
+        world.ask(Request::PlaySoundboard { conversation: world.key("4202"), sound_id: "b".into(), guild_id: None }),
+        Response::Ok
+    ));
+    let played = world.discord.requests_to("POST", "/channels/4202/send-soundboard-sound");
+    assert_eq!(played.len(), 1);
+    assert_eq!(played[0].body["sound_id"], "b");
+
+    world.discord.push("VOICE_CHANNEL_EFFECT_SEND", json!({
+        "channel_id": "4202", "guild_id": "4000", "user_id": "2001", "sound_id": "q",
+        "sound_volume": 1, "emoji": {"name": "duck"}
+    }));
+    wait("the sound on the call", || match world.ask(Request::Status) {
+        Response::Status { call: Some(call), .. } => call.effect.filter(|effect| effect.user_id == "2001" && effect.sound_id == "q"),
+        other => panic!("{other:?}"),
+    });
 }

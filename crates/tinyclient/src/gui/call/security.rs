@@ -653,6 +653,12 @@ mod tests {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        activity: None,
+        stage_topic: String::new(),
+        stage: false,
+        request_to_speak: false,
+        raised: Vec::new(),
+        effect: None,
         }
     }
 

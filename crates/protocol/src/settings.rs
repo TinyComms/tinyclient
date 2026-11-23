@@ -82,6 +82,10 @@ pub const STREAMER_HIDE_WINDOW: &str = "streamer_hide_window";
 pub const STREAMER_DETECT_OBS: &str = "streamer_detect_obs";
 /// V5. Everyone's voice, 0 to 100.
 pub const VOICE_VOLUME: &str = "voice_volume";
+/// V28. Discord soundboard sounds, 0 to 100. 0 plays nothing.
+pub const SOUNDBOARD_VOLUME: &str = "soundboard_volume";
+/// Sound ids the soundboard picker keeps at the front, comma or newline separated.
+pub const SOUNDBOARD_FAVORITES: &str = "soundboard_favorites";
 /// V6. The level, 0 to 100, from which our microphone counts as speech, and in voice
 /// activation opens.
 pub const SENSITIVITY: &str = "sensitivity";
@@ -313,7 +317,8 @@ fn kind(key: &str) -> Option<Kind> {
         MUTED_TALK | AUTO_WATCH_SHARE => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
-        VOICE_VOLUME => Kind::Percent(100),
+        VOICE_VOLUME | SOUNDBOARD_VOLUME => Kind::Percent(100),
+        SOUNDBOARD_FAVORITES => Kind::Keywords,
         INPUT_VOLUME => Kind::Percent(100),
         SENSITIVITY => Kind::Percent(25),
         INPUT | OUTPUT | CAMERA => Kind::Device,

@@ -6628,6 +6628,46 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::StageVoice { conversation, action, person } => {
+                let account = conversation.account();
+                if person.as_ref().is_some_and(|person| person.account() != account) {
+                    return error(ErrorCode::Refused, "That participant belongs to a different account.");
+                }
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::StageVoice {
+                    conversation_id: conversation.id,
+                    action,
+                    person_id: person.map(|person| person.id),
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::Soundboard { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::Soundboard { conversation_id: conversation.id, reply }) {
+                    Ok(sounds) => Response::Soundboard { sounds },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::PlaySoundboard { conversation, sound_id, guild_id } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::PlaySoundboard {
+                    conversation_id: conversation.id, sound_id, guild_id, reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Handoff { conversation } => {
                 let conversation_id = conversation.id.clone();
                 match self.ask(&conversation.account(), |reply| Command::Handoff { conversation_id, reply }) {

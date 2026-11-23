@@ -250,6 +250,18 @@ impl Call {
                 self.controls.cue(cue);
                 return MediaResponse::Done;
             }
+            MediaRequest::PlayFile { path, gain } => {
+                if gain == 0 {
+                    return MediaResponse::Done;
+                }
+                return match crate::decode::load_stereo(std::path::Path::new(&path)) {
+                    Ok(samples) => {
+                        self.controls.play_file(samples, gain);
+                        MediaResponse::Done
+                    }
+                    Err(detail) => MediaResponse::Refused { detail },
+                };
+            }
             // A fresh offer for a Tiny call already running is its rejoin: the call keeps its
             // devices and carries on with the new connection once the answer comes.
             MediaRequest::TinyOffer(spec) => {
