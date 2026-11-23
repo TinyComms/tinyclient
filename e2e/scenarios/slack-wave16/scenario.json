@@ -1,0 +1,16 @@
+{
+  "id": "slack-wave16",
+  "title": "Read a Slack huddle summary, open its thread, and open the notes canvas",
+  "platforms": [
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "not_applicable": {
+    "android": "The loopback workspace and desktop OCR driver have no Android adapter.",
+    "ios": "The loopback workspace and desktop OCR driver have no iOS adapter."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 35
+}

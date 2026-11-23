@@ -3911,7 +3911,14 @@ impl Discord {
         }
         match command {
             // `serve_commands` keeps these two for itself.
-            Command::Backfill(id) | Command::Warm(id) => self.backfill(&id),
+            Command::Backfill(id) => self.backfill(&id),
+            Command::Warm(id) => {
+                self.backfill(&id);
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                unsafe {
+                    libc::malloc_trim(0);
+                }
+            }
             Command::History { conversation_id, before } => {
                 if let Ok(Some(conversation)) = self.ctx.known(&conversation_id) {
                     self.fetch(&conversation, Stretch::Before(&before));

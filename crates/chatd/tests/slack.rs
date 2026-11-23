@@ -1816,7 +1816,7 @@ impl World {
             ],
         });
         let log = if std::env::var_os("TINYCLIENT_TEST_LOG").is_some() { Stdio::inherit() } else { Stdio::null() };
-        let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
+        let child = Command::new(std::env::var("CHATD_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_chatd").to_owned()))
             .env("TINYCLIENT_DIR", dir)
             .env("TINYCLIENT_SESSION_SLACK", session.to_string())
             .env("TINYCLIENT_SLACK_API", format!("{}/", fake.base))
@@ -2324,11 +2324,13 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     assert_eq!(world.messages(&general).len(), 7);
     assert!(world.message(&general, ROOT).is_some(), "only the deleted message went");
 
-    // A huddle is one grey line while it runs and after, and the call itself is the official app's.
+    // A huddle's live event and its update share one message id.
     let huddle = "1760000800.000800";
     let room = |ended: bool| json!({
         "id": "R0HUD", "name": "", "media_server": "", "created_by": "U0ANA", "date_start": 1760000800,
-        "date_end": if ended { 1760001100 } else { 0 }, "participants": ["U0ANA"], "participant_history": ["U0ANA"],
+        "date_end": if ended { 1760001100 } else { 0 },
+        "participants": if ended { json!([]) } else { json!(["U0ANA"]) },
+        "participant_history": ["U0ANA", "U0BEN", "U0ANA"],
         "participants_camera_on": [], "participants_camera_off": [], "participants_screenshare_on": [],
         "participants_screenshare_off": [], "canvas_thread_ts": huddle, "thread_root_ts": huddle, "channels": ["C0GEN"],
         "is_dm_call": false, "was_rejected": false, "was_missed": false, "was_accepted": false, "has_ended": ended,
@@ -2341,7 +2343,12 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     });
     world.fake.push(ALPHA, started.clone());
     let line = world.until("the huddle's line", || world.message(&general, huddle));
-    assert_eq!((line.kind.clone(), line.text.as_str()), (MessageKind::System, "A huddle started"));
+    assert_eq!((line.kind, line.text.as_str()), (MessageKind::System, "A huddle started"));
+    let call = line.call.expect("structured live huddle");
+    assert_eq!(call.outcome, protocol::CallOutcome::Live);
+    assert_eq!(call.caller_id, "U0ANA");
+    assert_eq!(call.participants, ["U0ANA"]);
+    assert_eq!(call.seconds, None);
     let mut ended = started;
     ended["room"] = room(true);
     world.fake.push(ALPHA, json!({
@@ -2350,6 +2357,21 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     }));
     let line = world.until("the huddle to end", || world.message(&general, huddle).filter(|line| line.text != "A huddle started"));
     assert_eq!((line.kind, line.text.as_str()), (MessageKind::System, "A huddle happened · 5 min"));
+    let call = line.call.expect("structured ended huddle");
+    assert_eq!(call.outcome, protocol::CallOutcome::Ended);
+    assert_eq!(call.participants, ["U0ANA", "U0BEN"]);
+    assert_eq!(call.seconds, Some(300));
+
+    let dm = alpha("D0ANA");
+    let missed = "1760001200.000000";
+    world.fake.push(ALPHA, json!({
+        "type": "message", "subtype": "huddle_thread", "channel": "D0ANA", "channel_type": "im",
+        "user": "USLACKBOT", "ts": missed, "event_ts": missed,
+        "room": { "is_dm_call": true, "was_missed": true },
+    }));
+    let line = world.until("the missed huddle", || world.message(&dm, missed));
+    assert_eq!(line.text, "Missed huddle");
+    assert_eq!(line.call.unwrap().outcome, protocol::CallOutcome::Missed);
 
     // Scrolling past the oldest cached message asks Slack for the page before it.
     let oldest = "1760000090.000090";
@@ -2502,6 +2524,42 @@ fn a_thread_is_a_conversation_that_can_be_read_and_answered() {
         panic!("no link");
     };
     assert_eq!(url, "https://app.slack.com/huddle/T01ALPHA/C0GEN");
+}
+
+#[test]
+fn slack_huddle_history_opens_its_thread_and_links_its_notes() {
+    let world = World::start_with(|fake| {
+        fake.extra_conversations.lock().unwrap().push(json!({
+            "id": "C0HUD", "name": "huddle-fixture", "is_channel": true, "is_member": true, "created": 1760000000,
+        }));
+    });
+    world.ready();
+    let channel = alpha("C0HUD");
+    let history = world.until("the huddle history", || Some(world.messages(&channel)).filter(|page| page.len() == 3));
+    let [quiet, ended, live] = history.as_slice() else { unreachable!() };
+    assert_eq!(live.call.as_ref().unwrap().outcome, protocol::CallOutcome::Live);
+    assert_eq!(ended.call.as_ref().unwrap().participants, ["U0ANA", "U0BEN"]);
+    let summary = ended.thread.as_ref().expect("the huddle thread");
+    assert_eq!(summary.id, "C0HUD:1760000200.000200");
+    assert_eq!(summary.replies, 3);
+
+    let notes: Vec<_> = ended.all_cards().collect();
+    let [notes] = notes.as_slice() else { panic!("expected one notes card, got {notes:?}") };
+    assert_eq!(notes.author, "Huddle notes");
+    assert_eq!(notes.title, "Launch recap");
+    assert_eq!(notes.text, "The team agreed to launch Tuesday.");
+    assert_eq!(notes.title_link, "https://acme.slack.com/docs/T01ALPHA/F0NOTES");
+    assert!(quiet.call.is_some(), "sparse huddles still have a summary");
+    assert_eq!(quiet.thread.as_ref().unwrap().replies, 0);
+    let notes = quiet.all_cards().next().expect("canvas id alone makes a notes card");
+    assert_eq!(notes.title_link, "https://acme.slack.com/docs/T01ALPHA/F0QUIET");
+
+    let thread = alpha(&summary.id);
+    let replies = world.until("the huddle's replies", || Some(world.messages(&thread)).filter(|page| page.len() == 4));
+    assert_eq!(replies.last().unwrap().text, "The launch checklist is ready");
+    let asked = world.fake.calls(ALPHA, "conversations.replies");
+    assert!(asked.iter().any(|call| call.params["channel"] == "C0HUD" && call.params["ts"] == "1760000200.000200"));
+    assert!(world.message(&channel, &replies.last().unwrap().id).is_none());
 }
 
 #[test]
