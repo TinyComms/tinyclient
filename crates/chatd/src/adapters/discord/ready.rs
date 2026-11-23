@@ -2062,10 +2062,14 @@ impl Discord {
         }
         let perms = parent.space.as_deref().and_then(|guild| self.channel_permission_bits(guild, parent_id));
         let clock = now();
-        let timed_out = parent.space.as_deref().and_then(|guild| {
+        let me = self.me();
+        let (timed_out, gated, gate_reason) = parent.space.as_deref().and_then(|guild| {
             let state = self.state.lock().unwrap();
-            state.guilds.get(guild).and_then(|info| info.timed_out(clock))
-        });
+            state.guilds.get(guild).map(|info| {
+                let (gated, reason) = info.lock_reason(clock, &me);
+                (info.timed_out(clock), gated, reason)
+            })
+        }).unwrap_or((None, false, String::new()));
         let exempt = match perms {
             Some(bits) => slowmode_exempt(bits, true),
             None => parent.rights.slowmode_exempt || parent.rights.manage_threads,
@@ -2079,6 +2083,7 @@ impl Discord {
             rights.rename = open && (rights.manage_threads || (child.rights.rename && !child.rights.manage_threads));
             rights.slowmode_exempt = exempt;
             let (read_only, read_only_reason) = thread_read_only(timed_out, clock, child.locked, &rights);
+            let (read_only, read_only_reason) = if !read_only && gated { (true, gate_reason.clone()) } else { (read_only, read_only_reason) };
             row.rights = rights;
             row.read_only = read_only;
             row.read_only_reason = read_only_reason;
