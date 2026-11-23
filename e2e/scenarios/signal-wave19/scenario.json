@@ -1,0 +1,12 @@
+{
+  "id": "signal-wave19",
+  "title": "Signal 1:1 voice/video calls and group calls (ring, raise hand, reactions, screen share)",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. Signal 1:1 and group calling are covered by desktop chatd prove + mediad loopback + integration tests.",
+    "ios": "The phone proof build does not run desktop chatd. Signal 1:1 and group calling are covered by desktop chatd prove + mediad loopback + integration tests."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

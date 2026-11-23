@@ -335,6 +335,15 @@ impl Chat {
                 adapter.command(Command::Tiny(adapters::tiny::live::Ask::Offer { sdp }));
             }
         });
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_ice(move |conversation, candidate| {
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::CallIce {
+                    conversation_id: conversation.id.clone(),
+                    candidate,
+                });
+            }
+        });
         // Tiny media dropped, or came back, while the call is still up. The live socket joins
         // again, or notes that the link held. A Discord call does this inside mediad.
         let adapters = chat.adapters.clone();
@@ -6759,6 +6768,34 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::CallRaiseHand { raised } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallRaiseHand {
+                    conversation_id,
+                    raised,
+                    reply,
+                }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallReact { emoji } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::CallReact {
+                    conversation_id,
+                    emoji,
+                    reply,
+                }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
             Request::Handoff { conversation } => {
                 let conversation_id = conversation.id.clone();
                 match self.ask(&conversation.account(), |reply| Command::Handoff { conversation_id, reply }) {
@@ -6841,7 +6878,7 @@ impl Chat {
                 if asked.is_ok() {
                     if let (Some(call), true) = self.hub.calls.describe() {
                         if let Some(picture) = picture {
-                            if call.conversation.network == Network::Discord {
+                            if matches!(call.conversation.network, Network::Discord | Network::Signal) {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
                             }
                         }

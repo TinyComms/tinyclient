@@ -261,6 +261,8 @@ mod tests {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        hand_raised: false,
+        reaction: None,
         }
     }
 

@@ -47,13 +47,14 @@
 //! club" with all three of us in it.
 
 use super::wire::{
-    call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
-    parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
-    CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, HistoryTransfer, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker,
-    MessageRequestAction, OwnCard, Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker,
-    StickerEntry, StickerPackInfo, StorageSnapshot, StoryContext, StoryDistributionList, StoryMessageData, StoryText,
-    Text, TransferOutcome, TransferProgress, Wire, FLAG_GIF, FLAG_VOICE_MESSAGE,
+    call_link_room_id, encode_group_call_signal, format_call_link, format_group_invite_link, gift_badge_label,
+    parse_call_link, parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin,
+    CallLogKind, CallOutcome, CallSignal, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry,
+    GroupAccess, GroupCallCredentials, GroupCallInfo, GroupCallSignal, GroupEdit, GroupInfo, GroupMember,
+    GroupMembers, GroupRingMode, HangupKind, HistoryTransfer, IdentityState, InviteLinkMode, LinkPreview, Linked,
+    Linker, MessageRequestAction, OwnCard, Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber,
+    Sticker, StickerEntry, StickerPackInfo, StorageSnapshot, StoryContext, StoryDistributionList, StoryMessageData,
+    StoryText, Text, TransferOutcome, TransferProgress, TurnServer, Wire, FLAG_GIF, FLAG_VOICE_MESSAGE,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -220,6 +221,10 @@ pub struct Fake {
     profiles: Arc<Mutex<HashMap<String, PersonProfile>>>,
     /// Known sticker packs (installed or available to preview/install in tests).
     sticker_packs: Arc<Mutex<HashMap<String, StickerPackInfo>>>,
+    /// Scripted TURN relay servers returned by `turn_servers()`.
+    turn_servers: Arc<Mutex<Vec<TurnServer>>>,
+    /// Scripted Signal SFU group-call states keyed by group hex id.
+    group_calls: Arc<Mutex<HashMap<String, GroupCallInfo>>>,
 }
 
 impl Fake {
@@ -263,6 +268,12 @@ impl Fake {
             identities: Arc::new(Mutex::new(initial_identities())),
             profiles: Arc::new(Mutex::new(initial_profiles())),
             sticker_packs: Arc::default(),
+            turn_servers: Arc::new(Mutex::new(vec![TurnServer {
+                urls: vec!["turn:127.0.0.1:3478?transport=udp".into()],
+                username: "fake-turn-user".into(),
+                password: "fake-turn-pass".into(),
+            }])),
+            group_calls: Arc::default(),
         };
         fake.listen();
         fake
@@ -270,7 +281,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles, sticker_packs) = (
+        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles, sticker_packs, turn_servers, group_calls) = (
             self.events.clone(),
             self.closed.clone(),
             self.refuse.clone(),
@@ -281,6 +292,8 @@ impl Fake {
             self.identities.clone(),
             self.profiles.clone(),
             self.sticker_packs.clone(),
+            self.turn_servers.clone(),
+            self.group_calls.clone(),
         );
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
@@ -290,6 +303,172 @@ impl Fake {
                 let Some(line) = line.map(str::trim) else {
                     return true;
                 };
+                if let Some(rest) = line.strip_prefix("group-call-full ") {
+                    let era = rest.trim().to_owned();
+                    let info = GroupCallInfo {
+                        era_id: if era.is_empty() { "era-full".into() } else { era },
+                        members: vec![GRACE.into(), ALAN.into()],
+                        started_by: Some(GRACE.into()),
+                        full: true,
+                        max_devices: 2,
+                    };
+                    group_calls.lock().unwrap_or_else(|p| p.into_inner()).insert(CLUB.to_owned(), info.clone());
+                    let _ = events.send(Event::GroupCallRoster { group_id: CLUB.to_owned(), info });
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-call-roster ") {
+                    let mut parts = rest.split_whitespace();
+                    let era = parts.next().unwrap_or("era-1").to_owned();
+                    let members: Vec<String> = parts
+                        .next()
+                        .unwrap_or("")
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|tok| who(tok).map(|(id, _)| id.to_owned()).unwrap_or_else(|| tok.to_owned()))
+                        .collect();
+                    let info = GroupCallInfo {
+                        era_id: era,
+                        started_by: members.first().cloned(),
+                        members,
+                        full: false,
+                        max_devices: 50,
+                    };
+                    group_calls.lock().unwrap_or_else(|p| p.into_inner()).insert(CLUB.to_owned(), info.clone());
+                    let _ = events.send(Event::GroupCallRoster { group_id: CLUB.to_owned(), info });
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-call-end ") {
+                    let by = who(rest.trim()).map(|(id, _)| id.to_owned()).unwrap_or_else(|| GRACE.to_owned());
+                    group_calls.lock().unwrap_or_else(|p| p.into_inner()).remove(CLUB);
+                    let _ = events.send(Event::GroupCallUpdate {
+                        peer: Peer::Group(CLUB.to_owned()),
+                        by,
+                        era_id: None,
+                        sent: super::now_ms(),
+                    });
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-call ") {
+                    let mut parts = rest.split_whitespace();
+                    let by = who(parts.next().unwrap_or("grace")).map(|(id, _)| id.to_owned()).unwrap_or_else(|| GRACE.to_owned());
+                    let era = parts.next().unwrap_or("era-1").to_owned();
+                    let info = GroupCallInfo {
+                        era_id: era.clone(),
+                        members: vec![by.clone()],
+                        started_by: Some(by.clone()),
+                        full: false,
+                        max_devices: 50,
+                    };
+                    group_calls.lock().unwrap_or_else(|p| p.into_inner()).insert(CLUB.to_owned(), info);
+                    let _ = events.send(Event::GroupCallUpdate {
+                        peer: Peer::Group(CLUB.to_owned()),
+                        by,
+                        era_id: Some(era),
+                        sent: super::now_ms(),
+                    });
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-ring ") {
+                    let mut parts = rest.split_whitespace();
+                    let raw_who = parts.next().unwrap_or("grace");
+                    let by = if raw_who == "stranger" {
+                        STRANGER.to_owned()
+                    } else {
+                        who(raw_who).map(|(id, _)| id.to_owned()).unwrap_or_else(|| raw_who.to_owned())
+                    };
+                    let era = parts.next().unwrap_or("era-1").to_owned();
+                    let mode = match parts.next().unwrap_or("ring") {
+                        "cancel" | "cancelled" => GroupRingMode::Cancelled,
+                        "decline" | "declined" => GroupRingMode::Declined,
+                        "busy" => GroupRingMode::Busy,
+                        _ => GroupRingMode::Ringing,
+                    };
+                    let data = encode_group_call_signal(&GroupCallSignal::Ring {
+                        group_id: CLUB.to_owned(),
+                        era_id: era,
+                        ring_id: 42,
+                        mode,
+                    });
+                    let _ = events.send(Event::CallOpaque { peer: Peer::Direct(by.clone()), by, data, urgent: true });
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-sender-key ") {
+                    let mut parts = rest.split_whitespace();
+                    let raw_who = parts.next().unwrap_or("grace");
+                    let by = if raw_who == "stranger" {
+                        STRANGER.to_owned()
+                    } else {
+                        who(raw_who).map(|(id, _)| id.to_owned()).unwrap_or_else(|| raw_who.to_owned())
+                    };
+                    let era = parts.next().unwrap_or("era-1").to_owned();
+                    let data = encode_group_call_signal(&GroupCallSignal::SenderKey {
+                        group_id: CLUB.to_owned(),
+                        era_id: era,
+                        key_bytes: vec![0xab; 32],
+                    });
+                    let _ = events.send(Event::CallOpaque { peer: Peer::Direct(by.clone()), by, data, urgent: true });
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-hand ") {
+                    let mut parts = rest.split_whitespace();
+                    let by = who(parts.next().unwrap_or("grace")).map(|(id, _)| id.to_owned()).unwrap_or_else(|| GRACE.to_owned());
+                    let raised = parts.next().unwrap_or("on") == "on";
+                    let _ = events.send(Event::GroupCallParticipantState {
+                        group_id: CLUB.to_owned(),
+                        aci: by,
+                        muted: None,
+                        camera: None,
+                        sharing: None,
+                        hand_raised: Some(raised),
+                        reaction: None,
+                    });
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-react ") {
+                    let mut parts = rest.split_whitespace();
+                    let by = who(parts.next().unwrap_or("grace")).map(|(id, _)| id.to_owned()).unwrap_or_else(|| GRACE.to_owned());
+                    let emoji = parts.next().unwrap_or("👍").to_owned();
+                    let _ = events.send(Event::GroupCallParticipantState {
+                        group_id: CLUB.to_owned(),
+                        aci: by,
+                        muted: None,
+                        camera: None,
+                        sharing: None,
+                        hand_raised: None,
+                        reaction: Some((!emoji.is_empty()).then_some(emoji)),
+                    });
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("group-media ") {
+                    let mut parts = rest.split_whitespace();
+                    let by = who(parts.next().unwrap_or("grace")).map(|(id, _)| id.to_owned()).unwrap_or_else(|| GRACE.to_owned());
+                    let what = parts.next().unwrap_or("camera");
+                    let on = parts.next().unwrap_or("on") == "on";
+                    let _ = events.send(Event::GroupCallParticipantState {
+                        group_id: CLUB.to_owned(),
+                        aci: by,
+                        muted: (what == "mute").then_some(on),
+                        camera: (what == "camera").then_some(on),
+                        sharing: (what == "share").then_some(on),
+                        hand_raised: None,
+                        reaction: None,
+                    });
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("turn ") {
+                    let mut parts = rest.split_whitespace();
+                    let url = parts.next().unwrap_or("").to_owned();
+                    let username = parts.next().unwrap_or("u").to_owned();
+                    let password = parts.next().unwrap_or("p").to_owned();
+                    if !url.is_empty() {
+                        turn_servers.lock().unwrap_or_else(|p| p.into_inner()).push(TurnServer {
+                            urls: vec![url],
+                            username,
+                            password,
+                        });
+                    }
+                    return true;
+                }
                 if let Some(rest) = line.strip_prefix("profile ") {
                     let mut parts = rest.splitn(2, ' ');
                     let target = parts.next().unwrap_or("").trim();
@@ -680,11 +859,55 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
                 return Vec::new();
             };
             let sent = next().parse().unwrap_or(T0);
-            vec![Event::Call { peer: direct(author), by: author.into(), name: name.into(), video: command == "call-video", id: sent, sent }]
+            let sdp = rest(line, 3).replace("\\n", "\r\n");
+            let opaque = sdp.as_bytes().to_vec();
+            vec![Event::Call {
+                peer: direct(author),
+                by: author.into(),
+                name: name.into(),
+                video: command == "call-video",
+                id: sent,
+                sent,
+                sdp,
+                opaque,
+            }]
         }
-        "hangup" | "hangup-accepted" | "busy" => {
+        "call-answer" => {
+            let Some((author, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let id = next().parse().unwrap_or(0);
+            let sdp = rest(line, 3).replace("\\n", "\r\n");
+            let opaque = sdp.as_bytes().to_vec();
+            vec![Event::CallAnswer { peer: direct(author), by: author.into(), id, sdp, opaque }]
+        }
+        "call-ice" => {
+            let Some((author, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let id = next().parse().unwrap_or(0);
+            let candidate = rest(line, 3);
+            if candidate.is_empty() {
+                return Vec::new();
+            }
+            vec![Event::CallIce { peer: direct(author), by: author.into(), id, candidates: vec![candidate] }]
+        }
+        "call-opaque" => {
+            let Some((author, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let data = rest(line, 2).into_bytes();
+            vec![Event::CallOpaque { peer: direct(author), by: author.into(), data, urgent: true }]
+        }
+        "hangup" | "hangup-accepted" | "hangup-declined" | "busy" => {
             let id = next().parse().unwrap_or(T0);
-            vec![Event::CallEnded { id, answered: command == "hangup-accepted" }]
+            let kind = match command {
+                "hangup-accepted" => HangupKind::Accepted,
+                "hangup-declined" => HangupKind::Declined,
+                "busy" => HangupKind::Busy,
+                _ => HangupKind::Normal,
+            };
+            vec![Event::CallEnded { id, answered: kind == HangupKind::Accepted, kind }]
         }
         "call-event" => {
             let target = next();
@@ -1579,6 +1802,28 @@ impl Wire for Fake {
                 };
                 format!("post-story {target} replies={allows_replies} {body_desc}")
             }
+            Body::Call(signal) => match signal {
+                CallSignal::Offer { id, video, sdp, .. } => {
+                    let relay = !sdp.contains(" typ host") && sdp.contains("typ relay");
+                    format!("send {} call-offer {id} video={video} sdp={} relay={relay}", describe(to), sdp.starts_with("v=0"))
+                }
+                CallSignal::Answer { id, sdp, .. } => {
+                    format!("send {} call-answer {id} sdp={}", describe(to), sdp.starts_with("v=0"))
+                }
+                CallSignal::IceUpdate { id, candidates } => {
+                    format!("send {} call-ice {id} count={}", describe(to), candidates.len())
+                }
+                CallSignal::Busy { id } => format!("send {} call-busy {id}", describe(to)),
+                CallSignal::Hangup { id, kind, .. } => format!("send {} call-hangup {id} {}", describe(to), kind.word()),
+                CallSignal::Opaque { data, urgent } => format!("send {} call-opaque urgent={urgent} len={}", describe(to), data.len()),
+            },
+            Body::GroupCallUpdate { era_id } => {
+                format!(
+                    "send {} group-call-update era={}",
+                    describe(to),
+                    era_id.as_deref().unwrap_or("none")
+                )
+            }
         };
         record(&line);
         if let Peer::Direct(aci) = to {
@@ -2324,6 +2569,108 @@ impl Wire for Fake {
         }
         std::fs::write(dest, &bytes).map_err(|err| Fault::Net(err.to_string()))?;
         Ok(bytes.len() as u64)
+    }
+
+    fn turn_servers(&self) -> Result<Vec<TurnServer>, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        Ok(self.turn_servers.lock().unwrap_or_else(|p| p.into_inner()).clone())
+    }
+
+    fn peek_group_call(&self, group_id: &str) -> Result<GroupCallInfo, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        Ok(self
+            .group_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(group_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn group_call_credentials(&self, group_id: &str) -> Result<GroupCallCredentials, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let existing = self
+            .group_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(group_id)
+            .map(|i| i.era_id.clone())
+            .filter(|e| !e.is_empty());
+        let era_id = existing.unwrap_or_else(|| format!("era-{}", self.clock.fetch_add(1, Ordering::Relaxed)));
+        record(&format!("group-call-creds g.{group_id} era={era_id}"));
+        Ok(GroupCallCredentials {
+            sfu_url: "https://sfu.fake.signal".to_owned(),
+            token: "fake-zkgroup-token".to_owned(),
+            era_id,
+            group_key: vec![0x5a; 32],
+        })
+    }
+
+    fn group_call_join(&self, group_id: &str, era_id: &str, offer_sdp: &str) -> Result<(String, GroupCallInfo), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let mut calls = self.group_calls.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = calls.get(group_id) {
+            if existing.full {
+                record(&format!("group-call-join g.{group_id} era={era_id} refused=full"));
+                return Err(Fault::Refused("This group call is full.".to_owned()));
+            }
+        }
+        let entry = calls.entry(group_id.to_owned()).or_insert_with(|| GroupCallInfo {
+            era_id: era_id.to_owned(),
+            members: Vec::new(),
+            started_by: Some(ME.to_owned()),
+            full: false,
+            max_devices: 50,
+        });
+        if entry.era_id.is_empty() {
+            entry.era_id = era_id.to_owned();
+        }
+        if !entry.members.iter().any(|m| m == ME) {
+            entry.members.push(ME.to_owned());
+        }
+        let info = entry.clone();
+        record(&format!("group-call-join g.{group_id} era={} sdp={}", info.era_id, offer_sdp.starts_with("v=0")));
+        Ok((String::new(), info))
+    }
+
+    fn group_call_leave(&self, group_id: &str, era_id: &str) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let mut calls = self.group_calls.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = calls.get_mut(group_id) {
+            entry.members.retain(|m| m != ME);
+            if entry.members.is_empty() {
+                calls.remove(group_id);
+            }
+        }
+        record(&format!("group-call-leave g.{group_id} era={era_id}"));
+        Ok(())
+    }
+
+    fn group_call_send_data(&self, group_id: &str, signal: GroupCallSignal) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let desc = match &signal {
+            GroupCallSignal::RaiseHand { raised, .. } => format!("raise-hand={raised}"),
+            GroupCallSignal::Reaction { emoji, .. } => format!("react={emoji}"),
+            GroupCallSignal::MediaState { muted, camera, sharing, .. } => {
+                format!("media muted={muted} camera={camera} sharing={sharing}")
+            }
+            GroupCallSignal::Ring { mode, .. } => format!("ring={mode:?}"),
+            GroupCallSignal::SenderKey { key_bytes, .. } => format!("sender-key len={}", key_bytes.len()),
+        };
+        record(&format!("group-call-data g.{group_id} {desc}"));
+        Ok(())
     }
 
     fn close(&self) {

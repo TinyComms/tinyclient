@@ -91,6 +91,7 @@ pub(super) fn stack(call: &Call, mut picture: impl FnMut(&Participant) -> Option
 
 /// The 13 px glyphs at the right of a person's row: server-imposed moderation in `danger`
 /// (or `warning` for suppressed), distinct from self mute/deafen in `text_faint`.
+#[allow(clippy::too_many_arguments)]
 fn status(
     muted: bool,
     deafened: bool,
@@ -99,12 +100,16 @@ fn status(
     suppressed: bool,
     camera: bool,
     sharing: bool,
+    hand_raised: bool,
+    reaction: Option<&str>,
 ) -> Div {
     div()
         .flex_none()
         .flex()
         .items_center()
         .gap(px(5.))
+        .children(reaction.filter(|r| !r.is_empty()).map(|emoji| div().text_size(px(13.)).child(emoji.to_owned())))
+        .when(hand_raised, |status| status.child(glyph("icons/hand.svg", 13., theme::warning())))
         .when(sharing, |status| status.child(glyph("icons/monitor-up.svg", 13., theme::text_soft())))
         .when(camera, |status| status.child(glyph("icons/video.svg", 13., theme::text_soft())))
         .when(server_muted, |status| status.child(glyph("icons/mic-off.svg", 13., theme::danger())))
@@ -186,6 +191,8 @@ fn rows(call: &Call, me: Option<&str>, sizes: &Sizes) -> Vec<Div> {
             call.suppressed,
             my_camera,
             my_sharing,
+            call.hand_raised,
+            call.reaction.as_deref(),
         ),
     );
     let others = roster(call).into_iter().map(|who| {
@@ -197,7 +204,17 @@ fn rows(call: &Call, me: Option<&str>, sizes: &Sizes) -> Vec<Div> {
             &who.name,
             false,
             speaking,
-            status(who.muted, who.deafened, who.server_muted, who.server_deafened, who.suppressed, who.camera, who.sharing),
+            status(
+                who.muted,
+                who.deafened,
+                who.server_muted,
+                who.server_deafened,
+                who.suppressed,
+                who.camera,
+                who.sharing,
+                who.hand_raised,
+                who.reaction.as_deref(),
+            ),
         )
     });
     std::iter::once(first).chain(others).collect()

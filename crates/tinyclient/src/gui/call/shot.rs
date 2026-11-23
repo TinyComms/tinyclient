@@ -322,6 +322,8 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         ringing: Vec::new(),
         moved_from: matches!(name.as_str(), "moving" | "moved_notice").then(|| key("direct")),
         move_notice: (name == "moved_notice").then(|| "Bea added Cy. The call moved to Campfire.".to_owned()),
+        hand_raised: false,
+        reaction: None,
     })
 }
 
@@ -478,6 +480,8 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        hand_raised: false,
+        reaction: None,
     }
 }
 

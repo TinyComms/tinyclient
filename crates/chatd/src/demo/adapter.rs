@@ -1303,7 +1303,10 @@ impl Demo {
             Command::SlashCommands { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AllUnreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
+            Command::CallRing { reply, .. }
+            | Command::CallStopRinging { reply, .. }
+            | Command::CallRaiseHand { reply, .. }
+            | Command::CallReact { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::CallAddPeople { reply, .. } => {
@@ -1506,6 +1509,7 @@ impl Demo {
             | Command::Wanted(_)
             | Command::WantedSpan { .. }
             | Command::Played { .. }
+            | Command::CallIce { .. }
             | Command::Stop => {}
         }
     }

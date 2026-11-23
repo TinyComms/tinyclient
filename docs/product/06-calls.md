@@ -38,6 +38,14 @@ When you watch a Go Live stream with sound, its Opus audio plays through the cal
 
 DAVE seals the picture as well as the voice. The transport encryption is the same AES-GCM or XChaCha the voice already uses. The client offers H.264 and does not offer another video codec. There is no simulcast, no AV1, VP8 or VP9, no system audio on shares sent by tinyclient, and no clips. A stage is still not joined.
 
+## Signal calls (1:1 and group)
+
+Signal 1:1 voice and video calls and Signal group calls run natively through `mediad` using pure-Rust `str0m` WebRTC (ICE, RustCrypto DTLS-SRTP, Opus 48 kHz audio, and H.264 constrained baseline video) rather than linking Signal's C++ RingRTC fork across five platforms. Avoiding RingRTC keeps tinyclient free of a gigabyte-scale Chromium WebRTC C++ build toolchain on Windows, macOS, Linux, Android, and iOS while sharing the same microphone processing (AEC3/NS/AGC2), hardware H.264 / OpenH264 video pipeline, and device pickers as Tiny and Discord calls.
+
+- **1:1 signalling and media:** `OfferMessage`, `AnswerMessage`, `IceUpdateMessage`, `HangupMessage` (Normal, Accepted, Declined, Busy, NeedPermission), `BusyMessage`, and `OpaqueMessage` travel end-to-end encrypted inside Signal's message path. Incoming calls ring natively in the call dock and system notifications with Accept and Decline; accepting on another device (`HangupAccepted`) clears the ring without leaving a missed call; an incoming call while already in another call replies `Busy`.
+- **Safety numbers and relay privacy (P7):** Every Signal call shows an end-to-end encrypted lock badge in the call header with the contact's 60-digit Signal safety number (grouped in twelve 5-digit blocks) and verification state. Calls to people not in contacts default to TURN relay-only ICE so your IP address is not exposed; Settings › Privacy › Calls › **Always relay Signal calls** (`signal_always_relay`) forces TURN-only ICE for all Signal calls using credentials from `/v1/accounts/turn`.
+- **Group calls:** `DataMessage.groupCallUpdate` and SFU peeks drive the live "in this call · Join" banner in group chats and clear it when the call ends. Joining verifies group membership, checks SFU capacity (surfacing "This group call is full." cleanly), distributes sender keys over 1:1 `CallMessage.opaque` only to verified group members (rejecting rings and keys from non-members), and supports ringing/cancelling members, raising/lowering hands, live emoji reactions, camera toggle, and desktop screen sharing.
+
 ## Hand-off
 
 Which call control is native, a hand-off, or missing is [the generated table](../parity.md). A control that table does not mark native names the official app and does not start mediad.

@@ -84,6 +84,8 @@ pub struct Controls {
     pub(crate) tiny_link: Mutex<Option<crate::tiny::Link>>,
     /// A Tiny server's newest slot map, not yet applied.
     pub(crate) tiny_slots: Mutex<Option<Vec<TinySlot>>>,
+    /// Remote ICE candidates delivered for an active Signal WebRTC call.
+    pub(crate) signal_ice: Mutex<Vec<String>>,
     /// The camera and the share the user asked for, and whether the one picture is watched.
     share: AtomicBool,
     camera: AtomicBool,
@@ -156,6 +158,14 @@ impl Controls {
     /// A Tiny server's new slot map, for its loop to apply.
     pub fn tiny_slots(&self, map: Vec<TinySlot>) {
         *self.tiny_slots.lock().unwrap() = Some(map);
+    }
+
+    pub fn push_signal_ice(&self, candidate: String) {
+        self.signal_ice.lock().unwrap().push(candidate);
+    }
+
+    pub fn take_signal_ice(&self) -> Vec<String> {
+        std::mem::take(&mut *self.signal_ice.lock().unwrap())
     }
 
     pub fn set_share(&self, on: bool) {

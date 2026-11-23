@@ -477,9 +477,9 @@ pub enum CallSupport {
     Restricted,
 }
 
-/// Camera and screen share run in this client on a Tiny or Discord call.
+/// Camera and screen share run in this client on a Tiny, Discord, or Signal call.
 pub fn call_pictures(network: Network) -> bool {
-    matches!(network, Network::Tiny | Network::Discord)
+    matches!(network, Network::Tiny | Network::Discord | Network::Signal)
 }
 
 /// How a conversation kind is called, as the adapter that builds its row decides.
@@ -3285,6 +3285,14 @@ pub enum Request {
     /// and rings them.
     CallAddPeople {
         people: Vec<String>,
+    },
+    /// Raises or lowers our hand in the active group call (Signal group calls).
+    CallRaiseHand {
+        raised: bool,
+    },
+    /// Sends a transient emoji reaction in the active group call (Signal group calls).
+    CallReact {
+        emoji: String,
     },
     /// Where the official app takes this conversation's call.
     Handoff {
