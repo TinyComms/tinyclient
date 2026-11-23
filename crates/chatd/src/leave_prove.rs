@@ -79,6 +79,7 @@ impl Voice {
             deafened: false,
             stream: false,
             watch: false,
+            stream_owner: None,
             group_id: String::new(),
         })
     }

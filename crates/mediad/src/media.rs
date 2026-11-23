@@ -1325,6 +1325,11 @@ impl Loop {
             }
         }
         drop(users);
+        if let Some(stream) = self.setup.controls.watched_audio.lock().unwrap().as_mut() {
+            if !deafened && !self.setup.controls.leg_done(true) {
+                stream.mix(&mut mix, &ear, ducked);
+            }
+        }
         mixdown(&mix, &self.setup.controls, &mut self.cue, &mut self.setup.audio, &mut self.processor, &mut self.limiter)
     }
 
