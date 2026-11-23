@@ -128,6 +128,16 @@ pub struct Controls {
     tg_signals: Mutex<std::collections::VecDeque<Vec<u8>>>,
     /// Updated Telegram group voice chat SSRC -> participant mapping.
     tg_sources: Mutex<Option<Vec<protocol::TelegramGroupSource>>>,
+    /// Updated Telegram group video & presentation endpoint/SSRC mapping (#467).
+    tg_video_sources: Mutex<Option<Vec<protocol::TelegramGroupVideoSource>>>,
+    /// Pending Telegram presentation transport stop flag (#467).
+    tg_presentation_stop: AtomicBool,
+    /// Queued RTMP live stream segments (time_ms, scale, video_channel, video_quality, raw bytes) (#454).
+    tg_rtmp_segments: Mutex<std::collections::VecDeque<crate::telegram::RtmpSegmentInput>>,
+    /// Latest RTMP stream state (#454).
+    tg_rtmp_state: Mutex<Option<protocol::RtmpStreamState>>,
+    /// Pure-Rust `tde2e`-compatible E2EE state for an encrypted Telegram conference call.
+    tg_conf_e2ee: Mutex<Option<crate::telegram_e2ee::ConferenceE2ee>>,
 }
 
 impl Controls {
@@ -328,6 +338,7 @@ impl Controls {
         let wanted = match cue {
             Cue::Test => true,
             Cue::Joined | Cue::Left | Cue::ShareStarted => tuning.joins && !self.deafened.load(Ordering::Relaxed),
+            Cue::RecordingStarted => !self.deafened.load(Ordering::Relaxed),
             // Our own room changed: as a join, but heard while deafened, since it is ours.
             Cue::Moved => tuning.joins,
             Cue::Muted | Cue::Unmuted | Cue::Deafened | Cue::Undeafened => tuning.mine,
@@ -479,6 +490,88 @@ impl Controls {
 
     pub fn take_tg_sources(&self) -> Option<Vec<protocol::TelegramGroupSource>> {
         self.tg_sources.lock().unwrap().take()
+    }
+
+    pub fn set_tg_video_sources(&self, sources: Vec<protocol::TelegramGroupVideoSource>) {
+        *self.tg_video_sources.lock().unwrap() = Some(sources);
+    }
+
+    pub fn take_tg_video_sources(&self) -> Option<Vec<protocol::TelegramGroupVideoSource>> {
+        self.tg_video_sources.lock().unwrap().take()
+    }
+
+    pub fn set_tg_presentation_stop(&self, stop: bool) {
+        self.tg_presentation_stop.store(stop, Ordering::Relaxed);
+    }
+
+    pub fn tg_presentation_stopped(&self) -> bool {
+        self.tg_presentation_stop.load(Ordering::Relaxed)
+    }
+
+    pub fn push_tg_rtmp_segment(&self, seg: crate::telegram::RtmpSegmentInput) {
+        let mut q = self.tg_rtmp_segments.lock().unwrap();
+        if q.len() >= 64 {
+            q.pop_front();
+        }
+        q.push_back(seg);
+    }
+
+    pub fn take_tg_rtmp_segments(&self) -> Vec<crate::telegram::RtmpSegmentInput> {
+        self.tg_rtmp_segments.lock().unwrap().drain(..).collect()
+    }
+
+    pub fn set_tg_rtmp_state(&self, state: protocol::RtmpStreamState) {
+        *self.tg_rtmp_state.lock().unwrap() = Some(state);
+    }
+
+    pub fn tg_rtmp_state(&self) -> Option<protocol::RtmpStreamState> {
+        *self.tg_rtmp_state.lock().unwrap()
+    }
+
+    pub fn init_tg_conference(&self, my_user_id: i64, public_key: [u8; 32]) {
+        *self.tg_conf_e2ee.lock().unwrap() = Some(crate::telegram_e2ee::ConferenceE2ee::new(my_user_id, public_key));
+    }
+
+    pub fn clear_tg_conference(&self) {
+        *self.tg_conf_e2ee.lock().unwrap() = None;
+    }
+
+    pub fn tg_conference_active(&self) -> bool {
+        self.tg_conf_e2ee.lock().unwrap().is_some()
+    }
+
+    pub fn apply_tg_conference_block(
+        &self,
+        sub_chain_id: i32,
+        raw: &[u8],
+    ) -> Result<protocol::CallSecurity, (crate::telegram_e2ee::E2eeError, protocol::CallSecurity)> {
+        let mut guard = self.tg_conf_e2ee.lock().unwrap();
+        let Some(e2ee) = guard.as_mut() else {
+            return Err((
+                crate::telegram_e2ee::E2eeError::NotReady,
+                protocol::CallSecurity::telegram_conference_blocked(),
+            ));
+        };
+        match e2ee.apply_block_bytes(sub_chain_id, raw) {
+            Ok(()) => Ok(e2ee.security()),
+            Err(err) => Err((err, e2ee.security())),
+        }
+    }
+
+    pub fn tg_conference_encrypt(&self, kind: u8, plaintext: &[u8]) -> Result<Vec<u8>, crate::telegram_e2ee::E2eeError> {
+        let mut guard = self.tg_conf_e2ee.lock().unwrap();
+        let Some(e2ee) = guard.as_mut() else {
+            return Err(crate::telegram_e2ee::E2eeError::NotReady);
+        };
+        e2ee.encrypt_frame(kind, plaintext)
+    }
+
+    pub fn tg_conference_decrypt(&self, packet: &[u8]) -> Result<(u8, i64, Vec<u8>), crate::telegram_e2ee::E2eeError> {
+        let guard = self.tg_conf_e2ee.lock().unwrap();
+        let Some(e2ee) = guard.as_ref() else {
+            return Err(crate::telegram_e2ee::E2eeError::NotReady);
+        };
+        e2ee.decrypt_frame(packet)
     }
 }
 

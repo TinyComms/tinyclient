@@ -369,6 +369,8 @@ fn notes(cue: Cue) -> (&'static [(f64, f64, f64)], bool) {
         Cue::Disconnected => (&[(0., 0.1, E4), (0.1, 0.2, A3)], false),
         // Soft rising two-note chime: someone started sharing their screen.
         Cue::ShareStarted => (&[(0., 0.08, E5), (0.08, 0.1, A5)], false),
+        // Clear two-tone alert: server-side recording started while joined (#463).
+        Cue::RecordingStarted => (&[(0., 0.09, A5), (0.09, 0.12, E5)], false),
     }
 }
 
@@ -609,6 +611,7 @@ mod tests {
             (Cue::Moved, 0.21),
             (Cue::Disconnected, 0.3),
             (Cue::ShareStarted, 0.18),
+            (Cue::RecordingStarted, 0.21),
             (Cue::Test, 0.18),
         ];
         for (cue, length) in lengths {

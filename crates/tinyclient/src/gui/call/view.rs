@@ -338,6 +338,14 @@ impl Shell {
             .children(place_chip)
             .children(voice_status.map(|status| self.voice_status_line(&call.conversation, &status, cx)))
             .child(chip(count_label, theme::text_soft(), theme::hover()))
+            .children(
+                call.record_start_date
+                    .map(|since| super::telegram::recording_badge("call-header-rec", since, call.record_video_active)),
+            )
+            .children(
+                call.rtmp_stream
+                    .then(|| chip("Live stream", theme::accent_text(), theme::accent_soft())),
+            )
             .children(self.call_security(&call, Place::TopBar, cx));
         let add_people = can_add_people.then(|| {
             button_with_icon(
@@ -451,6 +459,12 @@ impl Shell {
             CallState::Failed { .. } => {
                 let (title, line, _) = self.call_failure(call)?;
                 ("icons/triangle-alert.svg", theme::danger(), theme::danger_soft(), title, Some(line))
+            }
+            CallState::Joined if call.rtmp_stream => {
+                let msg = call
+                    .rtmp_state
+                    .and_then(super::telegram::rtmp_state_banner)?;
+                ("icons/radio.svg", theme::warning(), theme::warning_soft(), msg.to_owned(), None)
             }
             _ => return None,
         };
@@ -1940,42 +1954,57 @@ impl Shell {
             }))
         };
         let joined = call.is_some_and(|call| call.state == CallState::Joined);
-        let pictures = joined && opts.video_allowed;
+        let is_rtmp = call.is_some_and(|call| call.rtmp_stream);
+        let pictures = joined && opts.video_allowed && !is_rtmp;
         let share_on = call.is_some_and(|call| sending(call, Content::Share));
         let camera_on = call.is_some_and(|call| sending(call, Content::Camera));
+        let share_limit = call.and_then(|c| c.video_limit_reason(share_on));
         let share = pictures.then(|| {
-            bar_button(
-                "tiny-bar-share",
-                "icons/monitor-up.svg",
-                if share_on { BarLook::On } else { BarLook::Rest },
-            )
-            .aria_label(if share_on { "Stop sharing" } else { "Share your screen" })
-            .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if share_on {
-                    this.tiny_stop_share(cx);
-                } else {
-                    this.tiny_share(window, cx);
-                }
-            }))
+            if let Some(reason) = share_limit {
+                bar_button("tiny-bar-share", "icons/monitor-up.svg", BarLook::Held)
+                    .aria_label(reason.clone())
+                    .tooltip(tip(reason, None))
+            } else {
+                bar_button(
+                    "tiny-bar-share",
+                    "icons/monitor-up.svg",
+                    if share_on { BarLook::On } else { BarLook::Rest },
+                )
+                .aria_label(if share_on { "Stop sharing" } else { "Share your screen" })
+                .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if share_on {
+                        this.tiny_stop_share(cx);
+                    } else {
+                        this.tiny_share(window, cx);
+                    }
+                }))
+            }
         });
+        let camera_limit = call.and_then(|c| c.video_limit_reason(camera_on));
         let camera = pictures.then(|| {
             let call_cam = call.cloned();
-            bar_button(
-                "tiny-bar-camera",
-                "icons/video.svg",
-                if camera_on { BarLook::On } else { BarLook::Rest },
-            )
-            .aria_label(if camera_on { "Turn camera off" } else { "Turn camera on" })
-            .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                if let Some(call) = &call_cam {
-                    this.call_camera_clicked(call, camera_on, cx);
-                } else {
-                    this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx);
-                }
-            }))
+            if let Some(reason) = camera_limit {
+                bar_button("tiny-bar-camera", "icons/video.svg", BarLook::Held)
+                    .aria_label(reason.clone())
+                    .tooltip(tip(reason, None))
+            } else {
+                bar_button(
+                    "tiny-bar-camera",
+                    "icons/video.svg",
+                    if camera_on { BarLook::On } else { BarLook::Rest },
+                )
+                .aria_label(if camera_on { "Turn camera off" } else { "Turn camera on" })
+                .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(call) = &call_cam {
+                        this.call_camera_clicked(call, camera_on, cx);
+                    } else {
+                        this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx);
+                    }
+                }))
+            }
         });
         let popout_open = self.call_popout_open();
         let popout = pictures.then(|| {
@@ -2098,6 +2127,7 @@ impl Shell {
             Some(Menu::Person { account, user_id, name }) => {
                 Some((260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.))))
             }
+            Some(Menu::TelegramCall) => Some((260., self.telegram_call_menu(call, cx).p(px(6.)))),
             _ => None,
         });
         let call_error = room_context.then(|| self.tiny_state.call_error.clone()).flatten();

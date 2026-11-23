@@ -17,6 +17,7 @@ pub(in crate::gui) mod security;
 mod shot;
 pub(in crate::gui) mod discord_ux;
 pub(in crate::gui) mod stage;
+pub(super) mod telegram;
 pub(in crate::gui) mod view;
 
 // The platform's side of a phone call: the mobile layer routes these (`phone::hooks`).
@@ -117,6 +118,8 @@ pub(super) enum Menu {
     Security,
     /// Per-person volume and local mute for someone in any call.
     Person { account: AccountKey, user_id: String, name: String },
+    /// Telegram group video chat actions (invite, links, rename, join-muted, switch identity).
+    TelegramCall,
     /// Discord soundboard for the joined voice channel.
     Soundboard,
 }
@@ -328,6 +331,8 @@ pub struct State {
     pub(super) rating: Option<CallRatingCard>,
     /// Auto-dismisses an untouched `rating` card after [`RATING_IDLE`].
     rating_timer: Option<Task<()>>,
+    /// Active Telegram group video chat modal dialog (join-as, start confirm, end choice, etc.).
+    pub(super) telegram_modal: Option<telegram::TelegramModal>,
     confirm: Option<Confirm>,
     /// A call that could not be asked for at all: the microphone is not allowed. Drawn as any
     /// failed call is, and gone when dismissed or when the next call starts.
@@ -389,6 +394,7 @@ pub struct State {
     watch_again: Option<(Vec<protocol::WatchSource>, Instant)>,
     /// Always-on-top pop-out window showing the call's video (`#267`). While `Some`, the main
     /// stage renders a placeholder so the decoded `RenderImage` is never drawn twice.
+    pub(super) telegram_noise_suppression: Option<bool>,
     pub(in crate::gui) popout: Option<gpui::WindowHandle<popout::CallPopout>>,
     /// Remembered `(x, y, width, height)` for the call pop-out window, persisted in `shell.prefs`.
     pub(in crate::gui) popout_frame: Option<(f32, f32, f32, f32)>,
@@ -478,7 +484,10 @@ fn desired_watch_sources(
     budget_small: usize,
 ) -> Vec<protocol::WatchSource> {
     use protocol::{PictureKind, WatchSize, WatchSource};
-    if call.state != CallState::Joined || call.deafened || call.conversation.network != Network::Tiny {
+    if call.state != CallState::Joined
+        || call.deafened
+        || !matches!(call.conversation.network, Network::Tiny | Network::Telegram)
+    {
         return Vec::new();
     }
     let mut out: Vec<WatchSource> = Vec::new();
@@ -795,11 +804,26 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         raised: Vec::new(),
         effect: None,
         incoming_video: false,
+        title: String::new(),
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
+        record_start_date: None,
+        record_video_active: false,
+        can_start_video: true,
+        unmuted_video_count: 0,
+        unmuted_video_limit: 0,
+        rtmp_stream: false,
+        rtmp_state: None,
+        rtmp_quality: None,
+        rtmp_qualities: Vec::new(),
     }
 }
 
@@ -1053,7 +1077,8 @@ fn call_row_key_action(key: &str, shift: bool, other_mod: bool) -> Option<RowKey
 
 /// Number of joined people in a call (me plus every participant who is not still ringing).
 pub(super) fn call_people_count(call: &Call) -> usize {
-    call.participants.iter().filter(|p| !p.ringing).count() + 1
+    let loaded = call.participants.iter().filter(|p| !p.ringing).count() + 1;
+    loaded.max(call.participants_count as usize)
 }
 
 /// The call's popover menu for a participant: volume slider, local mute, Message, Profile, and
@@ -1100,6 +1125,7 @@ impl Shell {
                 state.muted_talk = health::MutedTalk::default();
                 state.muted_talk_task = None;
                 state.metering = None;
+                state.telegram_noise_suppression = None;
                 state.cued = None;
                 state.auto_watch = None;
                 state.discord_speaker = None;
@@ -1660,6 +1686,11 @@ impl Shell {
         let person_key = Key::new(&account, user_id);
         let msg_person = protocol::Person::new(person_key.clone(), name.to_owned());
         let profile_key = person_key.clone();
+        let participant_now = self
+            .call_now()
+            .filter(|call| call.conversation.account() == account)
+            .and_then(|call| call.participants.iter().find(|p| p.id == user_id).cloned());
+        let is_channel = participant_now.as_ref().is_some_and(|p| p.is_channel);
         let mut items = div()
             .flex()
             .flex_col()
@@ -1667,34 +1698,97 @@ impl Shell {
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
             .child(menu_label(name.to_owned()))
             .child(menu_separator().mx(px(8.)))
-            .child(self.call_volume_controls(account.clone(), user_id, cx))
-            .child(menu_separator().mx(px(8.)))
-            .child(
-                menu_item(
-                    SharedString::from(format!("call-person-message-{user_id}")),
-                    Some("icons/message-square.svg"),
-                    "Message",
-                    None,
+            .child(self.call_volume_controls(account.clone(), user_id, cx));
+        if !is_channel {
+            items = items
+                .child(menu_separator().mx(px(8.)))
+                .child(
+                    menu_item(
+                        SharedString::from(format!("call-person-message-{user_id}")),
+                        Some("icons/message-square.svg"),
+                        "Message",
+                        None,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_menu_close(cx);
+                        this.open_person(&msg_person, cx);
+                    })),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.call_menu_close(cx);
-                    this.open_person(&msg_person, cx);
-                })),
-            )
-            .child(
-                menu_item(
-                    SharedString::from(format!("call-person-profile-{user_id}")),
-                    Some("icons/user.svg"),
-                    "Profile",
-                    None,
-                )
-                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.call_menu_close(cx);
-                    this.open_profile(profile_key.clone(), event.position(), cx);
-                })),
-            );
+                .child(
+                    menu_item(
+                        SharedString::from(format!("call-person-profile-{user_id}")),
+                        Some("icons/user.svg"),
+                        "Profile",
+                        None,
+                    )
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.call_menu_close(cx);
+                        this.open_profile(profile_key.clone(), event.position(), cx);
+                    })),
+                );
+        }
+        if account.network == Network::Telegram {
+            if let (Some(call), Some(participant)) = (
+                self.call_now().filter(|call| call.conversation.account() == account),
+                participant_now.as_ref(),
+            ) {
+                let manage = self.telegram_can_manage_call(&call.conversation);
+                if manage {
+                    let conv = call.conversation.clone();
+                    let pid = user_id.to_owned();
+                    let pname = name.to_owned();
+                    items = items.child(menu_separator().mx(px(8.))).child(menu_label("Moderation (for everyone)"));
+                    if participant.suppressed {
+                        items = items.child(
+                            menu_item(
+                                SharedString::from(format!("tg-call-allow-{user_id}")),
+                                Some("icons/mic.svg"),
+                                "Allow to speak",
+                                None,
+                            )
+                            .on_click(cx.listener({
+                                let conv = conv.clone();
+                                let pid = pid.clone();
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.telegram_moderate_mute(conv.clone(), pid.clone(), false, cx);
+                                }
+                            })),
+                        );
+                    } else {
+                        items = items.child(
+                            menu_item(
+                                SharedString::from(format!("tg-call-mute-{user_id}")),
+                                Some("icons/mic-off.svg"),
+                                "Mute for everyone",
+                                None,
+                            )
+                            .on_click(cx.listener({
+                                let conv = conv.clone();
+                                let pid = pid.clone();
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.telegram_moderate_mute(conv.clone(), pid.clone(), true, cx);
+                                }
+                            })),
+                        );
+                    }
+                    items = items.child(
+                        super::components::menu_item_danger(
+                            SharedString::from(format!("tg-call-remove-{user_id}")),
+                            Some("icons/ban.svg"),
+                            "Remove from group…",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.telegram_confirm_remove(conv.clone(), pid.clone(), pname.clone(), cx);
+                        })),
+                    );
+                }
+            }
+        }
         if account.network == Network::Discord {
             if let Some(call) = self.call_now().filter(|call| call.conversation.account() == account) {
                 if let (Some(row), Some(participant)) = (self.discord_voice_row(&call.conversation), call.participants.iter().find(|p| p.id == user_id)) {
@@ -1783,8 +1877,7 @@ impl Shell {
 
     pub(super) fn call_people_list(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let account = call.conversation.account();
-        let mut people: Vec<&protocol::Participant> = call.participants.iter().collect();
-        people.sort_by_key(|who| (who.ringing, who.name.to_lowercase()));
+        let people = telegram::sort_call_participants(&call.participants, call.conversation.network == Network::Telegram);
         let seated: Vec<&str> = people.iter().map(|who| who.id.as_str()).collect();
         let joined_count = call_people_count(call);
         let noun = if joined_count == 1 { "PERSON" } else { "PEOPLE" };
@@ -1926,12 +2019,60 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| open_menu_more(this, cx)))
                 .child(glyph("icons/ellipsis.svg", 13., theme::text_soft()));
+            let is_channel = who.is_channel;
+            let row_tip = if !who.about.is_empty() {
+                who.about.clone()
+            } else if is_channel {
+                "Channel".to_owned()
+            } else {
+                "Open profile".to_owned()
+            };
+            let hand_badge = who.hand_raised.then(|| {
+                div()
+                    .id(SharedString::from(format!("call-person-hand-{}", who.id)))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .tooltip(tip("Hand raised", None))
+                    .child(glyph("icons/hand.svg", 13., theme::accent()))
+            });
+            let channel_tag = is_channel.then(|| {
+                div()
+                    .flex_none()
+                    .px(px(5.))
+                    .h(px(16.))
+                    .rounded(px(4.))
+                    .bg(theme::quiet_fill())
+                    .flex()
+                    .items_center()
+                    .type_micro()
+                    .text_color(theme::text_faint())
+                    .child("Channel")
+            });
+            let name_col = if who.about.is_empty() {
+                div().flex_1().min_w_0().truncate().child(who.name.clone())
+            } else {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().truncate().child(who.name.clone()))
+                    .child(
+                        div()
+                            .truncate()
+                            .type_micro()
+                            .text_color(theme::text_faint())
+                            .child(who.about.clone()),
+                    )
+            };
             rows.push(
                 div()
                     .id(row_group.clone())
                     .group(row_group)
                     .w_full()
-                    .h(px(32.))
+                    .min_h(px(32.))
+                    .py(px(3.))
                     .flex_none()
                     .pl(px(12.))
                     .pr(px(8.))
@@ -1944,29 +2085,34 @@ impl Shell {
                     .hover(|s| s.bg(theme::hover()))
                     .text_size(px(13.))
                     .text_color(if who.speaking { theme::text() } else { theme::text_soft() })
-                    .tooltip(tip("Open profile", None))
+                    .tooltip(tip(row_tip, None))
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         cx.stop_propagation();
                         this.call_menu_close(cx);
-                        this.open_profile(profile_key.clone(), event.position(), cx);
+                        if !is_channel {
+                            this.open_profile(profile_key.clone(), event.position(), cx);
+                        }
                     }))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| open_menu(this, cx)))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                         let mods = event.keystroke.modifiers;
                         let other = mods.control || mods.alt || mods.platform || mods.function;
                         match call_row_key_action(event.keystroke.key.as_str(), mods.shift, other) {
-                            Some(RowKeyAction::Profile) => {
+                            Some(RowKeyAction::Profile) if !is_channel => {
                                 cx.stop_propagation();
                                 this.call_menu_close(cx);
                                 this.show_info(key_enter.clone(), cx);
                             }
+                            Some(RowKeyAction::Profile) => {}
                             Some(RowKeyAction::Menu) => open_menu_key(this, cx),
                             None => {}
                         }
                     }))
                     .child(ringed(avatar, 22., who.speaking))
-                    .child(div().flex_1().min_w_0().truncate().child(who.name.clone()))
+                    .child(name_col)
+                    .children(channel_tag)
                     .children(gain_tag.map(|tag| div().flex_none().type_micro().text_color(if muted { theme::warning() } else { theme::text_faint() }).child(tag)))
+                    .children(hand_badge)
                     .children(watch_btn)
                     .children(camera_glyph)
                     .when(who.server_muted, |r| r.child(glyph("icons/mic-off.svg", 13., theme::danger())))
@@ -3221,7 +3367,17 @@ impl Shell {
             cx.notify();
             return;
         }
+        if conversation.network == Network::Telegram && self.telegram_is_group_or_channel(&conversation) {
+            self.telegram_join_group_call(conversation, None, false, cx);
+            return;
+        }
         self.call_begin(vec![Request::CallStart { conversation: conversation.clone() }], conversation, cx);
+    }
+
+    /// Places an outgoing 1:1 video call (`video: true` on `phone.requestCall`).
+    #[allow(dead_code)]
+    pub(in crate::gui) fn call_start_video(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        self.call_begin(vec![Request::CallStartVideo { conversation: conversation.clone() }], conversation, cx);
     }
 
     /// "Leave & call": leaves the call that is up, then starts the one that was asked for.
@@ -3495,7 +3651,7 @@ impl Shell {
                         if incoming {
                             this.call_decline(cx);
                         } else {
-                            this.call_leave(cx);
+                            this.telegram_leave_or_end(cx);
                         }
                     }))
                     .child(icon("icons/phone-off.svg", glyph(14.), theme::danger(), Some(("call-pill", theme::on_accent()))))
@@ -3517,7 +3673,7 @@ impl Shell {
                             .text_color(theme::text())
                             .hover(|style| style.bg(theme::selected()))
                             .tooltip(tip(format!("Start a {label} in {}", open.title), None))
-                            .on_click(cx.listener(move |this, _, _, cx| this.group_call_start(key.clone(), cx)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.telegram_open_start_confirm(key.clone(), cx)))
                             .child(icon("icons/phone.svg", glyph(14.), if phone { theme::text_soft() } else { theme::text() }, None))
                             .children(words(label.into())),
                     );
@@ -3715,6 +3871,8 @@ mod tests {
             streaming: false,
             camera: false,
             speaking: false,
+            hand_raised: false,
+            is_channel: false,
         };
         Occupants { people: names.iter().map(person).collect(), total, ..Occupants::default() }
     }
@@ -3871,6 +4029,8 @@ mod tests {
             protocol::Participant { id: "u3".into(), name: "Cam".into(), ringing: false, ..Default::default() },
         ];
         assert_eq!(call_people_count(&call), 3);
+        call.participants_count = 42;
+        assert_eq!(call_people_count(&call), 42);
     }
 
     #[test]

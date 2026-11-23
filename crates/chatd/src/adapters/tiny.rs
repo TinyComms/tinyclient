@@ -2072,8 +2072,8 @@ pub(crate) mod tests {
         });
         let hub = test_hub();
         with_session(&base, "owner", |account| {
-            let seat = protocol::Occupant { person: Key::new(&account, BEA), name: "Bea".into(), avatar: None, muted: true, deafened: false, server_muted: false, server_deafened: false, suppressed: false, speaking: false, streaming: false, camera: false };
-            hub.set_occupants(Key::new(&account, LOBBY), protocol::Occupants { people: vec![seat], total: 1, ..Default::default() });
+            let seat = protocol::Occupant { person: Key::new(&account, BEA), name: "Bea".into(), avatar: None, muted: true, deafened: false, server_muted: false, server_deafened: false, suppressed: false, speaking: false, streaming: false, camera: false, hand_raised: false, is_channel: false };
+            hub.set_occupants(Key::new(&account, LOBBY), protocol::Occupants { people: vec![seat], total: 1, ..protocol::Occupants::default() });
             hub.set_presence(Key::new(&account, BEA), Presence::Online, "", true);
             match community(&hub, account) {
                 Response::TinyCommunity { community } => {

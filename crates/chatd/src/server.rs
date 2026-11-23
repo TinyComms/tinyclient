@@ -4163,6 +4163,34 @@ impl Chat {
         self.status()
     }
 
+    /// Places a 1:1 video call (`video: true` on `phone.requestCall`).
+    fn call_start_video(&self, conversation: Key) -> Response {
+        if conversation.network == Network::Tiny {
+            return self.tiny_call_start(conversation);
+        }
+        match self.hub.store().conversation(&conversation) {
+            Ok(Some(row)) if row.call == CallSupport::Native => {}
+            Ok(Some(row)) if row.call == CallSupport::Handoff => {
+                return error(ErrorCode::Unsupported, format!("{} calls open in its own app.", conversation.network.label()))
+            }
+            Ok(Some(row)) if row.call == CallSupport::Restricted => {
+                return error(ErrorCode::Refused, "This person's privacy settings don't allow calls.")
+            }
+            Ok(Some(_)) => return error(ErrorCode::Unsupported, "This conversation has no calls tinyclient can join."),
+            Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
+            Err(err) => return internal(err),
+        }
+        if let Err(err) = self.hub.calls.start(&self.hub, conversation.clone()) {
+            return call_error(err);
+        }
+        let account = conversation.account();
+        self.command(&account, Command::CallJoinVideo(conversation.id));
+        if self.hub.settings().on(settings::JOIN_MUTED) {
+            self.command(&account, Command::CallAudio { muted: true, deafened: false });
+        }
+        self.status()
+    }
+
     /// A Tiny voice room is joined as before. A direct message the server can ring is a ring,
     /// with no mediad until it is accepted. An id this client has never stored is still joined
     /// as a room, which is how a room call is started.
@@ -6626,7 +6654,22 @@ impl Chat {
                 if let Err(err) = self.hub.set_setting(&scope, &key, value) {
                     return internal(err);
                 }
-                self.hub.calls.gain(&self.hub, &account, user_id, percent, muted);
+                self.hub.calls.gain(&self.hub, &account, user_id.clone(), percent, muted);
+                if account.network == Network::Telegram {
+                    if let (Some(call), true) = self.hub.calls.describe() {
+                        if call.conversation.account() == account {
+                            self.command(
+                                &account,
+                                Command::GroupCallParticipantGain {
+                                    conversation_id: call.conversation.id,
+                                    participant_id: user_id,
+                                    percent,
+                                    muted,
+                                },
+                            );
+                        }
+                    }
+                }
                 Response::Ok
             }
             // Only ever from the person's own click: nothing else turns a blocked call to clear.
@@ -6718,6 +6761,40 @@ impl Chat {
                 }
             }
             Request::CallStart { conversation } => self.call_start(conversation),
+            Request::CallStartVideo { conversation } => self.call_start_video(conversation),
+            Request::ConferenceResolve { account, slug } => {
+                match self.ask(&account, |reply| Command::ConferenceResolve { slug, reply }) {
+                    Ok(info) => Response::ConferenceInfo { info },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ConferenceCreate { account, video, join } => {
+                match self.ask(&account, |reply| Command::ConferenceCreate { video, join, reply }) {
+                    Ok(info) => Response::ConferenceInfo { info },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ConferenceJoin { account, slug, call_id, msg_id, video } => {
+                match self.ask(&account, |reply| Command::ConferenceJoin { slug, call_id, msg_id, video, reply }) {
+                    Ok(()) => self.status(),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ConferenceRemove { people, kick } => {
+                let Some(call) = self.hub.calls.describe().0 else {
+                    return error(ErrorCode::NoCall, "There is no active call.");
+                };
+                let conversation_id = call.conversation.id.clone();
+                match self.ask(&call.conversation.account(), |reply| Command::ConferenceRemove {
+                    conversation_id,
+                    people,
+                    kick,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CallAccept => self.call_accept(),
             // A ring waiting beside a call is declined on its own. Ending the call does not
             // take that ring into the slot, so the next call the user places is not that ring.
@@ -6894,6 +6971,171 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::GroupCallJoinAs { conversation } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallJoinAs {
+                    conversation_id,
+                    reply,
+                }) {
+                    Ok(peers) => Response::GroupCallJoinAs(peers),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallJoin { conversation, join_as, invite_hash, save_default } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallJoin {
+                    conversation_id,
+                    join_as,
+                    invite_hash,
+                    save_default,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallSaveDefaultJoinAs { conversation, peer_id } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallSaveDefaultJoinAs {
+                    conversation_id,
+                    peer_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallCreate { conversation, title, rtmp_stream, join } => {
+                let account = conversation.account();
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::GroupCallCreate {
+                    conversation_id,
+                    title,
+                    rtmp_stream,
+                    join,
+                    reply,
+                }) {
+                    Ok(target_id) => Response::GroupCallStarted {
+                        conversation: Key::new(&account, target_id),
+                    },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallEditTitle { conversation, title } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallEditTitle {
+                    conversation_id,
+                    title,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallDiscard { conversation } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallDiscard {
+                    conversation_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallInvite { conversation, users } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallInvite {
+                    conversation_id,
+                    users,
+                    reply,
+                }) {
+                    Ok(result) => Response::GroupCallInvited(result),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallExportInvite { conversation, can_self_unmute } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallExportInvite {
+                    conversation_id,
+                    can_self_unmute,
+                    reply,
+                }) {
+                    Ok(link) => Response::GroupCallInviteLink { link, speaker: can_self_unmute },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallSettings { conversation, join_muted, reset_invite_hash } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallSettings {
+                    conversation_id,
+                    join_muted,
+                    reset_invite_hash,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallRaiseHand { conversation, raised } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallRaiseHand {
+                    conversation_id,
+                    raised,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallModerate { conversation, participant_id, muted, remove } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallModerate {
+                    conversation_id,
+                    participant_id,
+                    muted,
+                    remove,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallRecord { conversation, start, video, video_portrait, title } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallRecord {
+                    conversation_id,
+                    start,
+                    video,
+                    video_portrait,
+                    title,
+                    reply,
+                }) {
+                    Ok((recording, notice)) => Response::GroupCallRecord { recording, notice },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallRtmpUrl { conversation, revoke } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallRtmpUrl {
+                    conversation_id,
+                    revoke,
+                    reply,
+                }) {
+                    Ok(rtmp) => Response::GroupCallRtmpUrl(rtmp),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallRtmpQuality { conversation, quality } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallRtmpQuality {
+                    conversation_id,
+                    quality,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Play(request) => {
                 let viewed = match &request {
                     protocol::PlayRequest::Start { conversation, message, .. } if !message.is_empty() => {
@@ -6958,6 +7200,30 @@ impl Chat {
                     MediaRequest::Watch { sources } => Some(Picture::WatchList(sources.clone())),
                     _ => None,
                 };
+                // Enforce Telegram group video limits (`can_start_video`, `unmuted_video_limit`, RTMP viewer) (#467, #454).
+                if let (Some(call), true) = self.hub.calls.describe() {
+                    if call.conversation.network == Network::Telegram {
+                        match &request {
+                            MediaRequest::Camera { on: true } => {
+                                let already = call.video.iter().any(|v| {
+                                    v.direction == protocol::Direction::Encode && v.content == protocol::Content::Camera
+                                });
+                                if let Some(reason) = call.video_limit_reason(already) {
+                                    return error(ErrorCode::Refused, reason);
+                                }
+                            }
+                            MediaRequest::ShareSend { on: true, .. } => {
+                                let already = call.video.iter().any(|v| {
+                                    v.direction == protocol::Direction::Encode && v.content == protocol::Content::Share
+                                });
+                                if let Some(reason) = call.video_limit_reason(already) {
+                                    return error(ErrorCode::Refused, reason);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let asked = match request {
                     // Joining is the adapter's to ask for, with what the network handed out.
                     MediaRequest::Join(_) | MediaRequest::Rejoin(_) => {
@@ -6966,11 +7232,11 @@ impl Chat {
                     MediaRequest::Meter { on } => self.hub.calls.meter(&self.hub, on),
                     request => self.hub.calls.request(&self.hub, &request).map(drop),
                 };
-                // A refusal never tells Discord we are sending. Other networks ignore the command.
+                // A refusal never tells the network we are sending. Other networks ignore the command.
                 if asked.is_ok() {
                     if let (Some(call), true) = self.hub.calls.describe() {
                         if let Some(picture) = picture {
-                            if matches!(call.conversation.network, Network::Discord | Network::Signal) {
+                            if matches!(call.conversation.network, Network::Discord | Network::Signal | Network::Telegram) {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
                             }
                         }
@@ -7884,9 +8150,10 @@ pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
             }
         };
         let chat = chat.clone();
-        // Authentication requests can exceed 256 KiB in debug builds as the request/status
-        // contract grows. Leave headroom so sign-in returns a reply instead of aborting chatd.
-        let spawned = std::thread::Builder::new().name("connection".into()).stack_size(1024 * 1024).spawn(move || {
+        // Authentication requests can exceed 1 MiB in debug builds as the request/status
+        // contract and scripted wire grow. Leave headroom so sign-in returns a reply instead of aborting chatd.
+        let stack = if cfg!(debug_assertions) { 4 * 1024 * 1024 } else { 1024 * 1024 };
+        let spawned = std::thread::Builder::new().name("connection".into()).stack_size(stack).spawn(move || {
             if let Err(err) = serve_connection(&chat, stream) {
                 tracing::warn!("chatd: connection: {err}");
             }

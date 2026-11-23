@@ -1204,6 +1204,23 @@ impl Floating {
                     }
                 })))
             }
+            Item::StartVideoChat => {
+                let row = conversation.cloned();
+                let words = if row.as_ref().is_some_and(|r| r.kind == protocol::ConversationKind::Channel) {
+                    "Start live stream…"
+                } else {
+                    "Start video chat…"
+                };
+                div().child(menu_item("menu-start-video-chat", Some("icons/phone.svg"), words, None).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(row) = row.clone() {
+                            this.shell_do(cx, move |shell, cx| {
+                                shell.telegram_open_start_confirm(row.key.clone(), cx);
+                            });
+                        }
+                    }),
+                ))
+            }
             Item::Leave => {
                 let row = conversation.cloned();
                 let words = if row.as_ref().is_some_and(|row| row.kind == protocol::ConversationKind::Group) { "Leave group" } else { "Leave" };

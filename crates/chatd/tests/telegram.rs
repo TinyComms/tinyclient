@@ -7063,6 +7063,987 @@ fn group_voice_chat_joins_muted_pages_participants_keepalives_mutes_speaks_and_l
 }
 
 #[test]
+fn group_call_join_as_channel_saves_default_switches_mid_call_and_shows_channel_participants() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_MEDIAD_AUDIO", "null")]);
+    world.connected();
+
+    world.steer("group-call-live-muted");
+    world.until("live muted group call seeded", || {
+        world.conversation("g8001")?.occupants.filter(|o| o.live && o.title == "Town Hall")
+    });
+
+    // Query allowed join-as peers: returns Me (u7001) and channel Field Notes (c9001).
+    let Response::GroupCallJoinAs(info) = world.ask(Request::GroupCallJoinAs { conversation: key("g8001") }) else {
+        panic!("expected GroupCallJoinAs response");
+    };
+    assert!(info.peers.iter().any(|p| p.id == "u7001" && p.is_self && p.name == "Me"));
+    assert!(info.peers.iter().any(|p| p.id == "c9001" && !p.is_self && p.name == "Field Notes"));
+    assert_eq!(info.default_peer, None);
+    assert!(!info.default_unknown);
+
+    // If full chat cannot be read, default_unknown is true so the UI asks rather than silently defaulting to Me.
+    world.steer("group-call-full-fail");
+    let Response::GroupCallJoinAs(unknown) = world.ask(Request::GroupCallJoinAs { conversation: key("g8001") }) else {
+        panic!("expected GroupCallJoinAs response");
+    };
+    assert!(unknown.default_unknown);
+    assert_eq!(unknown.default_peer, None);
+    world.steer("group-call-full-ok");
+
+    // Join as channel c9001 and save default for this chat.
+    assert_eq!(
+        world.ask(Request::GroupCallJoin {
+            conversation: key("g8001"),
+            join_as: Some("c9001".into()),
+            invite_hash: None,
+            save_default: true,
+        }),
+        Response::Ok
+    );
+    let joined_channel = world.until("joined as channel", || {
+        let call = current_call(&world)?;
+        (call.state == protocol::CallState::Joined && call.joined_as.as_deref() == Some("c9001")).then_some(call)
+    });
+    assert_eq!(joined_channel.joined_as.as_deref(), Some("c9001"));
+    assert!(calls_log_contains(&world, "SaveDefaultGroupCallJoinAs g8001 as=c9001"));
+    assert!(calls_log_contains(&world, "JoinGroupCall") && calls_log_contains(&world, "join_as=c9001"));
+
+    // Remembered default is returned on subsequent GetGroupCallJoinAs queries.
+    let Response::GroupCallJoinAs(remembered) = world.ask(Request::GroupCallJoinAs { conversation: key("g8001") }) else {
+        panic!("expected GroupCallJoinAs response");
+    };
+    assert_eq!(remembered.default_peer.as_deref(), Some("c9001"));
+    assert!(!remembered.default_unknown);
+
+    // Mid-call identity switch back to personal account leaves cleanly and rejoins with join_as=u7001.
+    assert_eq!(
+        world.ask(Request::GroupCallJoin {
+            conversation: key("g8001"),
+            join_as: Some("u7001".into()),
+            invite_hash: None,
+            save_default: false,
+        }),
+        Response::Ok
+    );
+    let switched = world.until("switched identity mid-call", || {
+        let call = current_call(&world)?;
+        (call.state == protocol::CallState::Joined && call.joined_as.as_deref() == Some("u7001")).then_some(call)
+    });
+    assert!(calls_log_contains(&world, "LeaveGroupCall"));
+    assert!(calls_log_contains(&world, "join_as=u7001"));
+    // Non-user channel participant is represented in the roster with is_channel=true.
+    world.steer("group-call-live-muted");
+    let _ = world.ask(Request::GroupCallJoin {
+        conversation: key("g8001"),
+        join_as: Some("u7001".into()),
+        invite_hash: None,
+        save_default: false,
+    });
+    let with_channel = world.until("channel participant visible in roster", || {
+        let call = current_call(&world)?;
+        call.participants.iter().any(|p| p.id == "c9001" && p.is_channel).then_some(call)
+    });
+    assert!(with_channel.participants.iter().any(|p| p.id == "c9001" && p.name == "Field Notes" && p.is_channel));
+    assert_eq!(switched.conversation, key("g8001"));
+
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("call ended", || current_call(&world).is_none().then_some(()));
+}
+
+#[test]
+fn group_call_invites_refusals_exported_links_reset_and_videochat_url_join() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[("TINYCLIENT_MEDIAD_AUDIO", "null"), ("TINYCLIENT_TELEGRAM_ADMIN", "1")],
+    );
+    world.connected();
+
+    world.steer("group-call-live");
+    world.until("live group call", || {
+        world.conversation("g8001")?.occupants.filter(|o| o.live)
+    });
+
+    // messageActionInviteToGroupCall maps to "... invited you to a video chat" with CallOutcome::Live for the Join action.
+    world.steer("group-call-invite-msg");
+    let inv_msg = world.until("invite service message", || {
+        world
+            .messages("g8001")
+            .into_iter()
+            .find(|m| m.text == "Odalys Brandt invited you to a video chat")
+    });
+    assert_eq!(inv_msg.kind, MessageKind::System);
+    assert_eq!(inv_msg.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Live));
+
+    // Inviting with empty list is refused (never invites without explicit selection).
+    assert!(matches!(
+        world.ask(Request::GroupCallInvite { conversation: key("g8001"), users: Vec::new() }),
+        Response::Error { .. }
+    ));
+
+    // Per-person refusals (privacy, not a member) are surfaced cleanly while valid users succeed.
+    world.steer("group-call-invite-refusals");
+    let Response::GroupCallInvited(inv_res) = world.ask(Request::GroupCallInvite {
+        conversation: key("g8001"),
+        users: vec!["u7002".into(), "u7003".into(), "u7012".into()],
+    }) else {
+        panic!("expected GroupCallInvited response");
+    };
+    assert_eq!(inv_res.invited, vec!["u7002".to_owned()]);
+    assert!(inv_res.refused.iter().any(|r| r.user_id == "u7003" && r.reason.contains("Privacy")));
+    assert!(inv_res.refused.iter().any(|r| r.user_id == "u7012" && r.reason.contains("not a member")));
+
+    // Export listener link and speaker link (admin).
+    let Response::GroupCallInviteLink { link: listener_link, speaker: listener_speaker } = world.ask(
+        Request::GroupCallExportInvite { conversation: key("g8001"), can_self_unmute: false },
+    ) else {
+        panic!("expected listener GroupCallInviteLink");
+    };
+    assert!(!listener_speaker);
+    assert!(listener_link.contains("rev1_listener"), "got {listener_link}");
+
+    let Response::GroupCallInviteLink { link: speaker_link, speaker: is_speaker } = world.ask(
+        Request::GroupCallExportInvite { conversation: key("g8001"), can_self_unmute: true },
+    ) else {
+        panic!("expected speaker GroupCallInviteLink");
+    };
+    assert!(is_speaker);
+    assert!(speaker_link.contains("rev1_speaker"), "got {speaker_link}");
+
+    // Admin link reset rotates the exported hash.
+    assert_eq!(
+        world.ask(Request::GroupCallSettings {
+            conversation: key("g8001"),
+            join_muted: None,
+            reset_invite_hash: true,
+        }),
+        Response::Ok
+    );
+    assert!(calls_log_contains(&world, "ToggleGroupCallSettings") && calls_log_contains(&world, "reset=true"));
+    let Response::GroupCallInviteLink { link: rotated, .. } = world.ask(
+        Request::GroupCallExportInvite { conversation: key("g8001"), can_self_unmute: true },
+    ) else {
+        panic!("expected rotated GroupCallInviteLink");
+    };
+    assert!(rotated.contains("rev2_speaker"), "got {rotated}");
+
+    // Opening a t.me/<name>?videochat=<hash> link resolves the chat and passes invite_hash into phone.joinGroupCall.
+    let hash = protocol::link::telegram_videochat_invite(&rotated)
+        .expect("videochat link")
+        .expect("invite hash");
+    assert_eq!(hash, "rev2_speaker");
+    let Response::Resolved { conversation: Some(resolved_conv), .. } =
+        world.ask(Request::Resolve { url: rotated.clone() })
+    else {
+        panic!("expected Resolved for {rotated}");
+    };
+    assert_eq!(resolved_conv, key("c9001"));
+
+    // Join g8001 with invite_hash -> passed directly to phone.joinGroupCall.
+    assert_eq!(
+        world.ask(Request::GroupCallJoin {
+            conversation: key("g8001"),
+            join_as: None,
+            invite_hash: Some(hash),
+            save_default: false,
+        }),
+        Response::Ok
+    );
+    world.until("joined with invite hash", || {
+        calls_log_contains(&world, "hash=rev2_speaker").then_some(())
+    });
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("call ended", || current_call(&world).is_none().then_some(()));
+}
+
+#[test]
+fn group_call_create_migration_rename_and_discard_gated_by_manage_call() {
+    // Non-admin cannot create, rename, or discard a video chat.
+    let non_admin = World::with(Some(SESSION), "30", &[("TINYCLIENT_MEDIAD_AUDIO", "null")]);
+    non_admin.connected();
+    let crew = non_admin.conversation("g8001").expect("g8001");
+    assert!(!crew.rights.manage_call);
+    assert!(matches!(
+        non_admin.ask(Request::GroupCallCreate {
+            conversation: key("g8001"),
+            title: Some("Unauthorized".into()),
+            rtmp_stream: false,
+            join: true,
+        }),
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        non_admin.ask(Request::GroupCallDiscard { conversation: key("g8001") }),
+        Response::Error { .. }
+    ));
+    drop(non_admin);
+
+    // Admin with manage_call creates a video chat, follows basic-group-to-supergroup migration,
+    // renames it, and ends it for everyone.
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[("TINYCLIENT_MEDIAD_AUDIO", "null"), ("TINYCLIENT_TELEGRAM_ADMIN", "1")],
+    );
+    world.connected();
+    assert!(world.conversation("g8001").expect("g8001").rights.manage_call);
+
+    world.steer("group-call-migrate-next");
+    let Response::GroupCallStarted { conversation: started_conv } = world.ask(Request::GroupCallCreate {
+        conversation: key("g8001"),
+        title: Some("Summit sync".into()),
+        rtmp_stream: false,
+        join: true,
+    }) else {
+        panic!("expected GroupCallStarted");
+    };
+    assert_eq!(started_conv, key("c9002"), "must follow basic-group-to-supergroup migration");
+    assert!(calls_log_contains(&world, "MigrateChat g8001"));
+    assert!(calls_log_contains(&world, "CreateGroupCall c9002"));
+
+    let joined = world.until("joined migrated video chat with title", || {
+        let call = current_call(&world)?;
+        (call.conversation == key("c9002")
+            && call.state == protocol::CallState::Joined
+            && call.title == "Summit sync")
+            .then_some(call)
+    });
+    assert_eq!(joined.title, "Summit sync");
+
+    // Rename updates both the call header (Call::title) and live call bar (Occupants::title).
+    assert_eq!(
+        world.ask(Request::GroupCallEditTitle {
+            conversation: key("c9002"),
+            title: "Afternoon debrief".into(),
+        }),
+        Response::Ok
+    );
+    assert!(calls_log_contains(&world, "EditGroupCallTitle") && calls_log_contains(&world, "Afternoon debrief"));
+    world.until("call title updated", || {
+        let call = current_call(&world)?;
+        let occ = world.conversation("c9002")?.occupants?;
+        (call.title == "Afternoon debrief" && occ.title == "Afternoon debrief").then_some(())
+    });
+
+    // End for everyone discards the group call and clears both active call and occupants.
+    assert_eq!(
+        world.ask(Request::GroupCallDiscard { conversation: key("c9002") }),
+        Response::Ok
+    );
+    assert!(calls_log_contains(&world, "DiscardGroupCall"));
+    world.until("discarded call cleared everywhere", || {
+        (current_call(&world).is_none()
+            && world.conversation("c9002").is_some_and(|c| c.occupants.is_none()))
+            .then_some(())
+    });
+}
+
+#[test]
+fn group_call_listener_raise_hand_allow_speak_admin_mute_remove_and_join_muted() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[("TINYCLIENT_MEDIAD_AUDIO", "null"), ("TINYCLIENT_TELEGRAM_ADMIN", "1")],
+    );
+    world.connected();
+
+    world.steer("group-call-live-muted");
+    world.until("live muted call seeded", || {
+        world.conversation("g8001")?.occupants.filter(|o| o.live && o.total == 12)
+    });
+
+    // Join muted listener call -> suppressed=true, participants_count=12, ordered speakers -> raised hands -> listeners.
+    assert_eq!(
+        world.ask(Request::GroupCallJoin {
+            conversation: key("g8001"),
+            join_as: None,
+            invite_hash: None,
+            save_default: false,
+        }),
+        Response::Ok
+    );
+    let call = world.until("joined suppressed with full roster", || {
+        let c = current_call(&world)?;
+        (c.state == protocol::CallState::Joined
+            && c.suppressed
+            && c.muted
+            && c.participants_count == 12
+            && c.participants.len() == 4)
+            .then_some(c)
+    });
+    assert!(call.join_muted && call.can_change_join_muted);
+    let ids: Vec<&str> = call.participants.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, vec!["u7002", "c9001", "u7003", "u7012"]);
+    assert_eq!(call.participants[0].about, "Lead guide");
+    assert!(call.participants[1].is_channel);
+    assert!(call.participants[2].suppressed && call.participants[2].hand_raised);
+    assert!(call.participants[3].suppressed && !call.participants[3].hand_raised && call.participants[3].muted_by_you);
+
+    // Raise hand while suppressed -> phone.editGroupCallParticipant(raise_hand=true).
+    assert_eq!(
+        world.ask(Request::GroupCallRaiseHand { conversation: key("g8001"), raised: true }),
+        Response::Ok
+    );
+    world.until("hand raised reflected on call", || {
+        current_call(&world).filter(|c| c.hand_raised && c.suppressed)
+    });
+    assert!(calls_log_contains(&world, "raise_hand=Some(true)"));
+
+    // Admin allows us to speak -> updateGroupCallParticipants clears suppressed immediately.
+    world.steer("group-call-allow-me");
+    world.until("allowed to speak clears suppressed", || {
+        current_call(&world).filter(|c| !c.suppressed && !c.hand_raised)
+    });
+
+    // Admin mutes us back -> suppressed=true again.
+    world.steer("group-call-mute-me");
+    world.until("admin muted us back to suppressed", || {
+        current_call(&world).filter(|c| c.suppressed && c.muted)
+    });
+
+    // Admin allows Tobin (u7003) to speak, mutes Odalys (u7002), and toggles join_muted=false.
+    assert_eq!(
+        world.ask(Request::GroupCallModerate {
+            conversation: key("g8001"),
+            participant_id: "u7003".into(),
+            muted: Some(false),
+            remove: false,
+        }),
+        Response::Ok
+    );
+    world.until("Tobin allowed to speak", || {
+        let c = current_call(&world)?;
+        c.participants.iter().find(|p| p.id == "u7003").filter(|p| !p.suppressed && !p.hand_raised).map(|_| ())
+    });
+
+    assert_eq!(
+        world.ask(Request::GroupCallModerate {
+            conversation: key("g8001"),
+            participant_id: "u7002".into(),
+            muted: Some(true),
+            remove: false,
+        }),
+        Response::Ok
+    );
+    world.until("Odalys muted by admin", || {
+        let c = current_call(&world)?;
+        c.participants.iter().find(|p| p.id == "u7002").filter(|p| p.suppressed && p.muted).map(|_| ())
+    });
+
+    assert_eq!(
+        world.ask(Request::GroupCallSettings {
+            conversation: key("g8001"),
+            join_muted: Some(false),
+            reset_invite_hash: false,
+        }),
+        Response::Ok
+    );
+    world.until("join_muted toggled off", || {
+        current_call(&world).filter(|c| !c.join_muted)
+    });
+
+    // Admin removes Nia (u7012) from the group (DeleteChatUser).
+    assert_eq!(
+        world.ask(Request::GroupCallModerate {
+            conversation: key("g8001"),
+            participant_id: "u7012".into(),
+            muted: None,
+            remove: true,
+        }),
+        Response::Ok
+    );
+    assert!(calls_log_contains(&world, "DeleteChatUser g8001"));
+    world.until("Nia removed from participants", || {
+        let c = current_call(&world)?;
+        (!c.participants.iter().any(|p| p.id == "u7012")).then_some(())
+    });
+
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("call ended", || current_call(&world).is_none().then_some(()));
+}
+
+#[test]
+fn wave16b2_recording_volume_camera_share_limits_and_rtmp_streams() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[
+            ("TINYCLIENT_TELEGRAM_CHECK_MS", "2500"),
+            ("TINYCLIENT_TELEGRAM_GAIN_DEBOUNCE_MS", "60"),
+            ("TINYCLIENT_TELEGRAM_RTMP_POLL_MS", "60"),
+            ("TINYCLIENT_MEDIAD_AUDIO", "null"),
+            ("TINYCLIENT_TELEGRAM_ADMIN", "1"),
+        ],
+    );
+    world.connected();
+    let account = key("g8001").account();
+
+    // ---------------------------------------------------------------------
+    // #463: Recording indicator via updateGroupCall + admin start/stop
+    // ---------------------------------------------------------------------
+    world.steer("group-call-live");
+    world.until("live group call banner appears", || {
+        world
+            .conversation("g8001")?
+            .occupants
+            .filter(|o| o.live && o.record_start_date.is_none())
+    });
+
+    // Recording starts before joining -> live bar immediately reflects record_start_date & video active.
+    world.steer("group-call-record-start");
+    let rec_occ = world.until("live bar shows recording indicator", || {
+        world
+            .conversation("g8001")?
+            .occupants
+            .filter(|o| o.record_start_date.is_some() && o.record_video_active)
+    });
+    assert!(rec_occ.record_start_date.is_some());
+
+    // Joining an already-recording chat immediately surfaces record_start_date on Call before unmuting.
+    assert_eq!(
+        world.ask(Request::GroupCallJoin {
+            conversation: key("g8001"),
+            join_as: None,
+            invite_hash: None,
+            save_default: false,
+        }),
+        Response::Ok
+    );
+    let call = world.until("joined already-recording chat shows recording dot while muted", || {
+        current_call(&world).filter(|c| {
+            c.state == protocol::CallState::Joined
+                && c.muted
+                && c.record_start_date.is_some()
+                && c.record_video_active
+        })
+    });
+    assert!(call.record_start_date.is_some());
+
+    // Admin stops recording -> phone.toggleGroupCallRecord(start=false) + Saved Messages notice.
+    let stop_resp = world.ask(Request::GroupCallRecord {
+        conversation: key("g8001"),
+        start: false,
+        video: false,
+        video_portrait: None,
+        title: None,
+    });
+    match stop_resp {
+        Response::GroupCallRecord { recording, notice } => {
+            assert!(!recording);
+            assert!(notice.as_deref().unwrap_or("").contains("Saved Messages"));
+        }
+        other => panic!("expected GroupCallRecord stop response, got {other:?}"),
+    }
+    world.until("recording cleared on Call", || {
+        current_call(&world).filter(|c| c.record_start_date.is_none() && !c.record_video_active)
+    });
+    assert!(calls_log_contains(&world, "ToggleGroupCallRecord"));
+
+    // Admin starts recording with title & portrait video -> sends expected flags.
+    let start_resp = world.ask(Request::GroupCallRecord {
+        conversation: key("g8001"),
+        start: true,
+        video: true,
+        video_portrait: Some(true),
+        title: Some("Summit debrief".into()),
+    });
+    assert!(matches!(start_resp, Response::GroupCallRecord { recording: true, .. }));
+    world.until("recording active again on Call", || {
+        current_call(&world).filter(|c| c.record_start_date.is_some() && c.record_video_active)
+    });
+    assert!(calls_log_contains(
+        &world,
+        "start=true video=true portrait=Some(true) title=Some(\"Summit debrief\")"
+    ));
+
+    // ---------------------------------------------------------------------
+    // #468: Per-person volume (5000 -> 50%), debounced slider sync, separate Mute for me
+    // ---------------------------------------------------------------------
+    world.steer("group-call-volume-5000");
+    world.until("participant volume 5000 mapped to 50%", || {
+        let c = current_call(&world)?;
+        c.participants
+            .iter()
+            .find(|p| p.id == "u7002")
+            .filter(|p| p.volume == Some(50))
+            .map(|_| ())
+    });
+
+    // Rapid slider drags coalesce into a single debounced editGroupCallParticipant with final volume.
+    for pct in [60u16, 80, 120, 140] {
+        assert_eq!(
+            world.ask(Request::CallGain {
+                account: account.clone(),
+                user_id: "u7002".into(),
+                percent: pct,
+                muted: false,
+            }),
+            Response::Ok
+        );
+    }
+    world.until("debounced volume=14000 sent to Telegram", || {
+        calls_log_contains(&world, "target=u7002 muted=None volume=Some(14000)").then_some(())
+    });
+    // Intermediate values were coalesced away.
+    assert!(!calls_log_contains(&world, "volume=Some(6000)"));
+
+    // CRITICAL (#468): Admin clicking "Mute for me" (CallGain muted=true) MUST NOT send muted=Some(true)
+    // to Telegram (which would mute Odalys for everyone).
+    assert_eq!(
+        world.ask(Request::CallGain {
+            account: account.clone(),
+            user_id: "u7002".into(),
+            percent: 140,
+            muted: true,
+        }),
+        Response::Ok
+    );
+    world.until("admin local mute sends volume=Some(1) with muted=None, never muting for everyone", || {
+        calls_log_contains(&world, "target=u7002 muted=None volume=Some(1)").then_some(())
+    });
+    assert!(
+        !calls_log_contains(&world, "target=u7002 muted=Some(true)"),
+        "admin local mute must never send server mute-for-everyone"
+    );
+
+    // ---------------------------------------------------------------------
+    // #467: Camera, screen share presentation, remote multi-video, & video limit
+    // ---------------------------------------------------------------------
+    // Remote camera (Odalys) and screen share presentation (Tobin) arrive.
+    world.steer("group-call-remote-videos");
+    world.until("remote camera and presentation streams tracked on participants", || {
+        let c = current_call(&world)?;
+        let odalys = c.participants.iter().find(|p| p.id == "u7002")?;
+        let tobin = c.participants.iter().find(|p| p.id == "u7003")?;
+        (odalys.camera && !odalys.video_paused && tobin.sharing && !tobin.presentation_paused).then_some(())
+    });
+
+    // Turn local camera on -> sends video_stopped=Some(false).
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::Camera { on: true })),
+        Response::Status { .. }
+    ));
+    world.until("camera editGroupCallParticipant sent", || {
+        calls_log_contains(&world, "video_stopped=Some(false)").then_some(())
+    });
+
+    // Start screen share -> phone.joinGroupCallPresentation + presentation_paused=Some(false).
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::ShareSend {
+            on: true,
+            screen: None,
+            quality: None,
+            show_cursor: None,
+            sound: None,
+            preview: None,
+        })),
+        Response::Status { .. }
+    ));
+    world.until("JoinGroupCallPresentation sent", || {
+        calls_log_contains(&world, "JoinGroupCallPresentation").then_some(())
+    });
+
+    // Stop screen share -> phone.leaveGroupCallPresentation.
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::ShareSend {
+            on: false,
+            screen: None,
+            quality: None,
+            show_cursor: None,
+            sound: None,
+            preview: None,
+        })),
+        Response::Status { .. }
+    ));
+    world.until("LeaveGroupCallPresentation sent", || {
+        calls_log_contains(&world, "LeaveGroupCallPresentation").then_some(())
+    });
+
+    // Turn camera off before testing video limit.
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::Camera { on: false })),
+        Response::Status { .. }
+    ));
+
+    // Server signals unmuted_video_limit reached (can_start_video=false, 4 of 4) -> Camera & ShareSend refused.
+    world.steer("group-call-video-limit");
+    world.until("video limit reflected on Call", || {
+        current_call(&world).filter(|c| !c.can_start_video && c.unmuted_video_limit == 4 && c.unmuted_video_count == 4)
+    });
+    match world.ask(Request::Media(protocol::MediaRequest::Camera { on: true })) {
+        Response::Error { detail, .. } => assert!(detail.contains("4 of 4"), "unexpected reason: {detail}"),
+        other => panic!("expected Camera refused at video limit, got {other:?}"),
+    }
+    match world.ask(Request::Media(protocol::MediaRequest::ShareSend {
+        on: true,
+        screen: None,
+        quality: None,
+        show_cursor: None,
+        sound: None,
+        preview: None,
+    })) {
+        Response::Error { detail, .. } => assert!(detail.contains("4 of 4"), "unexpected reason: {detail}"),
+        other => panic!("expected ShareSend refused at video limit, got {other:?}"),
+    }
+
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("group call ended before RTMP test", || current_call(&world).is_none().then_some(()));
+
+    // ---------------------------------------------------------------------
+    // #454: Channel RTMP live stream — key fetch/revoke (never logged), live bar, watch, quality, pause
+    // ---------------------------------------------------------------------
+    let rtmp1 = match world.ask(Request::GroupCallRtmpUrl {
+        conversation: key("c9001"),
+        revoke: false,
+    }) {
+        Response::GroupCallRtmpUrl(info) => info,
+        other => panic!("expected GroupCallRtmpUrl, got {other:?}"),
+    };
+    assert!(rtmp1.url.starts_with("rtmps://"));
+    assert!(!rtmp1.key.is_empty());
+    assert!(
+        !calls_log_contains(&world, &rtmp1.key),
+        "RTMP stream key must NEVER appear in logs"
+    );
+
+    let rtmp2 = match world.ask(Request::GroupCallRtmpUrl {
+        conversation: key("c9001"),
+        revoke: true,
+    }) {
+        Response::GroupCallRtmpUrl(info) => info,
+        other => panic!("expected revoked GroupCallRtmpUrl, got {other:?}"),
+    };
+    assert_ne!(rtmp1.key, rtmp2.key);
+    assert!(calls_log_contains(&world, "GetGroupCallStreamRtmpUrl c9001 revoke=true"));
+    assert!(
+        !calls_log_contains(&world, &rtmp2.key),
+        "revoked RTMP stream key must NEVER appear in logs"
+    );
+
+    // Channel goes live with rtmp_stream=true and 42 viewers.
+    world.steer("group-call-rtmp-live");
+    let rtmp_occ = world.until("channel live bar shows RTMP live stream with viewer count", || {
+        world
+            .conversation("c9001")?
+            .occupants
+            .filter(|o| o.live && o.rtmp_stream && o.total == 42)
+    });
+    assert!(rtmp_occ.rtmp_stream && rtmp_occ.total == 42);
+
+    // Join as viewer -> suppressed (cannot speak), fetches GetGroupCallStreamChannels + inputGroupCallStream segment.
+    assert_eq!(
+        world.ask(Request::GroupCallJoin {
+            conversation: key("c9001"),
+            join_as: None,
+            invite_hash: None,
+            save_default: false,
+        }),
+        Response::Ok
+    );
+    let rtmp_call = world.until("watching RTMP stream as suppressed viewer with Live state", || {
+        current_call(&world).filter(|c| {
+            c.state == protocol::CallState::Joined
+                && c.rtmp_stream
+                && c.suppressed
+                && c.rtmp_state == Some(protocol::RtmpStreamState::Live)
+        })
+    });
+    assert_eq!(rtmp_call.rtmp_quality, Some(1));
+    assert!(calls_log_contains(&world, "GetGroupCallStreamChannels"));
+    assert!(calls_log_contains(&world, "GetFile stream"));
+
+    // Switch quality to High (2) -> fetches segment with q=Some(2).
+    assert_eq!(
+        world.ask(Request::GroupCallRtmpQuality { conversation: key("c9001"), quality: 2 }),
+        Response::Ok
+    );
+    world.until("RTMP quality switched to High and fetched with q=Some(2)", || {
+        (current_call(&world).is_some_and(|c| c.rtmp_quality == Some(2))
+            && calls_log_contains(&world, "q=Some(2)"))
+            .then_some(())
+    });
+
+    // Stream pauses -> TIME_TOO_BIG transitions Call.rtmp_state to Paused.
+    world.steer("group-call-rtmp-pause");
+    world.until("RTMP stream transitions to Paused state", || {
+        current_call(&world).filter(|c| c.rtmp_state == Some(protocol::RtmpStreamState::Paused))
+    });
+
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("RTMP viewer ended cleanly", || current_call(&world).is_none().then_some(()));
+}
+
+#[test]
+fn direct_video_call_camera_toggle_and_remote_paused_low_battery() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[("TINYCLIENT_MEDIAD_AUDIO", "tone"), ("TINYCLIENT_MEDIAD_PICTURE", "pattern")],
+    );
+    world.connected();
+
+    // 1. Place outgoing 1:1 video call (`video: true` on `phone.requestCall`).
+    assert!(matches!(world.ask(Request::CallStartVideo { conversation: key("u7002") }), Response::Status { .. }));
+    world.until("RequestCall video=true logged", || {
+        calls_log_contains(&world, "RequestCall u7002 video=true").then_some(())
+    });
+
+    // 2. Peer accepts -> confirmCall -> Joined with 4 E2EE emoji.
+    world.steer("call-accept-out");
+    let joined = world.until("1:1 video call joined with 4 emoji", || {
+        let call = current_call(&world)?;
+        let sec = call.security.as_ref()?;
+        (call.state == protocol::CallState::Joined && sec.emojis.len() == 4).then_some(call)
+    });
+    assert_eq!(joined.conversation, key("u7002"));
+
+    // 3. Toggle camera on -> mediad sends encrypted signaling update.
+    assert!(matches!(world.ask(Request::Media(protocol::MediaRequest::Camera { on: true })), Response::Status { .. }));
+    world.until("camera signaling transmitted", || {
+        world.calls().iter().filter(|l| l.contains("SendSignalingData")).count() >= 2
+    }.then_some(()));
+
+    // 4. Remote peer reports camera paused + low battery over encrypted signaling.
+    world.steer("call-peer-paused-low-battery");
+    let paused = world.until("remote camera paused and low_battery reflected", || {
+        let call = current_call(&world)?;
+        let peer = call.participants.iter().find(|p| p.id == "u7002")?;
+        (peer.camera && peer.camera_paused && peer.low_battery && call.stream_paused).then_some(call)
+    });
+    assert!(paused.stream_paused);
+
+    // 5. Hang up sends DiscardCall with `video=true`.
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("video call cleared", || current_call(&world).is_none().then_some(()));
+    world.until("DiscardCall video=true logged", || {
+        calls_log_contains(&world, "reason=hangup video=true").then_some(())
+    });
+}
+
+#[test]
+fn direct_screen_share_with_sound_updates_sharing_and_notifies_stop() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[
+            ("TINYCLIENT_MEDIAD_AUDIO", "tone"),
+            ("TINYCLIENT_MEDIAD_PICTURE", "pattern"),
+            ("TINYCLIENT_MEDIAD_SCREEN", "null"),
+            ("TINYCLIENT_SHARE_AUDIO", "tone"),
+        ],
+    );
+    world.connected();
+
+    assert!(matches!(world.ask(Request::CallStart { conversation: key("u7002") }), Response::Status { .. }));
+    world.until("outgoing call ringing", || {
+        current_call(&world).filter(|c| c.state == protocol::CallState::RingingOut)
+    });
+    world.steer("call-accept-out");
+    world.until("1:1 call joined", || {
+        current_call(&world).filter(|c| c.state == protocol::CallState::Joined)
+    });
+
+    // 1. Start screen share with sound enabled (`ShareSend.sound = Some(true)`).
+    let sig_before = world.calls().iter().filter(|l| l.contains("SendSignalingData")).count();
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::ShareSend {
+            on: true,
+            screen: None,
+            quality: Some(protocol::ShareQuality::Low),
+            show_cursor: Some(true),
+            sound: Some(true),
+            preview: None,
+        })),
+        Response::Status { .. }
+    ));
+    world.until("share start signaling sent", || {
+        (world.calls().iter().filter(|l| l.contains("SendSignalingData")).count() > sig_before).then_some(())
+    });
+
+    // 2. Peer starts screen share -> `Participant::sharing` flips true; peer stops -> flips false.
+    world.steer("call-peer-share-start");
+    world.until("peer sharing reflected in roster", || {
+        let call = current_call(&world)?;
+        call.participants.iter().find(|p| p.id == "u7002")?.sharing.then_some(())
+    });
+    world.steer("call-peer-share-stop");
+    world.until("peer sharing cleared on stop", || {
+        let call = current_call(&world)?;
+        (!call.participants.iter().find(|p| p.id == "u7002")?.sharing).then_some(())
+    });
+
+    // 3. Stop our screen share -> stop signaling sent and call ends cleanly with video=true.
+    let sig_mid = world.calls().iter().filter(|l| l.contains("SendSignalingData")).count();
+    assert!(matches!(
+        world.ask(Request::Media(protocol::MediaRequest::ShareSend {
+            on: false,
+            screen: None,
+            quality: None,
+            show_cursor: None,
+            sound: None,
+            preview: None,
+        })),
+        Response::Status { .. }
+    ));
+    world.until("share stop signaling sent", || {
+        (world.calls().iter().filter(|l| l.contains("SendSignalingData")).count() > sig_mid).then_some(())
+    });
+
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("call ended cleanly", || current_call(&world).is_none().then_some(()));
+}
+
+#[test]
+fn encrypted_conference_call_link_upgrade_emoji_update_and_fail_closed() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[("TINYCLIENT_MEDIAD_AUDIO", "tone")],
+    );
+    world.connected();
+
+    // 1. Incoming `messageActionConferenceCall` maps to a call row with participants AND rings;
+    // declining calls `phone.declineConferenceCallInvite`.
+    let account = key("u7002").account();
+    world.steer("conf-invite-in");
+    world.until("conference call row with participants stored", || {
+        let Response::Messages { messages, .. } = world.ask(Request::Messages {
+            conversation: key("u7002"),
+            page: protocol::Page::Newest,
+            limit: 10,
+        }) else {
+            return None;
+        };
+        messages.into_iter().find(|m| {
+            m.call
+                .as_ref()
+                .is_some_and(|n| n.outcome == protocol::CallOutcome::Live && n.participants.len() == 2 && n.call_id.is_some())
+        })
+    });
+    world.until("conference invite ringing", || {
+        current_call(&world).filter(|c| matches!(c.state, protocol::CallState::RingingIn { .. }) && c.incoming_video)
+    });
+    assert!(matches!(world.ask(Request::CallDecline), Response::Status { .. }));
+    world.until("declineConferenceCallInvite sent", || {
+        calls_log_contains(&world, "DeclineConferenceCallInvite").then_some(())
+    });
+    world.until("ring cleared after decline", || current_call(&world).is_none().then_some(()));
+
+    // 2. Resolve `t.me/call/ridge-sync` via `phone.getGroupCall(inputGroupCallSlug)` without joining.
+    world.steer("conf-seed-slug");
+    let Response::ConferenceInfo { info } = world.ask(Request::ConferenceResolve {
+        account: account.clone(),
+        slug: "ridge-sync".to_owned(),
+    }) else {
+        panic!("expected ConferenceInfo");
+    };
+    assert_eq!(info.slug, "ridge-sync");
+    assert!(info.e2ee);
+    assert_eq!(info.participants_count, 2);
+    assert!(calls_log_contains(&world, "GetGroupCall slug=ridge-sync"));
+    assert!(current_call(&world).is_none(), "resolve must not auto-join");
+
+    // 3. Join the conference -> verifies chain blocks, joins, broadcasts, and shows 4 verification emoji.
+    assert!(matches!(
+        world.ask(Request::ConferenceJoin {
+            account: account.clone(),
+            slug: Some("ridge-sync".to_owned()),
+            call_id: None,
+            msg_id: None,
+            video: false,
+        }),
+        Response::Status { .. }
+    ));
+    let joined = world.until("conference joined with 4 E2EE emojis", || {
+        let call = current_call(&world)?;
+        let sec = call.security.as_ref()?;
+        (call.state == protocol::CallState::Joined
+            && sec.mode == protocol::SecurityMode::EndToEnd
+            && sec.emojis.len() == 4)
+            .then_some(call)
+    });
+    let emojis_before = joined.security.as_ref().unwrap().emojis.clone();
+    assert_eq!(joined.invite_link.as_deref(), Some("https://t.me/call/ridge-sync"));
+    assert!(calls_log_contains(&world, "GetGroupCallChainBlocks"));
+    assert!(calls_log_contains(&world, "SendConferenceCallBroadcast"));
+
+    // 4. Membership change (`updateGroupCallChainBlocks`) MUST update the 4 verification emoji.
+    world.steer("conf-member-join");
+    let updated = world.until("4 emojis updated on membership change", || {
+        let call = current_call(&world)?;
+        let sec = call.security.as_ref()?;
+        (sec.mode == protocol::SecurityMode::EndToEnd && sec.emojis.len() == 4 && sec.emojis != emojis_before)
+            .then_some(call)
+    });
+    assert_ne!(updated.security.as_ref().unwrap().emojis, emojis_before);
+
+    // 5. Removing a participant sends `phone.deleteConferenceCallParticipants`.
+    assert!(matches!(
+        world.ask(Request::ConferenceRemove { people: vec!["u7003".to_owned()], kick: true }),
+        Response::Ok
+    ));
+    world.until("deleteConferenceCallParticipants logged", || {
+        calls_log_contains(&world, "DeleteConferenceCallParticipants").then_some(())
+    });
+
+    // 6. Tampered `updateGroupCallChainBlocks` FAILS CLOSED (Blocked, required=true, LeaveGroupCall).
+    world.steer("conf-tampered-update");
+    let failed = world.until("tampered chain block failed closed", || {
+        let call = current_call(&world)?;
+        let sec = call.security.as_ref()?;
+        (sec.mode == protocol::SecurityMode::Blocked
+            && sec.required
+            && matches!(call.state, protocol::CallState::Failed { reason: protocol::CallFailure::Encryption, .. }))
+            .then_some(call)
+    });
+    assert!(failed.security.as_ref().unwrap().emojis.is_empty());
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("failed conference dismissed", || current_call(&world).is_none().then_some(()));
+
+    // 7. Joining a conference with a tampered genesis chain block REFUSES TO JOIN before JoinGroupCall!
+    let joins_before = world.calls().iter().filter(|l| l.contains("JoinGroupCall")).count();
+    world.steer("conf-seed-tampered");
+    let refused = world.ask(Request::ConferenceJoin {
+        account: account.clone(),
+        slug: Some("bad-chain".to_owned()),
+        call_id: None,
+        msg_id: None,
+        video: false,
+    });
+    assert!(matches!(refused, Response::Error { .. }), "tampered conference join must be refused: {refused:?}");
+    let joins_after = world.calls().iter().filter(|l| l.contains("JoinGroupCall")).count();
+    assert_eq!(joins_before, joins_after, "must NEVER call JoinGroupCall when chain verification fails");
+
+    // 8. Adding people to a running 1:1 call upgrades it cleanly into an encrypted conference!
+    assert!(matches!(world.ask(Request::CallStart { conversation: key("u7002") }), Response::Status { .. }));
+    world.until("1:1 call ringing out", || {
+        current_call(&world).filter(|c| c.state == protocol::CallState::RingingOut)
+    });
+    world.steer("call-accept-out");
+    world.until("1:1 call joined before upgrade", || {
+        current_call(&world).filter(|c| c.conversation == key("u7002") && c.state == protocol::CallState::Joined)
+    });
+    let upgraded = world.ask(Request::CallAddPeople { people: vec!["u7003".to_owned()] });
+    assert!(matches!(upgraded, Response::Conversation { .. } | Response::Ok), "unexpected upgrade response: {upgraded:?}");
+    world.until("1:1 upgraded to encrypted conference", || {
+        let call = current_call(&world)?;
+        let sec = call.security.as_ref()?;
+        (call.conversation.id.starts_with("conf:")
+            && call.state == protocol::CallState::Joined
+            && sec.mode == protocol::SecurityMode::EndToEnd
+            && sec.emojis.len() == 4
+            && call.invite_link.is_some())
+            .then_some(call)
+    });
+    assert!(calls_log_contains(&world, "CreateConferenceCall"));
+    assert!(calls_log_contains(&world, "InviteConferenceCallParticipant"));
+    assert!(calls_log_contains(&world, "reason=migrate_conference"));
+
+    assert!(matches!(world.ask(Request::CallEnd), Response::Status { .. }));
+    world.until("upgraded conference ended", || current_call(&world).is_none().then_some(()));
+}
+
+#[test]
 fn stories_never_read_before_open_then_read_react_reply_and_forwarded_story() {
     let world = World::signed_in();
     world.connected();

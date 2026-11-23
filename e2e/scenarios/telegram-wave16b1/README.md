@@ -1,0 +1,8 @@
+# Telegram group call / video chat controls (Wave 16B1)
+
+Covers `#460`, `#459`, `#466`, and `#464`:
+
+- **#460 (Join as channel)**: Queries `phone.getGroupCallJoinAs` and `groupcall_default_join_as`, skips the picker when only the personal account is eligible, prompts when the full chat cannot be read, saves per-chat defaults via `phone.saveDefaultGroupCallJoinAs`, renders non-user channel participants without opening user profiles, and supports mid-call identity switching.
+- **#459 (Invites & links)**: Maps `messageActionInviteToGroupCall` service rows with a Join action, invites explicitly selected users via `phone.inviteToGroupCall` with per-person refusal reporting, exports listener and admin speaker links via `phone.exportGroupCallInvite`, resets invite hashes via `phone.toggleGroupCallSettings`, and opens `t.me/<name>?videochat[=hash]` / `?voicechat` / `?livestream` links carrying `invite_hash` into `phone.joinGroupCall`.
+- **#466 (Start, rename, end)**: Gates video chat creation, renaming (`phone.editGroupCallTitle`), and ending for everyone (`phone.discardGroupCall`) on `manage_call`, shows a confirmation dialog with optional title and RTMP placeholder before starting, and follows basic-group-to-supergroup migration on start.
+- **#464 (Raise hand, roles & moderation)**: Tracks listener/speaker suppression (`muted && !can_self_unmute`), turns the mic button into Raise hand / Lower hand while suppressed, keeps `mediad` silent while suppressed, orders the roster as speakers -> raised hands -> listeners, displays `participants_count`, and provides admin Mute / Allow to speak / Remove & ban from group controls plus the `join_muted` toggle.

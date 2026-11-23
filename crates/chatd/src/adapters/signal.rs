@@ -3645,6 +3645,8 @@ fn publish_group_call_state(account: &Account, conversation: &str) {
                     streaming: st.sharing,
                     camera: st.camera,
                     speaking: false,
+                    hand_raised: st.hand_raised,
+                    is_channel: false,
                 }
             })
             .collect();

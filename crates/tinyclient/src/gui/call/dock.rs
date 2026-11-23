@@ -936,10 +936,11 @@ impl Shell {
     }
 
     /// Share and camera belong on a joined call that allows video (`Call::video_allowed`) on a
-    /// network that carries it (Tiny, Discord, or Signal).
+    /// network that carries it (Tiny, Discord, Signal, or Telegram — excluding RTMP viewer streams).
     fn call_pictures(&self, call: &Call) -> bool {
         call.state == CallState::Joined
             && call.video_allowed
+            && !call.rtmp_stream
             && protocol::call_pictures(call.conversation.network)
     }
 
@@ -1085,6 +1086,9 @@ impl Shell {
             (_, Menu::Person { account, user_id, name }) if joined => {
                 (260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.)))
             }
+            (_, Menu::TelegramCall) if joined => {
+                (260., self.telegram_call_menu(call, cx).p(px(6.)))
+            }
             _ => return None,
         };
         // Above the card, level with its left edge, on top of whatever the list shows.
@@ -1162,7 +1166,23 @@ impl Shell {
         } else {
             theme::text_soft()
         };
-        let words = if talking { format!("You're muted. Press {} to talk", crate::gui::shortcuts::label("⌘⇧M")) } else { words };
+        let peer_note = live.then(|| {
+            let paused = call.participants.iter().any(|p| p.camera_paused);
+            let low_bat = call.participants.iter().any(|p| p.low_battery);
+            match (paused, low_bat) {
+                (true, true) => Some("Camera paused · Low battery".to_owned()),
+                (true, false) => Some("Camera paused".to_owned()),
+                (false, true) => Some("Peer battery low".to_owned()),
+                (false, false) => None,
+            }
+        }).flatten();
+        let words = if talking {
+            format!("You're muted. Press {} to talk", crate::gui::shortcuts::label("⌘⇧M"))
+        } else if let Some(note) = peer_note {
+            note
+        } else {
+            words
+        };
         let counter = if refused.is_some() || notice.is_some() { None } else { self.call_counter(call, cx) };
         let refused = refused.or(notice);
         // Give the server name or notice the full line; status and clock have their own row.
@@ -1232,7 +1252,11 @@ impl Shell {
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
-                            .child(subject.title.clone()),
+                            .child(super::telegram::call_header_display_title(call, &subject.title)),
+                    )
+                    .children(
+                        call.record_start_date
+                            .map(|since| super::telegram::recording_badge("call-dock-rec", since, call.record_video_active)),
                     ),
             )
             .child(place)
@@ -1289,35 +1313,53 @@ impl Shell {
         // Reconnecting keeps the joined controls, dead; only Leave is live.
         let enabled = call.state != CallState::Reconnecting;
         let menu = self.call_menu().filter(|_| enabled);
+        let mic_mode = super::telegram::telegram_mic_button_mode(call);
         let forced_mute = call.server_muted || call.suppressed;
         let off = call.muted || call.deafened || forced_mute;
-        let mute_enabled = enabled && !forced_mute;
-        let mute_tip = if call.server_muted {
-            "Server muted"
-        } else if call.suppressed {
-            "Can't speak in this channel"
-        } else if off {
-            "Unmute"
-        } else {
-            "Mute"
+        let mute_enabled = match mic_mode {
+            super::telegram::TelegramMicMode::Normal => enabled && !forced_mute,
+            super::telegram::TelegramMicMode::RaiseHand | super::telegram::TelegramMicMode::LowerHand => enabled && joined,
+        };
+        let (mute_icon, mute_look, mute_tip) = match mic_mode {
+            super::telegram::TelegramMicMode::RaiseHand => ("icons/hand.svg", Look::Rest, "Raise hand"),
+            super::telegram::TelegramMicMode::LowerHand => ("icons/hand.svg", Look::On, "Lower hand"),
+            super::telegram::TelegramMicMode::Normal => {
+                let tip_text = if call.server_muted {
+                    "Server muted"
+                } else if call.suppressed {
+                    "Can't speak in this channel"
+                } else if off {
+                    "Unmute"
+                } else {
+                    "Mute"
+                };
+                (
+                    if off { "icons/mic-off.svg" } else { "icons/mic.svg" },
+                    if off { Look::Off } else { Look::Rest },
+                    tip_text,
+                )
+            }
         };
 
         let mute = control(
             "call-mute",
-            if off {
-                "icons/mic-off.svg"
-            } else {
-                "icons/mic.svg"
-            },
-            if off { Look::Off } else { Look::Rest },
+            mute_icon,
+            mute_look,
             mute_enabled,
         )
         .aria_label(mute_tip)
-        .tooltip(tip(mute_tip, mute_enabled.then_some("⌘⇧M")))
+        .tooltip(tip(
+            mute_tip,
+            (mute_enabled && mic_mode == super::telegram::TelegramMicMode::Normal).then_some("⌘⇧M"),
+        ))
         .when(mute_enabled, |mute| {
-            mute.on_click(cx.listener(|this, _, _, cx| {
+            mute.on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.call_mute(cx);
+                if mic_mode == super::telegram::TelegramMicMode::Normal {
+                    this.call_mute(cx);
+                } else {
+                    this.telegram_toggle_hand(cx);
+                }
             }))
         })
         // While I am heard: a 2 px ring inside the button, the same green as a speaker's.
@@ -1363,34 +1405,40 @@ impl Shell {
         let pictures = self.call_pictures(call);
         let share_on = encoding(call, Content::Share);
         let camera_on = encoding(call, Content::Camera);
+        let share_limit = call.video_limit_reason(share_on);
+        let share_enabled = enabled && share_limit.is_none();
+        let share_tip: gpui::SharedString = match &share_limit {
+            Some(reason) => reason.clone().into(),
+            None if share_on => "Stop sharing".into(),
+            None => "Share your screen".into(),
+        };
         let share = pictures.then(|| {
             control(
                 "call-share",
                 "icons/monitor-up.svg",
                 if share_on { Look::On } else { Look::Rest },
-                enabled,
+                share_enabled,
             )
-            .aria_label(if share_on { "Stop sharing" } else { "Share your screen" })
-            .when(enabled, |share| {
-                share
-                    .tooltip(tip(
-                        if share_on {
-                            "Stop sharing"
-                        } else {
-                            "Share your screen"
-                        },
-                        None,
-                    ))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        if share_on {
-                            this.tiny_stop_share(cx);
-                        } else {
-                            this.tiny_share(window, cx);
-                        }
-                    }))
+            .aria_label(share_tip.clone())
+            .tooltip(tip(share_tip, None))
+            .when(share_enabled, |share| {
+                share.on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    if share_on {
+                        this.tiny_stop_share(cx);
+                    } else {
+                        this.tiny_share(window, cx);
+                    }
+                }))
             })
         });
+        let camera_limit = call.video_limit_reason(camera_on);
+        let camera_enabled = enabled && camera_limit.is_none();
+        let camera_tip: gpui::SharedString = match &camera_limit {
+            Some(reason) => reason.clone().into(),
+            None if camera_on => "Turn camera off".into(),
+            None => "Turn camera on".into(),
+        };
         let camera = pictures.then(|| {
             let call_cam = call.clone();
             control(
@@ -1403,23 +1451,15 @@ impl Shell {
                 } else {
                     Look::Rest
                 },
-                enabled,
+                camera_enabled,
             )
-            .aria_label(if camera_on { "Turn camera off" } else { "Turn camera on" })
-            .when(enabled, |camera| {
-                camera
-                    .tooltip(tip(
-                        if camera_on {
-                            "Turn camera off"
-                        } else {
-                            "Turn camera on"
-                        },
-                        None,
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.call_camera_clicked(&call_cam, camera_on, cx);
-                    }))
+            .aria_label(camera_tip.clone())
+            .tooltip(tip(camera_tip, None))
+            .when(camera_enabled, |camera| {
+                camera.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_camera_clicked(&call_cam, camera_on, cx);
+                }))
             })
         });
         let ring_again = (joined
@@ -1463,7 +1503,12 @@ impl Shell {
             && joined
             && enabled
             && (call.participants.len() + 1) < 10;
-        let add_people = (picker || discord_add).then(|| {
+        let telegram_add = !picker
+            && call.conversation.network == Network::Telegram
+            && (subject.kind.is_direct() || call.conversation.id.starts_with("conf:"))
+            && joined
+            && enabled;
+        let add_people = (picker || discord_add || telegram_add).then(|| {
             control(
                 "call-add-people",
                 "icons/user-plus.svg",
@@ -1483,6 +1528,15 @@ impl Shell {
                     }
                 }
             }))
+        });
+        let copy_link = call.invite_link.clone().filter(|link| !link.is_empty() && joined && enabled).map(|link| {
+            control("call-copy-link", "icons/link.svg", Look::Rest, true)
+                .aria_label("Copy call link")
+                .tooltip(tip("Copy call link", None))
+                .on_click(cx.listener(move |_this, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(link.clone()));
+                }))
         });
         let soundboard = (in_call(call) && call.conversation.network == Network::Discord).then(|| {
             let sound_key = call.conversation.clone();
@@ -1521,6 +1575,24 @@ impl Shell {
                     this.call_menu_toggle(Menu::Devices, cx);
                 }))
         });
+        let tg_actions = (call.conversation.network == Network::Telegram
+            && matches!(subject.kind, ConversationKind::Group | ConversationKind::Channel)
+            && joined
+            && enabled)
+            .then(|| {
+                control(
+                    "call-tg-actions",
+                    "icons/ellipsis.svg",
+                    if menu == Some(Menu::TelegramCall) { Look::Open } else { Look::Rest },
+                    true,
+                )
+                .aria_label("Video chat options")
+                .tooltip(tip("Video chat options", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::TelegramCall, cx);
+                }))
+            });
         let end = if in_call(call) {
             leave()
         } else {
@@ -1538,6 +1610,7 @@ impl Shell {
             })
             .tooltip(tip("Cancel", Some("⌘⇧H")))
         };
+        let in_live_call = in_call(call);
         // Joined controls share the width equally, including when video adds two buttons.
         let controls = div()
             .w_full()
@@ -1547,21 +1620,27 @@ impl Shell {
             .flex_wrap()
             .items_center()
             .gap(px(4.))
-            .child(mute.when(in_call(call), |button| button.flex_1().min_w_0()))
+            .child(mute.when(in_live_call, |button| button.flex_1().min_w_0()))
             // Deafen is for a call that is up; before that only mute and devices can be preset.
-            .when(in_call(call), |row| row.child(deafen.flex_1().min_w_0()))
+            .when(in_live_call, |row| row.child(deafen.flex_1().min_w_0()))
             .children(share.map(|button| button.flex_1().min_w_0()))
             .children(camera.map(|button| button.flex_1().min_w_0()))
             .children(raise_hand.map(|button| button.flex_1().min_w_0()))
             .children(ring_again.map(|button| button.flex_1().min_w_0()))
             .children(add_people.map(|button| button.flex_1().min_w_0()))
+            .children(tg_actions.map(|button| button.flex_1().min_w_0()))
+            .children(copy_link.map(|button| button.flex_1().min_w_0()))
             .children(soundboard.map(|button| button.flex_1().min_w_0()))
-            .child(devices.when(in_call(call), |button| button.flex_1().min_w_0()))
+            .child(devices.when(in_live_call, |button| button.flex_1().min_w_0()))
             .child(
-                end.when(in_call(call), |button| button.flex_1().min_w_0())
-                    .on_click(cx.listener(|this, _, _, cx| {
+                end.when(in_live_call, |button| button.flex_1().min_w_0())
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.call_leave(cx);
+                        if in_live_call {
+                            this.telegram_leave_or_end(cx);
+                        } else {
+                            this.call_leave(cx);
+                        }
                     })),
             );
 
@@ -1783,11 +1862,26 @@ mod tests {
         raised: Vec::new(),
         effect: None,
         incoming_video: false,
+        title: String::new(),
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
+        record_start_date: None,
+        record_video_active: false,
+        can_start_video: true,
+        unmuted_video_count: 0,
+        unmuted_video_limit: 0,
+        rtmp_stream: false,
+        rtmp_state: None,
+        rtmp_quality: None,
+        rtmp_qualities: Vec::new(),
         }
     }
 

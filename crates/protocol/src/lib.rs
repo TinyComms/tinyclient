@@ -477,9 +477,9 @@ pub enum CallSupport {
     Restricted,
 }
 
-/// Camera and screen share run in this client on a Tiny, Discord, or Signal call.
+/// Camera and screen share run in this client on Tiny, Discord, Signal, and Telegram calls.
 pub fn call_pictures(network: Network) -> bool {
-    matches!(network, Network::Tiny | Network::Discord | Network::Signal)
+    matches!(network, Network::Tiny | Network::Discord | Network::Signal | Network::Telegram)
 }
 
 /// How a conversation kind is called, as the adapter that builds its row decides.
@@ -544,6 +544,12 @@ pub struct Occupant {
     /// not suppress.
     #[serde(default, skip_serializing_if = "is_false")]
     pub speaking: bool,
+    /// Raised hand in a moderated Telegram video chat.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hand_raised: bool,
+    /// True when this occupant joined as a channel or group peer rather than a personal user.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_channel: bool,
 }
 
 /// Who is in a voice channel or live/scheduled group call, whether or not we are. Never stored:
@@ -579,6 +585,15 @@ pub struct Occupants {
     /// True when a group video chat is live even if `total == 0` (e.g. just started).
     #[serde(default, skip_serializing_if = "is_false")]
     pub live: bool,
+    /// Unix seconds when server-side recording started (`groupCall.record_start_date`) (#463).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_start_date: Option<i64>,
+    /// True when video is also being recorded (`groupCall.record_video_active`) (#463).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub record_video_active: bool,
+    /// True when this Telegram broadcast is an RTMP live stream (`groupCall.rtmp_stream`) (#454).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rtmp_stream: bool,
 }
 
 impl Occupants {
@@ -3281,6 +3296,45 @@ pub enum Request {
     CallStart {
         conversation: Key,
     },
+    /// Places an outgoing 1:1 video call (`video: true` on `phone.requestCall`).
+    CallStartVideo {
+        conversation: Key,
+    },
+    /// Resolves a Telegram encrypted conference link (`t.me/call/<slug>`) via `phone.getGroupCall`
+    /// with `inputGroupCallSlug` without joining, returning who is in the call.
+    ConferenceResolve {
+        account: AccountKey,
+        slug: String,
+    },
+    /// Creates an encrypted Telegram conference call via `phone.createConferenceCall`, returning
+    /// its shareable `t.me/call/<slug>` link (and joining when `join` is true).
+    ConferenceCreate {
+        account: AccountKey,
+        #[serde(default)]
+        video: bool,
+        #[serde(default)]
+        join: bool,
+    },
+    /// Joins an encrypted Telegram conference call by `slug` (`t.me/call/<slug>`), `call_id`,
+    /// or incoming invite `msg_id`.
+    ConferenceJoin {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slug: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<i32>,
+        #[serde(default)]
+        video: bool,
+    },
+    /// Removes participants from the active encrypted Telegram conference call
+    /// (`phone.deleteConferenceCallParticipants`).
+    ConferenceRemove {
+        people: Vec<String>,
+        #[serde(default)]
+        kick: bool,
+    },
     /// Answers the incoming ring. Starts mediad.
     CallAccept,
     /// Stops the incoming ring for both sides. mediad never starts.
@@ -3369,6 +3423,106 @@ pub enum Request {
     GroupCallSubscribe {
         conversation: Key,
         subscribed: bool,
+    },
+    /// Queries allowed `join_as` peers (`phone.getGroupCallJoinAs`) and the chat's remembered
+    /// `groupcall_default_join_as` (#460).
+    GroupCallJoinAs {
+        conversation: Key,
+    },
+    /// Joins (or switches identity mid-call in) a Telegram group/channel video chat with an
+    /// optional `join_as` peer, optional `invite_hash`, and optional `save_default` (#460, #459).
+    GroupCallJoin {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        join_as: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invite_hash: Option<String>,
+        #[serde(default)]
+        save_default: bool,
+    },
+    /// Saves the remembered join-as peer for a chat (`phone.saveDefaultGroupCallJoinAs`) (#460).
+    GroupCallSaveDefaultJoinAs {
+        conversation: Key,
+        peer_id: String,
+    },
+    /// Starts a live Telegram group/channel video chat (`phone.createGroupCall`), following
+    /// basic-group-to-supergroup migration if Telegram upgrades the chat, and optionally joining
+    /// immediately (#466).
+    GroupCallCreate {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default)]
+        rtmp_stream: bool,
+        #[serde(default)]
+        join: bool,
+    },
+    /// Renames a live or scheduled Telegram video chat (`phone.editGroupCallTitle`) (#466).
+    GroupCallEditTitle {
+        conversation: Key,
+        title: String,
+    },
+    /// Ends a Telegram video chat for everyone (`phone.discardGroupCall`, requires `manage_call`) (#466).
+    GroupCallDiscard {
+        conversation: Key,
+    },
+    /// Invites selected users to a live Telegram video chat (`phone.inviteToGroupCall`) (#459).
+    GroupCallInvite {
+        conversation: Key,
+        users: Vec<String>,
+    },
+    /// Exports a listener or speaker invite link (`phone.exportGroupCallInvite`) (#459).
+    GroupCallExportInvite {
+        conversation: Key,
+        #[serde(default)]
+        can_self_unmute: bool,
+    },
+    /// Updates admin group call settings (`phone.toggleGroupCallSettings`: `join_muted` / `reset_invite_hash`) (#459, #464).
+    GroupCallSettings {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        join_muted: Option<bool>,
+        #[serde(default)]
+        reset_invite_hash: bool,
+    },
+    /// Raises or lowers our own hand in a moderated Telegram video chat (`phone.editGroupCallParticipant`) (#464).
+    GroupCallRaiseHand {
+        conversation: Key,
+        raised: bool,
+    },
+    /// Moderates a participant in a Telegram video chat (`manage_call`): mute/allow-to-speak
+    /// (`phone.editGroupCallParticipant`) or remove/ban from the group (#464).
+    GroupCallModerate {
+        conversation: Key,
+        participant_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        muted: Option<bool>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Starts or stops server-side recording of a Telegram video chat (`phone.toggleGroupCallRecord`,
+    /// requires `manage_call`) (#463).
+    GroupCallRecord {
+        conversation: Key,
+        start: bool,
+        #[serde(default)]
+        video: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_portrait: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Queries or revokes the RTMP server URL and stream key (`phone.getGroupCallStreamRtmpUrl`,
+    /// requires `manage_call`) (#454).
+    GroupCallRtmpUrl {
+        conversation: Key,
+        #[serde(default)]
+        revoke: bool,
+    },
+    /// Switches the requested quality tier (0 = Low, 1 = Medium, 2 = High) on a watched RTMP live stream (#454).
+    GroupCallRtmpQuality {
+        conversation: Key,
+        quality: u8,
     },
     Media(MediaRequest),
     /// A voice message or audio file: play, pause, seek, speed, stop. Answers `Ok`; the rest is
@@ -4836,6 +4990,28 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "is_false")]
         more: bool,
     },
+    /// Answers `GroupCallJoinAs` (#460).
+    GroupCallJoinAs(GroupCallJoinAs),
+    /// Answers `GroupCallCreate`, reporting the target conversation (which may be a migrated supergroup) (#466).
+    GroupCallStarted {
+        conversation: Key,
+    },
+    /// Answers `GroupCallInvite`, listing invited users and per-person refusals (#459).
+    GroupCallInvited(GroupCallInviteResult),
+    /// Answers `GroupCallExportInvite` (#459).
+    GroupCallInviteLink {
+        link: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        speaker: bool,
+    },
+    /// Answers `GroupCallRecord` (#463).
+    GroupCallRecord {
+        recording: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+    },
+    /// Answers `GroupCallRtmpUrl` (#454).
+    GroupCallRtmpUrl(GroupCallRtmpUrl),
     Voicemails {
         entries: Vec<Voicemail>,
         next: Option<String>,
@@ -4898,6 +5074,11 @@ pub enum Response {
     /// Answers `InvitePreview`: metadata and member counts for an invite code.
     InvitePreview {
         preview: InvitePreview,
+    },
+    /// Answers `ConferenceResolve` and `ConferenceCreate`: encrypted conference metadata,
+    /// current participants, and shareable `t.me/call/<slug>` link.
+    ConferenceInfo {
+        info: ConferenceCallInfo,
     },
     /// Answers `InviteJoin`: the joined Space and landing conversation, when reported.
     InviteJoined {

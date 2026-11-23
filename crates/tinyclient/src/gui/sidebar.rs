@@ -212,6 +212,7 @@ pub struct State {
     pub folder_edit: Option<FolderEdit>,
     pub forum_post: Option<ForumPostModal>,
     pub join_server: Option<JoinServerModal>,
+    pub conference_link: Option<ConferenceLinkModal>,
     pub create_server: Option<CreateServerModal>,
     /// Cached scheduled & active events per Discord Space.
     pub space_events: HashMap<Key, Vec<protocol::SpaceEvent>>,
@@ -364,6 +365,14 @@ pub struct JoinServerModal {
     pub busy: bool,
 }
 
+pub struct ConferenceLinkModal {
+    pub account: AccountKey,
+    pub slug: String,
+    pub info: Option<protocol::ConferenceCallInfo>,
+    pub error: Option<String>,
+    pub busy: bool,
+}
+
 pub struct CreateServerModal {
     pub account: AccountKey,
     pub name: Entity<crate::gui::input::TextInput>,
@@ -504,6 +513,7 @@ impl State {
             folder_edit: None,
             forum_post: None,
             join_server: None,
+            conference_link: None,
             create_server: None,
             space_events: HashMap::new(),
             events_modal: None,
@@ -3707,6 +3717,201 @@ impl Shell {
         };
         self.open_join_invite(account, Some(url), cx);
         true
+    }
+
+    /// Opens the Telegram encrypted conference preview sheet for a clicked `t.me/call/<slug>` link.
+    /// Resolves via `phone.getGroupCall(inputGroupCallSlug)` to display who is in the call and offers Join.
+    pub(in crate::gui) fn open_telegram_conference(
+        &mut self,
+        preferred: Option<AccountKey>,
+        slug: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let account = preferred
+            .filter(|k| {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|s| s.account(k))
+                    .is_some_and(|a| a.link == Link::Connected)
+            })
+            .or_else(|| {
+                self.snapshot.as_ref().and_then(|s| {
+                    s.accounts
+                        .iter()
+                        .find(|a| a.key.network == Network::Telegram && a.link == Link::Connected)
+                        .map(|a| a.key.clone())
+                })
+            });
+        let Some(account) = account else {
+            return false;
+        };
+        self.sidebar_state.conference_link = Some(ConferenceLinkModal {
+            account: account.clone(),
+            slug: slug.clone(),
+            info: None,
+            error: None,
+            busy: true,
+        });
+        cx.notify();
+        let req = Request::ConferenceResolve { account, slug };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(modal) = this.sidebar_state.conference_link.as_mut() {
+                    modal.busy = false;
+                    match answer {
+                        Ok(Response::ConferenceInfo { info }) => {
+                            modal.info = Some(info);
+                            modal.error = None;
+                        }
+                        Ok(Response::Error { detail, .. }) => {
+                            modal.error = Some(detail);
+                        }
+                        Ok(_) => modal.error = Some("Could not load conference call details.".to_owned()),
+                        Err(err) => modal.error = Some(err.to_string()),
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        true
+    }
+
+    fn submit_join_conference(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.conference_link.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let account = modal.account.clone();
+        let slug = modal.slug.clone();
+        cx.notify();
+        let req = Request::ConferenceJoin {
+            account,
+            slug: Some(slug),
+            call_id: None,
+            msg_id: None,
+            video: false,
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                match answer {
+                    Ok(Response::Error { detail, .. }) => {
+                        if let Some(modal) = this.sidebar_state.conference_link.as_mut() {
+                            modal.busy = false;
+                            modal.error = Some(detail);
+                        }
+                    }
+                    Ok(_) => {
+                        this.sidebar_state.conference_link = None;
+                    }
+                    Err(err) => {
+                        if let Some(modal) = this.sidebar_state.conference_link.as_mut() {
+                            modal.busy = false;
+                            modal.error = Some(err.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn conference_link_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.conference_link.as_ref()?;
+        let heading = modal
+            .info
+            .as_ref()
+            .filter(|i| !i.title.is_empty())
+            .map(|i| i.title.clone())
+            .unwrap_or_else(|| "Encrypted Telegram call".to_owned());
+        let details = modal.info.as_ref().map(|info| {
+            let names: Vec<String> = info.participants.iter().map(|p| p.name.clone()).collect();
+            let count_line = if info.participants_count == 1 {
+                "1 person in this call".to_owned()
+            } else {
+                format!("{} people in this call", info.participants_count)
+            };
+            div()
+                .p(px(10.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(count_line))
+                .when(!names.is_empty(), |box_el| {
+                    box_el.child(div().type_small().text_color(theme::text_soft()).child(names.join(", ")))
+                })
+                .when(info.e2ee, |box_el| {
+                    box_el.child(div().type_micro().text_color(theme::text_faint()).child("End-to-end encrypted conference"))
+                })
+        });
+        let can_join = modal.info.is_some() && !modal.busy;
+        let card = div()
+            .id("conference-link-card")
+            .w(px(380.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child(heading))
+            .child(div().type_small().text_color(theme::text_faint()).child(format!("t.me/call/{}", modal.slug)))
+            .when(modal.busy && modal.info.is_none(), |c| {
+                c.child(div().type_small().text_color(theme::text_soft()).child("Loading participants…"))
+            })
+            .children(details)
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("conference-link-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.conference_link = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "conference-link-join",
+                            ButtonKind::Primary,
+                            if modal.busy { "Joining…" } else { "Join" },
+                        )
+                        .when(can_join, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.submit_join_conference(cx)))
+                        }),
+                    ),
+            );
+        Some(
+            div()
+                .id("conference-link-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.conference_link = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
     }
 
     fn preview_join_server(&mut self, cx: &mut Context<Self>) {
@@ -7001,7 +7206,7 @@ pub(crate) mod tests {
         Occupants {
             people: speaking
                 .iter()
-                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), avatar: None, muted: false, deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: *live })
+                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), avatar: None, muted: false, deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: *live, hand_raised: false, is_channel: false })
                 .collect(),
             total: speaking.len() as u32,
             ..Default::default()

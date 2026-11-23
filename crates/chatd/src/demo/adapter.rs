@@ -542,6 +542,8 @@ impl Demo {
             streaming: false,
             camera: false,
             speaking: false,
+            hand_raised: false,
+            is_channel: false,
         });
         change(&mut occupants.people, me);
         let total = occupants.people.len() as u32 + hidden;
@@ -1513,12 +1515,43 @@ impl Demo {
             | Command::WantedSpan { .. }
             | Command::TelegramCallSignal { .. }
             | Command::TelegramCallSpeaking { .. }
+            | Command::GroupCallParticipantGain { .. }
+            | Command::CallJoinVideo(_)
             | Command::Played { .. }
             | Command::CallIce { .. }
             | Command::Stop => {}
             Command::GroupCallSchedule { reply, .. }
             | Command::GroupCallStart { reply, .. }
-            | Command::GroupCallSubscribe { reply, .. } => {
+            | Command::GroupCallSubscribe { reply, .. }
+            | Command::GroupCallJoin { reply, .. }
+            | Command::GroupCallSaveDefaultJoinAs { reply, .. }
+            | Command::GroupCallEditTitle { reply, .. }
+            | Command::GroupCallDiscard { reply, .. }
+            | Command::GroupCallSettings { reply, .. }
+            | Command::GroupCallRaiseHand { reply, .. }
+            | Command::GroupCallModerate { reply, .. }
+            | Command::GroupCallRtmpQuality { reply, .. }
+            | Command::ConferenceJoin { reply, .. }
+            | Command::ConferenceRemove { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::GroupCallRecord { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::GroupCallRtmpUrl { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::GroupCallJoinAs { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::GroupCallCreate { reply, .. }
+            | Command::GroupCallExportInvite { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::GroupCallInvite { reply, .. } => {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            }
+            Command::ConferenceResolve { reply, .. } | Command::ConferenceCreate { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
         }

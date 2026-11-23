@@ -523,6 +523,8 @@ fn publish_group(ctx: &Context, seat: &Seat, group_id: &str) {
             streaming: who.sharing,
             camera: who.camera,
             speaking: group.speaking.iter().any(|id| id == &who.user),
+            hand_raised: false,
+            is_channel: false,
         })
         .collect();
     let total = occupants.len() as u32;
@@ -544,9 +546,7 @@ fn publish_group(ctx: &Context, seat: &Seat, group_id: &str) {
         camera: who.camera,
         sharing: who.sharing,
         ringing: false,
-        preview: String::new(),
-        hand_raised: false,
-        reaction: None,
+        ..Participant::default()
     });
     ctx.participants(group_id, others.collect());
     let ringing = group

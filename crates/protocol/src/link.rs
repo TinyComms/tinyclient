@@ -946,6 +946,78 @@ pub fn telegram_family(raw: &str) -> bool {
         || host.ends_with(".telegram.dog")
 }
 
+/// Parses a Telegram video chat / voice chat / live stream query parameter from a `t.me` or
+/// `telegram.me` link (`?videochat[=hash]`, `?voicechat[=hash]`, `?livestream[=hash]`).
+///
+/// Returns `Some(Some(hash))` when a non-empty invite hash is carried, `Some(None)` when bare
+/// (`?videochat`), and `None` when the URL is not a Telegram video chat link (including `t.me/call/...`
+/// conference links which are handled separately).
+pub fn telegram_videochat_invite(raw: &str) -> Option<Option<String>> {
+    telegram_app_link(raw)?;
+    let parsed = Url::parse(raw.trim()).ok()?;
+    for (k, v) in parsed.query_pairs() {
+        let lower = k.to_ascii_lowercase();
+        if matches!(lower.as_str(), "videochat" | "voicechat" | "livestream") {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                return Some(None);
+            }
+            if trimmed.len() <= 128 && trimmed.bytes().all(|b| b.is_ascii_graphic()) {
+                return Some(Some(trimmed.to_owned()));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Extracts the conference call slug from a Telegram conference link:
+/// `https://t.me/call/<slug>`, `https://telegram.me/call/<slug>`, or `tg://call?slug=<slug>`.
+/// Rejects path traversals, userinfo, extra segments, and invalid characters.
+pub fn telegram_call_link(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > LINK_LIMIT || telegram_path_unsafe(trimmed) {
+        return None;
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let slug = match parsed.scheme() {
+        "http" | "https" => {
+            let host = parsed.host_str()?.to_ascii_lowercase();
+            if !matches!(host.as_str(), "t.me" | "telegram.me") {
+                return None;
+            }
+            let segments: Vec<&str> = parsed
+                .path_segments()
+                .map(|s| s.filter(|p| !p.is_empty()).collect())
+                .unwrap_or_default();
+            if segments.len() != 2 || !segments[0].eq_ignore_ascii_case("call") {
+                return None;
+            }
+            segments[1].to_owned()
+        }
+        "tg" => {
+            if !parsed.host_str().is_some_and(|h| h.eq_ignore_ascii_case("call")) {
+                return None;
+            }
+            parsed
+                .query_pairs()
+                .find(|(k, _)| k == "slug")
+                .map(|(_, v)| v.into_owned())?
+        }
+        _ => return None,
+    };
+    if slug.is_empty()
+        || slug.len() > 128
+        || !slug.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(slug)
+}
+
 fn telegram_utility(segment: &str) -> bool {
     matches!(
         segment.to_ascii_lowercase().as_str(),
@@ -963,6 +1035,7 @@ fn telegram_utility(segment: &str) -> bool {
             | "setlanguage"
             | "boost"
             | "giftcode"
+            | "call"
     )
 }
 
@@ -1482,5 +1555,45 @@ mod tests {
         // The wider parser still accepts dog and tg. This helper is the in-app gate.
         assert!(parse_network_link("https://telegram.dog/rustlang").is_some());
         assert!(parse_network_link("tg://resolve?domain=rustlang").is_some());
+    }
+
+    #[test]
+    fn telegram_videochat_links_extract_invite_hash_and_ignore_conference_links() {
+        assert_eq!(telegram_videochat_invite("https://t.me/field_notes?videochat"), Some(None));
+        assert_eq!(
+            telegram_videochat_invite("https://t.me/field_notes?videochat=abc123XYZ"),
+            Some(Some("abc123XYZ".into()))
+        );
+        assert_eq!(telegram_videochat_invite("https://t.me/field_notes?voicechat=vhash"), Some(Some("vhash".into())));
+        assert_eq!(telegram_videochat_invite("https://telegram.me/field_notes?livestream"), Some(None));
+        assert_eq!(
+            telegram_videochat_invite("https://telegram.me/field_notes?livestream=live_99"),
+            Some(Some("live_99".into()))
+        );
+        assert_eq!(telegram_videochat_invite("https://t.me/field_notes"), None);
+        assert_eq!(telegram_videochat_invite("https://t.me/call/conference-slug"), None);
+        assert_eq!(telegram_app_link("https://t.me/call/conference-slug"), None);
+    }
+
+    #[test]
+    fn telegram_call_link_parses_valid_slugs_and_rejects_bad_urls() {
+        assert_eq!(telegram_call_link("https://t.me/call/AbC-123_xyz"), Some("AbC-123_xyz".into()));
+        assert_eq!(telegram_call_link("http://t.me/call/conf_slug_99"), Some("conf_slug_99".into()));
+        assert_eq!(telegram_call_link("https://telegram.me/call/team-standup"), Some("team-standup".into()));
+        assert_eq!(telegram_call_link("tg://call?slug=quick_meet"), Some("quick_meet".into()));
+        assert_eq!(telegram_app_link("https://t.me/call/AbC-123_xyz"), None);
+        for bad in [
+            "https://t.me/call/",
+            "https://t.me/call/a/b",
+            "https://t.me/call/../secret",
+            "https://t.me/call/bad%2fslug",
+            "https://user:pass@t.me/call/abc",
+            "https://example.com/call/abc",
+            "https://telegram.dog/call/abc",
+            "tg://call?other=abc",
+            "https://t.me/+invitehash",
+        ] {
+            assert_eq!(telegram_call_link(bad), None, "{bad}");
+        }
     }
 }

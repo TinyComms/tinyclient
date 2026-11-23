@@ -604,6 +604,8 @@ impl Discord {
                     streaming: heard.sharing,
                     camera: heard.camera,
                     speaking: heard.live,
+                    hand_raised: false,
+                    is_channel: false,
                 });
                 let people: Vec<Occupant> = people.collect();
                 state.voice.told.insert(channel.clone(), Some(guild));

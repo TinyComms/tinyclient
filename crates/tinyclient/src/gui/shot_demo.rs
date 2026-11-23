@@ -498,7 +498,7 @@ fn build() -> Fixture {
     campfire.occupants = Some(Occupants {
         people: ["yusuf", "ines"]
             .into_iter()
-            .map(|id| Occupant { person: Key::new(&d, id), name: who(id).map_or(id, |w| w.name).into(), avatar: None, muted: id == "ines", deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: id == "yusuf" })
+            .map(|id| Occupant { person: Key::new(&d, id), name: who(id).map_or(id, |w| w.name).into(), avatar: None, muted: id == "ines", deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: id == "yusuf", hand_raised: false, is_channel: false })
             .collect(),
         total: 2,
         ..Default::default()
@@ -1031,6 +1031,7 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
     }
 }
 

@@ -1,0 +1,12 @@
+{
+  "id": "telegram-wave16b2",
+  "title": "Wave 16B2 Telegram group call recording, per-person volume & mute for me, camera/screen share & video limits, and channel RTMP live streams",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 16B2 Telegram group video chat controls verified by protocol, mediad, GUI unit, and chatd fake-server integration suites.",
+    "ios": "Desktop Wave 16B2 Telegram group video chat controls verified by protocol, mediad, GUI unit, and chatd fake-server integration suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

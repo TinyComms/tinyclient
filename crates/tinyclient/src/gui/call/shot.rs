@@ -331,11 +331,26 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         effect: None,
         move_notice: (name == "moved_notice").then(|| "Bea added Cy. The call moved to Campfire.".to_owned()),
         incoming_video: false,
+        title: String::new(),
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
+        record_start_date: None,
+        record_video_active: false,
+        can_start_video: true,
+        unmuted_video_count: 0,
+        unmuted_video_limit: 0,
+        rtmp_stream: false,
+        rtmp_state: None,
+        rtmp_quality: None,
+        rtmp_qualities: Vec::new(),
     })
 }
 
@@ -422,6 +437,8 @@ pub(super) fn running() -> Option<Occupants> {
         streaming: false,
         camera: false,
         speaking: false,
+        hand_raised: false,
+        is_channel: false,
     };
     (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3, ..Default::default() })
     (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3, ..Occupants::default() })
@@ -500,11 +517,26 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         effect: None,
         move_notice: None,
         incoming_video: false,
+        title: String::new(),
         viewers: Vec::new(),
         stream_paused: false,
         stream_security: None,
         hand_raised: false,
         reaction: None,
+        invite_link: None,
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
+        record_start_date: None,
+        record_video_active: false,
+        can_start_video: true,
+        unmuted_video_count: 0,
+        unmuted_video_limit: 0,
+        rtmp_stream: false,
+        rtmp_state: None,
+        rtmp_quality: None,
+        rtmp_qualities: Vec::new(),
     }
 }
 

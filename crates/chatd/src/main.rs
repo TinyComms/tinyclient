@@ -1157,6 +1157,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-messages-wave12:0");
         return Ok(());
     }
+    // The lab's telegram-wave18a driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-wave18a") {
+        if let Err(err) = chatd::adapters::telegram::prove_wave18a() {
+            eprintln!("telegram-wave18a: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-wave18a:0");
+        return Ok(());
+    }
     // The lab's telegram-wave15c driver (#540 stories & #452 live location sharing).
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-wave15c") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_wave15c() {

@@ -1951,6 +1951,8 @@ pub enum Command {
     CallMove { conversation_id: String, person_id: String, to: Option<String>, reply: Reply<()> },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),
+    /// Place a 1:1 video call (`video: true` on `phone.requestCall`).
+    CallJoinVideo(String),
     /// Leave, cancel or decline on the network. Also sent when the call failed here (mediad
     /// died, a deadline passed), so the network stops showing us in the channel or ringing the
     /// other side. May arrive for a call the adapter already left: then it is nothing.
@@ -1974,6 +1976,97 @@ pub enum Command {
     GroupCallStart { conversation_id: String, reply: Reply<()> },
     /// Toggles the reminder subscription on a scheduled Telegram video chat.
     GroupCallSubscribe { conversation_id: String, subscribed: bool, reply: Reply<()> },
+    /// Queries allowed `join_as` peers and remembered default for a Telegram video chat (#460).
+    GroupCallJoinAs { conversation_id: String, reply: Reply<protocol::GroupCallJoinAs> },
+    /// Joins or switches identity in a Telegram video chat with optional `join_as` / `invite_hash` (#460, #459).
+    GroupCallJoin {
+        conversation_id: String,
+        join_as: Option<String>,
+        invite_hash: Option<String>,
+        save_default: bool,
+        reply: Reply<()>,
+    },
+    /// Saves the default join-as peer for a chat (`phone.saveDefaultGroupCallJoinAs`) (#460).
+    GroupCallSaveDefaultJoinAs { conversation_id: String, peer_id: String, reply: Reply<()> },
+    /// Creates a live Telegram video chat (`phone.createGroupCall`), following migration if needed, and optionally joins (#466).
+    GroupCallCreate {
+        conversation_id: String,
+        title: Option<String>,
+        rtmp_stream: bool,
+        join: bool,
+        reply: Reply<String>,
+    },
+    /// Renames a live or scheduled Telegram video chat (`phone.editGroupCallTitle`) (#466).
+    GroupCallEditTitle { conversation_id: String, title: String, reply: Reply<()> },
+    /// Ends a Telegram video chat for everyone (`phone.discardGroupCall`) (#466).
+    GroupCallDiscard { conversation_id: String, reply: Reply<()> },
+    /// Invites selected users into a Telegram video chat (`phone.inviteToGroupCall`) (#459).
+    GroupCallInvite {
+        conversation_id: String,
+        users: Vec<String>,
+        reply: Reply<protocol::GroupCallInviteResult>,
+    },
+    /// Exports a listener or speaker invite link (`phone.exportGroupCallInvite`) (#459).
+    GroupCallExportInvite { conversation_id: String, can_self_unmute: bool, reply: Reply<String> },
+    /// Updates admin group call settings (`phone.toggleGroupCallSettings`) (#459, #464).
+    GroupCallSettings {
+        conversation_id: String,
+        join_muted: Option<bool>,
+        reset_invite_hash: bool,
+        reply: Reply<()>,
+    },
+    /// Raises or lowers our own hand in a Telegram video chat (`phone.editGroupCallParticipant`) (#464).
+    GroupCallRaiseHand { conversation_id: String, raised: bool, reply: Reply<()> },
+    /// Moderates a participant in a Telegram video chat: mute, allow to speak, or remove/ban from group (#464).
+    GroupCallModerate {
+        conversation_id: String,
+        participant_id: String,
+        muted: Option<bool>,
+        remove: bool,
+        reply: Reply<()>,
+    },
+    /// Starts or stops server-side recording (`phone.toggleGroupCallRecord`, requires `manage_call`) (#463).
+    GroupCallRecord {
+        conversation_id: String,
+        start: bool,
+        video: bool,
+        video_portrait: Option<bool>,
+        title: Option<String>,
+        reply: Reply<(bool, Option<String>)>,
+    },
+    /// Syncs a local participant volume/mute-for-me change to Telegram (debounced `editGroupCallParticipant`) (#468).
+    GroupCallParticipantGain {
+        conversation_id: String,
+        participant_id: String,
+        percent: u16,
+        muted: bool,
+    },
+    /// Queries or revokes the RTMP server URL & stream key (`phone.getGroupCallStreamRtmpUrl`, requires `manage_call`) (#454).
+    GroupCallRtmpUrl {
+        conversation_id: String,
+        revoke: bool,
+        reply: Reply<protocol::GroupCallRtmpUrl>,
+    },
+    /// Switches the requested quality tier (0..=2) on a watched RTMP live stream (#454).
+    GroupCallRtmpQuality {
+        conversation_id: String,
+        quality: u8,
+        reply: Reply<()>,
+    },
+    /// Resolves a Telegram encrypted conference link (`t.me/call/<slug>`) without joining.
+    ConferenceResolve { slug: String, reply: Reply<protocol::ConferenceCallInfo> },
+    /// Creates an encrypted Telegram conference call (`phone.createConferenceCall`).
+    ConferenceCreate { video: bool, join: bool, reply: Reply<protocol::ConferenceCallInfo> },
+    /// Joins an encrypted Telegram conference call by slug, call_id, or invite msg_id.
+    ConferenceJoin {
+        slug: Option<String>,
+        call_id: Option<String>,
+        msg_id: Option<i32>,
+        video: bool,
+        reply: Reply<()>,
+    },
+    /// Removes participants from an active Telegram encrypted conference call.
+    ConferenceRemove { conversation_id: String, people: Vec<String>, kick: bool, reply: Reply<()> },
     /// In-call signalling bytes from mediad for Telegram `phone.sendSignalingData` (base64).
     TelegramCallSignal { conversation_id: String, data: String },
     /// Local speaking state changed in a Telegram group call (`speakingInGroupCallAction`).
@@ -2192,12 +2285,31 @@ impl Command {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Soundboard { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. }
+            Command::CallRing { reply, .. }
+            | Command::CallStopRinging { reply, .. }
             | Command::GroupCallSchedule { reply, .. }
             | Command::GroupCallStart { reply, .. }
-            | Command::GroupCallSubscribe { reply, .. } => {
+            | Command::GroupCallSubscribe { reply, .. }
+            | Command::GroupCallJoin { reply, .. }
+            | Command::GroupCallSaveDefaultJoinAs { reply, .. }
+            | Command::GroupCallEditTitle { reply, .. }
+            | Command::GroupCallDiscard { reply, .. }
+            | Command::GroupCallSettings { reply, .. }
+            | Command::GroupCallRaiseHand { reply, .. }
+            | Command::GroupCallModerate { reply, .. }
+            | Command::ConferenceJoin { reply, .. }
+            | Command::ConferenceRemove { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::ConferenceResolve { reply, .. } | Command::ConferenceCreate { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::GroupCallJoinAs { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GroupCallCreate { reply, .. }
+            | Command::GroupCallExportInvite { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::GroupCallInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -3666,9 +3778,28 @@ impl Context {
         self.hub.calls.telegram_call(&self.hub, &self.key(conversation_id), join);
     }
 
-    /// Asks mediad to build the join params JSON + SSRC for a Telegram group video chat.
-    pub fn telegram_group_offer(&self, conversation_id: &str, offer: protocol::TelegramGroupOffer) -> Result<(String, u32), String> {
+    /// Asks mediad to build the join params JSON + SSRC + optional E2EE public key for a Telegram group/conference call.
+    pub fn telegram_group_offer(
+        &self,
+        conversation_id: &str,
+        offer: protocol::TelegramGroupOffer,
+    ) -> Result<(String, u32, Option<String>), String> {
         self.hub.calls.telegram_group_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    /// Feeds Telegram encrypted conference chain blocks to mediad for verification.
+    pub fn telegram_conference_blocks(
+        &self,
+        conversation_id: &str,
+        sub_chain_id: i32,
+        blocks: Vec<String>,
+    ) -> Result<(), String> {
+        self.hub.calls.telegram_conference_blocks(&self.hub, &self.key(conversation_id), sub_chain_id, blocks)
+    }
+
+    /// Sets or clears the shareable invite link (`https://t.me/call/<slug>`) on the active call.
+    pub fn call_invite_link(&self, conversation_id: &str, invite_link: Option<String>) {
+        self.hub.calls.set_invite_link(&self.hub, &self.key(conversation_id), invite_link);
     }
 
     /// Applies Telegram's server transport JSON (`updateGroupCallConnection`) to mediad.
@@ -3679,6 +3810,71 @@ impl Context {
     /// Updates SSRC -> participant id mapping for a Telegram group video chat.
     pub fn telegram_group_sources(&self, conversation_id: &str, sources: Vec<protocol::TelegramGroupSource>) {
         self.hub.calls.telegram_group_sources(&self.hub, &self.key(conversation_id), sources);
+    }
+
+    /// Asks mediad for a Telegram presentation offer (`phone.joinGroupCallPresentation`) (#467).
+    pub fn telegram_group_presentation_offer(&self, conversation_id: &str) -> Result<(String, u32), String> {
+        self.hub.calls.telegram_group_presentation_offer(&self.hub, &self.key(conversation_id))
+    }
+
+    /// Passes Telegram presentation answer JSON to mediad (#467).
+    pub fn telegram_group_presentation_answer(&self, conversation_id: &str, params: String) {
+        self.hub.calls.telegram_group_presentation_answer(&self.hub, &self.key(conversation_id), params);
+    }
+
+    /// Tears down Telegram presentation transport in mediad (#467).
+    pub fn telegram_group_presentation_leave(&self, conversation_id: &str) {
+        self.hub.calls.telegram_group_presentation_leave(&self.hub, &self.key(conversation_id));
+    }
+
+    /// Updates remote video & presentation sources in mediad (#467).
+    pub fn telegram_group_video_sources(
+        &self,
+        conversation_id: &str,
+        sources: Vec<protocol::TelegramGroupVideoSource>,
+    ) {
+        self.hub.calls.telegram_group_video_sources(&self.hub, &self.key(conversation_id), sources);
+    }
+
+    /// Starts receive-only RTMP live stream playback in mediad (#454).
+    pub fn telegram_rtmp_start(&self, conversation_id: &str) -> Result<(), String> {
+        self.hub.calls.telegram_rtmp_start(&self.hub, &self.key(conversation_id))
+    }
+
+    /// Delivers one fetched RTMP segment to mediad (#454).
+    pub fn telegram_rtmp_segment(
+        &self,
+        conversation_id: &str,
+        time_ms: i64,
+        scale: i32,
+        video_channel: Option<i32>,
+        video_quality: Option<u8>,
+        data: String,
+    ) {
+        self.hub.calls.telegram_rtmp_segment(
+            &self.hub,
+            &self.key(conversation_id),
+            time_ms,
+            scale,
+            video_channel,
+            video_quality,
+            data,
+        );
+    }
+
+    /// Updates RTMP live stream playback state in mediad (#454).
+    pub fn telegram_rtmp_state(&self, conversation_id: &str, state: protocol::RtmpStreamState) {
+        self.hub.calls.telegram_rtmp_state(&self.hub, &self.key(conversation_id), state);
+    }
+
+    /// Applies one participant's local gain/mute in mediad (#468).
+    pub fn call_gain(&self, user_id: String, percent: u16, muted: bool) {
+        self.hub.calls.gain(&self.hub, &self.account, user_id, percent, muted);
+    }
+
+    /// Plays one notice cue on the active call (e.g. `Cue::RecordingStarted` #463).
+    pub fn call_cue(&self, conversation_id: &str, cue: protocol::Cue) {
+        self.hub.calls.play_cue(&self.hub, &self.key(conversation_id), cue);
     }
 
     /// The caller gave up, or another device answered.
@@ -3759,6 +3955,11 @@ impl Context {
     /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).
     pub fn self_moderation(&self, conversation_id: &str, server_muted: bool, server_deafened: bool, suppressed: bool) {
         self.hub.calls.set_self_moderation(&self.hub, &self.key(conversation_id), server_muted, server_deafened, suppressed);
+    }
+
+    /// Updates Telegram group call metadata on the active call snapshot.
+    pub fn group_call_meta(&self, conversation_id: &str, meta: crate::media::GroupCallMeta) {
+        self.hub.calls.set_group_call_meta(&self.hub, &self.key(conversation_id), meta);
     }
 
     /// A Tiny server call: mediad's offer for this room, with mediad started for it first. A

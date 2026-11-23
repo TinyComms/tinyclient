@@ -332,6 +332,8 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
             streaming,
             camera: false,
             speaking: false,
+            hand_raised: false,
+            is_channel: false,
         };
         let mut people: Vec<Occupant> = seats.iter().map(seated).collect();
         // A full room: everyone we know who is not already talking somewhere (a person is in
