@@ -105,10 +105,17 @@ fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
-/// The popover open above the dock.
-#[derive(Clone, PartialEq, Eq)]
+/// The popover open above the dock or call stage bar.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum Menu {
+    /// Compact call options hub (device summaries, 1:1 volume, test, settings).
     Devices,
+    /// Focused microphone / input device picker with live input meter.
+    Input { from_hub: bool },
+    /// Focused speaker / output device picker with live output meter and Test speakers.
+    Output { from_hub: bool },
+    /// Focused camera picker (hot-swap while camera is on, or entered from `Devices`).
+    Camera { from_hub: bool },
     /// Camera picker and live preview before turning the camera on.
     CameraPreview,
     People,
@@ -122,6 +129,76 @@ pub(super) enum Menu {
     TelegramCall,
     /// Discord soundboard for the joined voice channel.
     Soundboard,
+}
+
+impl Menu {
+    /// Menus that display live audio levels (or the mobile Devices sheet) and request `Meter`.
+    pub(super) fn metered(&self) -> bool {
+        matches!(self, Menu::Devices | Menu::Input { .. } | Menu::Output { .. } | Menu::CameraPreview)
+    }
+
+    /// True when `self` and `other` represent the same popover kind regardless of `from_hub`.
+    pub(super) fn same_kind(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Menu::Input { .. }, Menu::Input { .. })
+            | (Menu::Output { .. }, Menu::Output { .. })
+            | (Menu::Camera { .. }, Menu::Camera { .. }) => true,
+            _ => self == other,
+        }
+    }
+}
+
+/// The lab's `call-device-ux` proof: verifies focused device picker routing, active device
+/// summaries (including disconnected warnings), metering coverage, and non-duplicated dock modes.
+pub(in crate::gui) fn prove_call_device_ux() -> Result<(), &'static str> {
+    use protocol::settings::DeviceChoice;
+    use protocol::{AudioDevice, CameraSource};
+
+    // 1. Sidebar dock collapses to CompactStage while the main-pane stage bar is visible, avoiding
+    //    duplicate mute/deafen/share/camera/options buttons, and restores Full when browsing chat.
+    if dock::dock_mode(false, false, true) != dock::DockMode::CompactStage {
+        return Err("call dock did not collapse while the call stage bar is visible");
+    }
+    if dock::dock_mode(false, false, false) != dock::DockMode::Full {
+        return Err("call dock did not show full controls while browsing away from the call stage");
+    }
+    if dock::dock_mode(true, true, true) != dock::DockMode::CompactTiny {
+        return Err("Tiny room dock did not stay compact above the Tiny user panel");
+    }
+    if dock::dock_mode(true, false, false) != dock::DockMode::Full {
+        return Err("Tiny room dock did not restore full controls when Tiny user panel is hidden");
+    }
+
+    // 2. Stuck device notices open the focused Microphone or Speaker picker directly instead of
+    //    dumping all devices into one giant menu.
+    if devices::stuck_device_menu("Microphone (HyperX SoloCast 2) isn't connected.") != (Menu::Input { from_hub: false }) {
+        return Err("microphone notice did not route to focused Input picker");
+    }
+    if devices::stuck_device_menu("Speaker (Headset Earphone) is silent.") != (Menu::Output { from_hub: false }) {
+        return Err("speaker notice did not route to focused Output picker");
+    }
+    if !(Menu::Input { from_hub: false }).metered() || !(Menu::Output { from_hub: true }).metered() {
+        return Err("focused Input/Output pickers did not enable audio metering");
+    }
+    if !(Menu::Input { from_hub: false }).same_kind(&Menu::Input { from_hub: true }) {
+        return Err("same_kind did not match Input menu across hub/direct entry");
+    }
+
+    // 3. Compact Call Options hub resolves active device summaries and flags disconnected devices.
+    let listed = vec![
+        AudioDevice { id: "lyra".into(), name: "Microphone (Lyra-CAM-Audio_36HW)".into(), auto: true, default: true, is_virtual: false },
+    ];
+    let missing = DeviceChoice::device("Microphone (HyperX SoloCast 2)", "hyperx");
+    let (summary, warn) = devices::active_device_summary(&missing, &listed, "lyra");
+    if !warn || !summary.contains("not connected") {
+        return Err("disconnected chosen device was not flagged in compact hub summary");
+    }
+    let cams = vec![CameraSource { id: "cam-1".into(), name: "Lyra-CAM_36HW".into(), thumbnail: String::new() }];
+    let (cam_summary, cam_warn) = devices::active_camera_summary(&DeviceChoice::Auto, &cams, "cam-1");
+    if cam_warn || cam_summary != "Lyra-CAM_36HW" {
+        return Err("active camera summary did not resolve the default camera");
+    }
+    Ok(())
 }
 
 /// What a counter in the dock is counting.
@@ -1232,7 +1309,7 @@ impl Shell {
                 self.call_state.notice = Some(words.clone());
                 self.call_state.brief = None;
                 if in_call(call) {
-                    self.call_menu_set(Some(Menu::Devices), cx);
+                    self.call_menu_set(Some(devices::stuck_device_menu(words)), cx);
                 }
                 cx.notify();
             }
@@ -1435,7 +1512,7 @@ impl Shell {
         let now = Instant::now();
         let values = super::app::prefs::values();
         let watching = call.state == CallState::Joined && call.muted && !call.deafened && values.on(MUTED_TALK);
-        let menu = self.call_state.menu == Some(Menu::Devices);
+        let menu = self.call_state.menu.as_ref().is_some_and(Menu::metered);
         if watching && !menu && call.level.is_none() {
             if self.call_state.metering.is_none_or(|at| now.duration_since(at) > METER_AGAIN) {
                 self.call_state.metering = Some(now);

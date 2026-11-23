@@ -169,7 +169,16 @@ pub(super) fn focus() -> Option<super::stage::Focus> {
 fn channel(name: &str) -> bool {
     matches!(
         name,
-        "joined_channel" | "devices_menu" | "people_menu" | "confirm" | "incoming_strip" | "confirm_answer" | "view_room_share"
+        "joined_channel"
+            | "devices_menu"
+            | "input_menu"
+            | "output_menu"
+            | "camera_menu"
+            | "people_menu"
+            | "confirm"
+            | "incoming_strip"
+            | "confirm_answer"
+            | "view_room_share"
     )
 }
 
@@ -268,8 +277,29 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         name if channel(name) => now() - 271,
         _ => now() - 724,
     };
-    let menu = name == "devices_menu";
-    let speaking = matches!(name.as_str(), "joined_speaking" | "devices_menu" | "people_menu" | "ptt_talking");
+    let menu = matches!(
+        name.as_str(),
+        "devices_menu"
+            | "input_menu"
+            | "output_menu"
+            | "camera_menu"
+            | "view_devices_menu"
+            | "view_input_menu"
+            | "view_output_menu"
+    );
+    let speaking = matches!(
+        name.as_str(),
+        "joined_speaking"
+            | "devices_menu"
+            | "input_menu"
+            | "output_menu"
+            | "camera_menu"
+            | "view_devices_menu"
+            | "view_input_menu"
+            | "view_output_menu"
+            | "people_menu"
+            | "ptt_talking"
+    );
     // The first is the system default and what the automatic choice uses; a "Krisp" one is virtual.
     let listed = |names: &[&str]| -> Vec<protocol::AudioDevice> {
         let device = |(ix, name): (usize, &&str)| protocol::AudioDevice {
@@ -395,7 +425,10 @@ pub(super) fn left() -> Option<String> {
 
 pub(super) fn menu() -> Option<Menu> {
     match named()?.as_str() {
-        "devices_menu" => Some(Menu::Devices),
+        "devices_menu" | "view_devices_menu" => Some(Menu::Devices),
+        "input_menu" | "view_input_menu" => Some(Menu::Input { from_hub: false }),
+        "output_menu" | "view_output_menu" => Some(Menu::Output { from_hub: false }),
+        "camera_menu" => Some(Menu::Camera { from_hub: false }),
         "camera_preview" => Some(Menu::CameraPreview),
         "people_menu" => Some(Menu::People),
         "security" | "security_bar" => Some(Menu::Security),

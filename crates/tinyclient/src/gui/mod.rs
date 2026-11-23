@@ -84,6 +84,11 @@ pub(crate) fn prove_health_grade() -> Result<(), &'static str> {
     }
 }
 
+/// The lab's call-device-ux driver. Verifies focused device pickers and non-duplicated dock modes.
+pub(crate) fn prove_call_device_ux() -> Result<(), &'static str> {
+    call::prove_call_device_ux()
+}
+
 /// The lab's compact-call-health driver. The Video tab's history holds video's own rates, and
 /// holds nothing for the seconds no video ran.
 pub(crate) fn prove_compact_call_health() -> Result<(), &'static str> {
