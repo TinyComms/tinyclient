@@ -1,9 +1,12 @@
 //! Video counters at the media boundaries. Rates use elapsed wall time, not call ticks.
 use protocol::VideoStats;
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 #[derive(Default)]
 pub struct Meter {
+    encoders: BTreeSet<&'static str>,
+    decoders: BTreeSet<&'static str>,
     since: Option<Instant>,
     sent: (u64, u32),
     received: (u64, u32),
@@ -14,6 +17,14 @@ pub struct Meter {
 }
 
 impl Meter {
+    pub fn encoded_with(&mut self, name: &'static str) {
+        self.encoders.insert(name);
+    }
+
+    pub fn decoded_with(&mut self, name: &'static str) {
+        self.decoders.insert(name);
+    }
+
     pub fn expect(&mut self, expected: bool, now: Instant) {
         if expected {
             self.watching.get_or_insert(now);
@@ -68,6 +79,8 @@ impl Meter {
         let elapsed = now.saturating_duration_since(self.since.replace(now).unwrap_or(now)).as_secs_f64().max(0.001);
         let rate = |count: u64| (count as f64 / elapsed).round().min(u32::MAX as f64) as u32;
         let stats = VideoStats {
+            encoder_backends: std::mem::take(&mut self.encoders).into_iter().map(str::to_owned).collect(),
+            decoder_backends: std::mem::take(&mut self.decoders).into_iter().map(str::to_owned).collect(),
             receive_expected: self.watching.is_some(),
             watching_ms: self.watching.map_or(0, |at| now.saturating_duration_since(at).as_millis().min(u32::MAX as u128) as u32),
             send_kbps: rate(self.sent.0 * 8 / 1000),
@@ -89,7 +102,23 @@ impl Meter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+use std::time::Duration;
+
+    #[test]
+    fn a_sample_lists_distinct_backends_and_drops_stale_names() {
+        let now = Instant::now();
+        let mut meter = Meter::default();
+        meter.encoded_with("VA-API");
+        meter.encoded_with("OpenH264");
+        meter.encoded_with("OpenH264");
+        meter.decoded_with("OpenH264");
+        let sample = meter.sample(now);
+        assert_eq!(sample.encoder_backends, ["OpenH264", "VA-API"]);
+        assert_eq!(sample.decoder_backends, ["OpenH264"]);
+        let idle = meter.sample(now + Duration::from_secs(1));
+        assert!(idle.encoder_backends.is_empty());
+        assert!(idle.decoder_backends.is_empty());
+    }
 
     #[test]
     fn rates_use_elapsed_time_and_a_stalled_picture_keeps_aging() {

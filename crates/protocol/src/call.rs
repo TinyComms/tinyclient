@@ -1090,6 +1090,11 @@ pub struct CallStats {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoStats {
+    /// Distinct encoders and decoders that produced video in the sampled interval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encoder_backends: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoder_backends: Vec<String>,
     /// A remote video slot is selected and being watched.
     pub receive_expected: bool,
     /// Time this receive slot has been watched, so startup is not called a stall.
@@ -1527,4 +1532,18 @@ mod tests {
         assert!(wire.contains(r#""hand_raised":true"#) && wire.contains(r#""reaction":"👏""#), "{wire}");
         assert_eq!(serde_json::from_str::<Participant>(&wire).unwrap(), p);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn video_codec_backends_are_optional_on_the_wire() {
+    let stats = VideoStats::default();
+    let old = serde_json::to_value(&stats).unwrap();
+    assert!(old.get("encoder_backends").is_none());
+    let mut new = old.clone();
+    new["encoder_backends"] = serde_json::json!(["VideoToolbox", "OpenH264"]);
+    new["decoder_backends"] = serde_json::json!(["VideoToolbox"]);
+    let round_trip = serde_json::to_value(serde_json::from_value::<VideoStats>(new.clone()).unwrap()).unwrap();
+    assert_eq!(round_trip, new);
+    assert_eq!(serde_json::from_value::<VideoStats>(old).unwrap(), stats);
 }

@@ -426,6 +426,7 @@ impl KeyGate {
 
 /// Encoders and their capture. `Outgoing`, or a stand-in for a test.
 pub trait Source {
+    fn encoder_backend(&self, _track: Track) -> Option<&'static str> { None }
     fn share(&mut self, ask: Ask) -> Result<Encoded, String>;
     /// High then low. A layer with no `Ask` is stopped, and comes back empty.
     fn camera(&mut self, high: Option<Ask>, low: Option<Ask>)
@@ -444,6 +445,11 @@ pub trait Source {
 }
 
 impl Source for Outgoing {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn encoder_backend(&self, track: Track) -> Option<&'static str> {
+        self.backend_name(track)
+    }
+
     fn self_view(&mut self) -> Option<Painted> {
         Outgoing::self_view(self)
     }
@@ -560,6 +566,9 @@ impl<S: Source> Capture<S> {
             self.gate(track).ask();
             return true;
         };
+        if let Some(name) = self.source.encoder_backend(track) {
+            self.controls.video_stats.lock().unwrap().encoded_with(name);
+        }
         if coded.key {
             tracing::debug!(?track, wanted_key, bytes = coded.bytes.len(), "keyframe handed to the tick");
         }
@@ -842,6 +851,7 @@ enum Take {
 
 /// The decoder and what it paints. `Incoming`, or a stand-in for a test.
 pub trait Screen {
+    fn decoder_backend(&self) -> Option<&'static str> { None }
     /// Decodes one frame, always, and has it painted for `paint` if given. `Err` when it did
     /// not decode. What was painted comes back from [`Screen::painted`], later.
     #[allow(clippy::result_unit_err)]
@@ -854,6 +864,11 @@ pub trait Screen {
 }
 
 impl Screen for Incoming {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn decoder_backend(&self) -> Option<&'static str> {
+        self.backend_name()
+    }
+
     fn decode(&mut self, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
         Incoming::decode(self, annex_b, paint)
     }
@@ -967,6 +982,9 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
         let painting = paint.is_some();
         let began = Instant::now();
         let decoded = self.screen.decode(&opened, paint);
+        if let Some(name) = self.screen.decoder_backend() {
+            self.controls.video_stats.lock().unwrap().decoded_with(name);
+        }
         self.cost.note(began, Instant::now(), painting && decoded.is_ok());
         match decoded {
             Ok(()) => {

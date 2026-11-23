@@ -452,6 +452,12 @@ impl Shell {
                         "Complete incoming video frames per second. No value while you are not watching."))
                     .child(row("Rendered", if incoming { video.rendered_fps.to_string() } else { "—".to_owned() }, "fps", incoming,
                         "Completed video images prepared for this window, not monitor refreshes.")));
+            if !video.encoder_backends.is_empty() {
+                card = card.child(meta_row("Encoder", video.encoder_backends.join(", ")));
+            }
+            if !video.decoder_backends.is_empty() {
+                card = card.child(meta_row("Decoder", video.decoder_backends.join(", ")));
+            }
             if incoming {
                 card = card.child(meta_row("Resolution", if video.width > 0 { format!("{} × {}", video.width, video.height) } else { "Waiting…".to_owned() }))
                     .child(meta_row("Last image", video.frame_age_ms.map_or_else(|| "None yet".to_owned(), |age| format!("{age} ms ago"))));

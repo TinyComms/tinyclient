@@ -1351,7 +1351,11 @@ impl Loop {
         self.drops.unnamed += self.held.expire(Instant::now());
         self.setup.audio.log_glitches();
         self.meter.troubles = self.setup.audio.troubles();
-        let stats = self.meter.second(self.streams.values_mut().map(Stream::counts));
+        let mut stats = self.meter.second(self.streams.values_mut().map(Stream::counts));
+        let video = self.setup.controls.video_stats.lock().unwrap().sample(Instant::now());
+        if !video.encoder_backends.is_empty() || !video.decoder_backends.is_empty() {
+            stats.video = Some(video);
+        }
         self.setup.controls.publish_stats(stats);
         let users = self.setup.users.lock().unwrap();
         self.streams.retain(|ssrc, stream| {
