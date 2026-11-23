@@ -415,6 +415,9 @@ pub struct Call {
     /// The stream we are watching has stopped sending. The tile says so.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stream_paused: bool,
+    /// A Go Live leg's own MLS group. It does not replace [`Call::security`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_security: Option<CallSecurity>,
 }
 
 /// Someone rung into a group call, and what the server last said of that ring.
@@ -464,6 +467,12 @@ pub struct CallSecurity {
     /// Only with [`SecurityMode::Transport`]: the server itself has no end-to-end encryption.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub server_lacks: bool,
+    /// This report is the Go Live leg, not the voice call. chatd keeps it on [`Call::stream_security`].
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub stream: bool,
+    /// Our DAVE identity public key (hex). Empty on a Tiny call. chatd publishes it once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity: String,
     /// This call is never carried on unencrypted: the person chose so, the server is an Incognito
     /// host, or the room only takes end-to-end encrypted calls. A [`SecurityMode::Blocked`] call
     /// then offers no way on but leaving.

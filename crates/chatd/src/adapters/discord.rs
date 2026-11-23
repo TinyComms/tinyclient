@@ -832,6 +832,13 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         search_turn: Mutex::new(()),
         stream_gate: Mutex::new(()),
     });
+    let posting = discord.clone();
+    discord.ctx.hub.calls.on_identity(move |conversation, identity| {
+        if conversation.account() != posting.ctx.account || posting.ctx.stopped() {
+            return;
+        }
+        posting.publish_dave_key(identity);
+    });
     let socket = discord.clone();
     std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
     let (commands, network_inbox) = channel();

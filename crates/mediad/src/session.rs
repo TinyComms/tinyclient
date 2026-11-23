@@ -653,6 +653,7 @@ impl Call {
         let first = self.dave.lock().unwrap().start(version);
         self.deliver(socket, first)?;
         self.dave_version = version;
+        self.dave_report();
         self.ssrc = transport.ssrc;
         let stop = Arc::new(AtomicBool::new(false));
         let setup = media::Setup {
@@ -770,6 +771,7 @@ impl Call {
             dave::EXECUTE_TRANSITION => {
                 if let Some(transition) = number(&d["transition_id"]) {
                     self.dave.lock().unwrap().execute_transition(transition as u16);
+                    self.dave_report();
                     self.encrypted()?;
                 }
             }
@@ -777,6 +779,7 @@ impl Call {
                 if let (Some(epoch), Some(version)) = (number(&d["epoch"]), number(&d["protocol_version"])) {
                     let answer = self.dave.lock().unwrap().prepare_epoch(epoch, version as u16);
                     self.deliver(socket, answer)?;
+                    self.dave_report();
                 }
             }
             // Media sink wants, flags, platform and the rest carry nothing an audio call needs.
@@ -786,6 +789,7 @@ impl Call {
     }
 
     fn binary(&mut self, socket: &mut Socket, op: u8, payload: &[u8]) -> Result<(), End> {
+        let epoch = matches!(op, dave::ANNOUNCE_COMMIT | dave::WELCOME);
         let answer = {
             let mut dave = self.dave.lock().unwrap();
             match op {
@@ -802,7 +806,34 @@ impl Call {
                 _ => Vec::new(),
             }
         };
-        self.deliver(socket, answer)
+        self.deliver(socket, answer)?;
+        if epoch {
+            self.dave_report();
+        }
+        Ok(())
+    }
+
+    /// The privacy code and each pairwise verification code, after a transition or a new epoch.
+    /// Scrypt runs off the dave lock: `encrypt` must not wait on it.
+    fn dave_report(&self) {
+        let wanted = self.dave.lock().unwrap().safety_wanted();
+        let made: Vec<(u64, Vec<u8>, String)> = wanted
+            .into_iter()
+            .map(|(id, key, me, mine)| {
+                let number = crate::e2ee::safety_number(id, &key, me, &mine);
+                (id, key, number)
+            })
+            .collect();
+        let report = {
+            let mut dave = self.dave.lock().unwrap();
+            for (id, key, number) in made {
+                dave.add_safety(id, key, number);
+            }
+            dave.take_report(self.join.stream)
+        };
+        if let Some(security) = report {
+            out::send(&MediaResponse::TinySecurity(security));
+        }
     }
 
     fn converse(&mut self, socket: &mut Socket) -> End {
@@ -968,6 +999,7 @@ impl Call {
         socket.send(gateway::SINK, json!({ "any": 100 })).map_err(dropped)?;
         self.joined = true;
         self.deadline = None;
+        self.dave_report();
         Ok(())
     }
 
@@ -1207,7 +1239,13 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
         seq_ack: None,
         transport: None,
         ssrc: 0,
-        dave: Arc::new(Mutex::new(Dave::new(user, room))),
+        dave: Arc::new(Mutex::new({
+            let mut dave = Dave::new(user, room);
+            if let Some(key) = dave::account_identity() {
+                dave.use_identity(key);
+            }
+            dave
+        })),
         dave_version: 0,
         users: Arc::default(),
         connected: BTreeSet::from([user]),

@@ -1786,6 +1786,30 @@ impl Discord {
             tracing::warn!("chatd: discord stream preview was not posted ({err})");
         }
     }
+
+    /// The account's DAVE public key, once per call. A failed post does not fail the call.
+    pub(super) fn publish_dave_key(&self, hex_key: &str) {
+        let Some(body) = identity_body(hex_key) else {
+            tracing::warn!("chatd: discord identity key was not a P-256 point");
+            return;
+        };
+        if let Err(err) = self.rest.call("POST", "/voice/public-keys", Some(body)) {
+            tracing::warn!("chatd: discord identity was not published ({err})");
+        }
+    }
+}
+
+/// `POST /voice/public-keys`: the 65-byte uncompressed P-256 point, standard base64.
+fn identity_body(hex_key: &str) -> Option<Value> {
+    let bytes = hex_bytes(hex_key)?;
+    (bytes.len() == 65).then(|| json!({ "public_key": base64::engine::general_purpose::STANDARD.encode(bytes) }))
+}
+
+fn hex_bytes(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok()).collect()
 }
 
 enum StreamNext {
@@ -1901,6 +1925,17 @@ fn tiny_jpeg() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn a_public_key_is_posted_as_standard_base64() {
+        let raw = vec![0x04u8; 65];
+        let hex: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
+        let body = identity_body(&hex).expect("a 65-byte point");
+        assert_eq!(body["public_key"], base64::engine::general_purpose::STANDARD.encode(&raw));
+        assert!(identity_body("abcd").is_none(), "too short to be a point");
+        assert!(identity_body(&"aa".repeat(64)).is_none(), "64 bytes is not an uncompressed point");
+    }
 
     #[test]
     fn a_preview_without_a_frame_is_still_a_jpeg() {

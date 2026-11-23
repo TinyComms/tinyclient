@@ -95,6 +95,12 @@ struct Live {
     room_bitrate: Option<u32>,
     /// How mediad last said the call is protected, before whom the user verified is applied.
     secured: Option<protocol::CallSecurity>,
+    /// The Go Live leg's report, kept apart from the voice call.
+    stream_secured: Option<protocol::CallSecurity>,
+    /// The identity key already given to Discord for this call.
+    posted_identity: Option<String>,
+    /// Set when a new identity should be published, read once outside the call lock.
+    pending_identity: Option<String>,
     /// A call has this mediad (`ActiveCall::adopt`, or a mediad started for one). Until then it
     /// is an engine waiting: what it says (its device list, again at every hot-plug) is learned
     /// but never drawn or announced as a call.
@@ -154,6 +160,9 @@ enum Slot {
 type Failed = Box<dyn Fn(&Key) + Send + Sync>;
 /// Told a frame mediad has for the network's socket, and the conversation of its call.
 type Signal = Box<dyn Fn(&Key, String) + Send + Sync>;
+/// Publishes one account's DAVE identity key. Held in an `Arc` so the list can be called
+/// without keeping this lock across the request.
+type IdentityHook = std::sync::Arc<dyn Fn(&Key, &str) + Send + Sync>;
 
 /// At most one call, across every network.
 #[derive(Default)]
@@ -172,6 +181,8 @@ pub struct Calls {
     /// Tiny media dropped, or came back. The live socket resumes the call; the same shape as `failed`.
     tiny_down: Mutex<Option<Failed>>,
     tiny_up: Mutex<Option<Failed>>,
+    /// Discord accounts that publish a DAVE identity key. One hook per signed-in account.
+    identity: Mutex<Vec<IdentityHook>>,
     /// The mediad started for Settings' microphone test or test sound, outside a call.
     tester: Mutex<Option<Tester>>,
     /// A mediad started ahead of the next call (`prewarm`).
@@ -295,6 +306,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         move_notice: None,
         viewers: Vec::new(),
         stream_paused: false,
+        stream_security: None,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -309,6 +321,9 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         push_to_talk: false,
         room_bitrate: None,
         secured: None,
+        stream_secured: None,
+        posted_identity: None,
+        pending_identity: None,
         adopted: false,
         over: false,
     }
@@ -535,16 +550,28 @@ impl Live {
                 self.call.outputs = outputs;
                 self.call.cameras = cameras;
             }
-            // Whom the user verified is chatd's to know; a call that is not a Tiny one never
-            // hears this.
+            // Whom the user verified is chatd's to know. A Discord report uses the same shape:
+            // the voice call on `security`, a Go Live leg on `stream_security`.
             MediaResponse::TinySecurity(security) => {
                 let account = self.call.conversation.account();
-                self.secured = Some(security.clone());
-                let security = Some(crate::verified::trusted(&account, security));
-                if self.call.security == security {
+                let stream = security.stream;
+                let identity = security.identity.clone();
+                let security = crate::verified::trusted(&account, security);
+                let same = if stream { self.call.stream_security.as_ref() == Some(&security) } else { self.call.security.as_ref() == Some(&security) };
+                if stream {
+                    self.stream_secured = Some(security.clone());
+                    self.call.stream_security = Some(security);
+                } else {
+                    self.secured = Some(security.clone());
+                    self.call.security = Some(security);
+                }
+                if !identity.is_empty() && self.posted_identity.as_deref() != Some(identity.as_str()) {
+                    self.posted_identity = Some(identity.clone());
+                    self.pending_identity = Some(identity);
+                }
+                if same {
                     return false;
                 }
-                self.call.security = security;
             }
             MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } | MediaResponse::TinyRenegotiate { .. } => return false,
             MediaResponse::Picture { path, width, height, generation, user_id, kind } => {
@@ -846,9 +873,13 @@ fn heard(hub: &Hub, seen: &Mutex<Live>, frame: MediaResponse) {
     let mut live = crate::hub::lock(seen);
     let conversation = live.call.conversation.clone();
     let call = live.hear(frame);
+    let identity = live.pending_identity.take();
     let adopted = live.adopted && !live.over;
     let state_now = live.call.state.clone();
     drop(live);
+    if let Some(identity) = identity {
+        hub.calls.tell_identity(&conversation, &identity);
+    }
     // Outside the call lock. A drop while already reconnecting does not redraw, and
     // still has to be resumed; the first connect is not one.
     if adopted && conversation.network == protocol::Network::Tiny {
@@ -990,6 +1021,18 @@ impl Calls {
         *crate::hub::lock(&self.tiny_up) = Some(Box::new(told));
     }
 
+    /// One signed-in Discord account publishes the key mediad kept for it.
+    pub fn on_identity(&self, told: impl Fn(&Key, &str) + Send + Sync + 'static) {
+        crate::hub::lock(&self.identity).push(std::sync::Arc::new(told));
+    }
+
+    fn tell_identity(&self, conversation: &Key, key: &str) {
+        let hooks = crate::hub::lock(&self.identity).clone();
+        for hook in hooks {
+            hook(conversation, key);
+        }
+    }
+
     fn signal(&self, conversation: &Key, frame: String) {
         if let Some(told) = &*crate::hub::lock(&self.signal) {
             told(conversation, frame);
@@ -1021,6 +1064,7 @@ impl Calls {
         };
         let refreshed = self.update(hub, &call.conversation, |live| {
             live.call.security = live.secured.clone().map(|security| crate::verified::trusted(account, security));
+            live.call.stream_security = live.stream_secured.clone().map(|security| crate::verified::trusted(account, security));
         });
         if refreshed {
             self.tell(hub);

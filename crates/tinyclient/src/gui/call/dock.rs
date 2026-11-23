@@ -1703,6 +1703,7 @@ mod tests {
         move_notice: None,
         viewers: Vec::new(),
         stream_paused: false,
+        stream_security: None,
         }
     }
 
