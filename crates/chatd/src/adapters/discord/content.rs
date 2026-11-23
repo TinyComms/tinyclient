@@ -1390,6 +1390,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         seal: protocol::Seal::Plain,
         card,
         cards: composed_cards,
+        meeting_transcript: None,
         deleted: false,
         moderated: false,
         forwarded: forwarded_from,

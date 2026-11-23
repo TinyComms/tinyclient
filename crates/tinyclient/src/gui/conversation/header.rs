@@ -294,6 +294,7 @@ impl Shell {
             .children(live_hint.map(|hint| div().flex_none().ml(px(8.)).child(hint)))
             .children(self.follow_button(open, cx).map(|follow| div().flex_none().ml(px(8.)).child(follow)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
+            .children(self.meeting_button(open, link, compact, cx))
             .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
             .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).children(add_people).child(search).children(members).children(details).child(windowed))
     }
