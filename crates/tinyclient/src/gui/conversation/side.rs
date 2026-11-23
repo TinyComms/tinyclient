@@ -1963,6 +1963,12 @@ impl Shell {
                         shell.open_thread_of(conversation, root.clone(), cx);
                     }
                 }
+                PaneEvent::OpenStory { peer, story_id } => {
+                    shell.open_story_viewer(peer.clone(), story_id.clone(), cx);
+                }
+                PaneEvent::StopLiveLocation { conversation, message_id } => {
+                    shell.stop_live_location(conversation.clone(), message_id.clone(), cx);
+                }
             })
         });
     }

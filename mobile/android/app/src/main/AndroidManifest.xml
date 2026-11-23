@@ -19,6 +19,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- Live location sharing (#452): runtime location permissions and foreground service notification. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
 
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
@@ -102,6 +107,12 @@
             android:name="dev.tinyclient.app.CallService"
             android:exported="false"
             android:foregroundServiceType="microphone|camera|mediaProjection" />
+
+        <!-- Live location sharing in progress (#452): persistent ongoing notification while active. -->
+        <service
+            android:name="dev.tinyclient.app.LocationService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
 
         <!-- Chromium binds back while the auth tab is foreground, keeping the in-process
              loopback listener runnable. Empty Binder only; never a started service. -->

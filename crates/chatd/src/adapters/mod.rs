@@ -1553,6 +1553,73 @@ pub enum Command {
         good: bool,
         reply: Reply<()>,
     },
+    /// List active story rings (`peer_id: None`) or one peer's stories (`peer_id: Some`).
+    /// Never marks any story as read.
+    Stories {
+        peer_id: Option<String>,
+        reply: Reply<(Vec<protocol::PeerStoryRing>, Vec<protocol::Story>)>,
+    },
+    /// Explicitly mark a peer's stories read up to `story_id` (`stories.readStories`).
+    ReadStory {
+        peer_id: String,
+        story_id: String,
+        reply: Reply<()>,
+    },
+    /// React to a story (`stories.sendReaction`) or clear reaction when `emoji` is `None`.
+    ReactStory {
+        peer_id: String,
+        story_id: String,
+        emoji: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Reply privately to a story (`inputReplyToStory`). Returns `(conversation_id, message)`.
+    ReplyStory {
+        peer_id: String,
+        story_id: String,
+        client_id: String,
+        text: String,
+        reply: Reply<(String, protocol::Message)>,
+    },
+    /// Send a one-time location (`inputMediaGeoPoint`).
+    SendLocation {
+        conversation_id: String,
+        client_id: String,
+        point: protocol::GeoPoint,
+        reply_to: Option<String>,
+        reply: Reply<protocol::Message>,
+    },
+    /// Start sharing a live location (`inputMediaGeoLive`).
+    StartLiveLocation {
+        conversation_id: String,
+        client_id: String,
+        point: protocol::GeoPoint,
+        period_secs: u32,
+        proximity_alert_radius: Option<u32>,
+        reply_to: Option<String>,
+        reply: Reply<protocol::LiveLocationShare>,
+    },
+    /// Update coordinates of an active live location share (`messages.editMessage`).
+    UpdateLiveLocation {
+        conversation_id: String,
+        message_id: String,
+        point: protocol::GeoPoint,
+        proximity_alert_radius: Option<u32>,
+        reply: Reply<protocol::LiveLocationShare>,
+    },
+    /// Stop one active live location share (`messages.editMessage` with `stopped: true`).
+    StopLiveLocation {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<()>,
+    },
+    /// Stop all active live location shares on this account.
+    StopAllLiveLocations {
+        reply: Reply<()>,
+    },
+    /// List active live location shares on this account.
+    ActiveLiveLocations {
+        reply: Reply<Vec<protocol::LiveLocationShare>>,
+    },
     /// Translate one message on demand into `to` (normalized ISO 639-1 language tag).
     /// Never called for end-to-end encrypted conversations.
     Translate {
@@ -2205,6 +2272,16 @@ impl Command {
             Command::Favourite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Transcribe { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Stories { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReadStory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReactStory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReplyStory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartLiveLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UpdateLiveLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StopLiveLocation { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StopAllLiveLocations { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActiveLiveLocations { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Voicemails { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2913,6 +2990,10 @@ impl Context {
         self.hub.store().message(&self.key(conversation_id), message_id)
     }
 
+    pub fn stored_conversation(&self, conversation_id: &str) -> rusqlite::Result<Option<protocol::Conversation>> {
+        self.hub.store().conversation(&self.key(conversation_id))
+    }
+
     /// The conversation a stored message is in. `None` when this account has no such message,
     /// so a receipt for it is not filed onto some other chat.
     pub fn conversation_of_message(&self, message_id: &str) -> rusqlite::Result<Option<String>> {
@@ -3338,6 +3419,22 @@ impl Context {
             message_id: message_id.to_owned(),
             action_id: action_id.to_owned(),
             reason: reason.to_owned(),
+        });
+    }
+
+    /// Publishes updated active story rings for this account (never marks anything seen).
+    pub fn stories(&self, rings: Vec<protocol::PeerStoryRing>) {
+        self.hub.changed(Change::Stories {
+            account: self.account.clone(),
+            rings,
+        });
+    }
+
+    /// Publishes the authoritative list of active live location shares for this account.
+    pub fn live_locations(&self, shares: Vec<protocol::LiveLocationShare>) {
+        self.hub.changed(Change::LiveLocations {
+            account: self.account.clone(),
+            shares,
         });
     }
 

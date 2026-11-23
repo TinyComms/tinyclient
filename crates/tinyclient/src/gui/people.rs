@@ -815,7 +815,11 @@ fn person_avatar(hub: &Hub, person: &Person, size: f32, ring: &Ring, in_call: bo
         (false, true) => Some(Shape::InCall),
         (false, false) => Shape::of(shown_presence(hub, person)),
     };
-    avatar.children(shape.and_then(|shape| presence::dot(shape, size, ring)))
+    let avatar = avatar.children(shape.and_then(|shape| presence::dot(shape, size, ring)));
+    match hub.story_ring(&person.key) {
+        Some(story_ring) => super::stories::wrap_avatar_ring(avatar, size, story_ring.has_unseen(), story_ring.close_friends),
+        None => avatar,
+    }
 }
 
 /// What is known now beats what the list said when it was read.

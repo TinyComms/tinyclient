@@ -18,6 +18,7 @@
 mod codec;
 pub(crate) mod jvm;
 mod approval;
+mod location;
 #[cfg(feature = "demo")]
 mod loopback;
 mod natives;
@@ -41,6 +42,7 @@ pub fn register() {
     mediad::platform::register(phone.clone());
     protocol::web_sign_in::register(phone);
     protocol::device_approval::register(Arc::new(approval::AndroidApproval));
+    protocol::location::register(Arc::new(location::AndroidLocation));
     hooks::route_system_settings(|_| open_settings());
     hooks::route_audio(routes, choose_route);
     hooks::route_flip(flip);
