@@ -10,7 +10,7 @@ pub(super) fn open(screen: Option<&str>) -> Result<Box<dyn Pull>, String> {
     let devices = host.input_devices().map_err(|err| err.to_string())?;
     let mut monitors = Vec::new();
     for device in devices {
-        let name = device.name().unwrap_or_default();
+        let name = device.description().ok().map(|d| d.name().to_owned()).unwrap_or_default();
         if name.to_ascii_lowercase().contains("monitor") {
             monitors.push((name, device));
         }

@@ -6,7 +6,7 @@ use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, DefinedClass};
+use objc2::{define_class, msg_send, AnyThread, DefinedClass};
 use objc2_core_media::CMSampleBuffer;
 use objc2_foundation::{NSError, NSObject};
 use objc2_screen_capture_kit::{SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamOutput, SCStreamOutputType};
@@ -62,8 +62,7 @@ pub(super) fn open(screen: Option<&str>) -> Result<Box<dyn Pull>, String> {
     if !unsafe { CGPreflightScreenCaptureAccess() } {
         return Err(PERMISSION.to_owned());
     }
-    let filter = crate::picture::mac_screen::share_filter(screen)?;
-    Live::start(filter)
+    Live::start(screen.map(str::to_owned))
 }
 
 struct Live {
@@ -88,22 +87,46 @@ impl Pull for Live {
 }
 
 impl Live {
-    fn start(filter: Retained<objc2_screen_capture_kit::SCContentFilter>) -> Result<Box<dyn Pull>, String> {
+    fn start(screen: Option<String>) -> Result<Box<dyn Pull>, String> {
         let (pcm, incoming) = Pcm::new(2, crate::RATE);
         let (stop, stopped) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("share-audio".into())
             .spawn(move || {
-                if let Err(err) = run(filter, incoming, stopped) {
+                if let Err(err) = run(screen.as_deref(), incoming, stopped, ready_tx) {
                     tracing::warn!("mediad: share audio: {err}");
                 }
             })
             .map_err(|err| err.to_string())?;
-        Ok(Box::new(Live { stop, thread: Some(thread), pcm }))
+        match ready_rx.recv_timeout(Duration::from_secs(6)) {
+            Ok(Ok(())) => Ok(Box::new(Live { stop, thread: Some(thread), pcm })),
+            Ok(Err(err)) => {
+                let _ = thread.join();
+                Err(err)
+            }
+            Err(_) => {
+                let _ = stop.send(());
+                let _ = thread.join();
+                Err("ScreenCaptureKit did not respond.".to_owned())
+            }
+        }
     }
 }
 
-fn run(filter: Retained<objc2_screen_capture_kit::SCContentFilter>, incoming: Arc<Mutex<VecDeque<i16>>>, stop: std::sync::mpsc::Receiver<()>) -> Result<(), String> {
+fn run(
+    screen: Option<&str>,
+    incoming: Arc<Mutex<VecDeque<i16>>>,
+    stop: std::sync::mpsc::Receiver<()>,
+    ready: std::sync::mpsc::SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    let filter = match crate::picture::mac_screen::share_filter(screen) {
+        Ok(filter) => filter,
+        Err(err) => {
+            let _ = ready.try_send(Err(err.clone()));
+            return Err(err);
+        }
+    };
     let output = Output::alloc().set_ivars(incoming);
     let output: Retained<Output> = unsafe { msg_send![super(output), init] };
     let queue = DispatchQueue::new("dev.tinyclient.share.audio", None);
@@ -116,16 +139,20 @@ fn run(filter: Retained<objc2_screen_capture_kit::SCContentFilter>, incoming: Ar
         config.setChannelCount(2);
         config.setExcludesCurrentProcessAudio(true);
         let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(ProtocolObject::from_ref(&*output)));
-        stream
-            .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Audio, Some(&queue))
-            .map_err(|err| err.localizedDescription().to_string())?;
+        if let Err(err) = stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Audio, Some(&queue)) {
+            let msg = err.localizedDescription().to_string();
+            let _ = ready.try_send(Err(msg.clone()));
+            return Err(msg);
+        }
         stream
     };
     let started = wait(|done| unsafe { stream.startCaptureWithCompletionHandler(Some(done)) });
     if let Err(err) = started {
         unsafe { stream.stopCaptureWithCompletionHandler(None) };
+        let _ = ready.try_send(Err(err.clone()));
         return Err(err);
     }
+    let _ = ready.try_send(Ok(()));
     let _ = stop.recv();
     unsafe { stream.stopCaptureWithCompletionHandler(None) };
     Ok(())
