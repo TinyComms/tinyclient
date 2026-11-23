@@ -1,0 +1,7 @@
+{
+  "id": "discord-wave15",
+  "title": "A Discord Go Live viewer hears the stream and can mute its sound",
+  "platforms": ["windows", "macos", "linux"],
+  "needs": [],
+  "release": false
+}
