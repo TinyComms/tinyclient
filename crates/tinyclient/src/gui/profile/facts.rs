@@ -680,6 +680,7 @@ pub enum Item {
     Block,
     Unblock,
     Report,
+    StartVideoChat,
     Leave,
 }
 
@@ -918,6 +919,14 @@ pub fn can_leave(conversation: &Conversation) -> bool {
 
 pub fn conversation_menu(conversation: &Conversation, link: Option<&str>, alt: bool) -> Vec<Item> {
     let mut items = Vec::new();
+    if conversation.key.network == Network::Telegram
+        && matches!(conversation.kind, ConversationKind::Group | ConversationKind::Channel)
+        && conversation.rights.manage_call
+        && conversation.occupants.as_ref().is_none_or(|o| !o.active())
+    {
+        items.push(Item::StartVideoChat);
+        items.push(Item::Separator);
+    }
     if link.is_some() {
         items.push(Item::CopyLink);
         // The foot opens it in the app where it draws one; a Telegram chat has no foot.
@@ -1465,6 +1474,12 @@ mod tests {
         assert_eq!(conversation_menu(&group, Some("l"), false), vec![Item::CopyLink, Item::Separator, Item::Leave]);
         // A Telegram chat has no foot, so its menu opens it.
         assert_eq!(conversation_menu(&row(Network::Telegram, ConversationKind::Group), Some("l"), false), vec![Item::CopyLink, Item::OpenIn, Item::Separator, Item::Leave]);
+        let mut tg_admin = row(Network::Telegram, ConversationKind::Group);
+        tg_admin.rights.manage_call = true;
+        assert_eq!(
+            conversation_menu(&tg_admin, Some("l"), false),
+            vec![Item::StartVideoChat, Item::Separator, Item::CopyLink, Item::OpenIn, Item::Separator, Item::Leave]
+        );
         let channel = row(Network::Slack, ConversationKind::Channel);
         assert_eq!(conversation_menu(&channel, None, false), vec![Item::Leave]);
         assert!(can_leave(&channel));

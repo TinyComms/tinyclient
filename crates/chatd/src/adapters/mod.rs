@@ -1863,6 +1863,55 @@ pub enum Command {
     GroupCallStart { conversation_id: String, reply: Reply<()> },
     /// Toggles the reminder subscription on a scheduled Telegram video chat.
     GroupCallSubscribe { conversation_id: String, subscribed: bool, reply: Reply<()> },
+    /// Queries allowed `join_as` peers and remembered default for a Telegram video chat (#460).
+    GroupCallJoinAs { conversation_id: String, reply: Reply<protocol::GroupCallJoinAs> },
+    /// Joins or switches identity in a Telegram video chat with optional `join_as` / `invite_hash` (#460, #459).
+    GroupCallJoin {
+        conversation_id: String,
+        join_as: Option<String>,
+        invite_hash: Option<String>,
+        save_default: bool,
+        reply: Reply<()>,
+    },
+    /// Saves the default join-as peer for a chat (`phone.saveDefaultGroupCallJoinAs`) (#460).
+    GroupCallSaveDefaultJoinAs { conversation_id: String, peer_id: String, reply: Reply<()> },
+    /// Creates a live Telegram video chat (`phone.createGroupCall`), following migration if needed, and optionally joins (#466).
+    GroupCallCreate {
+        conversation_id: String,
+        title: Option<String>,
+        rtmp_stream: bool,
+        join: bool,
+        reply: Reply<String>,
+    },
+    /// Renames a live or scheduled Telegram video chat (`phone.editGroupCallTitle`) (#466).
+    GroupCallEditTitle { conversation_id: String, title: String, reply: Reply<()> },
+    /// Ends a Telegram video chat for everyone (`phone.discardGroupCall`) (#466).
+    GroupCallDiscard { conversation_id: String, reply: Reply<()> },
+    /// Invites selected users into a Telegram video chat (`phone.inviteToGroupCall`) (#459).
+    GroupCallInvite {
+        conversation_id: String,
+        users: Vec<String>,
+        reply: Reply<protocol::GroupCallInviteResult>,
+    },
+    /// Exports a listener or speaker invite link (`phone.exportGroupCallInvite`) (#459).
+    GroupCallExportInvite { conversation_id: String, can_self_unmute: bool, reply: Reply<String> },
+    /// Updates admin group call settings (`phone.toggleGroupCallSettings`) (#459, #464).
+    GroupCallSettings {
+        conversation_id: String,
+        join_muted: Option<bool>,
+        reset_invite_hash: bool,
+        reply: Reply<()>,
+    },
+    /// Raises or lowers our own hand in a Telegram video chat (`phone.editGroupCallParticipant`) (#464).
+    GroupCallRaiseHand { conversation_id: String, raised: bool, reply: Reply<()> },
+    /// Moderates a participant in a Telegram video chat: mute, allow to speak, or remove/ban from group (#464).
+    GroupCallModerate {
+        conversation_id: String,
+        participant_id: String,
+        muted: Option<bool>,
+        remove: bool,
+        reply: Reply<()>,
+    },
     /// In-call signalling bytes from mediad for Telegram `phone.sendSignalingData` (base64).
     TelegramCallSignal { conversation_id: String, data: String },
     /// Local speaking state changed in a Telegram group call (`speakingInGroupCallAction`).
@@ -2074,12 +2123,26 @@ impl Command {
             | Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
-            Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. }
+            Command::CallRing { reply, .. }
+            | Command::CallStopRinging { reply, .. }
             | Command::GroupCallSchedule { reply, .. }
             | Command::GroupCallStart { reply, .. }
-            | Command::GroupCallSubscribe { reply, .. } => {
+            | Command::GroupCallSubscribe { reply, .. }
+            | Command::GroupCallJoin { reply, .. }
+            | Command::GroupCallSaveDefaultJoinAs { reply, .. }
+            | Command::GroupCallEditTitle { reply, .. }
+            | Command::GroupCallDiscard { reply, .. }
+            | Command::GroupCallSettings { reply, .. }
+            | Command::GroupCallRaiseHand { reply, .. }
+            | Command::GroupCallModerate { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::GroupCallJoinAs { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GroupCallCreate { reply, .. }
+            | Command::GroupCallExportInvite { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::GroupCallInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -3535,6 +3598,29 @@ impl Context {
     /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).
     pub fn self_moderation(&self, conversation_id: &str, server_muted: bool, server_deafened: bool, suppressed: bool) {
         self.hub.calls.set_self_moderation(&self.hub, &self.key(conversation_id), server_muted, server_deafened, suppressed);
+    }
+
+    /// Updates Telegram group call metadata on the active call snapshot.
+    pub fn group_call_meta(
+        &self,
+        conversation_id: &str,
+        title: String,
+        hand_raised: bool,
+        join_muted: bool,
+        can_change_join_muted: bool,
+        participants_count: u32,
+        joined_as: Option<String>,
+    ) {
+        self.hub.calls.set_group_call_meta(
+            &self.hub,
+            &self.key(conversation_id),
+            title,
+            hand_raised,
+            join_muted,
+            can_change_join_muted,
+            participants_count,
+            joined_as,
+        );
     }
 
     /// A Tiny server call: mediad's offer for this room, with mediad started for it first. A

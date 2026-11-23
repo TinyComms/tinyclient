@@ -654,6 +654,12 @@ mod tests {
         moved_from: None,
         move_notice: None,
         incoming_video: false,
+        title: String::new(),
+        hand_raised: false,
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
         }
     }
 

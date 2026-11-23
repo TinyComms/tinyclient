@@ -858,7 +858,18 @@ fn offline(ctx: &Context, command: Command) {
         Command::PreviewChannel { reply, .. } | Command::Join { reply, .. } => drop(reply.send(Err(down()))),
         Command::GroupCallSchedule { reply, .. }
         | Command::GroupCallStart { reply, .. }
-        | Command::GroupCallSubscribe { reply, .. } => drop(reply.send(Err(down()))),
+        | Command::GroupCallSubscribe { reply, .. }
+        | Command::GroupCallJoin { reply, .. }
+        | Command::GroupCallSaveDefaultJoinAs { reply, .. }
+        | Command::GroupCallEditTitle { reply, .. }
+        | Command::GroupCallDiscard { reply, .. }
+        | Command::GroupCallSettings { reply, .. }
+        | Command::GroupCallRaiseHand { reply, .. }
+        | Command::GroupCallModerate { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GroupCallJoinAs { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GroupCallCreate { reply, .. }
+        | Command::GroupCallExportInvite { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GroupCallInvite { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
     }
@@ -1386,6 +1397,48 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::GroupCallSubscribe { conversation_id, subscribed, reply } => {
             let _ = reply.send(group_call::subscribe(account, &conversation_id, subscribed).map_err(refused));
+        }
+        Command::GroupCallJoinAs { conversation_id, reply } => {
+            let _ = reply.send(group_call::join_as_peers(account, &conversation_id).map_err(refused));
+        }
+        Command::GroupCallJoin { conversation_id, join_as, invite_hash, save_default, reply } => {
+            let _ = reply.send(
+                group_call::join_group_with(account, &conversation_id, join_as, invite_hash, save_default)
+                    .map_err(refused),
+            );
+        }
+        Command::GroupCallSaveDefaultJoinAs { conversation_id, peer_id, reply } => {
+            let _ = reply.send(group_call::save_default_join_as(account, &conversation_id, &peer_id).map_err(refused));
+        }
+        Command::GroupCallCreate { conversation_id, title, rtmp_stream, join, reply } => {
+            let _ = reply.send(
+                group_call::create(account, &conversation_id, title, rtmp_stream, join).map_err(refused),
+            );
+        }
+        Command::GroupCallEditTitle { conversation_id, title, reply } => {
+            let _ = reply.send(group_call::edit_title(account, &conversation_id, &title).map_err(refused));
+        }
+        Command::GroupCallDiscard { conversation_id, reply } => {
+            let _ = reply.send(group_call::discard(account, &conversation_id).map_err(refused));
+        }
+        Command::GroupCallInvite { conversation_id, users, reply } => {
+            let _ = reply.send(group_call::invite(account, &conversation_id, users).map_err(refused));
+        }
+        Command::GroupCallExportInvite { conversation_id, can_self_unmute, reply } => {
+            let _ = reply.send(group_call::export_invite(account, &conversation_id, can_self_unmute).map_err(refused));
+        }
+        Command::GroupCallSettings { conversation_id, join_muted, reset_invite_hash, reply } => {
+            let _ = reply.send(
+                group_call::settings(account, &conversation_id, join_muted, reset_invite_hash).map_err(refused),
+            );
+        }
+        Command::GroupCallRaiseHand { conversation_id, raised, reply } => {
+            let _ = reply.send(group_call::raise_hand(account, &conversation_id, raised).map_err(refused));
+        }
+        Command::GroupCallModerate { conversation_id, participant_id, muted, remove, reply } => {
+            let _ = reply.send(
+                group_call::moderate(account, &conversation_id, &participant_id, muted, remove).map_err(refused),
+            );
         }
         Command::TelegramCallSignal { conversation_id, data } => {
             call::send_signal(account, &conversation_id, &data);

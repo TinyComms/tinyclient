@@ -2221,6 +2221,7 @@ impl Render for Shell {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             let root = root.children(self.phone_share_layer(window, cx));
             return root
+                .children(self.telegram_call_modal(window, cx))
                 .children(self.toast_layer(width, cx))
                 .children(super::settings::phone_page(window, cx))
                 .children(self.streamer_mark(window, cx));
@@ -2330,6 +2331,7 @@ impl Render for Shell {
             .children(self.discord_admin_modal(window, cx))
             .children(self.link_ask_modal(window, cx))
             .children(self.call_full_stage(snapshot, cx))
+            .children(self.telegram_call_modal(window, cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))

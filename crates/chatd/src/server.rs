@@ -6674,6 +6674,135 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::GroupCallJoinAs { conversation } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallJoinAs {
+                    conversation_id,
+                    reply,
+                }) {
+                    Ok(peers) => Response::GroupCallJoinAs(peers),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallJoin { conversation, join_as, invite_hash, save_default } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallJoin {
+                    conversation_id,
+                    join_as,
+                    invite_hash,
+                    save_default,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallSaveDefaultJoinAs { conversation, peer_id } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallSaveDefaultJoinAs {
+                    conversation_id,
+                    peer_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallCreate { conversation, title, rtmp_stream, join } => {
+                let account = conversation.account();
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::GroupCallCreate {
+                    conversation_id,
+                    title,
+                    rtmp_stream,
+                    join,
+                    reply,
+                }) {
+                    Ok(target_id) => Response::GroupCallStarted {
+                        conversation: Key::new(&account, target_id),
+                    },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallEditTitle { conversation, title } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallEditTitle {
+                    conversation_id,
+                    title,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallDiscard { conversation } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallDiscard {
+                    conversation_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallInvite { conversation, users } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallInvite {
+                    conversation_id,
+                    users,
+                    reply,
+                }) {
+                    Ok(result) => Response::GroupCallInvited(result),
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallExportInvite { conversation, can_self_unmute } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallExportInvite {
+                    conversation_id,
+                    can_self_unmute,
+                    reply,
+                }) {
+                    Ok(link) => Response::GroupCallInviteLink { link, speaker: can_self_unmute },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallSettings { conversation, join_muted, reset_invite_hash } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallSettings {
+                    conversation_id,
+                    join_muted,
+                    reset_invite_hash,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallRaiseHand { conversation, raised } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallRaiseHand {
+                    conversation_id,
+                    raised,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::GroupCallModerate { conversation, participant_id, muted, remove } => {
+                let conversation_id = conversation.id.clone();
+                match self.ask(&conversation.account(), |reply| Command::GroupCallModerate {
+                    conversation_id,
+                    participant_id,
+                    muted,
+                    remove,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Play(request) => {
                 let viewed = match &request {
                     protocol::PlayRequest::Start { conversation, message, .. } if !message.is_empty() => {

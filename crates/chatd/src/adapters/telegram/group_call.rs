@@ -1,23 +1,17 @@
 //! Telegram group and channel video chats (`#462` live presence, `#465` scheduled video chats,
-//! `#461` joining group voice chats).
-//!
-//! - Reads `chatFull.call` / `channelFull.call` and `phone.getGroupCall` once when an active group
-//!   or channel is opened (never polling non-open chats).
-//! - Applies `updateGroupCall`, `updateGroupCallParticipants`, `updateGroupCallConnection`, and
-//!   `speakingInGroupCallAction`.
-//! - Schedules (`phone.createGroupCall` with `schedule_date`), starts (`phone.startScheduledGroupCall`),
-//!   and toggles start reminders (`phone.toggleGroupCallStartSubscription`).
-//! - Joins live group voice chats muted by default (`phone.joinGroupCall`), pages participants
-//!   (`phone.getGroupParticipants`), runs the `phone.checkGroupCall` keepalive timer, forwards
-//!   mute/unmute (`phone.editGroupCallParticipant`), sends `speakingInGroupCallAction`, and always
-//!   sends `phone.leaveGroupCall` on leave.
+//! `#461` joining group voice chats, `#460` join-as channel/peer picker, `#459` invites & links,
+//! `#466` start/rename/end with migration, `#464` raise hand, listener/speaker roles & moderation).
 
 use super::peers::Who;
 use super::wire::{self, Fault};
 use super::{live, sync, Account};
 use grammers_tl_types as tl;
-use protocol::{CallFailure, Occupant, Occupants, Participant, TelegramGroupOffer, TelegramGroupSource};
-use std::collections::HashMap;
+use protocol::{
+    CallFailure, GroupCallInviteRefusal, GroupCallInviteResult, GroupCallJoinAs, GroupCallJoinPeer,
+    Occupant, Occupants, Participant, TelegramGroupOffer, TelegramGroupSource,
+};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// Keepalive interval for `phone.checkGroupCall`. Overridable in tests via `TINYCLIENT_TELEGRAM_CHECK_MS`.
@@ -38,6 +32,8 @@ const SPEAKING_PACE: Duration = Duration::from_secs(4);
 const MAX_PARTICIPANT_PAGES: usize = 5;
 /// Participants requested per page.
 const PARTICIPANT_PAGE_SIZE: i32 = 50;
+/// Safe cap on people invited in a single `phone.inviteToGroupCall` batch (#459).
+const MAX_INVITE_BATCH: usize = 10;
 
 #[derive(Clone, Debug)]
 pub(super) struct GroupParticipant {
@@ -46,7 +42,21 @@ pub(super) struct GroupParticipant {
     pub muted: bool,
     pub can_self_unmute: bool,
     pub speaking: bool,
+    pub raise_hand_rating: Option<i64>,
+    pub about: String,
+    pub muted_by_you: bool,
+    pub is_self: bool,
     pub order: u64,
+}
+
+impl GroupParticipant {
+    pub(super) fn suppressed(&self) -> bool {
+        self.muted && !self.can_self_unmute
+    }
+
+    pub(super) fn hand_raised(&self) -> bool {
+        self.raise_hand_rating.is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +67,8 @@ pub(super) struct TrackedGroupCall {
     pub participants_count: u32,
     pub schedule_date: Option<i64>,
     pub schedule_start_subscribed: bool,
+    pub join_muted: bool,
+    pub can_change_join_muted: bool,
     pub participants: HashMap<Who, GroupParticipant>,
     pub next_order: u64,
     pub fetched_once: bool,
@@ -67,6 +79,7 @@ pub(super) struct JoinedGroupCall {
     pub who: Who,
     pub call_id: i64,
     pub access_hash: i64,
+    pub join_as: Who,
     pub source: u32,
     pub muted: bool,
     pub deafened: bool,
@@ -123,6 +136,8 @@ pub(super) fn note_full_call(account: &Account, who: Who, call: Option<&tl::enum
             participants_count: 0,
             schedule_date: None,
             schedule_start_subscribed: false,
+            join_muted: false,
+            can_change_join_muted: false,
             participants: HashMap::new(),
             next_order: 0,
             fetched_once: false,
@@ -134,6 +149,12 @@ fn ensure_input_call(account: &Account, who: Who) -> Result<Option<(i64, i64)>, 
     if let Some((id, hash)) = account.live().group_calls.calls.get(&who).map(|c| (c.id, c.access_hash)) {
         return Ok(Some((id, hash)));
     }
+    let (call, _) = fetch_full_call_info(account, who)?;
+    Ok(call)
+}
+
+/// Reads `call` and `groupcall_default_join_as` from `GetFullChat` / `GetFullChannel`.
+fn fetch_full_call_info(account: &Account, who: Who) -> Result<(Option<(i64, i64)>, Option<Who>), Fault> {
     match who {
         Who::Group(chat_id) => {
             let tl::enums::messages::ChatFull::Full(full) =
@@ -141,7 +162,9 @@ fn ensure_input_call(account: &Account, who: Who) -> Result<Option<(i64, i64)>, 
             account.learn(&full.users, &full.chats);
             if let tl::enums::ChatFull::Full(chat) = full.full_chat {
                 note_full_call(account, who, chat.call.as_ref());
-                return Ok(chat.call.as_ref().and_then(extract_input_call));
+                let call = chat.call.as_ref().and_then(extract_input_call);
+                let default_join_as = chat.groupcall_default_join_as.as_ref().map(Who::of);
+                return Ok((call, default_join_as));
             }
         }
         Who::Channel(_) => {
@@ -151,12 +174,14 @@ fn ensure_input_call(account: &Account, who: Who) -> Result<Option<(i64, i64)>, 
             account.learn(&full.users, &full.chats);
             if let tl::enums::ChatFull::ChannelFull(channel) = full.full_chat {
                 note_full_call(account, who, channel.call.as_ref());
-                return Ok(channel.call.as_ref().and_then(extract_input_call));
+                let call = channel.call.as_ref().and_then(extract_input_call);
+                let default_join_as = channel.groupcall_default_join_as.as_ref().map(Who::of);
+                return Ok((call, default_join_as));
             }
         }
         Who::User(_) => {}
     }
-    Ok(None)
+    Ok((None, None))
 }
 
 fn apply_group_call_obj(tracked: &mut TrackedGroupCall, gc: &tl::types::GroupCall) {
@@ -166,6 +191,8 @@ fn apply_group_call_obj(tracked: &mut TrackedGroupCall, gc: &tl::types::GroupCal
     tracked.participants_count = gc.participants_count.max(0) as u32;
     tracked.schedule_date = gc.schedule_date.filter(|&d| d > 0).map(i64::from);
     tracked.schedule_start_subscribed = gc.schedule_start_subscribed;
+    tracked.join_muted = gc.join_muted;
+    tracked.can_change_join_muted = gc.can_change_join_muted;
 }
 
 fn apply_participants(tracked: &mut TrackedGroupCall, list: &[tl::enums::GroupCallParticipant]) {
@@ -178,11 +205,23 @@ fn apply_participants(tracked: &mut TrackedGroupCall, list: &[tl::enums::GroupCa
             }
             continue;
         }
-        let order = tracked.participants.get(&who).map(|old| old.order).unwrap_or_else(|| {
+        let prev = tracked.participants.get(&who);
+        let order = prev.map(|old| old.order).unwrap_or_else(|| {
             let next = tracked.next_order;
             tracked.next_order += 1;
             next
         });
+        let about = match &p.about {
+            Some(text) => text.clone(),
+            None if p.min => prev.map(|old| old.about.clone()).unwrap_or_default(),
+            None => String::new(),
+        };
+        let is_self = p.is_self || (p.min && prev.is_some_and(|old| old.is_self));
+        let muted_by_you = if p.min {
+            prev.is_some_and(|old| old.muted_by_you)
+        } else {
+            p.muted_by_you
+        };
         let source = p.source.max(0) as u32;
         let speaking = !p.muted && p.active_date.is_some();
         let inserted = tracked
@@ -195,6 +234,10 @@ fn apply_participants(tracked: &mut TrackedGroupCall, list: &[tl::enums::GroupCa
                     muted: p.muted,
                     can_self_unmute: p.can_self_unmute,
                     speaking,
+                    raise_hand_rating: p.raise_hand_rating,
+                    about,
+                    muted_by_you,
+                    is_self,
                     order,
                 },
             )
@@ -212,8 +255,30 @@ fn apply_participants(tracked: &mut TrackedGroupCall, list: &[tl::enums::GroupCa
     }
 }
 
+/// Roster ordering (`#464`): speakers first, then raised hands (highest rating first), then listeners.
+fn sort_participants<'a>(participants: impl Iterator<Item = &'a GroupParticipant>) -> Vec<&'a GroupParticipant> {
+    let mut sorted: Vec<&GroupParticipant> = participants.collect();
+    sorted.sort_by_key(|p| {
+        let tier: u8 = if !p.suppressed() {
+            0
+        } else if p.hand_raised() {
+            1
+        } else {
+            2
+        };
+        (
+            tier,
+            !p.speaking,
+            p.muted,
+            Reverse(p.raise_hand_rating.unwrap_or(0)),
+            p.order,
+        )
+    });
+    sorted
+}
+
 fn publish_occupants(account: &Account, who: Who) {
-    let (occupants, joined_match, call_participants, sources) = {
+    let (occupants, joined_meta) = {
         let live = account.live();
         let Some(tracked) = live.group_calls.calls.get(&who) else {
             drop(live);
@@ -222,8 +287,7 @@ fn publish_occupants(account: &Account, who: Who) {
             return;
         };
         let dir = account.dir();
-        let mut sorted: Vec<&GroupParticipant> = tracked.participants.values().collect();
-        sorted.sort_by_key(|p| (!p.speaking, p.muted, p.order));
+        let sorted = sort_participants(tracked.participants.values());
         let people: Vec<Occupant> = sorted
             .iter()
             .take(24)
@@ -237,10 +301,12 @@ fn publish_occupants(account: &Account, who: Who) {
                     deafened: false,
                     server_muted: false,
                     server_deafened: false,
-                    suppressed: !p.can_self_unmute && p.muted,
+                    suppressed: p.suppressed(),
                     speaking: p.speaking,
                     streaming: false,
                     camera: false,
+                    hand_raised: p.hand_raised(),
+                    is_channel: !matches!(p.who, Who::User(_)),
                 }
             })
             .collect();
@@ -259,46 +325,89 @@ fn publish_occupants(account: &Account, who: Who) {
             live: is_live,
         };
 
-        let joined_here = live.group_calls.joined.as_ref().is_some_and(|j| j.who == who);
-        let (call_participants, sources) = if joined_here {
-            let me = Who::User(account.me);
+        let joined_info = live
+            .group_calls
+            .joined
+            .as_ref()
+            .filter(|j| j.who == who)
+            .map(|j| j.join_as);
+        let joined_meta = if let Some(self_who) = joined_info {
+            let my_participant = tracked
+                .participants
+                .values()
+                .find(|p| p.is_self || p.who == self_who);
+            let self_suppressed = my_participant.is_some_and(GroupParticipant::suppressed);
+            let self_hand_raised = my_participant.is_some_and(GroupParticipant::hand_raised);
             let participants: Vec<Participant> = sorted
                 .iter()
-                .filter(|p| p.who != me)
-                .map(|p| {
-                    let id = p.who.text();
-                    Participant {
-                        id,
-                        name: dir.name(p.who),
-                        muted: p.muted,
-                        deafened: false,
-                        speaking: p.speaking,
-                        suppressed: !p.can_self_unmute && p.muted,
-                        ..Participant::default()
-                    }
+                .filter(|p| !p.is_self && p.who != self_who)
+                .map(|p| Participant {
+                    id: p.who.text(),
+                    name: dir.name(p.who),
+                    muted: p.muted,
+                    deafened: false,
+                    speaking: p.speaking,
+                    suppressed: p.suppressed(),
+                    hand_raised: p.hand_raised(),
+                    raise_hand_rating: p.raise_hand_rating,
+                    about: p.about.clone(),
+                    muted_by_you: p.muted_by_you,
+                    is_channel: !matches!(p.who, Who::User(_)),
+                    ..Participant::default()
                 })
                 .collect();
             let sources: Vec<TelegramGroupSource> = sorted
                 .iter()
-                .filter(|p| p.who != me && p.source > 0)
+                .filter(|p| !p.is_self && p.who != self_who && p.source > 0)
                 .map(|p| TelegramGroupSource {
                     ssrc: p.source,
                     user_id: p.who.text(),
                 })
                 .collect();
-            (participants, sources)
+            Some((
+                participants,
+                sources,
+                self_suppressed,
+                self_hand_raised,
+                tracked.title.clone(),
+                tracked.join_muted,
+                tracked.can_change_join_muted,
+                total,
+                self_who.text(),
+            ))
         } else {
-            (Vec::new(), Vec::new())
+            None
         };
-        (occupants, joined_here, call_participants, sources)
+        (occupants, joined_meta)
     };
 
     let conv_id = who.text();
     account.ctx.group_call_occupants(&conv_id, occupants);
     sync::refresh_row(account, who);
-    if joined_match {
+    if let Some((
+        call_participants,
+        sources,
+        self_suppressed,
+        self_hand_raised,
+        title,
+        join_muted,
+        can_change_join_muted,
+        total,
+        joined_as,
+    )) = joined_meta
+    {
         account.ctx.participants(&conv_id, call_participants);
         account.ctx.telegram_group_sources(&conv_id, sources);
+        account.ctx.self_moderation(&conv_id, false, false, self_suppressed);
+        account.ctx.group_call_meta(
+            &conv_id,
+            title,
+            self_hand_raised,
+            join_muted,
+            can_change_join_muted,
+            total,
+            Some(joined_as),
+        );
     }
 }
 
@@ -339,6 +448,8 @@ pub(super) fn open_chat(account: &Account, who: Who) {
                     participants_count: 0,
                     schedule_date: None,
                     schedule_start_subscribed: false,
+                    join_muted: false,
+                    can_change_join_muted: false,
                     participants: HashMap::new(),
                     next_order: 0,
                     fetched_once: false,
@@ -407,6 +518,8 @@ pub(super) fn on_group_call(account: &Account, update: &tl::types::UpdateGroupCa
                     participants_count: 0,
                     schedule_date: None,
                     schedule_start_subscribed: false,
+                    join_muted: false,
+                    can_change_join_muted: false,
                     participants: HashMap::new(),
                     next_order: 0,
                     fetched_once: false,
@@ -595,35 +708,633 @@ pub(super) fn subscribe(account: &Account, conversation_id: &str, subscribed: bo
 }
 
 // ---------------------------------------------------------------------------
-// Join, Audio Mute, Speaking, Keepalive, Leave (`#461`)
+// Join-as, Create (with Migration), Rename, End, Invite, Links, Moderation
+// (#460, #459, #466, #464)
+// ---------------------------------------------------------------------------
+
+fn require_manage_call(account: &Account, who: Who) -> Result<(), Fault> {
+    if account.dir().get(who).is_some_and(|k| k.rights.manage_call) {
+        Ok(())
+    } else {
+        Err(Fault::Refused("You don't have permission to manage video chats in this chat.".to_owned()))
+    }
+}
+
+fn input_peer_for_identity(account: &Account, identity: Who) -> Result<tl::enums::InputPeer, Fault> {
+    if identity == Who::User(account.me) {
+        Ok(tl::enums::InputPeer::PeerSelf)
+    } else {
+        account.input(identity)
+    }
+}
+
+/// Queries `phone.getGroupCallJoinAs` and reads `groupcall_default_join_as` from the full chat (#460).
+pub(super) fn join_as_peers(account: &Account, conversation_id: &str) -> Result<GroupCallJoinAs, Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("Video chats are only available in groups and channels.".to_owned()));
+    };
+    let peer = account.input(who)?;
+    let tl::enums::phone::JoinAsPeers::Peers(found) =
+        account.ask(&tl::functions::phone::GetGroupCallJoinAs { peer })?;
+    account.learn(&found.users, &found.chats);
+
+    let (default_peer, default_unknown) = match fetch_full_call_info(account, who) {
+        Ok((_, def)) => (def.map(|w| w.text()), false),
+        Err(_) => (None, true),
+    };
+
+    let dir = account.dir();
+    let me = Who::User(account.me);
+    let mut seen = HashSet::new();
+    let mut peers = Vec::with_capacity(found.peers.len());
+    for raw in &found.peers {
+        let p_who = Who::of(raw);
+        if !seen.insert(p_who) {
+            continue;
+        }
+        let is_self = p_who == me;
+        let name = if is_self { "Me".to_owned() } else { dir.name(p_who) };
+        peers.push(GroupCallJoinPeer {
+            id: p_who.text(),
+            name,
+            is_self,
+            avatar: None,
+        });
+    }
+    Ok(GroupCallJoinAs { peers, default_peer, default_unknown })
+}
+
+/// Saves the remembered join-as peer for a chat (`phone.saveDefaultGroupCallJoinAs`) (#460).
+pub(super) fn save_default_join_as(account: &Account, conversation_id: &str, peer_id: &str) -> Result<(), Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("Video chats are only available in groups and channels.".to_owned()));
+    };
+    let Some((join_who, None)) = Who::parse(peer_id) else {
+        return Err(Fault::Refused("Unknown join-as identity.".to_owned()));
+    };
+    let peer = account.input(who)?;
+    let join_as = input_peer_for_identity(account, join_who)?;
+    let _ = account.ask(&tl::functions::phone::SaveDefaultGroupCallJoinAs { peer, join_as })?;
+    Ok(())
+}
+
+/// Extracts a migrated channel id from `Updates` if Telegram upgraded a basic group to a supergroup.
+fn migrated_channel_in_updates(updates: &tl::enums::Updates, original: Who) -> Option<Who> {
+    if !matches!(original, Who::Group(_)) {
+        return None;
+    }
+    let list = match updates {
+        tl::enums::Updates::Updates(u) => u.updates.as_slice(),
+        tl::enums::Updates::Combined(u) => u.updates.as_slice(),
+        tl::enums::Updates::UpdateShort(u) => std::slice::from_ref(&u.update),
+        _ => &[],
+    };
+    for upd in list {
+        match upd {
+            tl::enums::Update::NewMessage(m) => {
+                if let tl::enums::Message::Service(svc) = &m.message {
+                    if let tl::enums::MessageAction::ChatMigrateTo(mig) = &svc.action {
+                        return Some(Who::Channel(mig.channel_id));
+                    }
+                }
+            }
+            tl::enums::Update::NewChannelMessage(m) => {
+                if let tl::enums::Message::Service(svc) = &m.message {
+                    if let tl::enums::MessageAction::ChatMigrateTo(mig) = &svc.action {
+                        return Some(Who::Channel(mig.channel_id));
+                    }
+                }
+            }
+            tl::enums::Update::GroupCall(gc) => {
+                if let Some(peer) = gc.peer.as_ref() {
+                    let who = Who::of(peer);
+                    if matches!(who, Who::Channel(_)) {
+                        return Some(who);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Starts a live Telegram group or channel video chat (`phone.createGroupCall`), following
+/// basic-group-to-supergroup migration if Telegram upgrades the chat, and optionally joining (#466).
+pub(super) fn create(
+    account: &Account,
+    conversation_id: &str,
+    title: Option<String>,
+    rtmp_stream: bool,
+    join: bool,
+) -> Result<String, Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("Video chats can only be started in a group or channel.".to_owned()));
+    };
+    require_manage_call(account, who)?;
+    let clean_title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+    let peer = account.input(who)?;
+    let req = tl::functions::phone::CreateGroupCall {
+        rtmp_stream,
+        peer,
+        random_id: random_i32(),
+        title: clean_title.clone(),
+        schedule_date: None,
+    };
+    let (target_who, answer) = match account.ask(&req) {
+        Ok(ans) => {
+            let target = migrated_channel_in_updates(&ans, who).unwrap_or(who);
+            (target, ans)
+        }
+        Err(fault)
+            if matches!(who, Who::Group(_))
+                && (fault.is("CHAT_MIGRATED")
+                    || fault.is("MIGRATE_TO_CHANNEL")
+                    || fault.is("GROUPCALL_MIGRATE")) =>
+        {
+            let Who::Group(chat_id) = who else { unreachable!() };
+            let migrated = account.ask(&tl::functions::messages::MigrateChat { chat_id })?;
+            live::answered(account, &migrated);
+            let new_who = migrated_channel_in_updates(&migrated, who).ok_or_else(|| {
+                Fault::Refused("Group upgraded to a supergroup, but the new chat could not be found.".to_owned())
+            })?;
+            let new_peer = account.input(new_who)?;
+            let ans = account.ask(&tl::functions::phone::CreateGroupCall {
+                rtmp_stream,
+                peer: new_peer,
+                random_id: random_i32(),
+                title: clean_title,
+                schedule_date: None,
+            })?;
+            (new_who, ans)
+        }
+        Err(fault) => return Err(fault),
+    };
+    live::answered(account, &answer);
+    if target_who != who {
+        sync::refresh_row(account, target_who);
+    }
+    if join && !rtmp_stream {
+        join_group_with(account, &target_who.text(), None, None, false)?;
+    }
+    Ok(target_who.text())
+}
+
+/// Renames a live or scheduled video chat (`phone.editGroupCallTitle`) (#466).
+pub(super) fn edit_title(account: &Account, conversation_id: &str, title: &str) -> Result<(), Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("No video chat in this conversation.".to_owned()));
+    };
+    require_manage_call(account, who)?;
+    let Some((id, access_hash)) = ensure_input_call(account, who)? else {
+        return Err(Fault::Refused("There is no active video chat in this chat.".to_owned()));
+    };
+    let clean = title.trim().to_owned();
+    let answer = account.ask(&tl::functions::phone::EditGroupCallTitle {
+        call: input_call_of(id, access_hash),
+        title: clean.clone(),
+    })?;
+    {
+        let mut live = account.live();
+        if let Some(tracked) = live.group_calls.calls.get_mut(&who) {
+            tracked.title = clean;
+        }
+    }
+    live::answered(account, &answer);
+    publish_occupants(account, who);
+    Ok(())
+}
+
+/// Ends a Telegram video chat for everyone (`phone.discardGroupCall`, requires `manage_call`) (#466).
+pub(super) fn discard(account: &Account, conversation_id: &str) -> Result<(), Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("No video chat in this conversation.".to_owned()));
+    };
+    require_manage_call(account, who)?;
+    let Some((id, access_hash)) = ensure_input_call(account, who)? else {
+        return Err(Fault::Refused("There is no active video chat in this chat.".to_owned()));
+    };
+    let answer = account.ask(&tl::functions::phone::DiscardGroupCall {
+        call: input_call_of(id, access_hash),
+    })?;
+    live::answered(account, &answer);
+    clear_discarded(account, who, id);
+    Ok(())
+}
+
+fn invite_refusal_words(fault: &Fault) -> String {
+    if fault.is("USER_PRIVACY_RESTRICTED") {
+        "Privacy settings prevent inviting this person.".to_owned()
+    } else if fault.is("USER_NOT_PARTICIPANT") {
+        "This person is not a member of this chat.".to_owned()
+    } else if fault.is("USER_NOT_MUTUAL_CONTACT") {
+        "Only mutual contacts can be invited.".to_owned()
+    } else if fault.is("USER_BANNED_IN_CHANNEL") || fault.is("USER_KICKED") {
+        "This person is banned from this chat.".to_owned()
+    } else if fault.is("USER_ALREADY_PARTICIPANT") {
+        "Already in the video chat.".to_owned()
+    } else if fault.is("INPUT_USER_DEACTIVATED") {
+        "This account is deactivated.".to_owned()
+    } else {
+        fault.words()
+    }
+}
+
+fn is_per_user_invite_fault(fault: &Fault) -> bool {
+    fault.is("USER_PRIVACY_RESTRICTED")
+        || fault.is("USER_NOT_PARTICIPANT")
+        || fault.is("USER_NOT_MUTUAL_CONTACT")
+        || fault.is("USER_BANNED_IN_CHANNEL")
+        || fault.is("USER_KICKED")
+        || fault.is("USER_ALREADY_PARTICIPANT")
+        || fault.is("INPUT_USER_DEACTIVATED")
+}
+
+/// Invites explicitly selected users into a live video chat (`phone.inviteToGroupCall`) (#459).
+pub(super) fn invite(
+    account: &Account,
+    conversation_id: &str,
+    users: Vec<String>,
+) -> Result<GroupCallInviteResult, Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("Video chats are only available in groups and channels.".to_owned()));
+    };
+    if users.is_empty() {
+        return Err(Fault::Refused("Select at least one person to invite.".to_owned()));
+    }
+    let Some((id, access_hash)) = ensure_input_call(account, who)? else {
+        return Err(Fault::Refused("There is no active video chat in this chat.".to_owned()));
+    };
+
+    let mut result = GroupCallInviteResult::default();
+    let mut resolved: Vec<(String, tl::enums::InputUser)> = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_id in users.into_iter().take(MAX_INVITE_BATCH) {
+        if !seen.insert(raw_id.clone()) {
+            continue;
+        }
+        let Some((u_who @ Who::User(_), None)) = Who::parse(&raw_id) else {
+            result.refused.push(GroupCallInviteRefusal {
+                user_id: raw_id,
+                reason: "Only user accounts can be invited to a video chat.".to_owned(),
+            });
+            continue;
+        };
+        let _ = account.input(u_who);
+        match account.dir().input_user(u_who) {
+            Some(input_user) => resolved.push((raw_id, input_user)),
+            None => result.refused.push(GroupCallInviteRefusal {
+                user_id: raw_id,
+                reason: "This person is not known to this chat.".to_owned(),
+            }),
+        }
+    }
+    if resolved.is_empty() {
+        return Ok(result);
+    }
+
+    let req = tl::functions::phone::InviteToGroupCall {
+        call: input_call_of(id, access_hash),
+        users: resolved.iter().map(|(_, u)| u.clone()).collect(),
+    };
+    match account.ask(&req) {
+        Ok(answer) => {
+            live::answered(account, &answer);
+            result.invited.extend(resolved.into_iter().map(|(uid, _)| uid));
+            Ok(result)
+        }
+        Err(fault) if is_per_user_invite_fault(&fault) => {
+            if resolved.len() == 1 {
+                let (uid, _) = resolved.remove(0);
+                result.refused.push(GroupCallInviteRefusal {
+                    user_id: uid,
+                    reason: invite_refusal_words(&fault),
+                });
+                return Ok(result);
+            }
+            for (uid, input_user) in resolved {
+                let single = tl::functions::phone::InviteToGroupCall {
+                    call: input_call_of(id, access_hash),
+                    users: vec![input_user],
+                };
+                match account.ask(&single) {
+                    Ok(answer) => {
+                        live::answered(account, &answer);
+                        result.invited.push(uid);
+                    }
+                    Err(single_fault) => {
+                        result.refused.push(GroupCallInviteRefusal {
+                            user_id: uid,
+                            reason: invite_refusal_words(&single_fault),
+                        });
+                    }
+                }
+            }
+            Ok(result)
+        }
+        Err(fault) => Err(fault),
+    }
+}
+
+/// Exports a listener link or (for admins) speaker link (`phone.exportGroupCallInvite`) (#459).
+pub(super) fn export_invite(
+    account: &Account,
+    conversation_id: &str,
+    can_self_unmute: bool,
+) -> Result<String, Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("No video chat in this conversation.".to_owned()));
+    };
+    if can_self_unmute {
+        require_manage_call(account, who)?;
+    }
+    let Some((id, access_hash)) = ensure_input_call(account, who)? else {
+        return Err(Fault::Refused("There is no active video chat in this chat.".to_owned()));
+    };
+    let tl::enums::phone::ExportedGroupCallInvite::Invite(exported) =
+        account.ask(&tl::functions::phone::ExportGroupCallInvite {
+            can_self_unmute,
+            call: input_call_of(id, access_hash),
+        })?;
+    Ok(exported.link)
+}
+
+/// Updates admin group call settings (`phone.toggleGroupCallSettings`: `join_muted` / `reset_invite_hash`) (#459, #464).
+pub(super) fn settings(
+    account: &Account,
+    conversation_id: &str,
+    join_muted: Option<bool>,
+    reset_invite_hash: bool,
+) -> Result<(), Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("No video chat in this conversation.".to_owned()));
+    };
+    require_manage_call(account, who)?;
+    if join_muted.is_some()
+        && account
+            .live()
+            .group_calls
+            .calls
+            .get(&who)
+            .is_some_and(|c| !c.can_change_join_muted)
+    {
+        return Err(Fault::Refused("This video chat does not allow changing join-muted settings.".to_owned()));
+    }
+    let Some((id, access_hash)) = ensure_input_call(account, who)? else {
+        return Err(Fault::Refused("There is no active video chat in this chat.".to_owned()));
+    };
+    let answer = account.ask(&tl::functions::phone::ToggleGroupCallSettings {
+        reset_invite_hash,
+        call: input_call_of(id, access_hash),
+        join_muted,
+        messages_enabled: None,
+        send_paid_messages_stars: None,
+    })?;
+    if let Some(jm) = join_muted {
+        let mut live = account.live();
+        if let Some(tracked) = live.group_calls.calls.get_mut(&who) {
+            tracked.join_muted = jm;
+        }
+    }
+    live::answered(account, &answer);
+    publish_occupants(account, who);
+    Ok(())
+}
+
+/// Raises or lowers our own hand in a moderated Telegram video chat (`phone.editGroupCallParticipant`) (#464).
+pub(super) fn raise_hand(account: &Account, conversation_id: &str, raised: bool) -> Result<(), Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("No video chat in this conversation.".to_owned()));
+    };
+    let joined = account
+        .live()
+        .group_calls
+        .joined
+        .as_ref()
+        .filter(|j| j.who == who)
+        .map(|j| (j.call_id, j.access_hash, j.join_as));
+    let Some((call_id, access_hash, join_as)) = joined else {
+        return Err(Fault::Refused("Join the video chat before raising your hand.".to_owned()));
+    };
+    let participant = input_peer_for_identity(account, join_as)?;
+    let answer = account.ask(&tl::functions::phone::EditGroupCallParticipant {
+        call: input_call_of(call_id, access_hash),
+        participant,
+        muted: None,
+        volume: None,
+        raise_hand: Some(raised),
+        video_stopped: None,
+        video_paused: None,
+        presentation_paused: None,
+    })?;
+    live::answered(account, &answer);
+    {
+        let mut live = account.live();
+        if let Some(tracked) = live.group_calls.calls.get_mut(&who) {
+            if let Some(me) = tracked.participants.get_mut(&join_as) {
+                if raised && me.raise_hand_rating.is_none() {
+                    me.raise_hand_rating = Some(1);
+                } else if !raised {
+                    me.raise_hand_rating = None;
+                }
+            }
+        }
+    }
+    publish_occupants(account, who);
+    Ok(())
+}
+
+/// Admin participant moderation (`manage_call`): mute, allow to speak, or remove/ban from group (#464).
+pub(super) fn moderate(
+    account: &Account,
+    conversation_id: &str,
+    participant_id: &str,
+    muted: Option<bool>,
+    remove: bool,
+) -> Result<(), Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Refused("No video chat in this conversation.".to_owned()));
+    };
+    require_manage_call(account, who)?;
+    let Some((target_who, None)) = Who::parse(participant_id) else {
+        return Err(Fault::Refused("Unknown participant.".to_owned()));
+    };
+    if remove {
+        let answer = match who {
+            Who::Channel(_) => {
+                let channel = account.input_channel(who)?;
+                let participant = account.input(target_who)?;
+                let banned_rights = tl::types::ChatBannedRights {
+                    view_messages: true,
+                    send_messages: true,
+                    send_media: true,
+                    send_stickers: true,
+                    send_gifs: true,
+                    send_games: true,
+                    send_inline: true,
+                    embed_links: true,
+                    send_polls: true,
+                    change_info: true,
+                    invite_users: true,
+                    pin_messages: true,
+                    manage_topics: true,
+                    send_photos: true,
+                    send_videos: true,
+                    send_roundvideos: true,
+                    send_audios: true,
+                    send_voices: true,
+                    send_docs: true,
+                    send_plain: true,
+                    send_reactions: true,
+                    edit_rank: true,
+                    until_date: 0,
+                }
+                .into();
+                account.ask(&tl::functions::channels::EditBanned {
+                    channel,
+                    participant,
+                    banned_rights,
+                })?
+            }
+            Who::Group(chat_id) => {
+                let Who::User(_) = target_who else {
+                    return Err(Fault::Refused("Only user accounts can be removed from a basic group.".to_owned()));
+                };
+                let _ = account.input(target_who);
+                let user_id = account
+                    .dir()
+                    .input_user(target_who)
+                    .ok_or_else(|| Fault::Refused("Unknown user.".to_owned()))?;
+                account.ask(&tl::functions::messages::DeleteChatUser {
+                    revoke_history: false,
+                    chat_id,
+                    user_id,
+                })?
+            }
+            Who::User(_) => unreachable!(),
+        };
+        live::answered(account, &answer);
+        {
+            let mut live = account.live();
+            if let Some(tracked) = live.group_calls.calls.get_mut(&who) {
+                if tracked.participants.remove(&target_who).is_some() {
+                    tracked.participants_count = tracked.participants_count.saturating_sub(1);
+                }
+            }
+        }
+        publish_occupants(account, who);
+        return Ok(());
+    }
+
+    let Some(mute_val) = muted else {
+        return Err(Fault::Refused("No moderation action specified.".to_owned()));
+    };
+    let Some((id, access_hash)) = ensure_input_call(account, who)? else {
+        return Err(Fault::Refused("There is no active video chat in this chat.".to_owned()));
+    };
+    let participant = account.input(target_who)?;
+    let answer = account.ask(&tl::functions::phone::EditGroupCallParticipant {
+        call: input_call_of(id, access_hash),
+        participant,
+        muted: Some(mute_val),
+        volume: None,
+        raise_hand: None,
+        video_stopped: None,
+        video_paused: None,
+        presentation_paused: None,
+    })?;
+    live::answered(account, &answer);
+    publish_occupants(account, who);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Join, Audio Mute, Speaking, Keepalive, Leave (`#461`, `#460`, `#459`)
 // ---------------------------------------------------------------------------
 
 /// Joins a live Telegram group or channel voice chat (`Command::CallJoin` on `g<id>` or `c<id>`).
 pub(super) fn join_group(account: &Account, who: Who) {
+    let _ = join_group_with(account, &who.text(), None, None, false);
+}
+
+/// Joins (or switches identity mid-call in) a Telegram group/channel video chat with explicit
+/// `join_as`, `invite_hash`, and optional `save_default` (#460, #459).
+pub(super) fn join_group_with(
+    account: &Account,
+    conversation_id: &str,
+    join_as: Option<String>,
+    invite_hash: Option<String>,
+    save_default: bool,
+) -> Result<(), Fault> {
+    let Some((who @ (Who::Group(_) | Who::Channel(_)), None)) = Who::parse(conversation_id) else {
+        let msg = "Video chats are only available in groups and channels.";
+        account.ctx.call_failed(conversation_id, CallFailure::Refused, msg);
+        return Err(Fault::Refused(msg.to_owned()));
+    };
     let conv_id = who.text();
+    let join_as_who = match join_as {
+        Some(ref pid) if !pid.is_empty() => match Who::parse(pid) {
+            Some((parsed, None)) => parsed,
+            _ => {
+                let msg = "Unknown join-as identity.";
+                account.ctx.call_failed(&conv_id, CallFailure::Refused, msg);
+                return Err(Fault::Refused(msg.to_owned()));
+            }
+        },
+        _ => Who::User(account.me),
+    };
+    let input_join_as = match input_peer_for_identity(account, join_as_who) {
+        Ok(p) => p,
+        Err(fault) => {
+            account.ctx.call_failed(&conv_id, CallFailure::Refused, &fault.words());
+            return Err(fault);
+        }
+    };
+
+    if save_default {
+        if let Ok(peer) = account.input(who) {
+            let _ = account.ask(&tl::functions::phone::SaveDefaultGroupCallJoinAs {
+                peer,
+                join_as: input_join_as.clone(),
+            });
+        }
+    }
+
     let call_ref = match ensure_input_call(account, who) {
         Ok(Some(c)) => c,
         Ok(None) => {
-            account.ctx.call_failed(&conv_id, CallFailure::Refused, "There is no live video chat in this chat.");
-            return;
+            let msg = "There is no live video chat in this chat.";
+            account.ctx.call_failed(&conv_id, CallFailure::Refused, msg);
+            return Err(Fault::Refused(msg.to_owned()));
         }
         Err(fault) => {
             account.ctx.call_failed(&conv_id, CallFailure::Refused, &fault.words());
-            return;
+            return Err(fault);
         }
     };
     // Ensure we know whether the call is live (not scheduled-only).
     if account.live().group_calls.calls.get(&who).is_some_and(|c| c.schedule_date.is_some()) {
-        account.ctx.call_failed(&conv_id, CallFailure::Refused, "This video chat hasn't started yet.");
-        return;
+        let msg = "This video chat hasn't started yet.";
+        account.ctx.call_failed(&conv_id, CallFailure::Refused, msg);
+        return Err(Fault::Refused(msg.to_owned()));
     }
 
-    let me_id = Who::User(account.me).text();
+    // Mid-call identity switch: cleanly leave the existing participant slot before rejoining.
+    let switching_here = account
+        .live()
+        .group_calls
+        .joined
+        .as_ref()
+        .is_some_and(|j| j.who == who);
+    if switching_here {
+        leave_group(account, who);
+    }
+
     // Always join muted by default (`#461`).
     let (params_json, ssrc) = match account.ctx.telegram_group_offer(
         &conv_id,
         TelegramGroupOffer {
-            user_id: me_id,
+            user_id: join_as_who.text(),
             muted: true,
             deafened: false,
         },
@@ -631,7 +1342,7 @@ pub(super) fn join_group(account: &Account, who: Who) {
         Ok(pair) => pair,
         Err(detail) => {
             account.ctx.call_failed(&conv_id, CallFailure::Engine, &detail);
-            return;
+            return Err(Fault::Refused(detail));
         }
     };
 
@@ -640,6 +1351,7 @@ pub(super) fn join_group(account: &Account, who: Who) {
         who,
         call_id,
         access_hash,
+        join_as: join_as_who,
         source: ssrc,
         muted: true,
         deafened: false,
@@ -647,12 +1359,13 @@ pub(super) fn join_group(account: &Account, who: Who) {
         last_speaking_sent: None,
     });
 
+    let clean_hash = invite_hash.map(|h| h.trim().to_owned()).filter(|h| !h.is_empty());
     let req = tl::functions::phone::JoinGroupCall {
         muted: true,
         video_stopped: true,
         call: input_call_of(call_id, access_hash),
-        join_as: tl::enums::InputPeer::PeerSelf,
-        invite_hash: None,
+        join_as: input_join_as,
+        invite_hash: clean_hash,
         public_key: None,
         block: None,
         params: tl::types::DataJson { data: params_json }.into(),
@@ -662,10 +1375,13 @@ pub(super) fn join_group(account: &Account, who: Who) {
             live::answered(account, &answer);
             // Fetch paged participants so the roster and SSRC map are complete.
             let _ = fetch_participants_pages(account, who, call_id, access_hash, MAX_PARTICIPANT_PAGES);
+            publish_occupants(account, who);
+            Ok(())
         }
         Err(fault) => {
             account.live().group_calls.joined = None;
             account.ctx.call_failed(&conv_id, CallFailure::Refused, &fault.words());
+            Err(fault)
         }
     }
 }
@@ -674,19 +1390,38 @@ pub(super) fn join_group(account: &Account, who: Who) {
 pub(super) fn set_group_audio(account: &Account, muted: bool, deafened: bool) {
     let target = {
         let mut live = account.live();
+        let Some((who, join_as, call_id, access_hash)) = live
+            .group_calls
+            .joined
+            .as_ref()
+            .map(|j| (j.who, j.join_as, j.call_id, j.access_hash))
+        else {
+            return;
+        };
+        let suppressed = live
+            .group_calls
+            .calls
+            .get(&who)
+            .and_then(|c| c.participants.values().find(|p| p.is_self || p.who == join_as))
+            .is_some_and(GroupParticipant::suppressed);
+        // Never attempt to unmute while suppressed (listener without can_self_unmute).
+        let eff_muted = if suppressed { true } else { muted };
         let Some(joined) = live.group_calls.joined.as_mut() else {
             return;
         };
-        let mute_changed = joined.muted != muted;
-        joined.muted = muted;
+        let mute_changed = joined.muted != eff_muted;
+        joined.muted = eff_muted;
         joined.deafened = deafened;
-        mute_changed.then_some((joined.call_id, joined.access_hash))
+        mute_changed.then_some((call_id, access_hash, join_as, eff_muted))
     };
-    if let Some((call_id, access_hash)) = target {
+    if let Some((call_id, access_hash, join_as, eff_muted)) = target {
+        let Ok(participant) = input_peer_for_identity(account, join_as) else {
+            return;
+        };
         let req = tl::functions::phone::EditGroupCallParticipant {
             call: input_call_of(call_id, access_hash),
-            participant: tl::enums::InputPeer::PeerSelf,
-            muted: Some(muted),
+            participant,
+            muted: Some(eff_muted),
             volume: None,
             raise_hand: None,
             video_stopped: None,
@@ -789,5 +1524,41 @@ pub(super) fn tick_keepalive(account: &Account) {
             clear_discarded(account, who, call_id);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(who: Who, muted: bool, can_self_unmute: bool, speaking: bool, raise_hand_rating: Option<i64>, order: u64) -> GroupParticipant {
+        GroupParticipant {
+            who,
+            source: 1,
+            muted,
+            can_self_unmute,
+            speaking,
+            raise_hand_rating,
+            about: String::new(),
+            muted_by_you: false,
+            is_self: false,
+            order,
+        }
+    }
+
+    #[test]
+    fn sort_participants_puts_speakers_then_raised_hands_then_listeners() {
+        let items = [
+            mk(Who::User(4), true, false, false, None, 0),          // listener
+            mk(Who::User(3), true, false, false, Some(20), 1),      // raised hand low
+            mk(Who::User(2), true, false, false, Some(500), 2),     // raised hand high
+            mk(Who::Channel(9), true, true, false, None, 3),        // muted speaker (channel)
+            mk(Who::User(1), false, true, true, None, 4),           // active speaker
+        ];
+        let ordered: Vec<Who> = sort_participants(items.iter()).into_iter().map(|p| p.who).collect();
+        assert_eq!(
+            ordered,
+            vec![Who::User(1), Who::Channel(9), Who::User(2), Who::User(3), Who::User(4)]
+        );
     }
 }

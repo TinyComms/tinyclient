@@ -2615,8 +2615,9 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
             None => format!("{who} started a video chat"),
         }),
         A::InviteToGroupCall(invite) => named(match invite.users.as_slice() {
-            [] => format!("{who} invited you to the video chat"),
-            users => format!("{who} invited {} to the video chat", names(users)),
+            [] => format!("{who} invited you to a video chat"),
+            [single] if *single == dir.me => format!("{who} invited you to a video chat"),
+            users => format!("{who} invited {} to a video chat", names(users)),
         }),
         A::GroupCallScheduled(scheduled) => {
             let when = local_schedule_time(i64::from(scheduled.schedule_date));
@@ -2853,7 +2854,18 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 Some((text, note)) => (text, true, Some(note)),
                 None => {
                     let (text, known) = action(dir, &who, &service.action);
-                    (text, known, None)
+                    let invite_note = match &service.action {
+                        MessageAction::InviteToGroupCall(invite) => Some(protocol::CallNote {
+                            outcome: protocol::CallOutcome::Live,
+                            caller_id: from.text(),
+                            seconds: None,
+                            participants: invite.users.iter().map(|id| Who::User(*id).text()).collect(),
+                            video: true,
+                            call_id: None,
+                        }),
+                        _ => None,
+                    };
+                    (text, known, invite_note)
                 }
             };
             let pin = matches!(service.action, MessageAction::PinMessage);
@@ -5778,12 +5790,16 @@ mod tests {
             said(tl::types::MessageActionSuggestProfilePhoto { photo: tl::types::PhotoEmpty { id: 1 }.into() }.into()),
             "Ada suggested a profile photo"
         );
-        let call = tl::types::InputGroupCall { id: 1, access_hash: 2 }.into();
+        let call: tl::enums::InputGroupCall = tl::types::InputGroupCall { id: 1, access_hash: 2 }.into();
         assert_eq!(
-            said(tl::types::MessageActionInviteToGroupCall { call, users: vec![9] }.into()),
-            "Ada invited Unknown to the video chat"
+            said(tl::types::MessageActionInviteToGroupCall { call: call.clone(), users: vec![9] }.into()),
+            "Ada invited Unknown to a video chat"
         );
-        let call = tl::types::InputGroupCall { id: 1, access_hash: 2 }.into();
+        assert_eq!(
+            said(tl::types::MessageActionInviteToGroupCall { call, users: vec![1] }.into()),
+            "Ada invited you to a video chat"
+        );
+        let call: tl::enums::InputGroupCall = tl::types::InputGroupCall { id: 1, access_hash: 2 }.into();
         let sched_text = said(tl::types::MessageActionGroupCallScheduled { call, schedule_date: 1_700_000_000 }.into());
         assert!(
             sched_text.starts_with("Ada scheduled a video chat for "),

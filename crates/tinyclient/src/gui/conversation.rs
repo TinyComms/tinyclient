@@ -4839,6 +4839,8 @@ mod tests {
                     speaking: true,
                     streaming: false,
                     camera: false,
+                    hand_raised: false,
+                    is_channel: false,
                 },
             ],
             ..protocol::Occupants::default()

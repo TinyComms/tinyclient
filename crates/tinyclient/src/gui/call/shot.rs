@@ -323,6 +323,12 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         moved_from: matches!(name.as_str(), "moving" | "moved_notice").then(|| key("direct")),
         move_notice: (name == "moved_notice").then(|| "Bea added Cy. The call moved to Campfire.".to_owned()),
         incoming_video: false,
+        title: String::new(),
+        hand_raised: false,
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
     })
 }
 
@@ -409,6 +415,8 @@ pub(super) fn running() -> Option<Occupants> {
         streaming: false,
         camera: false,
         speaking: false,
+        hand_raised: false,
+        is_channel: false,
     };
     (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3, ..Occupants::default() })
 }
@@ -480,6 +488,12 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         moved_from: None,
         move_notice: None,
         incoming_video: false,
+        title: String::new(),
+        hand_raised: false,
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
     }
 }
 

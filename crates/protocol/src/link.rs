@@ -946,6 +946,31 @@ pub fn telegram_family(raw: &str) -> bool {
         || host.ends_with(".telegram.dog")
 }
 
+/// Parses a Telegram video chat / voice chat / live stream query parameter from a `t.me` or
+/// `telegram.me` link (`?videochat[=hash]`, `?voicechat[=hash]`, `?livestream[=hash]`).
+///
+/// Returns `Some(Some(hash))` when a non-empty invite hash is carried, `Some(None)` when bare
+/// (`?videochat`), and `None` when the URL is not a Telegram video chat link (including `t.me/call/...`
+/// conference links which are handled separately).
+pub fn telegram_videochat_invite(raw: &str) -> Option<Option<String>> {
+    telegram_app_link(raw)?;
+    let parsed = Url::parse(raw.trim()).ok()?;
+    for (k, v) in parsed.query_pairs() {
+        let lower = k.to_ascii_lowercase();
+        if matches!(lower.as_str(), "videochat" | "voicechat" | "livestream") {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                return Some(None);
+            }
+            if trimmed.len() <= 128 && trimmed.bytes().all(|b| b.is_ascii_graphic()) {
+                return Some(Some(trimmed.to_owned()));
+            }
+            return None;
+        }
+    }
+    None
+}
+
 fn telegram_utility(segment: &str) -> bool {
     matches!(
         segment.to_ascii_lowercase().as_str(),
@@ -963,6 +988,7 @@ fn telegram_utility(segment: &str) -> bool {
             | "setlanguage"
             | "boost"
             | "giftcode"
+            | "call"
     )
 }
 
@@ -1482,5 +1508,23 @@ mod tests {
         // The wider parser still accepts dog and tg. This helper is the in-app gate.
         assert!(parse_network_link("https://telegram.dog/rustlang").is_some());
         assert!(parse_network_link("tg://resolve?domain=rustlang").is_some());
+    }
+
+    #[test]
+    fn telegram_videochat_links_extract_invite_hash_and_ignore_conference_links() {
+        assert_eq!(telegram_videochat_invite("https://t.me/field_notes?videochat"), Some(None));
+        assert_eq!(
+            telegram_videochat_invite("https://t.me/field_notes?videochat=abc123XYZ"),
+            Some(Some("abc123XYZ".into()))
+        );
+        assert_eq!(telegram_videochat_invite("https://t.me/field_notes?voicechat=vhash"), Some(Some("vhash".into())));
+        assert_eq!(telegram_videochat_invite("https://telegram.me/field_notes?livestream"), Some(None));
+        assert_eq!(
+            telegram_videochat_invite("https://telegram.me/field_notes?livestream=live_99"),
+            Some(Some("live_99".into()))
+        );
+        assert_eq!(telegram_videochat_invite("https://t.me/field_notes"), None);
+        assert_eq!(telegram_videochat_invite("https://t.me/call/conference-slug"), None);
+        assert_eq!(telegram_app_link("https://t.me/call/conference-slug"), None);
     }
 }

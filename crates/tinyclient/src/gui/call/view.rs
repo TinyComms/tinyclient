@@ -1928,6 +1928,7 @@ impl Shell {
             Some(Menu::Person { account, user_id, name }) => {
                 Some((260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.))))
             }
+            Some(Menu::TelegramCall) => Some((260., self.telegram_call_menu(call, cx).p(px(6.)))),
             _ => None,
         });
         let call_error = room_context.then(|| self.tiny_state.call_error.clone()).flatten();

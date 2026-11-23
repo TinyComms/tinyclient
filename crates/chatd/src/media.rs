@@ -300,6 +300,12 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         moved_from: None,
         move_notice: None,
         incoming_video: false,
+        title: String::new(),
+        hand_raised: false,
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -2048,6 +2054,39 @@ impl Calls {
         }
     }
 
+    /// Updates Telegram group call metadata (`title`, `hand_raised`, `join_muted`,
+    /// `can_change_join_muted`, `participants_count`, `joined_as`) on the active call snapshot.
+    pub fn set_group_call_meta(
+        &self,
+        hub: &Hub,
+        conversation: &Key,
+        title: String,
+        hand_raised: bool,
+        join_muted: bool,
+        can_change_join_muted: bool,
+        participants_count: u32,
+        joined_as: Option<String>,
+    ) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            changed = live.call.title != title
+                || live.call.hand_raised != hand_raised
+                || live.call.join_muted != join_muted
+                || live.call.can_change_join_muted != can_change_join_muted
+                || live.call.participants_count != participants_count
+                || live.call.joined_as != joined_as;
+            live.call.title = title;
+            live.call.hand_raised = hand_raised;
+            live.call.join_muted = join_muted;
+            live.call.can_change_join_muted = can_change_join_muted;
+            live.call.participants_count = participants_count;
+            live.call.joined_as = joined_as;
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
     /// Asks mediad to build the local ICE/DTLS join params JSON and SSRC for a Telegram group call.
     pub fn telegram_group_offer(
         &self,
@@ -2057,6 +2096,15 @@ impl Calls {
     ) -> Result<(String, u32), String> {
         let (call, running) = self.describe();
         let here = call.as_ref().is_some_and(|call| call.conversation == *conversation) && running;
+        // Rejoining mid-call (e.g. switching join-as identity) requires a fresh mediad WebRTC session.
+        let already_joined = here
+            && call
+                .as_ref()
+                .is_some_and(|c| matches!(c.state, CallState::Joined | CallState::Reconnecting));
+        if already_joined {
+            self.end_if(hub, conversation);
+        }
+        let here = here && !already_joined;
         if !here {
             self.start(hub, conversation.clone()).map_err(|err| match err {
                 CallError::Active => IN_ANOTHER_CALL.to_owned(),

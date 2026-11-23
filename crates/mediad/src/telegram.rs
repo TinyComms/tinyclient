@@ -1016,7 +1016,7 @@ pub fn run_group(mut link: GroupLink, user_id: String, controls: Arc<Controls>) 
             out::send(&MediaResponse::Speaking { user_id: user_id.clone(), speaking });
         }
 
-        if !link.fake_loopback {
+        if !link.fake_loopback && !controls.muted.load(Ordering::Relaxed) {
             let mut send_opus = |data: &[u8], tick: u64| {
                 if let Some(writer) = link.rtc.writer(link.mic_mid) {
                     let pt = writer.payload_params().next().map(|p| p.pt());

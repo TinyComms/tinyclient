@@ -251,6 +251,62 @@ pub struct Participant {
     /// Being rung for this call and not yet joined (Discord DM / group DM calls).
     #[serde(default, skip_serializing_if = "is_false")]
     pub ringing: bool,
+    /// Raised hand in a moderated group video chat (`groupCallParticipant.raise_hand_rating`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hand_raised: bool,
+    /// Ordering rating for raised hands in Telegram group video chats (`raise_hand_rating`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raise_hand_rating: Option<i64>,
+    /// Short bio/about text returned on the participant (`groupCallParticipant.about`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub about: String,
+    /// Locally muted by you on the server (`groupCallParticipant.muted_by_you`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted_by_you: bool,
+    /// True when this participant joined as a channel or group rather than a user account.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_channel: bool,
+}
+
+/// One eligible identity returned by `phone.getGroupCallJoinAs` (#460).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupCallJoinPeer {
+    /// Peer id (`u<id>`, `c<id>`, `g<id>`).
+    pub id: String,
+    pub name: String,
+    /// True when this peer is the user's own personal account ("Me").
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_self: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<crate::MediaFile>,
+}
+
+/// Allowed join-as peers and the chat's remembered choice (`groupcall_default_join_as`) (#460).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupCallJoinAs {
+    pub peers: Vec<GroupCallJoinPeer>,
+    /// Remembered peer id for this chat, when present on the full chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_peer: Option<String>,
+    /// True when the full chat could not be read; the UI should ask rather than defaulting to Me.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default_unknown: bool,
+}
+
+/// Per-person refusal returned when inviting people into a Telegram group video chat (#459).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupCallInviteRefusal {
+    pub user_id: String,
+    pub reason: String,
+}
+
+/// Result of `Request::GroupCallInvite` (#459).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupCallInviteResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invited: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<GroupCallInviteRefusal>,
 }
 
 /// The most screens and windows `mediad --screens` lists.
@@ -408,6 +464,29 @@ pub struct Call {
     /// An incoming ring is a video call (Telegram `phoneCallRequested.video`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub incoming_video: bool,
+    /// Title of the live group video chat / live stream, when set (`groupCall.title`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// True while our own hand is raised as a suppressed listener (`raise_hand_rating`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hand_raised: bool,
+    /// Telegram `groupCall.join_muted`: whether new participants join muted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub join_muted: bool,
+    /// Telegram `groupCall.can_change_join_muted`: whether we may toggle `join_muted`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_change_join_muted: bool,
+    /// Total participant count reported by the server (`groupCall.participants_count`), which may
+    /// exceed `participants.len() + 1` in large video chats.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub participants_count: u32,
+    /// Peer id we joined this Telegram group call as (`u<id>` / `c<id>` / `g<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_as: Option<String>,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Someone rung into a group call, and what the server last said of that ring.
@@ -1548,5 +1627,48 @@ mod tests {
 
         let rights = crate::ConversationRights { manage_call: true, ..crate::ConversationRights::default() };
         assert!(crate::ConversationRights::from_bits(rights.to_bits()).manage_call);
+    }
+
+    #[test]
+    fn wave16b1_group_call_types_and_additive_fields_round_trip() {
+        let p = Participant {
+            id: "c9001".into(),
+            name: "Field Notes".into(),
+            muted: true,
+            suppressed: true,
+            hand_raised: true,
+            raise_hand_rating: Some(42),
+            about: "Trail dispatch".into(),
+            muted_by_you: true,
+            is_channel: true,
+            ..Participant::default()
+        };
+        let p_json = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<Participant>(&p_json).unwrap(), p);
+        // Legacy JSON without new fields deserializes with defaults.
+        let legacy: Participant = serde_json::from_str(r#"{"id":"u1","name":"Ada"}"#).unwrap();
+        assert!(!legacy.hand_raised && legacy.raise_hand_rating.is_none() && legacy.about.is_empty() && !legacy.is_channel);
+
+        let join_as = GroupCallJoinAs {
+            peers: vec![
+                GroupCallJoinPeer { id: "u1".into(), name: "Me".into(), is_self: true, avatar: None },
+                GroupCallJoinPeer { id: "c9001".into(), name: "Field Notes".into(), is_self: false, avatar: None },
+            ],
+            default_peer: Some("c9001".into()),
+            default_unknown: false,
+        };
+        assert_eq!(
+            serde_json::from_str::<GroupCallJoinAs>(&serde_json::to_string(&join_as).unwrap()).unwrap(),
+            join_as
+        );
+
+        let invited = GroupCallInviteResult {
+            invited: vec!["u2".into()],
+            refused: vec![GroupCallInviteRefusal { user_id: "u3".into(), reason: "Privacy settings prevent inviting this user.".into() }],
+        };
+        assert_eq!(
+            serde_json::from_str::<GroupCallInviteResult>(&serde_json::to_string(&invited).unwrap()).unwrap(),
+            invited
+        );
     }
 }

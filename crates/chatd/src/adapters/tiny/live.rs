@@ -2228,6 +2228,7 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             camera: who.camera,
             sharing: who.sharing,
             ringing: false,
+            ..Participant::default()
         });
         ctx.participants(room, roster.collect());
     }
@@ -2268,6 +2269,8 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             streaming: who.sharing,
             camera: who.camera,
             speaking: seat.speaking.contains(&who.user),
+            hand_raised: false,
+            is_channel: false,
         })
         .collect();
     ctx.occupants(room, occupants, people.len() as u32);
@@ -2954,6 +2957,7 @@ fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
             camera: who.camera,
             sharing: who.sharing,
             ringing: false,
+            ..Participant::default()
         });
     ctx.participants(direct_id, roster.collect());
 }

@@ -511,12 +511,19 @@ pub(crate) fn call_line_spec(message: &Message, peer_title: &str) -> CallRowSpec
                 pill: Some("Call back"),
             }
         }
-        (protocol::CallOutcome::Live, _) => CallRowSpec {
-            icon: if video { "icons/video.svg" } else { "icons/phone.svg" },
-            missed: false,
-            label: format!("{cap_noun} in progress with {other}"),
-            pill: Some("Join"),
-        },
+        (protocol::CallOutcome::Live, _) => {
+            let label = if message.text.contains("invited") && message.text.contains("video chat") {
+                message.text.clone()
+            } else {
+                format!("{cap_noun} in progress with {other}")
+            };
+            CallRowSpec {
+                icon: if video { "icons/video.svg" } else { "icons/phone.svg" },
+                missed: false,
+                label,
+                pill: Some("Join"),
+            }
+        }
     }
 }
 
@@ -5865,6 +5872,13 @@ mod tests {
         assert!(vm.missed);
         assert_eq!(vm.label, "Missed video call from Bea");
         assert_eq!(vm.pill, Some("Call back"));
+
+        let mut invite = make(protocol::CallOutcome::Live, false, None);
+        invite.text = "Odalys invited you to a video chat".into();
+        invite.call.as_mut().unwrap().video = true;
+        let inv = call_line_spec(&invite, "Trail Crew");
+        assert_eq!(inv.label, "Odalys invited you to a video chat");
+        assert_eq!(inv.pill, Some("Join"));
     }
 
     #[test]

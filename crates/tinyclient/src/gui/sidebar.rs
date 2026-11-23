@@ -6974,7 +6974,7 @@ pub(crate) mod tests {
         Occupants {
             people: speaking
                 .iter()
-                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), avatar: None, muted: false, deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: *live })
+                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), avatar: None, muted: false, deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: *live, hand_raised: false, is_channel: false })
                 .collect(),
             total: speaking.len() as u32,
             ..Occupants::default()

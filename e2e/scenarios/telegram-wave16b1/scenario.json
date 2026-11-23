@@ -1,0 +1,12 @@
+{
+  "id": "telegram-wave16b1",
+  "title": "Wave 16B1 Telegram group call join-as channels, invites & links, start/rename/end with migration, raise hand, and admin moderation",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 16B1 Telegram group video chat controls verified by protocol, GUI unit, and chatd fake-server integration suites.",
+    "ios": "Desktop Wave 16B1 Telegram group video chat controls verified by protocol, GUI unit, and chatd fake-server integration suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

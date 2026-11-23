@@ -1082,6 +1082,9 @@ impl Shell {
             (_, Menu::Person { account, user_id, name }) if joined => {
                 (260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.)))
             }
+            (_, Menu::TelegramCall) if joined => {
+                (260., self.telegram_call_menu(call, cx).p(px(6.)))
+            }
             _ => return None,
         };
         // Above the card, level with its left edge, on top of whatever the list shows.
@@ -1229,7 +1232,7 @@ impl Shell {
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
-                            .child(subject.title.clone()),
+                            .child(super::telegram::call_header_display_title(call, &subject.title)),
                     ),
             )
             .child(place)
@@ -1286,35 +1289,53 @@ impl Shell {
         // Reconnecting keeps the joined controls, dead; only Leave is live.
         let enabled = call.state != CallState::Reconnecting;
         let menu = self.call_menu().filter(|_| enabled);
+        let mic_mode = super::telegram::telegram_mic_button_mode(call);
         let forced_mute = call.server_muted || call.suppressed;
         let off = call.muted || call.deafened || forced_mute;
-        let mute_enabled = enabled && !forced_mute;
-        let mute_tip = if call.server_muted {
-            "Server muted"
-        } else if call.suppressed {
-            "Can't speak in this channel"
-        } else if off {
-            "Unmute"
-        } else {
-            "Mute"
+        let mute_enabled = match mic_mode {
+            super::telegram::TelegramMicMode::Normal => enabled && !forced_mute,
+            super::telegram::TelegramMicMode::RaiseHand | super::telegram::TelegramMicMode::LowerHand => enabled && joined,
+        };
+        let (mute_icon, mute_look, mute_tip) = match mic_mode {
+            super::telegram::TelegramMicMode::RaiseHand => ("icons/hand.svg", Look::Rest, "Raise hand"),
+            super::telegram::TelegramMicMode::LowerHand => ("icons/hand.svg", Look::On, "Lower hand"),
+            super::telegram::TelegramMicMode::Normal => {
+                let tip_text = if call.server_muted {
+                    "Server muted"
+                } else if call.suppressed {
+                    "Can't speak in this channel"
+                } else if off {
+                    "Unmute"
+                } else {
+                    "Mute"
+                };
+                (
+                    if off { "icons/mic-off.svg" } else { "icons/mic.svg" },
+                    if off { Look::Off } else { Look::Rest },
+                    tip_text,
+                )
+            }
         };
 
         let mute = control(
             "call-mute",
-            if off {
-                "icons/mic-off.svg"
-            } else {
-                "icons/mic.svg"
-            },
-            if off { Look::Off } else { Look::Rest },
+            mute_icon,
+            mute_look,
             mute_enabled,
         )
         .aria_label(mute_tip)
-        .tooltip(tip(mute_tip, mute_enabled.then_some("⌘⇧M")))
+        .tooltip(tip(
+            mute_tip,
+            (mute_enabled && mic_mode == super::telegram::TelegramMicMode::Normal).then_some("⌘⇧M"),
+        ))
         .when(mute_enabled, |mute| {
-            mute.on_click(cx.listener(|this, _, _, cx| {
+            mute.on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.call_mute(cx);
+                if mic_mode == super::telegram::TelegramMicMode::Normal {
+                    this.call_mute(cx);
+                } else {
+                    this.telegram_toggle_hand(cx);
+                }
             }))
         })
         // While I am heard: a 2 px ring inside the button, the same green as a speaker's.
@@ -1480,6 +1501,24 @@ impl Shell {
                     this.call_menu_toggle(Menu::Devices, cx);
                 }))
         });
+        let tg_actions = (call.conversation.network == Network::Telegram
+            && matches!(subject.kind, ConversationKind::Group | ConversationKind::Channel)
+            && joined
+            && enabled)
+            .then(|| {
+                control(
+                    "call-tg-actions",
+                    "icons/ellipsis.svg",
+                    if menu == Some(Menu::TelegramCall) { Look::Open } else { Look::Rest },
+                    true,
+                )
+                .aria_label("Video chat options")
+                .tooltip(tip("Video chat options", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::TelegramCall, cx);
+                }))
+            });
         let end = if in_call(call) {
             leave()
         } else {
@@ -1497,6 +1536,7 @@ impl Shell {
             })
             .tooltip(tip("Cancel", Some("⌘⇧H")))
         };
+        let in_live_call = in_call(call);
         // Joined controls share the width equally, including when video adds two buttons.
         let controls = div()
             .w_full()
@@ -1506,19 +1546,24 @@ impl Shell {
             .flex_wrap()
             .items_center()
             .gap(px(4.))
-            .child(mute.when(in_call(call), |button| button.flex_1().min_w_0()))
+            .child(mute.when(in_live_call, |button| button.flex_1().min_w_0()))
             // Deafen is for a call that is up; before that only mute and devices can be preset.
-            .when(in_call(call), |row| row.child(deafen.flex_1().min_w_0()))
+            .when(in_live_call, |row| row.child(deafen.flex_1().min_w_0()))
             .children(share.map(|button| button.flex_1().min_w_0()))
             .children(camera.map(|button| button.flex_1().min_w_0()))
             .children(ring_again.map(|button| button.flex_1().min_w_0()))
             .children(add_people.map(|button| button.flex_1().min_w_0()))
-            .child(devices.when(in_call(call), |button| button.flex_1().min_w_0()))
+            .children(tg_actions.map(|button| button.flex_1().min_w_0()))
+            .child(devices.when(in_live_call, |button| button.flex_1().min_w_0()))
             .child(
-                end.when(in_call(call), |button| button.flex_1().min_w_0())
-                    .on_click(cx.listener(|this, _, _, cx| {
+                end.when(in_live_call, |button| button.flex_1().min_w_0())
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.call_leave(cx);
+                        if in_live_call {
+                            this.telegram_leave_or_end(cx);
+                        } else {
+                            this.call_leave(cx);
+                        }
                     })),
             );
 
@@ -1734,6 +1779,12 @@ mod tests {
         moved_from: None,
         move_notice: None,
         incoming_video: false,
+        title: String::new(),
+        hand_raised: false,
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
         }
     }
 

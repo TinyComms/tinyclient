@@ -243,10 +243,13 @@ impl Pane {
                     let parsed = protocol::link::parse_network_link(&owned);
                     let boost = parsed.as_ref().is_some_and(|link| link.space.as_deref() == Some("boost"));
                     let start = parsed.and_then(|link| (link.space.as_deref() == Some("start")).then(|| link.thread_id.unwrap_or_default()));
+                    let videochat_invite = protocol::link::telegram_videochat_invite(&owned);
                     let _ = this.update(cx, |this, cx| {
                         let _ = this.shell.update(cx, |shell, cx| {
                             shell.open_resolved_link(key.clone(), message_id, &title, cx);
-                            if boost {
+                            if let Some(invite_hash) = videochat_invite {
+                                shell.telegram_offer_videochat_link(key, title, invite_hash, cx);
+                            } else if boost {
                                 shell.details_conversation(key, cx);
                             } else if let Some(param) = start {
                                 shell.start_bot(key, param, cx);
