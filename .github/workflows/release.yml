@@ -189,7 +189,7 @@ jobs:
             codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'
             for program in tinyclient chatd mediad tinyclient-login; do
               bin="$app/Contents/MacOS/$program"
-              lipo -verify_arch ${{ matrix.arch }} "$bin"
+              lipo "$bin" -verify_arch ${{ matrix.arch }}
               out=$("$bin" --version)
               echo "$out"
               test "$out" = "$program $VERSION"
