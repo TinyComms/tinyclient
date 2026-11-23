@@ -46,6 +46,8 @@ use tungstenite::protocol::CloseFrame;
 
 /// The first part is base64 for the user id 1000, as in a real token.
 const TOKEN: &str = "MTAwMA.Zx9aBc.not-a-real-signature";
+/// User 2000. A second account signed in beside [`TOKEN`].
+const TOKEN_B: &str = "MjAwMA.Zx9aBc.not-a-real-signature";
 const READY: &str = include_str!("fixtures/discord/ready.json");
 
 #[test]
@@ -1005,7 +1007,7 @@ fn serve_http(shared: Arc<Shared>, stream: TcpStream) {
 
 /// One gateway connection: hello, then READY for an identify or RESUMED for a resume, a
 /// heartbeat answered with an ack, and whatever the test pushes.
-fn serve_gateway(shared: &Shared, stream: TcpStream, control: &Receiver<Control>, gateway: &str) {
+fn serve_gateway(shared: &Shared, stream: TcpStream, control: &Mutex<Receiver<Control>>, gateway: &str) {
     let mut socket = tungstenite::accept(stream).unwrap();
     socket.get_ref().set_read_timeout(Some(Duration::from_millis(15))).unwrap();
     shared.connections.fetch_add(1, Ordering::Relaxed);
@@ -1024,7 +1026,8 @@ fn serve_gateway(shared: &Shared, stream: TcpStream, control: &Receiver<Control>
                 let sent = match frame["op"].as_u64() {
                     Some(1) => socket.send(json!({"op": 11}).to_string().into()),
                     Some(2) => {
-                        assert_eq!(frame["d"]["token"], TOKEN, "identify carries the session's token");
+                        let token = frame["d"]["token"].as_str().unwrap_or("");
+                        assert!(token == TOKEN || token == TOKEN_B, "identify carries a session token, not {token}");
                         // A queued 0 lets that identify through.
                         let close = shared.closes.lock().unwrap().pop_front().filter(|code| *code != 0);
                         if let Some(code) = close {
@@ -1052,7 +1055,7 @@ fn serve_gateway(shared: &Shared, stream: TcpStream, control: &Receiver<Control>
             Err(tungstenite::Error::Io(err)) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(_) => return,
         }
-        while let Ok(control) = control.try_recv() {
+        while let Ok(control) = control.lock().unwrap().try_recv() {
             match control {
                 Control::Push(event, data) => {
                     if dispatch(&mut socket, &event, data).is_err() {
@@ -1178,9 +1181,13 @@ impl World {
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         let gateway = format!("ws://{}", socket.local_addr().unwrap());
         let (for_gateway, address) = (shared.clone(), gateway.clone());
+        let controlled = Arc::new(Mutex::new(controlled));
         std::thread::spawn(move || {
             for stream in socket.incoming().flatten() {
-                serve_gateway(&for_gateway, stream, &controlled, &address);
+                let shared = for_gateway.clone();
+                let address = address.clone();
+                let control = controlled.clone();
+                std::thread::spawn(move || serve_gateway(&shared, stream, &control, &address));
             }
         });
 
@@ -4328,6 +4335,61 @@ fn member_search_is_paced_per_server_and_remembered() {
     assert_eq!(second["d"]["query"], "sandra");
     let apart = second["_at"].as_u64().unwrap() - first["_at"].as_u64().unwrap();
     assert!(apart >= 30_000, "the same server was searched again after {apart} ms");
+}
+
+#[test]
+fn two_discord_accounts_stay_connected_and_signing_one_out_leaves_the_other() {
+    let session = json!({
+        "user_agent": "Safari/26.0",
+        "accounts": [
+            {"token": TOKEN, "id": "1000", "name": "Work"},
+            {"token": TOKEN_B, "id": "2000", "name": "Home"},
+        ],
+    })
+    .to_string();
+    let world = World::launch(&[("TINYCLIENT_SESSION_DISCORD", session.as_str())], |_| {});
+    let status = || match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts,
+        other => panic!("{other:?}"),
+    };
+    wait("both Discord accounts", || {
+        let accounts = status();
+        let link = |id: &str| accounts.iter().find(|account| account.key.account == id).map(|account| account.link);
+        (link("1000") == Some(Link::Connected) && link("2000") == Some(Link::Connected)).then_some(())
+    });
+    let tokens: Vec<String> = world
+        .discord
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|frame| frame["op"] == 2)
+        .filter_map(|frame| frame["d"]["token"].as_str().map(str::to_owned))
+        .collect();
+    assert!(tokens.contains(&TOKEN.to_owned()) && tokens.contains(&TOKEN_B.to_owned()), "{tokens:?}");
+    let inbox = match world.ask(Request::Inbox { network: None, filter: Default::default(), offset: 0, limit: 80 }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("{other:?}"),
+    };
+    let of = |id: &str| inbox.iter().filter(|row| row.key.id == "3001" && row.key.account == id).count();
+    assert_eq!((of("1000"), of("2000")), (1, 1), "each account keeps its own copy of the same DM");
+    let signed_out = AccountKey { network: Network::Discord, account: "1000".into() };
+    let answered = world.ask(Request::SignOut { account: signed_out, erase: false });
+    assert!(matches!(answered, Response::Status { .. }), "{answered:?}");
+    let accounts = status();
+    let link = |id: &str| accounts.iter().find(|account| account.key.account == id).map(|account| account.link);
+    // Sign-out forgets that account's store row. A missing row is signed out, as `World::link` reads it.
+    assert!(matches!(link("1000"), None | Some(Link::SignedOut)));
+    assert_eq!(link("2000"), Some(Link::Connected));
+    let inbox = match world.ask(Request::Inbox { network: None, filter: Default::default(), offset: 0, limit: 80 }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("{other:?}"),
+    };
+    let of = |id: &str| inbox.iter().filter(|row| row.key.id == "3001" && row.key.account == id).count();
+    assert_eq!((of("1000"), of("2000")), (0, 1), "signing out forgets only that account's copy");
+    let ended = world.discord.requests_to("POST", "/auth/logout");
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].headers["authorization"], TOKEN);
 }
 
 #[test]

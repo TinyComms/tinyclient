@@ -24,6 +24,8 @@ pub enum TeamsCloud {
     Dod,
     /// Microsoft 365 operated by 21Vianet in China.
     China,
+    /// A personal Microsoft account (Teams free, teams.live.com).
+    Personal,
 }
 
 /// Token audience selector resolved against a cloud's own endpoints.
@@ -189,12 +191,35 @@ pub const CHINA: CloudEndpoints = CloudEndpoints {
     ],
 };
 
+/// Personal Microsoft accounts. Hosts are the consumer service only: a personal session never
+/// sends a token to a work Teams host.
+pub const PERSONAL: CloudEndpoints = CloudEndpoints {
+    login: "https://login.microsoftonline.com",
+    teams: "https://teams.live.com",
+    spaces: "https://mtsvc.fl.teams.microsoft.com",
+    aggregator: "https://teams.live.com",
+    presence: "https://presence.teams.live.com",
+    graph: "https://graph.microsoft.com",
+    trouter: "https://teams.live.com",
+    ours: &[
+        "teams.live.com",
+        "presence.teams.live.com",
+        "mtsvc.fl.teams.microsoft.com",
+    ],
+    media_hosts: &["teams.live.com"],
+    fetch_open: &[],
+    fetch_session: &["teams.live.com"],
+    sharepoint: &[],
+    upload_hosts: &["teams.live.com"],
+};
+
 impl TeamsCloud {
     pub fn parse(raw: &str) -> TeamsCloud {
         match raw.trim().to_ascii_lowercase().as_str() {
             "gcc_high" | "gcchigh" | "gcc-high" | "usgov" | "usgov_high" | "usgovhigh" => TeamsCloud::GccHigh,
             "dod" | "usgov_dod" | "usgovdod" | "usdod" => TeamsCloud::Dod,
             "china" | "21vianet" | "cn" | "gallatin" => TeamsCloud::China,
+            "personal" | "consumers" | "live" => TeamsCloud::Personal,
             _ => TeamsCloud::Worldwide,
         }
     }
@@ -205,6 +230,7 @@ impl TeamsCloud {
             TeamsCloud::GccHigh => "gcc_high",
             TeamsCloud::Dod => "dod",
             TeamsCloud::China => "china",
+            TeamsCloud::Personal => "personal",
         }
     }
 
@@ -214,6 +240,7 @@ impl TeamsCloud {
             TeamsCloud::GccHigh => &GCC_HIGH,
             TeamsCloud::Dod => &DOD,
             TeamsCloud::China => &CHINA,
+            TeamsCloud::Personal => &PERSONAL,
         }
     }
 }
@@ -256,6 +283,13 @@ mod tests {
         assert_eq!(TeamsCloud::parse("dod"), TeamsCloud::Dod);
         assert_eq!(TeamsCloud::parse("21vianet"), TeamsCloud::China);
         assert_eq!(TeamsCloud::parse("china"), TeamsCloud::China);
+        assert_eq!(TeamsCloud::parse("personal"), TeamsCloud::Personal);
+        assert_eq!(TeamsCloud::parse("consumers"), TeamsCloud::Personal);
+        let personal = TeamsCloud::Personal.endpoints();
+        assert_eq!(personal.teams, "https://teams.live.com");
+        assert_eq!(personal.presence, "https://presence.teams.live.com");
+        assert!(!personal.ours.contains(&"teams.microsoft.com"));
+        assert!(!personal.media_hosts.contains(&"teams.microsoft.com"));
 
         let gcc = TeamsCloud::GccHigh.endpoints();
         assert_eq!(gcc.login, "https://login.microsoftonline.us");
