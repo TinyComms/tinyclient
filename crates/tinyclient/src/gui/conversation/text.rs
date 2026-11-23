@@ -112,6 +112,7 @@ impl Rich {
             }
             if run.mark {
                 color = theme::text_faint().into_color();
+                tips.push((range.clone(), ix));
             }
             if run.code {
                 boxes.push((range.clone(), tokens::code_inline().into_color()));
@@ -135,7 +136,11 @@ impl Rich {
                     MentionKind::Channel | MentionKind::Command => false,
                 };
                 face.weight = FontWeight::MEDIUM;
-                color = if mine { gpui::white() } else { tokens::link().into_color() };
+                color = if mine {
+                    if theme::is_light() { theme::accent_text().into_color() } else { gpui::white() }
+                } else {
+                    tokens::link().into_color()
+                };
                 let fill: Hsla = if mine { tokens::mention_me().into_color() } else { theme::accent_soft().into_color() };
                 boxes.push((range.clone(), fill));
                 if run.link.is_none() {

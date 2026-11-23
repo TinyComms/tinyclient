@@ -166,7 +166,7 @@ impl Shell {
                             .child(div().type_ui().font_weight(if unread { theme::SEMIBOLD } else { theme::REGULAR }).text_color(theme::text()).child("Apps"))
                             .child(glyph(chevron, 12., theme::text_faint()))
                             .child(div().flex_1())
-                            .child(div().type_micro().text_color(theme::text_faint()).child(row_time(now(), apps.newest()))),
+                            .child(div().flex_none().type_micro().text_color(theme::text_faint()).child(row_time(now(), apps.newest()))),
                     )
                     .child(
                         div()
@@ -226,7 +226,8 @@ impl Shell {
     /// A placeholder in a row's final geometry, for a list still on its way.
     fn inbox_placeholder(ix: usize) -> Div {
         let widths = [120., 90., 140., 100., 130., 80.];
-        div().h(px(48.)).px(px(16.)).flex().items_center().gap(px(10.)).child(div().size(px(32.)).rounded(px(16.)).bg(theme::hover())).child(
+        let avatar = theme::row_avatar();
+        div().h(px(theme::row_height(theme::ROW_TWO))).px(px(16.)).flex().items_center().gap(px(10.)).child(div().size(px(avatar)).rounded(px(avatar / 2.)).bg(theme::hover())).child(
             div().flex().flex_col().gap(px(8.)).child(skeleton(widths[ix % widths.len()], 10.)).child(skeleton(widths[(ix + 2) % widths.len()] + 40., 8.)),
         )
     }
@@ -358,10 +359,12 @@ impl Shell {
                 .py(px(3.))
                 .rounded(px(theme::R_CONTROL))
                 .bg(if on { theme::selected() } else { theme::raised() })
+                .border_1()
+                .border_color(if on { gpui::rgba(0) } else { theme::hairline() })
                 .type_small()
                 .text_color(if on { theme::text() } else { theme::text_soft() })
                 .cursor_pointer()
-                .hover(|s| s.bg(theme::hover()))
+                .when(!on, |s| s.hover(|s| s.bg(theme::hover())))
                 .child(label)
         };
         let bar = div()
@@ -434,7 +437,7 @@ impl Shell {
                                         .text_color(theme::text())
                                         .child(header_line),
                                 )
-                                .child(div().type_micro().text_color(theme::text_faint()).child(row_time(now(), hit.sent)))
+                                .child(div().flex_none().type_micro().text_color(theme::text_faint()).child(row_time(now(), hit.sent)))
                                 .child(
                                     div()
                                         .id(("mention-dismiss", ix))
@@ -503,10 +506,12 @@ impl Shell {
                     .py(px(3.))
                     .rounded(px(theme::R_CONTROL))
                     .bg(if active { theme::selected() } else { theme::raised() })
+                    .border_1()
+                    .border_color(if active { gpui::rgba(0) } else { theme::hairline() })
                     .type_small()
                     .text_color(if active { theme::text() } else { theme::text_soft() })
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()))
+                    .when(!active, |s| s.hover(|s| s.bg(theme::hover())))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_activity_filter(kind, cx)))
                     .child(label),
             );
@@ -573,8 +578,8 @@ impl Shell {
                                     .text_color(theme::text())
                                     .child(who),
                             )
-                            .child(div().type_micro().text_color(theme::text_faint()).child(row_time(now(), item.time)))
-                            .children(item.unread.then(|| badge_dot(7., theme::accent()))),
+                            .child(div().flex_none().type_micro().text_color(theme::text_faint()).child(row_time(now(), item.time)))
+                            .children(item.unread.then(|| badge_dot(8., if item.kind == ActivityItemKind::Mention { theme::mention() } else { theme::unread() }))),
                     )
                     .when(hide, |col| {
                         let id = item.id.clone();

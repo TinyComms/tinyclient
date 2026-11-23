@@ -75,6 +75,10 @@ fn continues(before: &Message, message: &Message, same_day: fn(i64, i64) -> bool
     before.kind == MessageKind::Normal
         && message.kind == MessageKind::Normal
         && message.reply_to.is_none()
+        // Pinned, starred, and command-invoked messages carry header indicators that must stay visible.
+        && !message.pinned
+        && !message.starred
+        && message.via.is_none()
         // Empty ids used to mean "Saved message" for every unauthenticated sealed row; treating
         // them as equal collapsed a whole back-and-forth under one header.
         && !before.sender.id.is_empty()
@@ -120,11 +124,11 @@ pub fn build(messages: &[Rc<Message>], build: &Build) -> Vec<Item> {
             // A thread's replies start under its root, which carries the day.
             None => build.root.as_ref().is_none_or(|(root, _)| !(build.same_day)(root.sent, message.sent)),
         };
-        if new {
-            items.push(Item::New);
-        }
         if new_day {
             items.push(Item::Day(message.sent));
+        }
+        if new {
+            items.push(Item::New);
         }
         if message.kind == MessageKind::System {
             items.push(Item::System(message.clone()));
@@ -243,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn the_new_divider_sits_above_the_first_unread_and_above_a_day_divider() {
+    fn the_new_divider_sits_above_the_first_unread_and_below_a_day_divider() {
         let t = 10 * DAY;
         let messages = [
             said("1", "Mara", t),
@@ -252,12 +256,24 @@ mod tests {
             said("4", "Mara", t + DAY),
         ];
         assert_eq!(shape(&lay(&messages, Some("1"))), "SDHNHcDH");
-        assert_eq!(shape(&lay(&messages, Some("3"))), "SDHccNDH");
+        assert_eq!(shape(&lay(&messages, Some("3"))), "SDHccDNH");
         // Everything read, or only my own messages after the marker: no divider.
         assert_eq!(shape(&lay(&messages, Some("4"))), "SDHccDH");
         let mine = [said("1", "Mara", t), said("2", "You", t + 1)];
         assert_eq!(shape(&lay(&mine, Some("1"))), "SDHH");
         assert_eq!(shape(&lay(&messages, Some("gone"))), "SDHccDH");
+    }
+
+    #[test]
+    fn pinned_and_starred_messages_start_a_new_group_so_their_marks_stay_visible() {
+        let t = 10 * DAY;
+        let messages = [
+            said("1", "Mara", t),
+            with(said("2", "Mara", t + 10), |m| m.pinned = true),
+            with(said("3", "Mara", t + 20), |m| m.starred = true),
+            said("4", "Mara", t + 30),
+        ];
+        assert_eq!(shape(&lay(&messages, None)), "SDHHHc");
     }
 
     #[test]

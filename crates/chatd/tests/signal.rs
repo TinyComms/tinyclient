@@ -9,7 +9,7 @@
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ContactKind, Conversation, ConversationKind, ErrorCode, Key, Link, Message,
     MessageKind, Network, Outgoing, OutgoingFile, Page, PollDraft, Relation, Request, Response, SendState, SignInInput, SignInProblem,
-    SignInStep,
+    SignInStep, TransferStage,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -38,6 +38,11 @@ fn id(sent: u64, author: &str) -> String {
     format!("{sent}-{author}")
 }
 
+fn chatd_bin() -> String {
+    // `CHATD_TEST_BIN` names a copy of the binary, for a target directory other builds also write to.
+    std::env::var("CHATD_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_chatd").to_owned())
+}
+
 struct World {
     child: Child,
     dir: PathBuf,
@@ -61,7 +66,7 @@ impl World {
         std::fs::create_dir_all(&dir).unwrap();
         setup(&dir);
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_chatd"));
+        let mut command = Command::new(chatd_bin());
         command
             .env("TINYCLIENT_DIR", &dir)
             .env("TINYCLIENT_SIGNAL_FAKE", "1")
@@ -90,7 +95,7 @@ impl World {
         let _ = self.child.wait();
         let _ = std::fs::remove_file(self.dir.join("chat.sock"));
         let log = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("stderr.log")).unwrap();
-        self.child = Command::new(env!("CARGO_BIN_EXE_chatd"))
+        self.child = Command::new(chatd_bin())
             .env("TINYCLIENT_DIR", &self.dir)
             .env("TINYCLIENT_SIGNAL_FAKE", "1")
             .env("TINYCLIENT_SESSION_SIGNAL", SESSION)
@@ -147,6 +152,10 @@ impl World {
 
     fn steer_link(&self, line: &str) {
         self.write_to("signal.signin.ctl", line);
+    }
+
+    fn steer_transfer(&self, line: &str) {
+        self.write_to("signal.transfer.ctl", line);
     }
 
     fn write_to(&self, control: &str, line: &str) {
@@ -3441,4 +3450,298 @@ fn stories_receive_expire_reply_react_view_post_with_distribution_lists_and_togg
         matches!(world.ask(Request::Handoff { conversation: key(&post_my) }), Response::Error { .. }),
         "posting a story must be refused when stories are off"
     );
+}
+
+fn spawn_single_http_response(status: &str, body: Vec<u8>) -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local transfer CDN stub");
+    let addr = listener.local_addr().unwrap();
+    let status = status.to_owned();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut req = [0u8; 2048];
+            let _ = stream.read(&mut req);
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}/transfer")
+}
+
+#[test]
+fn history_transfer_advertises_capability_streams_imports_and_fetches_attachments() {
+    let world = World::start(None);
+    let (_, seq) = world.status();
+    assert!(matches!(world.sign_in(None), SignInStep::Qr { .. }));
+    let link = world.until("a Signal link URI", || match world.sign_in(None) {
+        SignInStep::Qr { link, problem: None, .. } if !link.is_empty() => Some(link),
+        _ => None,
+    });
+    assert!(link.starts_with("sgnl://linkdevice?"), "{link}");
+    assert!(link.contains("capabilities=transfer"), "link must advertise transfer capability: {link}");
+
+    world.steer_link("scan-transfer");
+    let waiting = world.changed(seq, "TransferStage::Waiting", |change| match change {
+        Change::SignIn {
+            network: Network::Signal,
+            step: SignInStep::Transfer { stage: TransferStage::Waiting, .. },
+        } => Some(()),
+        _ => None,
+    });
+    assert_eq!(waiting, ());
+    world.heard("transfer waiting");
+
+    let key_bytes = [0x4du8; 32];
+    let key_hex: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mk = [0x29u8; 32];
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let (archive, gid) = chatd::adapters::signal::transfer::build_fixture_archive(
+        &key_bytes,
+        ME,
+        GRACE,
+        "Grace Ombra",
+        &mk,
+        "History Group",
+        now_ms,
+        4,
+    )
+    .expect("build fixture archive");
+    let url = spawn_single_http_response("200 OK", archive);
+
+    let (_, seq) = world.status();
+    world.steer_transfer(&format!("archive-url {url} {key_hex}"));
+    let done = world.changed(seq, "SignInStep::Done after transfer", |change| match change {
+        Change::SignIn { network: Network::Signal, step: SignInStep::Done { account } } => Some(account.clone()),
+        _ => None,
+    });
+    assert_eq!(done, Some(account()));
+    world.connected();
+
+    // Direct chat imported with exact live message IDs, styles, quote, edit, reaction, attachment, and expiry.
+    let dm_msgs = world.until("imported direct messages", || {
+        let msgs = world.messages(GRACE);
+        (msgs.len() == 2).then_some(msgs)
+    });
+    let first = dm_msgs
+        .iter()
+        .find(|m| m.text == "Hello from before linking")
+        .expect("imported first message");
+    assert!(first.id.ends_with(&format!("-{GRACE}")));
+    assert!(first.edited);
+    assert_eq!(first.prior_text.as_deref(), Some("Hello typo"));
+    assert_eq!(first.reactions.len(), 1);
+    assert_eq!(first.reactions[0].emoji, "❤️");
+    assert_eq!(first.attachments.len(), 1);
+    let att_id = first.attachments[0].file.id.clone();
+
+    let second = dm_msgs
+        .iter()
+        .find(|m| m.text == "Glad history came over!")
+        .expect("imported reply");
+    assert!(second.outgoing);
+    assert_eq!(second.reply_to.as_ref().map(|q| q.id.as_str()), Some(first.id.as_str()));
+    assert!(second.expires_at.is_some(), "active disappearing timer must be preserved");
+
+    // Imported group and its poll + extra messages exist.
+    let group_conv = format!("g.{gid}");
+    let grp_msgs = world.messages(&group_conv);
+    assert_eq!(grp_msgs.len(), 5);
+    assert!(grp_msgs.iter().any(|m| m.poll.as_ref().is_some_and(|p| p.question == "Next meeting?")));
+
+    // A live reaction targets the imported message ID seamlessly.
+    let sent_ts: u64 = first.id.split_once('-').unwrap().0.parse().unwrap();
+    world.steer(&format!("react grace grace {sent_ts} 🔥"));
+    world.until("live reaction on imported message", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == first.id && m.reactions.iter().any(|r| r.emoji == "🔥"))
+    });
+
+    // Requesting the imported attachment pointer downloads and lands it via the live Signal wire.
+    let (_, media_seq) = world.status();
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![att_id.clone()], size: None, retry: false, span: None });
+    world.heard("attachment-download hist-photo-1");
+    let landed = world.changed(media_seq, "imported attachment landed", |change| match change {
+        Change::Media { file, .. } if file.id == att_id && file.path.is_some() => Some(file.clone()),
+        _ => None,
+    });
+    assert!(landed.path.as_deref().is_some_and(|p| std::path::Path::new(p).exists()));
+
+    // Temporary encrypted transfer archive file must be cleaned up after import.
+    assert!(!world.dir.join("signal").join("transfer-cdn.enc").exists());
+}
+
+#[test]
+fn history_transfer_can_be_skipped_while_waiting_keeping_linked_account() {
+    let world = World::start(None);
+    let (_, seq) = world.status();
+    world.sign_in(None);
+    world.until("link code", || match world.sign_in(None) {
+        SignInStep::Qr { link, .. } if !link.is_empty() => Some(()),
+        _ => None,
+    });
+    world.steer_link("scan-transfer");
+    world.changed(seq, "TransferStage::Waiting", |change| match change {
+        Change::SignIn {
+            network: Network::Signal,
+            step: SignInStep::Transfer { stage: TransferStage::Waiting, .. },
+        } => Some(()),
+        _ => None,
+    });
+
+    let (_, seq) = world.status();
+    let _ = world.sign_in(Some(SignInInput::Skip));
+    world.heard("transfer skipped");
+    let done = world.changed(seq, "SignInStep::Done after skip", |change| match change {
+        Change::SignIn { network: Network::Signal, step: SignInStep::Done { account } } => Some(account.clone()),
+        _ => None,
+    });
+    assert_eq!(done, Some(account()));
+    world.connected();
+}
+
+#[test]
+fn history_transfer_decline_and_expiry_and_tampered_archive_leave_device_linked() {
+    // 1. Primary phone declines history transfer.
+    {
+        let world = World::start(None);
+        let (_, seq) = world.status();
+        world.sign_in(None);
+        world.until("link code", || match world.sign_in(None) {
+            SignInStep::Qr { link, .. } if !link.is_empty() => Some(()),
+            _ => None,
+        });
+        world.steer_link("scan-transfer");
+        world.changed(seq, "Waiting", |change| match change {
+            Change::SignIn {
+                network: Network::Signal,
+                step: SignInStep::Transfer { stage: TransferStage::Waiting, .. },
+            } => Some(()),
+            _ => None,
+        });
+        let (_, seq) = world.status();
+        world.steer_transfer("decline Phone declined transfer");
+        let detail = world.changed(seq, "Declined", |change| match change {
+            Change::SignIn {
+                network: Network::Signal,
+                step: SignInStep::Transfer { stage: TransferStage::Declined, detail, .. },
+            } => Some(detail.clone()),
+            _ => None,
+        });
+        assert!(detail.contains("declined"), "{detail}");
+        let (_, seq) = world.status();
+        let _ = world.sign_in(Some(SignInInput::Skip));
+        let done = world.changed(seq, "Done after decline ack", |change| match change {
+            Change::SignIn { network: Network::Signal, step: SignInStep::Done { account } } => Some(account.clone()),
+            _ => None,
+        });
+        assert_eq!(done, Some(account()));
+        world.connected();
+    }
+
+    // 2. Archive expired on CDN (HTTP 410 Gone).
+    {
+        let world = World::start(None);
+        let (_, seq) = world.status();
+        world.sign_in(None);
+        world.until("link code", || match world.sign_in(None) {
+            SignInStep::Qr { link, .. } if !link.is_empty() => Some(()),
+            _ => None,
+        });
+        world.steer_link("scan-transfer");
+        world.changed(seq, "Waiting", |change| match change {
+            Change::SignIn {
+                network: Network::Signal,
+                step: SignInStep::Transfer { stage: TransferStage::Waiting, .. },
+            } => Some(()),
+            _ => None,
+        });
+        let url = spawn_single_http_response("410 Gone", Vec::new());
+        let key_hex = "11".repeat(32);
+        let (_, seq) = world.status();
+        world.steer_transfer(&format!("archive-url {url} {key_hex}"));
+        world.changed(seq, "Expired", |change| match change {
+            Change::SignIn {
+                network: Network::Signal,
+                step: SignInStep::Transfer { stage: TransferStage::Expired, .. },
+            } => Some(()),
+            _ => None,
+        });
+        let (_, seq) = world.status();
+        let _ = world.sign_in(Some(SignInInput::Skip));
+        let done = world.changed(seq, "Done after expiry ack", |change| match change {
+            Change::SignIn { network: Network::Signal, step: SignInStep::Done { account } } => Some(account.clone()),
+            _ => None,
+        });
+        assert_eq!(done, Some(account()));
+        world.connected();
+    }
+
+    // 3. Tampered archive fails HMAC verification without unlinking.
+    {
+        let world = World::start(None);
+        let (_, seq) = world.status();
+        world.sign_in(None);
+        world.until("link code", || match world.sign_in(None) {
+            SignInStep::Qr { link, .. } if !link.is_empty() => Some(()),
+            _ => None,
+        });
+        world.steer_link("scan-transfer");
+        world.changed(seq, "Waiting", |change| match change {
+            Change::SignIn {
+                network: Network::Signal,
+                step: SignInStep::Transfer { stage: TransferStage::Waiting, .. },
+            } => Some(()),
+            _ => None,
+        });
+        let key_bytes = [0x99u8; 32];
+        let key_hex: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (mut archive, _) = chatd::adapters::signal::transfer::build_fixture_archive(
+            &key_bytes,
+            ME,
+            GRACE,
+            "Grace Ombra",
+            &[0x11u8; 32],
+            "Group",
+            now_ms,
+            0,
+        )
+        .unwrap();
+        archive[20] ^= 0xff; // Tamper ciphertext -> HMAC failure
+        let url = spawn_single_http_response("200 OK", archive);
+        let (_, seq) = world.status();
+        world.steer_transfer(&format!("archive-url {url} {key_hex}"));
+        let detail = world.changed(seq, "Failed", |change| match change {
+            Change::SignIn {
+                network: Network::Signal,
+                step: SignInStep::Transfer { stage: TransferStage::Failed, detail, .. },
+            } => Some(detail.clone()),
+            _ => None,
+        });
+        assert!(detail.contains("HMAC"), "{detail}");
+        assert!(!world.dir.join("signal").join("transfer-cdn.enc").exists());
+        let (_, seq) = world.status();
+        let _ = world.sign_in(Some(SignInInput::Skip));
+        let done = world.changed(seq, "Done after fail ack", |change| match change {
+            Change::SignIn { network: Network::Signal, step: SignInStep::Done { account } } => Some(account.clone()),
+            _ => None,
+        });
+        assert_eq!(done, Some(account()));
+        world.connected();
+    }
 }

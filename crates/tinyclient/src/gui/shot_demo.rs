@@ -126,6 +126,7 @@ fn telegram() -> AccountKey {
 }
 
 fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: Presence) -> AccountStatus {
+    let translate = key.network == Network::Telegram;
     AccountStatus {
         key,
         name: name.into(),
@@ -152,6 +153,7 @@ fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: 
             forward: true,
             polls: Some(protocol::PollCapabilities::default()),
             reactions: true,
+            translate,
             ..Capabilities::default()
         },
         send_as: Vec::new(),
@@ -422,7 +424,7 @@ fn build() -> Fixture {
     let mut nadia = direct(&tg, "dm-nadia", "nadia", ago(35));
     nadia.muted = true;
     nadia.unread = 3;
-    said(&mut nadia, "nadia", "The ferry timetable moved, we take the 7:40 now");
+    said(&mut nadia, "nadia", FERRY_ORIGINAL);
 
     let mut platform = in_space(row(&s, "c-platform", ConversationKind::Channel, "platform", ago(70)), harbor, "Harbor Labs", "eng", "Engineering", 0);
     platform.topic = "Infra, deploys and the on-call rota".into();
@@ -553,7 +555,7 @@ fn build() -> Fixture {
                 ("kofi", "Ooh, those little cups are lovely", 20),
                 ("dita", "@Robin is this Cladonia or just very confused moss?", 0),
             ],
-            "dm-nadia" => vec![("nadia", "The ferry timetable moved, we take the 7:40 now", 0)],
+            "dm-nadia" => vec![("nadia", FERRY_ORIGINAL, 0)],
             "c-trailcams" => vec![
                 ("yusuf", "Cam 3 moved to the oak by the creek", 600),
                 ("kofi", "night shot of the marten again, third time this week", 0),
@@ -696,6 +698,24 @@ fn find(key: &Key) -> Option<&'static Conversation> {
 
 fn messages_of(key: &Key) -> &'static [Message] {
     fixture().messages.iter().find(|(k, _)| k == key).map_or(&[], |(_, m)| m.as_slice())
+}
+
+const FERRY_ORIGINAL: &str = "Cambió el horario del ferry. Ahora salimos a las 7:40.";
+const FERRY_ENGLISH: &str = "The ferry schedule changed. We leave at 7:40 now.";
+
+#[test]
+fn demo_translates_the_ferry_message_without_replacing_it() {
+    let conversation = key_of("dm-nadia").unwrap();
+    let message = &messages_of(&conversation)[0];
+    let response = answer(&Request::Translate {
+        conversation: conversation.clone(),
+        message_id: message.id.clone(),
+        to: "en".into(),
+    }).unwrap();
+    let Response::Translated { translation, .. } = response else { panic!("expected a translation") };
+    assert_eq!(translation.text, FERRY_ENGLISH);
+    assert_eq!(translation.source_lang.as_deref(), Some("es"));
+    assert_eq!(messages_of(&conversation)[0].text, FERRY_ORIGINAL);
 }
 
 fn conversations(rows: Vec<Conversation>, offset: u32, limit: u32) -> Response {
@@ -1202,8 +1222,12 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                 conversation: conversation.clone(),
                 message_id: message_id.clone(),
                 translation: protocol::Translation {
-                    text: format!("[{target_lang}] {original}"),
-                    source_lang: Some("auto".to_owned()),
+                    text: if original == FERRY_ORIGINAL && target_lang == "en" {
+                        FERRY_ENGLISH.to_owned()
+                    } else {
+                        format!("[{target_lang}] {original}")
+                    },
+                    source_lang: (original == FERRY_ORIGINAL).then(|| "es".to_owned()),
                     target_lang,
                 },
             }

@@ -49,8 +49,34 @@ fn is_zero(value: &i64) -> bool {
     *value == 0
 }
 
+fn is_u32_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_u64_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Where an optional post-link message history transfer stands (`SignInStep::Transfer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferStage {
+    /// Waiting for the primary phone to confirm and upload the history archive.
+    Waiting,
+    /// Downloading and verifying the encrypted history archive.
+    Downloading,
+    /// Streaming and importing chats and messages into the local store.
+    Importing,
+    /// The primary phone declined or skipped sending message history.
+    Declined,
+    /// The transfer window or archive expired before download finished.
+    Expired,
+    /// The transfer failed; the device is still linked and can continue without history.
+    Failed,
 }
 
 /// Where a sign-in stands: what the shell draws now.
@@ -172,6 +198,20 @@ pub enum SignInStep {
     },
     /// Google Messages asks the user to select this emoji on the paired phone.
     Emoji { emoji: String },
+    /// Linked to Signal; waiting for or importing optional message history from the primary phone.
+    Transfer {
+        stage: TransferStage,
+        #[serde(default, skip_serializing_if = "is_u32_zero")]
+        chats: u32,
+        #[serde(default, skip_serializing_if = "is_u32_zero")]
+        messages: u32,
+        #[serde(default, skip_serializing_if = "is_u64_zero")]
+        downloaded_bytes: u64,
+        #[serde(default, skip_serializing_if = "is_u64_zero")]
+        total_bytes: u64,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
+    },
     /// Signed in. The account is in `Status` from now on.
     Done {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +267,8 @@ pub enum SignInInput {
     OpenBrowser,
     /// Send the code again, the way `SignInStep::Code::next` says.
     Resend,
+    /// Skip an optional post-link step (such as Signal message history transfer) and finish.
+    Skip,
     /// One step back: from the code to the number, from the number to the QR code.
     Back,
 }
@@ -252,6 +294,7 @@ impl fmt::Debug for SignInInput {
             SignInInput::Invite { .. } => "Invite { .. }",
             SignInInput::OpenBrowser => "OpenBrowser",
             SignInInput::Resend => "Resend",
+            SignInInput::Skip => "Skip",
             SignInInput::Back => "Back",
         })
     }
@@ -337,5 +380,27 @@ mod tests {
             serde_json::from_str::<SignInStep>(r#"{"step":"sign_up"}"#).unwrap(),
             SignInStep::SignUp { phone: String::new(), terms: String::new(), problem: None }
         );
+        let transfer = SignInStep::Transfer {
+            stage: TransferStage::Importing,
+            chats: 3,
+            messages: 42,
+            downloaded_bytes: 1024,
+            total_bytes: 2048,
+            detail: String::new(),
+        };
+        let encoded = serde_json::to_string(&transfer).unwrap();
+        assert_eq!(serde_json::from_str::<SignInStep>(&encoded).unwrap(), transfer);
+        assert_eq!(
+            serde_json::from_str::<SignInStep>(r#"{"step":"transfer","stage":"waiting"}"#).unwrap(),
+            SignInStep::Transfer {
+                stage: TransferStage::Waiting,
+                chats: 0,
+                messages: 0,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                detail: String::new(),
+            }
+        );
+        assert_eq!(serde_json::to_string(&SignInInput::Skip).unwrap(), r#"{"input":"skip"}"#);
     }
 }

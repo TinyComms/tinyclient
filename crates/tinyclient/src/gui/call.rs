@@ -1482,6 +1482,37 @@ impl Shell {
     /// Reusable per-person volume slider and "Mute for me" toggle, shared by the call-owned person
     /// popover, the device menu (for 1:1 calls), and the Tiny server person menu.
     pub(in crate::gui) fn call_volume_controls(&self, account: AccountKey, user_id: &str, cx: &mut Context<Self>) -> Div {
+        self.call_gain_controls(account, user_id, ("Mute for me", "Unmute for me"), cx)
+    }
+
+    fn call_stream_volume(&self, call: &Call, user_id: &str, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if call.conversation.network != Network::Discord || !call.video.iter().any(|stream| {
+            stream.direction == protocol::Direction::Decode
+                && stream.content == protocol::Content::Share
+                && stream.source == user_id
+        }) {
+            return None;
+        }
+        Some(div()
+            .id("call-stream-volume")
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .bg(theme::overlay())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.call_track(event, cx)))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
+            .child(menu_label("Stream volume"))
+            .child(self.call_gain_controls(
+                call.conversation.account(),
+                &protocol::discord_stream_gain_key(user_id),
+                ("Mute stream", "Unmute stream"),
+                cx,
+            )))
+    }
+
+    fn call_gain_controls(&self, account: AccountKey, user_id: &str, labels: (&'static str, &'static str), cx: &mut Context<Self>) -> Div {
         const SLIDER: f32 = 132.;
         let (percent, muted) = self.call_gain(&account, user_id);
         let slide_account = account.clone();
@@ -1504,7 +1535,7 @@ impl Shell {
         let mute_account = account;
         let mute_id = user_id.to_owned();
         let mute_icon = if muted { "icons/volume-2.svg" } else { "icons/volume-x.svg" };
-        let mute_label = if muted { "Unmute for me" } else { "Mute for me" };
+        let mute_label = if muted { labels.1 } else { labels.0 };
         div()
             .flex()
             .flex_col()
@@ -2320,6 +2351,10 @@ impl Shell {
             .or_else(|| peer_sender.map(|p| p.sharing))
             .unwrap_or(false);
         let peer_kind = if peer_is_share { protocol::PictureKind::Share } else { protocol::PictureKind::Camera };
+        let volume = peer_id
+            .filter(|_| peer_is_share)
+            .and_then(|id| self.call_stream_volume(call, id, cx))
+            .map(|controls| controls.absolute().bottom(px(8.)).left(px(8.)));
         let peer_frame = peer_id.and_then(|id| self.call_frame(Some(call), id, peer_kind));
         let my_share = self.call_self_frame(Some(call), true);
         let my_camera = self.call_self_frame(Some(call), false);
@@ -2519,6 +2554,7 @@ impl Shell {
             .border_color(theme::hairline())
             .overflow_hidden()
             .child(main_body)
+            .children(volume)
             .child(
                 div()
                     .absolute()

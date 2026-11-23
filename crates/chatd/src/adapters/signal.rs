@@ -23,7 +23,9 @@
 //! itself, which Signal's ratchets change with every message (identity and prekeys, sessions,
 //! group keys, contacts), is one file per account under `signal/` in the support directory, each
 //! value sealed with that key (`vault`). No message is kept there: messages go to chatd's store
-//! as they arrive, and Signal keeps no history on its servers to fetch again.
+//! as they arrive, and when linking a new device the primary phone may transfer encrypted message
+//! history (chats and recent media pointers) into chatd's store (`transfer`). Signal's servers do
+//! not retain older history for later on-demand backfill.
 //!
 //! # What the user did, and only that
 //!
@@ -37,6 +39,7 @@ mod files;
 mod real;
 mod style;
 pub mod signin;
+pub mod transfer;
 #[cfg(feature = "signal")]
 mod vault;
 mod wire;
@@ -58,7 +61,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use wire::{view_once_label, Body, Event, Fault, Peer, Quote, Text, Wire};
 
-/// Signal has no history to fetch, so nothing is paced.
+/// Signal has no on-demand server history backfill, so nothing is paced (linked-device history
+/// transfer runs once during linking in `signin`).
 const PACE: Duration = Duration::ZERO;
 /// Others are told the user is typing at most this often per conversation. Signal shows it for
 /// fifteen seconds and its own apps renew it every ten.
@@ -797,6 +801,9 @@ struct Live {
     /// Received encrypted attachment pointers waiting to be downloaded on `Command::Wanted`.
     held_attachments: HashMap<String, HeldAttachment>,
     held_order: VecDeque<String>,
+    /// `{support}/signal/{aci}.attachments`. Holds pointers across restarts and from history transfer.
+    attachments_path: PathBuf,
+    attachments_loaded: bool,
     /// Installed Signal sticker packs (persisted to `{support}/signal/{aci}.stickers`).
     sticker_packs: Vec<wire::StickerPackInfo>,
     stickers_path: PathBuf,
@@ -1098,7 +1105,35 @@ impl Live {
         expired
     }
 
+    fn load_attachments(&mut self, force: bool) {
+        if self.attachments_loaded && !force {
+            return;
+        }
+        self.attachments_loaded = true;
+        for row in transfer::read_kept_attachments(&self.attachments_path) {
+            if !self.held_attachments.contains_key(&row.id) {
+                while self.held_order.len() >= REACTIONS_KEPT {
+                    if let Some(old) = self.held_order.pop_front() {
+                        self.held_attachments.remove(&old);
+                    }
+                }
+                self.held_order.push_back(row.id.clone());
+                self.held_attachments.insert(
+                    row.id,
+                    HeldAttachment {
+                        pointer: row.pointer,
+                        file: row.file,
+                        address: row.address,
+                        conversation: row.conversation,
+                        message_id: row.message_id,
+                    },
+                );
+            }
+        }
+    }
+
     fn remember_attachment(&mut self, id: String, held: HeldAttachment) {
+        self.load_attachments(false);
         if !self.held_attachments.contains_key(&id) {
             while self.held_order.len() >= REACTIONS_KEPT {
                 if let Some(old) = self.held_order.pop_front() {
@@ -1108,6 +1143,22 @@ impl Live {
             self.held_order.push_back(id.clone());
         }
         self.held_attachments.insert(id, held);
+        let rows: Vec<transfer::KeptAttachment> = self
+            .held_order
+            .iter()
+            .filter_map(|k| {
+                let h = self.held_attachments.get(k)?;
+                Some(transfer::KeptAttachment {
+                    id: k.clone(),
+                    pointer: h.pointer.clone(),
+                    file: h.file.clone(),
+                    address: h.address.clone(),
+                    conversation: h.conversation.clone(),
+                    message_id: h.message_id.clone(),
+                })
+            })
+            .collect();
+        transfer::write_kept_attachments(&self.attachments_path, &rows);
     }
 
     fn pins_for(&mut self, conversation: &str) -> Vec<PinRecord> {
@@ -1259,6 +1310,87 @@ fn write_reactions(path: &Path, order: &VecDeque<(String, String)>, book: &HashM
     }
 }
 
+/// The lab's signal-wave13 driver: proves mobile companion linking (#735) and linked-device
+/// message history transfer (#724) end-to-end against a scratch SQLite store.
+pub fn prove_signal_wave13() -> Result<(), String> {
+    use protocol::{AccountKey, Network, Page};
+    use std::sync::atomic::AtomicBool;
+
+    if std::env::var_os("TINYCLIENT_DIR").is_none() {
+        return Err("a scratch directory is required".into());
+    }
+    // 1. Verify #735 / #724 link URI advertises companion transfer capability.
+    if !fake::LINK.starts_with("sgnl://linkdevice?") || !fake::LINK.contains("capabilities=transfer") {
+        return Err(format!("Signal link URI must advertise transfer capability: {}", fake::LINK));
+    }
+
+    // 2. Verify #724 streaming encryption, HMAC verification, gzip decompression, protobuf decode,
+    //    disappearing-timer enforcement, attachment pointer persistence, and idempotent import.
+    let dir = protocol::support_dir().join("prove-wave13");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let store = crate::store::Store::open(&dir.join("store.db")).map_err(|err| err.to_string())?;
+    let hub = Arc::new(crate::hub::Hub::new(store));
+    let me = fake::ME;
+    let peer = fake::GRACE;
+    let account = AccountKey { network: Network::Signal, account: me.into() };
+    let key = [0x5cu8; 32];
+    let mk = [0x19u8; 32];
+    let now_ms = (crate::hub::now() as u64) * 1_000;
+
+    let (archive_bytes, gid) =
+        transfer::build_fixture_archive(&key, me, peer, "Grace Ombra", &mk, "Bridge club", now_ms, 10)?;
+    let archive_path = dir.join("transfer.bin");
+    std::fs::write(&archive_path, &archive_bytes).map_err(|err| err.to_string())?;
+
+    let skip = AtomicBool::new(false);
+    let first = transfer::import_archive(&hub, &account, me, "Ada Quill", &key, &archive_path, &|_, _| {}, &skip)?;
+    if first.chats != 2 || first.messages != 13 || first.new_messages != 13 || first.skipped_expired != 1 {
+        return Err(format!("unexpected first import summary: {first:?}"));
+    }
+
+    // Re-importing the exact same archive must be idempotent (0 new messages, no duplicates).
+    let second = transfer::import_archive(&hub, &account, me, "Ada Quill", &key, &archive_path, &|_, _| {}, &skip)?;
+    if second.new_messages != 0 {
+        return Err(format!("re-import duplicated messages: {second:?}"));
+    }
+
+    let dm_key = protocol::Key { network: account.network, account: account.account.clone(), id: peer.to_owned() };
+    let dm = hub
+        .store()
+        .messages(&dm_key, &Page::Newest, 20, crate::hub::now())
+        .map_err(|e| e.to_string())?
+        .map(|p| p.messages)
+        .unwrap_or_default();
+    if dm.len() != 2 {
+        return Err(format!("expected 2 non-expired direct messages, got {}", dm.len()));
+    }
+    let grp_key = protocol::Key {
+        network: account.network,
+        account: account.account.clone(),
+        id: Peer::Group(gid).conversation(),
+    };
+    let grp = hub
+        .store()
+        .messages(&grp_key, &Page::Newest, 20, crate::hub::now())
+        .map_err(|e| e.to_string())?
+        .map(|p| p.messages)
+        .unwrap_or_default();
+    if grp.len() != 11 {
+        return Err(format!("expected 11 group messages, got {}", grp.len()));
+    }
+
+    // Tampered archive must be rejected by HMAC verification.
+    let mut bad = archive_bytes;
+    bad[24] ^= 0x01;
+    let bad_path = dir.join("tampered.bin");
+    std::fs::write(&bad_path, &bad).map_err(|err| err.to_string())?;
+    if transfer::import_archive(&hub, &account, me, "Ada Quill", &key, &bad_path, &|_, _| {}, &skip).is_ok() {
+        return Err("tampered archive was accepted".into());
+    }
+    Ok(())
+}
+
 /// The lab's signal-reaction-restart driver. A build without this keeps running.
 pub fn prove_signal_reaction_restart() -> Result<(), String> {
     if std::env::var_os("TINYCLIENT_DIR").is_none() {
@@ -1319,6 +1451,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         reactions_path: reactions_path(&saved.aci),
         pins_path: pins_path(&saved.aci),
         stickers_path: stickers_path(&saved.aci),
+        attachments_path: transfer::attachments_path(&saved.aci),
         ..Live::default()
     }));
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
@@ -4844,7 +4977,11 @@ fn send_sticker(
 /// Streams and decrypts wanted Signal attachments and sticker tiles off the command thread into chatd's media cache.
 fn wanted(account: &Arc<Account>, ids: &[String]) {
     let (jobs, sticker_jobs): (Vec<(String, HeldAttachment)>, Vec<(String, HeldSticker)>) = {
-        let live = account.live();
+        let mut live = account.live();
+        live.load_attachments(false);
+        if ids.iter().any(|id| !live.held_attachments.contains_key(id)) {
+            live.load_attachments(true);
+        }
         let jobs = ids
             .iter()
             .filter_map(|id| live.held_attachments.get(id).cloned().map(|h| (id.clone(), h)))

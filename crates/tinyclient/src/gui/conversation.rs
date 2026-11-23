@@ -6,7 +6,7 @@
 //! the pictures). A thread is a second, dense `Pane` in the right pane.
 
 mod actions;
-mod draw;
+pub(super) mod draw;
 mod forum;
 mod emoji;
 mod header;
@@ -16,7 +16,7 @@ pub(in crate::gui) mod links;
 mod media;
 mod pages;
 mod player;
-mod rich;
+pub(super) mod rich;
 mod rows;
 #[cfg(feature = "gui-shot")]
 mod shot;
@@ -24,7 +24,7 @@ mod popout;
 mod side;
 mod text;
 mod text_preview;
-mod tokens;
+pub(super) mod tokens;
 mod video;
 mod viewer;
 mod when;
@@ -131,6 +131,21 @@ fn history_failure(purpose: &Purpose, detail: &str) -> String {
         _ => "older messages",
     };
     format!("Couldn't load {what}. {detail}")
+}
+
+fn announced_message_words(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => "1 new message since opening this conversation".into(),
+        count => format!("{count} new messages since opening this conversation"),
+    }
+}
+
+#[test]
+fn new_message_status_is_silent_until_there_is_an_arrival() {
+    assert!(announced_message_words(0).is_empty());
+    assert_eq!(announced_message_words(1), "1 new message since opening this conversation");
+    assert_eq!(announced_message_words(2), "2 new messages since opening this conversation");
 }
 
 fn answer_detail(answer: &io::Result<Response>) -> String {
@@ -389,6 +404,7 @@ pub struct Pane {
     away: bool,
     /// Messages that arrived while away.
     unseen: usize,
+    announced_messages: usize,
     read: ReadMark,
     active: bool,
     watching_window: Option<Subscription>,
@@ -623,7 +639,7 @@ impl Pane {
             window: pages::Window::default(),
             items: Vec::new(),
             list: ListState::new(0, alignment, px(AHEAD)),
-            focus: cx.focus_handle(),
+            focus: cx.focus_handle().tab_index(0).tab_stop(true),
             loading_older: false,
             loading_newer: false,
             older_failed: None,
@@ -633,6 +649,7 @@ impl Pane {
             stale: false,
             away: false,
             unseen: 0,
+            announced_messages: 0,
             read: ReadMark::default(),
             active: false,
             watching_window: None,
@@ -1169,6 +1186,7 @@ impl Pane {
         self.stale = false;
         self.away = false;
         self.unseen = 0;
+        self.announced_messages = 0;
         self.read = ReadMark::default();
         self.images_stale = true;
         self.want.clear();
@@ -1469,7 +1487,9 @@ impl Pane {
                 return;
             }
         };
-        let opened = self.open.as_ref().is_some_and(|open| open.marker_known) && !self.window.messages.is_empty();
+        let marker_known = self.open.as_ref().is_some_and(|open| open.marker_known);
+        let was_empty = self.window.messages.is_empty();
+        let opened = marker_known && !was_empty;
         if let Some(open) = self.open.as_mut().filter(|open| !open.marker_known) {
             open.last_read = last_read;
             open.marker_known = true;
@@ -1511,8 +1531,17 @@ impl Pane {
         // What joined the end since: mine sends the view to it, anyone else's is counted.
         let arrived = last.and_then(|last| self.window.position(&last.id)).map(|at| &self.window.messages[at + 1..]);
         let mine = arrived.is_some_and(|new| new.iter().any(|message| message.outgoing && message.state == SendState::Pending));
+        let incoming = arrived.map_or(0, |new| new.iter().filter(|message| !message.outgoing).count());
+        if self.active && matches!(purpose, Purpose::Newest | Purpose::Arrivals) {
+            let count = if marker_known && was_empty {
+                self.window.messages.iter().filter(|message| !message.outgoing).count()
+            } else {
+                incoming
+            };
+            self.announced_messages += count;
+        }
         if !pinned && !mine {
-            self.unseen += arrived.map_or(0, |new| new.iter().filter(|message| !message.outgoing).count());
+            self.unseen += incoming;
         }
         let pin_on_load = pinned || mine || (purpose == Purpose::Open && !self.is_thread());
         self.relay(pin_on_load, top);
@@ -2935,7 +2964,7 @@ impl Pane {
     }
 
     fn unread_jump_buttons(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        if self.thread {
+        if self.thread || self.multi_select.active {
             return None;
         }
         let key = self.key()?.clone();
@@ -2954,7 +2983,7 @@ impl Pane {
         }
         // Sit above the "jump to latest" pill while that pill is on screen.
         let bottom = if self.away {
-            if self.metrics == Metrics::PHONE { px(68.) } else { px(48.) }
+            if self.metrics == Metrics::PHONE { px(68.) } else { px(50.) }
         } else {
             px(16.)
         };
@@ -2970,7 +2999,7 @@ impl Pane {
             stack = stack.child(
                 div()
                     .id("jump-unread-reactions")
-                    .h(px(32.))
+                    .h(px(30.))
                     .px(px(10.))
                     .rounded_full()
                     .bg(theme::overlay())
@@ -2979,13 +3008,14 @@ impl Pane {
                     .shadow(theme::shadow_popover())
                     .flex()
                     .items_center()
-                    .gap(px(4.))
+                    .gap(px(5.))
                     .type_small()
                     .font_weight(theme::SEMIBOLD)
                     .text_color(theme::text())
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()))
-                    .child(format!("♥ {reactions}"))
+                    .hover(|s| s.bg(theme::over(theme::hover(), theme::overlay())))
+                    .child(crate::gui::components::glyph("icons/smile.svg", 13., theme::text_soft()))
+                    .child(reactions.to_string())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.jump_next_unread(protocol::UnreadItemKind::Reactions, cx);
                     })),
@@ -2995,7 +3025,7 @@ impl Pane {
             stack = stack.child(
                 div()
                     .id("jump-unread-mentions")
-                    .h(px(32.))
+                    .h(px(30.))
                     .px(px(10.))
                     .rounded_full()
                     .bg(theme::accent())
@@ -3009,7 +3039,9 @@ impl Pane {
                     .font_weight(theme::SEMIBOLD)
                     .text_color(theme::on_accent())
                     .cursor_pointer()
-                    .child(format!("@ {mentions}"))
+                    .hover(|s| s.bg(theme::accent_hover()))
+                    .child(crate::gui::components::glyph("icons/at-sign.svg", 13., theme::on_accent()))
+                    .child(mentions.to_string())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.jump_next_unread(protocol::UnreadItemKind::Mentions, cx);
                     })),
@@ -3105,24 +3137,27 @@ impl Pane {
         Some(
             div()
                 .id("pin-bar")
+                .relative()
                 .flex_none()
                 .px(px(theme::PANE_PAD))
                 .py(px(6.))
+                .bg(theme::raised())
                 .border_b_1()
                 .border_color(theme::hairline())
                 .flex()
                 .items_center()
                 .gap(px(8.))
                 .cursor_pointer()
-                .hover(|style| style.bg(theme::hover()))
-                .child(icons::icon(icons::Icon::Pin, 14., theme::accent()))
+                .hover(|style| style.bg(theme::over(theme::hover(), theme::raised())))
+                .child(div().absolute().top_0().bottom_0().left_0().w(px(2.)).bg(theme::accent()))
+                .child(icons::icon(icons::Icon::Pin, 14., theme::accent_text()))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .child(div().type_micro().text_color(theme::accent()).child(pin_bar_title(at, bar.pins.len())))
+                        .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::accent_text()).child(pin_bar_title(at, bar.pins.len())))
                         .child(div().truncate().type_small().text_color(theme::text_soft()).child(said)),
                 )
                 .child(
@@ -3266,11 +3301,8 @@ impl Pane {
             );
         }
         let mut bar = div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .px(px(12.))
+            .flex_none()
+            .px(px(theme::PANE_PAD))
             .py(px(6.))
             .bg(theme::raised())
             .border_b_1()
@@ -3939,6 +3971,9 @@ impl Render for Pane {
         });
         div()
             .id("messages")
+            .role(gpui::Role::List)
+            .aria_label("Messages")
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .size_full()
             .flex()
             .flex_col()
@@ -3982,6 +4017,8 @@ impl Render for Pane {
             }))
             .children(app_bar)
             .children(pin_bar)
+            .children((!showing_app_tab).then(|| self.saved_filter_bar(cx)).flatten())
+            .child(super::components::live_status("new-message-status", announced_message_words(self.announced_messages)))
             .child(if showing_app_tab {
                 self.app_tab_body(cx)
             } else {
@@ -3989,9 +4026,9 @@ impl Render for Pane {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .when(self.metrics != Metrics::PHONE, |body| body.pb(px(12.)))
                     .child(crate::gui::components::scroll_frame("message-scroll-frame", self.list.clone(), rows).keyboard(false))
                     .child(after)
-                    .children(self.saved_filter_bar(cx))
                     .children(self.live_call_row(cx))
                     .children(self.history_banner(cx))
                     .children(self.unread_jump_buttons(cx))

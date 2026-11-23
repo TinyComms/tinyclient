@@ -22,6 +22,9 @@ mod log_tail;
 mod tiny_setup;
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(all(test, feature = "gui"))]
+#[path = "mobile/share.rs"]
+mod mobile_share;
 #[cfg(feature = "gui")]
 mod lottie;
 #[cfg(all(feature = "gui", target_os = "linux"))]
@@ -447,6 +450,15 @@ fn main() -> ExitCode {
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("screen-lock") {
         if let Err(err) = gui::prove_screen_lock() {
             eprintln!("screen-lock: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's message-ux-polish driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("message-ux-polish") {
+        if let Err(err) = gui::prove_message_ux_polish() {
+            eprintln!("message-ux-polish: {err}");
             return ExitCode::from(1);
         }
         return ExitCode::SUCCESS;

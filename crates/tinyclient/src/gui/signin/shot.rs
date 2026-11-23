@@ -10,7 +10,7 @@
 
 use super::{now, Face};
 use crate::gui::time::clock;
-use protocol::{CodeVia, Network, SignInProblem, SignInStep};
+use protocol::{CodeVia, Network, SignInProblem, SignInStep, TransferStage};
 
 /// What to draw, and what the fields hold as if it had been typed.
 pub(super) struct Canned {
@@ -93,6 +93,65 @@ pub(super) fn canned() -> Option<Canned> {
         "qr-waiting" => qr("", None),
         "qr" => qr(LINK, None),
         "qr-offline" => qr("", Some(SignInProblem::Unreachable)),
+        "signal-qr" => {
+            canned.network = Network::Signal;
+            qr("sgnl://linkdevice?uuid=shot-device-1&pub_key=BshotPubKey1&capabilities=transfer", None)
+        }
+        "signal-transfer-waiting" => {
+            canned.network = Network::Signal;
+            SignInStep::Transfer {
+                stage: TransferStage::Waiting,
+                chats: 0,
+                messages: 0,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                detail: String::new(),
+            }
+        }
+        "signal-transfer-downloading" => {
+            canned.network = Network::Signal;
+            SignInStep::Transfer {
+                stage: TransferStage::Downloading,
+                chats: 0,
+                messages: 0,
+                downloaded_bytes: 1_572_864,
+                total_bytes: 4_718_592,
+                detail: String::new(),
+            }
+        }
+        "signal-transfer-importing" => {
+            canned.network = Network::Signal;
+            SignInStep::Transfer {
+                stage: TransferStage::Importing,
+                chats: 8,
+                messages: 245,
+                downloaded_bytes: 4_718_592,
+                total_bytes: 4_718_592,
+                detail: String::new(),
+            }
+        }
+        "signal-transfer-declined" => {
+            canned.network = Network::Signal;
+            SignInStep::Transfer {
+                stage: TransferStage::Declined,
+                chats: 0,
+                messages: 0,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                detail: "Your phone chose not to transfer message history.".to_owned(),
+            }
+        }
+        "signal-transfer-expired" => {
+            canned.network = Network::Signal;
+            SignInStep::Transfer {
+                stage: TransferStage::Expired,
+                chats: 0,
+                messages: 0,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                detail: "The message history transfer archive expired.".to_owned(),
+            }
+        }
         "phone" => {
             canned.number = "555 010 0142";
             SignInStep::Phone { problem: None }

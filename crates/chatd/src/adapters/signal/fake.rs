@@ -50,10 +50,10 @@ use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
-    Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo,
-    StorageSnapshot, StoryContext, StoryDistributionList, StoryMessageData, StoryText, Text, Wire, FLAG_GIF,
-    FLAG_VOICE_MESSAGE,
+    GroupMember, GroupMembers, HistoryTransfer, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker,
+    MessageRequestAction, OwnCard, Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker,
+    StickerEntry, StickerPackInfo, StorageSnapshot, StoryContext, StoryDistributionList, StoryMessageData, StoryText,
+    Text, TransferOutcome, TransferProgress, Wire, FLAG_GIF, FLAG_VOICE_MESSAGE,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -74,9 +74,9 @@ const VAULT: &str = "00000000000000000000000000000000000000000000000000000000000
 /// 2026-10-13 12:00 UTC, in milliseconds. A scripted line that names no time uses this, which is
 /// outside the edit and delete-for-everyone windows. A send from the test uses the clock below.
 const T0: u64 = 1_791_892_800_000;
-/// The link the fake shows, and the one after it expires.
-pub const LINK: &str = "sgnl://linkdevice?uuid=fake-1&pub_key=BfakeKey1";
-pub const LINK_AGAIN: &str = "sgnl://linkdevice?uuid=fake-2&pub_key=BfakeKey2";
+/// The link the fake shows, and the one after it expires. Both advertise `capabilities=transfer`.
+pub const LINK: &str = "sgnl://linkdevice?uuid=fake-1&pub_key=BfakeKey1&capabilities=transfer";
+pub const LINK_AGAIN: &str = "sgnl://linkdevice?uuid=fake-2&pub_key=BfakeKey2&capabilities=transfer";
 
 fn who(word: &str) -> Option<(&'static str, &'static str)> {
     match word {
@@ -2338,6 +2338,207 @@ impl Drop for Fake {
     }
 }
 
+/// Scripted post-link history transfer driven by `signal.transfer.ctl`.
+struct FakeHistoryTransfer;
+
+impl HistoryTransfer for FakeHistoryTransfer {
+    fn fetch(
+        self: Box<Self>,
+        on_progress: &dyn Fn(TransferProgress),
+        skip: Arc<AtomicBool>,
+    ) -> TransferOutcome {
+        record("transfer waiting");
+        on_progress(TransferProgress::Waiting);
+        let control = script::control("signal.transfer.ctl");
+        let mut outcome: Option<TransferOutcome> = None;
+        script::follow(&control, |line| {
+            if skip.load(Ordering::Relaxed) {
+                record("transfer skipped");
+                outcome = Some(TransferOutcome::Skipped);
+                return false;
+            }
+            let Some(line) = line.map(str::trim).filter(|l| !l.is_empty()) else {
+                return true;
+            };
+            let (cmd, rest) = line.split_once(' ').map_or((line, ""), |(c, r)| (c, r.trim()));
+            match cmd {
+                "progress" => {
+                    let mut parts = rest.split_whitespace();
+                    let dl = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    let total = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(dl);
+                    on_progress(TransferProgress::Downloading {
+                        downloaded_bytes: dl,
+                        total_bytes: total,
+                    });
+                    true
+                }
+                "archive" => {
+                    let Some((src, key_hex)) = rest.rsplit_once(' ') else {
+                        outcome = Some(TransferOutcome::Failed("Invalid fake archive command.".into()));
+                        return false;
+                    };
+                    let key_bytes = unhex_bytes(key_hex.trim());
+                    let Ok(ephemeral_key) = <[u8; 32]>::try_from(key_bytes.as_slice()) else {
+                        outcome = Some(TransferOutcome::Failed("Invalid fake ephemeral backup key.".into()));
+                        return false;
+                    };
+                    let src_path = PathBuf::from(src.trim());
+                    let dest = protocol::support_dir().join("signal").join("transfer-fake.enc");
+                    if let Some(parent) = dest.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::fs::copy(&src_path, &dest) {
+                        Ok(total_bytes) => {
+                            on_progress(TransferProgress::Downloading {
+                                downloaded_bytes: total_bytes,
+                                total_bytes,
+                            });
+                            record("transfer ready");
+                            outcome = Some(TransferOutcome::Ready {
+                                path: dest,
+                                ephemeral_key,
+                                total_bytes,
+                            });
+                        }
+                        Err(err) => {
+                            outcome = Some(TransferOutcome::Failed(format!("Could not read fake archive: {err}")));
+                        }
+                    }
+                    false
+                }
+                "archive-url" => {
+                    let Some((url, key_hex)) = rest.rsplit_once(' ') else {
+                        outcome = Some(TransferOutcome::Failed("Invalid fake archive-url command.".into()));
+                        return false;
+                    };
+                    let url = url.trim();
+                    if !(url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:")) {
+                        outcome = Some(TransferOutcome::Failed("Invalid local transfer CDN stub URL.".into()));
+                        return false;
+                    }
+                    let key_bytes = unhex_bytes(key_hex.trim());
+                    let Ok(ephemeral_key) = <[u8; 32]>::try_from(key_bytes.as_slice()) else {
+                        outcome = Some(TransferOutcome::Failed("Invalid fake ephemeral backup key.".into()));
+                        return false;
+                    };
+                    record(&format!("transfer-download {url}"));
+                    let config = ureq::Agent::config_builder().http_status_as_error(false).build();
+                    let agent = ureq::Agent::new_with_config(config);
+                    match agent.get(url).call() {
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            if matches!(status, 404 | 410) {
+                                record("transfer expired");
+                                outcome = Some(TransferOutcome::Expired(
+                                    "The message history transfer archive expired before it could be downloaded.".into(),
+                                ));
+                                return false;
+                            }
+                            if !(200..300).contains(&status) {
+                                outcome = Some(TransferOutcome::Failed(format!("Transfer CDN returned HTTP {status}.")));
+                                return false;
+                            }
+                            let total_hint = resp
+                                .headers()
+                                .get("content-length")
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            let dest = protocol::support_dir().join("signal").join("transfer-cdn.enc");
+                            if let Some(parent) = dest.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let mut reader = resp.into_body().into_reader();
+                            let mut file = match protocol::private::create(&dest) {
+                                Ok(f) => f,
+                                Err(err) => {
+                                    outcome = Some(TransferOutcome::Failed(err.to_string()));
+                                    return false;
+                                }
+                            };
+                            let mut buf = vec![0u8; 32 * 1024];
+                            let mut downloaded = 0u64;
+                            loop {
+                                if skip.load(Ordering::Relaxed) {
+                                    drop(file);
+                                    let _ = std::fs::remove_file(&dest);
+                                    record("transfer skipped");
+                                    outcome = Some(TransferOutcome::Skipped);
+                                    return false;
+                                }
+                                match std::io::Read::read(&mut reader, &mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if let Err(err) = file.write_all(&buf[..n]) {
+                                            drop(file);
+                                            let _ = std::fs::remove_file(&dest);
+                                            outcome = Some(TransferOutcome::Failed(err.to_string()));
+                                            return false;
+                                        }
+                                        downloaded = downloaded.saturating_add(n as u64);
+                                        on_progress(TransferProgress::Downloading {
+                                            downloaded_bytes: downloaded,
+                                            total_bytes: total_hint.max(downloaded),
+                                        });
+                                    }
+                                    Err(err) => {
+                                        drop(file);
+                                        let _ = std::fs::remove_file(&dest);
+                                        outcome = Some(TransferOutcome::Failed(format!("Transfer download failed: {err}")));
+                                        return false;
+                                    }
+                                }
+                            }
+                            record("transfer ready");
+                            outcome = Some(TransferOutcome::Ready {
+                                path: dest,
+                                ephemeral_key,
+                                total_bytes: downloaded,
+                            });
+                        }
+                        Err(err) => {
+                            outcome = Some(TransferOutcome::Failed(format!("Transfer download failed: {err}")));
+                        }
+                    }
+                    false
+                }
+                "decline" => {
+                    record("transfer declined");
+                    let reason = if rest.is_empty() {
+                        "Your phone chose not to transfer message history.".to_owned()
+                    } else {
+                        rest.to_owned()
+                    };
+                    outcome = Some(TransferOutcome::Declined(reason));
+                    false
+                }
+                "expire" => {
+                    record("transfer expired");
+                    let reason = if rest.is_empty() {
+                        "The message history transfer window expired.".to_owned()
+                    } else {
+                        rest.to_owned()
+                    };
+                    outcome = Some(TransferOutcome::Expired(reason));
+                    false
+                }
+                "fail" => {
+                    record("transfer failed");
+                    let reason = if rest.is_empty() {
+                        "The message history transfer could not be completed.".to_owned()
+                    } else {
+                        rest.to_owned()
+                    };
+                    outcome = Some(TransferOutcome::Failed(reason));
+                    false
+                }
+                _ => true,
+            }
+        });
+        outcome.unwrap_or(TransferOutcome::Skipped)
+    }
+}
+
 /// Links when the test says the phone scanned the code.
 pub struct FakeLinker;
 
@@ -2356,7 +2557,23 @@ impl Linker for FakeLinker {
             match line.map(str::trim) {
                 Some("scan") => {
                     let saved = Saved { aci: ME.into(), name: "Ada Quill".into(), vault: VAULT.into() };
-                    outcome = Some(serde_json::to_string(&saved).map(|session| Linked { session }).map_err(|err| Fault::Net(err.to_string())));
+                    outcome = Some(
+                        serde_json::to_string(&saved)
+                            .map(|session| Linked { session, transfer: None })
+                            .map_err(|err| Fault::Net(err.to_string())),
+                    );
+                    false
+                }
+                Some("scan-transfer") => {
+                    let saved = Saved { aci: ME.into(), name: "Ada Quill".into(), vault: VAULT.into() };
+                    outcome = Some(
+                        serde_json::to_string(&saved)
+                            .map(|session| Linked {
+                                session,
+                                transfer: Some(Box::new(FakeHistoryTransfer)),
+                            })
+                            .map_err(|err| Fault::Net(err.to_string())),
+                    );
                     false
                 }
                 Some("expire") => {
