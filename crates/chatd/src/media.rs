@@ -293,6 +293,8 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        viewers: Vec::new(),
+        stream_paused: false,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -1856,6 +1858,34 @@ impl Calls {
         let known = self.update(hub, conversation, |live| {
             if live.call.ringing != next {
                 live.call.ringing = std::mem::take(&mut next);
+                changed = true;
+            }
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
+    /// People watching our own share, as the network named them.
+    pub fn set_viewers(&self, hub: &Hub, conversation: &Key, viewers: Vec<Participant>) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.viewers != viewers {
+                live.call.viewers = viewers.clone();
+                changed = true;
+            }
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
+    /// The stream we are watching stopped sending, or started again.
+    pub fn set_stream_paused(&self, hub: &Hub, conversation: &Key, paused: bool) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.stream_paused != paused {
+                live.call.stream_paused = paused;
                 changed = true;
             }
         });

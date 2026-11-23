@@ -184,7 +184,7 @@ fn real_video_peer() {
             let label = format!("{scope}-{kind:?}");
             if owner {
                 let send = |on| match kind {
-                    PictureKind::Share => MediaRequest::ShareSend { on, screen: None, quality: None, show_cursor: None, sound: None },
+                    PictureKind::Share => MediaRequest::ShareSend { on, screen: None, quality: None, show_cursor: None, sound: None, preview: None },
                     PictureKind::Camera => MediaRequest::Camera { on },
                 };
                 running.hub.calls.request(&running.hub, &send(true)).unwrap();

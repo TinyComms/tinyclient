@@ -261,6 +261,8 @@ mod tests {
         ringing: Vec::new(),
         moved_from: None,
         move_notice: None,
+        viewers: Vec::new(),
+        stream_paused: false,
         }
     }
 

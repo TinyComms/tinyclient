@@ -25,6 +25,16 @@ pub(in crate::gui) fn share_sound_flag(on: bool) -> Option<bool> {
     share_sound_offered().then_some(on)
 }
 
+/// The picker is where a preview can be switched off. A phone shares at once and sends none.
+pub(in crate::gui) fn share_preview_offered() -> bool {
+    !crate::gui::phone::active()
+}
+
+/// `Some` only where the picker is shown. Off is `Some(false)`, so Discord is not posted a preview.
+pub(in crate::gui) fn share_preview_flag(on: bool) -> Option<bool> {
+    share_preview_offered().then_some(on)
+}
+
 /// The picker's qualities, with what each costs in words.
 const QUALITIES: [(ShareQuality, &str, &str); 3] = [
     (ShareQuality::Best, "Best", "Your screen as it is, up to 1440p at 60 fps. About 8 Mb/s."),
@@ -36,7 +46,7 @@ impl Shell {
     /// Share pressed while not sharing: the picker.
     pub(in crate::gui) fn tiny_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if crate::gui::phone::active() {
-            self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None }), cx);
+            self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: None }), cx);
             return;
         }
         self.tiny_state.screens = None;
@@ -63,12 +73,13 @@ impl Shell {
         let quality = Some(self.tiny_state.share_quality);
         let show_cursor = Some(self.tiny_state.share_cursor);
         let sound = share_sound_flag(self.tiny_state.share_sound);
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen, quality, show_cursor, sound }), cx);
+        let preview = share_preview_flag(self.tiny_state.share_preview);
+        self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen, quality, show_cursor, sound, preview }), cx);
     }
 
     pub(in crate::gui) fn tiny_stop_share(&mut self, cx: &mut Context<Self>) {
         self.tiny_state.shared = None;
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None }), cx);
+        self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None, preview: None }), cx);
     }
 
     /// The picker: screens or windows, a picture and a name each, Cancel and Share.
@@ -162,6 +173,29 @@ impl Shell {
                         cx.notify();
                     }))))
         });
+        // A small picture of the share, posted to Discord outside the encrypted stream.
+        let preview = share_preview_offered().then(|| {
+            div()
+                .mt(px(10.))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().type_ui().text_color(theme::text_soft()).child("Preview"))
+                    .child(segmented()
+                        .child(segment("tiny-share-preview-on", "On", state.share_preview).on_click(cx.listener(|this, _, _, cx| {
+                            this.tiny_state.share_preview = true;
+                            cx.notify();
+                        })))
+                        .child(segment("tiny-share-preview-off", "Off", !state.share_preview).on_click(cx.listener(|this, _, _, cx| {
+                            this.tiny_state.share_preview = false;
+                            cx.notify();
+                        })))))
+                .child(div().whitespace_normal().type_small().text_color(theme::text_faint()).child("A small picture of this share, sent to Discord outside the encrypted stream."))
+        });
         let ready = state.screen_pick.is_some();
         let go = if ready && !self.tiny_state.busy {
             button("tiny-share-go", ButtonKind::Primary, "Share").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_share_picked(cx))).into_any_element()
@@ -177,6 +211,7 @@ impl Shell {
             .child(quality)
             .child(pointer)
             .children(sound)
+            .children(preview)
             .child(
                 div()
                     .mt(px(20.))
@@ -238,6 +273,18 @@ mod tests {
             assert_eq!(share_sound_flag(false), Some(false));
         } else {
             assert_eq!(share_sound_flag(true), None);
+        }
+    }
+
+    #[test]
+    fn share_preview_is_sent_only_where_the_picker_is_shown() {
+        let offered = !crate::gui::phone::active();
+        assert_eq!(share_preview_offered(), offered);
+        if offered {
+            assert_eq!(share_preview_flag(true), Some(true));
+            assert_eq!(share_preview_flag(false), Some(false));
+        } else {
+            assert_eq!(share_preview_flag(true), None);
         }
     }
 }

@@ -9,7 +9,7 @@ use super::Subject;
 use crate::gui::theme;
 use crate::gui::tiny::{model, Page};
 use protocol::{
-    Call, CallState, Content, ConversationKind, Direction, Key, Network, PictureKind, TinyRoom,
+    Call, CallState, Content, ConversationKind, Direction, Key, Network, Participant, PictureKind, TinyRoom,
     TinySeat,
 };
 use std::collections::HashMap;
@@ -344,6 +344,26 @@ pub(in crate::gui) enum Trouble {
     BudgetFull,
 }
 
+/// "{n} watching: names" for our own share. Empty when Discord has named nobody.
+pub(in crate::gui) fn viewer_line(viewers: &[Participant]) -> Option<String> {
+    if viewers.is_empty() {
+        return None;
+    }
+    let names = viewers.iter().map(|who| if who.name.is_empty() { who.id.as_str() } else { who.name.as_str() }).collect::<Vec<_>>().join(", ");
+    Some(format!("{} watching: {names}", viewers.len()))
+}
+
+/// The words on a stream tile before its picture, or while Discord says it is paused.
+pub(in crate::gui) fn watch_words(asked: bool, paused: bool) -> &'static str {
+    if paused {
+        "Stream paused"
+    } else if asked {
+        "Connecting…"
+    } else {
+        "Watch stream"
+    }
+}
+
 /// Diagnoses why watching `user_id` has not yielded a frame after `since`.
 /// Returns `None` during the initial 3 s window when no immediate blocker is known.
 pub(in crate::gui) fn watch_trouble(
@@ -592,6 +612,17 @@ mod tests {
 
         call.deafened = true;
         assert_eq!(watch_trouble(&call, "mara", name, Duration::from_secs(0)), Some(Trouble::Deafened));
+    }
+
+    #[test]
+    fn a_paused_stream_is_named_and_viewers_are_counted() {
+        assert_eq!(watch_words(false, false), "Watch stream");
+        assert_eq!(watch_words(true, false), "Connecting…");
+        assert_eq!(watch_words(true, true), "Stream paused");
+        assert_eq!(viewer_line(&[]), None);
+        let dev = Participant { id: "2002".into(), name: "Dev Patel".into(), ..Participant::default() };
+        let sam = Participant { id: "2006".into(), name: String::new(), ..Participant::default() };
+        assert_eq!(viewer_line(&[dev, sam]).as_deref(), Some("2 watching: Dev Patel, 2006"));
     }
 
     #[test]

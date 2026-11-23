@@ -9,6 +9,7 @@ use super::Discord;
 use protocol::{
     CallFailure, CallSupport, ConversationKind, Dave, MediaFile, MediaRequest, Network, Occupant, Participant, Relation, VoiceJoin, VoiceQuality, Watching,
 };
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -340,6 +341,30 @@ struct StreamSlot {
     told: bool,
     /// The user turned it off before Discord named the stream. The create is then deleted.
     drop: bool,
+    /// Post a small preview to Discord. A watch leg never does.
+    preview: bool,
+    /// When the last preview was posted. `None` until the stream exists.
+    preview_at: Option<Instant>,
+    viewer_ids: Vec<String>,
+    paused: bool,
+}
+
+impl StreamSlot {
+    fn open(key: String, preview: bool) -> Self {
+        Self {
+            key,
+            rtc_server: None,
+            rtc_channel: None,
+            token: None,
+            endpoint: None,
+            told: false,
+            drop: false,
+            preview,
+            preview_at: None,
+            viewer_ids: Vec::new(),
+            paused: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -365,6 +390,9 @@ pub struct Voice {
     share: Option<StreamSlot>,
     /// The share we are watching.
     watch: Option<StreamSlot>,
+    /// A stream preview fetched while this call is up: when, and the file if one landed.
+    /// Not filled at sign-in. Asked once, then left alone for [`PREVIEW_FOR`].
+    previews: HashMap<String, (Instant, String)>,
 }
 
 impl Voice {
@@ -419,6 +447,11 @@ fn voice_state(guild: Option<&str>, channel: Option<&str>, muted: bool, deafened
     })
 }
 
+/// A fetched preview is reused this long, including a miss, so a roster tick never polls.
+const PREVIEW_FOR: Duration = Duration::from_secs(120);
+/// Our own preview is posted again after this, from the next roster, not a timer.
+const PREVIEW_EVERY: Duration = Duration::from_secs(180);
+
 /// `guild:guild:channel:user` in a server, `call:channel:user` in a direct call.
 fn stream_key(guild: Option<&str>, channel: &str, user: &str) -> String {
     match guild {
@@ -431,6 +464,19 @@ fn owned_by(key: &str, user: &str) -> bool {
     key.rsplit(':').next() == Some(user)
 }
 
+/// A viewer Discord named, looked up from the call and then from people we already know.
+fn named_viewer(id: &str, state: &super::State) -> Participant {
+    let name = state
+        .voice
+        .states
+        .get(id)
+        .map(|heard| heard.name.clone())
+        .filter(|name| !name.is_empty())
+        .or_else(|| state.users.get(id).cloned())
+        .unwrap_or_else(|| id.to_owned());
+    Participant { id: id.to_owned(), name, ..Participant::default() }
+}
+
 impl Discord {
     /// Everyone in the call but us, to chatd, whenever a voice state changed; and, on a call we
     /// rang, the moment someone else is in it: that is the answer.
@@ -441,6 +487,7 @@ impl Discord {
             let Some(call) = &mut state.voice.call else {
                 return;
             };
+            let previews: HashMap<String, String> = state.voice.previews.iter().map(|(key, (_, path))| (key.clone(), path.clone())).collect();
             let there = state.voice.states.iter().filter(|(id, heard)| heard.channel == call.conversation && **id != state.me);
             let mut participants: Vec<Participant> = there
                 .map(|(id, heard)| Participant {
@@ -456,6 +503,7 @@ impl Discord {
                     camera: heard.camera,
                     sharing: heard.sharing,
                     ringing: false,
+                    preview: previews.get(&stream_key(heard.guild.as_deref(), &heard.channel, id)).cloned().unwrap_or_default(),
                     ..Participant::default()
                 })
                 .collect();
@@ -482,6 +530,7 @@ impl Discord {
         if answered {
             self.ctx.answered(&conversation);
         }
+        self.note_previews();
     }
 
     /// Tells chatd who is in each of `channels`, for those it is to know (see
@@ -1346,7 +1395,7 @@ impl Discord {
                 };
                 self.tell(4, frame);
             }
-            Picture::Share(true) => {
+            Picture::Share { on: true, preview } => {
                 let (guild, channel) = {
                     let mut state = self.state.lock().unwrap();
                     let Some(call) = state.voice.call.as_ref() else {
@@ -1357,15 +1406,7 @@ impl Discord {
                     }
                     let guild = call.guild.clone();
                     let channel = call.conversation.clone();
-                    state.voice.share = Some(StreamSlot {
-                        key: String::new(),
-                        rtc_server: None,
-                        rtc_channel: None,
-                        token: None,
-                        endpoint: None,
-                        told: false,
-                        drop: false,
-                    });
+                    state.voice.share = Some(StreamSlot::open(String::new(), preview));
                     (guild, channel)
                 };
                 self.tell(18, json!({
@@ -1375,7 +1416,7 @@ impl Discord {
                     "preferred_region": Value::Null,
                 }));
             }
-            Picture::Share(false) => {
+            Picture::Share { on: false, .. } => {
                 let _gate = self.stream_gate.lock().unwrap();
                 let (key, conversation) = {
                     let mut state = self.state.lock().unwrap();
@@ -1395,6 +1436,7 @@ impl Discord {
                 }
                 if let Some(conversation) = conversation {
                     self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: false });
+                    self.ctx.set_viewers(&conversation, Vec::new());
                 }
             }
             Picture::Watch(Some(user)) => {
@@ -1408,15 +1450,7 @@ impl Discord {
                     let replaced = state.voice.watch.as_ref()
                         .filter(|slot| slot.key != key)
                         .map(|_| call.conversation.clone());
-                    state.voice.watch = Some(StreamSlot {
-                        key: key.clone(),
-                        rtc_server: None,
-                        rtc_channel: None,
-                        token: None,
-                        endpoint: None,
-                        told: false,
-                        drop: false,
-                    });
+                    state.voice.watch = Some(StreamSlot::open(key.clone(), false));
                     (key, replaced)
                 };
                 if let Some(conversation) = replaced {
@@ -1433,6 +1467,7 @@ impl Discord {
                 };
                 if let Some(conversation) = conversation {
                     self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch: true });
+                    self.ctx.set_stream_paused(&conversation, false);
                 }
             }
         }
@@ -1440,11 +1475,12 @@ impl Discord {
 
     pub(super) fn stream_created(&self, data: &str) -> Result<(), Failure> {
         let made: StreamMade = serde_json::from_str(data)?;
-        let next = {
+        let (next, upload) = {
             let mut state = self.state.lock().unwrap();
             let me = state.me.clone();
             let mine = owned_by(&made.stream_key, &me);
-            if state.voice.call.is_none() {
+            let mut upload = None;
+            let next = if state.voice.call.is_none() {
                 if mine { StreamNext::Delete(made.stream_key) } else { StreamNext::Quiet }
             } else if mine {
                 let dropping = state.voice.share.as_ref().is_some_and(|slot| slot.drop);
@@ -1455,6 +1491,10 @@ impl Discord {
                 } else if fits {
                     let slot = state.voice.share.as_mut().expect("the share was just found");
                     note_stream(slot, &made);
+                    if slot.preview && slot.preview_at.is_none() && !slot.key.is_empty() {
+                        slot.preview_at = Some(Instant::now());
+                        upload = Some(slot.key.clone());
+                    }
                     StreamNext::Flush(false)
                 } else {
                     StreamNext::Quiet
@@ -1465,9 +1505,52 @@ impl Discord {
                 StreamNext::Flush(true)
             } else {
                 StreamNext::Quiet
-            }
+            };
+            (next, upload)
         };
         self.follow(next);
+        if let Some(key) = upload {
+            self.post_preview(&key);
+        }
+        Ok(())
+    }
+
+    /// Discord's `viewer_ids` and `paused` for a stream. Viewers of ours go on the call. A
+    /// pause is for the stream we are watching, not guessed from who is in the channel.
+    pub(super) fn stream_updated(&self, data: &str) -> Result<(), Failure> {
+        let update: StreamUpdate = serde_json::from_str(data)?;
+        let told = {
+            let mut state = self.state.lock().unwrap();
+            let me = state.me.clone();
+            let conversation = state.voice.call.as_ref().map(|call| call.conversation.clone());
+            if state.voice.share.as_ref().is_some_and(|slot| slot.key == update.stream_key || (slot.key.is_empty() && owned_by(&update.stream_key, &me))) {
+                {
+                    let slot = state.voice.share.as_mut().expect("the share was just found");
+                    if slot.key.is_empty() {
+                        slot.key = update.stream_key.clone();
+                    }
+                    slot.viewer_ids = update.viewer_ids.clone();
+                    slot.paused = update.paused;
+                }
+                let viewers = update.viewer_ids.iter().map(|id| named_viewer(id, &state)).collect();
+                Some((conversation, Some(viewers), None))
+            } else if state.voice.watch.as_ref().is_some_and(|slot| slot.key == update.stream_key) {
+                let slot = state.voice.watch.as_mut().expect("the watch was just found");
+                slot.viewer_ids = update.viewer_ids.clone();
+                slot.paused = update.paused;
+                Some((conversation, None, Some(update.paused)))
+            } else {
+                None
+            }
+        };
+        if let Some((Some(conversation), viewers, paused)) = told {
+            if let Some(viewers) = viewers {
+                self.ctx.set_viewers(&conversation, viewers);
+            }
+            if let Some(paused) = paused {
+                self.ctx.set_stream_paused(&conversation, paused);
+            }
+        }
         Ok(())
     }
 
@@ -1619,11 +1702,88 @@ impl Discord {
         self.ctx.tell_media(&conversation, MediaRequest::StreamStop { watch });
         if forget {
             let request = if watch {
+                self.ctx.set_stream_paused(&conversation, false);
                 MediaRequest::ShareWatch { source: None }
             } else {
-                MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None }
+                self.ctx.set_viewers(&conversation, Vec::new());
+                MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None, preview: None }
             };
             self.ctx.tell_media(&conversation, request);
+        }
+    }
+
+    /// One preview fetch per live stream in this call, and another post of ours after a few
+    /// minutes. Nothing here runs at sign-in: there is no call yet, so no request and nothing kept.
+    fn note_previews(&self) {
+        let (due, refresh) = {
+            let state = self.state.lock().unwrap();
+            let Some(call) = &state.voice.call else {
+                return;
+            };
+            let conversation = &call.conversation;
+            let guild = call.guild.as_deref();
+            let mut due = Vec::new();
+            for (id, heard) in &state.voice.states {
+                if id == &state.me || !heard.sharing || &heard.channel != conversation {
+                    continue;
+                }
+                let key = stream_key(guild, conversation, id);
+                let fresh = state.voice.previews.get(&key).is_some_and(|(at, _)| at.elapsed() < PREVIEW_FOR);
+                if !fresh {
+                    due.push((key, id.clone()));
+                }
+            }
+            let refresh = state.voice.share.as_ref().and_then(|slot| {
+                (slot.preview && !slot.key.is_empty() && slot.preview_at.is_some_and(|at| at.elapsed() >= PREVIEW_EVERY)).then(|| slot.key.clone())
+            });
+            (due, refresh)
+        };
+        for (key, user) in due {
+            {
+                let mut state = self.state.lock().unwrap();
+                state.voice.previews.insert(key.clone(), (Instant::now(), String::new()));
+            }
+            self.fetch_preview(&key, &user);
+        }
+        if let Some(key) = refresh {
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(slot) = state.voice.share.as_mut() {
+                    slot.preview_at = Some(Instant::now());
+                }
+            }
+            self.post_preview(&key);
+        }
+    }
+
+    fn fetch_preview(&self, key: &str, user: &str) {
+        let body = self.rest.call("GET", &format!("/streams/{key}/preview"), None).ok();
+        let url = body.as_deref().and_then(|body| serde_json::from_str::<Value>(body).ok()).and_then(|value| value.get("url").and_then(Value::as_str).map(str::to_owned));
+        let Some(url) = url else {
+            return;
+        };
+        let Some(bytes) = fetch_image(&url) else {
+            return;
+        };
+        let file = protocol::MediaFile::new(format!("stream-preview-{user}"), protocol::MediaKind::Image);
+        let Some(landed) = self.ctx.landed(&file, &url, &bytes) else {
+            return;
+        };
+        let Some(path) = landed.path else {
+            return;
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            state.voice.previews.insert(key.to_owned(), (Instant::now(), path));
+        }
+        self.roster();
+    }
+
+    fn post_preview(&self, key: &str) {
+        let thumbnail = self.ctx.share_frame().and_then(|path| jpeg_uri(&path)).unwrap_or_else(tiny_jpeg);
+        let path = format!("/streams/{key}/preview");
+        if let Err(err) = self.rest.call("POST", &path, Some(json!({ "thumbnail": thumbnail }))) {
+            tracing::warn!("chatd: discord stream preview was not posted ({err})");
         }
     }
 }
@@ -1691,9 +1851,64 @@ struct StreamGone {
     reason: String,
 }
 
+/// `STREAM_UPDATE`: who is watching, and whether the stream stopped sending.
+#[derive(Deserialize)]
+struct StreamUpdate {
+    stream_key: String,
+    #[serde(default)]
+    viewer_ids: Vec<String>,
+    #[serde(default)]
+    paused: bool,
+}
+
+/// Downloads a preview Discord named. Only a JPEG or PNG is kept.
+fn fetch_image(url: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .http_status_as_error(true)
+        .build();
+    let agent: ureq::Agent = config.into();
+    let mut response = agent.get(url).call().ok()?;
+    let mut bytes = Vec::new();
+    response.body_mut().as_reader().take(256 * 1024).read_to_end(&mut bytes).ok()?;
+    let jpeg = bytes.starts_with(&[0xFF, 0xD8]);
+    let png = bytes.starts_with(&[0x89, b'P', b'N', b'G']);
+    (jpeg || png).then_some(bytes)
+}
+
+/// The self-view frame, shrunk, as the data URI Discord's preview post takes.
+fn jpeg_uri(path: &str) -> Option<String> {
+    let picture = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?;
+    let picture = picture.thumbnail(320, 180);
+    let mut bytes = Vec::new();
+    picture.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 60)).ok()?;
+    Some(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
+/// A tiny JPEG so a share with no painted frame still posts one preview.
+fn tiny_jpeg() -> String {
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(8, 8, image::Rgb([24, 24, 28]))
+        .write_to(&mut bytes, image::ImageFormat::Jpeg)
+        .expect("an 8x8 jpeg encodes");
+    format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_preview_without_a_frame_is_still_a_jpeg() {
+        let uri = tiny_jpeg();
+        assert!(uri.starts_with("data:image/jpeg;base64,"));
+        let bytes = base64::engine::general_purpose::STANDARD.decode(uri.split_once(',').unwrap().1).unwrap();
+        assert!(bytes.starts_with(&[0xFF, 0xD8]));
+    }
 
     #[test]
     fn a_stage_is_never_joined_here_and_a_voice_channel_is() {

@@ -87,7 +87,7 @@ impl Call {
     fn apply(&mut self, request: MediaRequest) -> MediaResponse {
         match request {
             MediaRequest::Streams => {}
-            MediaRequest::ShareSend { on, screen, quality, show_cursor, sound } => {
+            MediaRequest::ShareSend { on, screen, quality, show_cursor, sound, .. } => {
                 // What the share captures, chosen before the probe so the probe tries that one,
                 // and what it spends. Before a call is up the request is only noted: the voice
                 // tests ask then, and a headless run must not open a screen to answer them.

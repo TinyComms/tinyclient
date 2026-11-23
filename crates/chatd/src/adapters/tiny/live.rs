@@ -2053,6 +2053,7 @@ fn heard_frame(
                                 quality: None,
                                 show_cursor: None,
                                 sound: None,
+                                preview: None,
                             },
                         );
                     }
@@ -2229,6 +2230,7 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             camera: who.camera,
             sharing: who.sharing,
             ringing: false,
+            preview: String::new(),
         });
         ctx.participants(room, roster.collect());
     }
@@ -2916,6 +2918,7 @@ fn direct_state(ctx: &Context, seat: &mut Seat, direct_id: &str, user: &str, fra
                 quality: None,
                 show_cursor: None,
                 sound: None,
+                preview: None,
             },
         );
     }
@@ -2956,6 +2959,7 @@ fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
             camera: who.camera,
             sharing: who.sharing,
             ringing: false,
+            preview: String::new(),
         });
     ctx.participants(direct_id, roster.collect());
 }

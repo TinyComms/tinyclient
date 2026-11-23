@@ -251,6 +251,9 @@ pub struct Participant {
     /// Being rung for this call and not yet joined (Discord DM / group DM calls).
     #[serde(default, skip_serializing_if = "is_false")]
     pub ringing: bool,
+    /// A short preview of their live stream, as a local file. Empty until one was fetched.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
 }
 
 /// The most screens and windows `mediad --screens` lists.
@@ -405,6 +408,13 @@ pub struct Call {
     /// One sentence about that move, or why it came back. The shell shows it once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub move_notice: Option<String>,
+    /// People watching our own share, named from the ids the network sent. Not inferred from
+    /// who is merely in the voice channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewers: Vec<Participant>,
+    /// The stream we are watching has stopped sending. The tile says so.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream_paused: bool,
 }
 
 /// Someone rung into a group call, and what the server last said of that ring.
@@ -664,6 +674,10 @@ pub enum MediaRequest {
         /// which is what an older shell asked for, and what a phone sends: it has no loopback.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sound: Option<bool>,
+        /// Send Discord a small preview of the share, outside the encrypted stream. `None` is
+        /// off: an older shell, or a phone, which has no switch for it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<bool>,
     },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
@@ -1271,20 +1285,25 @@ mod tests {
     #[test]
     fn a_share_without_a_screen_is_the_frame_an_older_build_sends() {
         let older: MediaRequest = serde_json::from_str(r#"{"media":"share_send","on":true}"#).unwrap();
-        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None });
+        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: None });
         assert_eq!(serde_json::to_string(&older).unwrap(), r#"{"media":"share_send","on":true}"#);
         // The pointer is on when nothing is said, so an older shell gets it like everyone.
-        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false), sound: None };
+        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false), sound: None, preview: None };
         let json = serde_json::to_string(&chosen).unwrap();
         assert!(json.contains(r#""quality":"balanced""#) && json.contains(r#""show_cursor":false"#));
         assert!(!json.contains("sound"), "{json}");
+        assert!(!json.contains("preview"), "{json}");
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), chosen);
-        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true), sound: None };
+        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true), sound: None, preview: None };
         assert_eq!(serde_json::to_string(&shown).unwrap(), r#"{"media":"share_send","on":true,"show_cursor":true}"#);
-        let heard = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: Some(true) };
+        let heard = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: Some(true), preview: None };
         let json = serde_json::to_string(&heard).unwrap();
         assert_eq!(json, r#"{"media":"share_send","on":true,"sound":true}"#);
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), heard);
+        let previewed = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: Some(true) };
+        let json = serde_json::to_string(&previewed).unwrap();
+        assert_eq!(json, r#"{"media":"share_send","on":true,"preview":true}"#);
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), previewed);
     }
 
     #[test]
