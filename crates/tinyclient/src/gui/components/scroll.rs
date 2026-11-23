@@ -255,7 +255,7 @@ impl RenderOnce for ScrollFrame {
                             } else {
                                 theme::scrollbar()
                             })
-                            .corner_radii(px(3.)),
+                            .corner_radii(px(width / 2.)),
                     );
                     tracks.push((
                         horizontal,
@@ -454,7 +454,7 @@ impl RenderOnce for ScrollFrame {
                 window.refresh();
             })
             .child(self.content)
-            .child(bars)
+            .when(!crate::gui::phone::active(), |frame| frame.child(bars))
     }
 }
 

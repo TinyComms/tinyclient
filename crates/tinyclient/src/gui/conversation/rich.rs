@@ -386,10 +386,12 @@ fn is_emoji(grapheme: &str) -> bool {
     let Some(first) = grapheme.chars().next() else {
         return false;
     };
+    // Exclude bare text-presentation symbols (arrows 0x2190..=0x21FF, ©/®/™, ℹ) unless paired
+    // with the emoji presentation selector FE0F so plain "→" replies don't render as 40px jumbo.
     let pictograph = matches!(first as u32,
-        0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0x2300..=0x23FF | 0x2190..=0x21FF
-        | 0x3030 | 0x303D | 0x3297 | 0x3299 | 0x00A9 | 0x00AE | 0x203C | 0x2049 | 0x2122 | 0x2139);
-    // A digit or symbol becomes an emoji only with the presentation selector or a keycap.
+        0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0x2300..=0x23FF
+        | 0x3030 | 0x303D | 0x3297 | 0x3299 | 0x203C | 0x2049);
+    // A digit or text-default symbol becomes an emoji only with the presentation selector or keycap.
     pictograph || grapheme.contains(['\u{FE0F}', '\u{20E3}'])
 }
 
@@ -797,5 +799,16 @@ mod tests {
             ]
         );
         assert_eq!(inline.plain(0..inline.text.len()), text);
+    }
+
+    #[test]
+    fn bare_text_arrows_and_symbols_do_not_trigger_jumbo_emoji() {
+        assert_eq!(jumbo("→", &[]), None);
+        assert_eq!(jumbo("←", &[]), None);
+        assert_eq!(jumbo("©", &[]), None);
+        assert_eq!(jumbo("™", &[]), None);
+        // Explicit emoji presentation selector still qualifies.
+        assert!(jumbo("➡️", &[]).is_some());
+        assert!(jumbo("👍", &[]).is_some());
     }
 }

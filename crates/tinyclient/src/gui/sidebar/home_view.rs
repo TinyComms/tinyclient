@@ -905,8 +905,8 @@ impl Shell {
                     (protocol::CallOutcome::Cancelled, _, _) => "Cancelled".to_owned(),
                     (protocol::CallOutcome::Busy, _, _) => "Line busy".to_owned(),
                     (protocol::CallOutcome::Voicemail, _, _) => "Voicemail".to_owned(),
-                    (_, true, Some(s)) if s > 0 => format!("Outgoing · {}s", s),
-                    (_, false, Some(s)) if s > 0 => format!("Incoming · {}s", s),
+                    (_, true, Some(s)) if s > 0 => format!("Outgoing · {}", format_call_log_duration(s)),
+                    (_, false, Some(s)) if s > 0 => format!("Incoming · {}", format_call_log_duration(s)),
                     (_, true, _) => "Outgoing".to_owned(),
                     (_, false, _) => "Incoming".to_owned(),
                 };
@@ -1039,7 +1039,7 @@ impl Shell {
                 click(row, cx).into_any_element()
             }
             Item::Folder { key, name, color, open, lit, mention } => {
-                let bar = color.map_or(theme::text_faint(), gpui::rgb);
+                let bar = color.filter(|&c| c != 0).map_or(theme::text_faint(), theme::role_color);
                 let chevron = if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" };
                 let content = div()
                     .gap(px(8.))
@@ -1142,10 +1142,11 @@ impl Shell {
         let lit = space.attention > 0 || space.unread;
         let here = if let Mode::Space(selected) = &self.sidebar_state.mode { selected == &space.key } else { self.open.as_ref().is_some_and(|open| self.snapshot.as_ref().and_then(|s| s.open.as_ref()).is_some_and(|row| row.key == *open && row.space.as_deref() == Some(space.key.id.as_str()))) };
         let icon = self.media_path(&space.key, space.icon.as_ref());
-        let color = if space.muted { theme::text_faint() } else if lit { theme::text() } else { theme::text_soft() };
+        let faint = if here { theme::text_soft() } else { theme::text_faint() };
+        let color = if space.muted { faint } else if lit || here { theme::text() } else { theme::text_soft() };
         // A team's chevron sits in the tree's 16 slot, so its name lines up with its channels'.
         let chevron = open.map(|open| {
-            div().w(px(16.)).mr(px(-8.)).flex_none().child(glyph(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }, 12., theme::text_faint()))
+            div().w(px(16.)).mr(px(-8.)).flex_none().child(glyph(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }, 12., faint))
         });
         let content = div()
             .gap(px(8.))
@@ -1176,7 +1177,7 @@ impl Shell {
     /// The people in a voice row. Their photos come from the person keys, not the channel key.
     fn voice_faces(&self, c: &Conversation, surface: gpui::Rgba, cx: &mut Context<Self>) -> Div {
         let people = c.occupants.as_ref().map(|inside| inside.people.as_slice()).unwrap_or(&[]);
-        let size = 32.;
+        let size = theme::row_avatar();
         match people {
             [] => self.conversation_avatar(c, size, surface, cx),
             [one] => Avatar::new(&one.person, &one.name, size).image_at(self.person_picture(&one.person, cx)).build(),
@@ -1226,6 +1227,7 @@ impl Shell {
                     && !matches!(call.state, protocol::CallState::Failed { .. })
             });
         let join = joins_from_list(c) && !ours;
+        let faint = if selected { theme::text_soft() } else { theme::text_faint() };
         let content = div()
             .gap(px(10.))
             .child(faces)
@@ -1237,15 +1239,15 @@ impl Shell {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(18.))
+                            .h(theme::line(18.))
                             .flex()
                             .items_center()
                             .gap(px(6.))
                             .child(glyph(glyph_name, 14., theme::accent_text()))
                             .child(div().flex_none().max_w(px(150.)).truncate().type_ui().text_color(theme::text()).child(title))
-                            .children((!c.space_title.is_empty()).then(|| div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_faint()).child(c.space_title.clone()))),
+                            .children((!c.space_title.is_empty()).then(|| div().flex_1().min_w_0().truncate().type_ui().text_color(faint).child(c.space_title.clone()))),
                     )
-                    .child(div().h(px(16.)).truncate().type_small().text_color(theme::text_soft()).child(who)),
+                    .child(div().h(theme::line(16.)).truncate().type_small().text_color(theme::text_soft()).child(who)),
             )
             .children(join.then(|| self.join_pill(c, cx)))
             .when(join, |row| row.group("voice"));
@@ -1288,6 +1290,7 @@ impl Shell {
             let key = id.clone().unwrap_or_default();
             div()
                 .id(gpui::SharedString::from(format!("tab-{key}")))
+                .group("folder-tab")
                 .flex_none()
                 .h(px(32.))
                 .px(px(8.))
@@ -1301,7 +1304,14 @@ impl Shell {
                     this.sidebar_state.cursor = None;
                     this.load_home(cx);
                 }))
-                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(if on { theme::text() } else { theme::text_soft() }).child(name))
+                .child(
+                    div()
+                        .type_ui()
+                        .font_weight(theme::MEDIUM)
+                        .text_color(if on { theme::text() } else { theme::text_soft() })
+                        .when(!on, |label| label.group_hover("folder-tab", |style| style.text_color(theme::text())))
+                        .child(name),
+                )
                 .children(count)
                 .children(on.then(|| div().absolute().bottom_0().left(px(8.)).right(px(8.)).h(px(2.)).rounded(px(1.)).bg(theme::text())))
         };
@@ -1355,6 +1365,8 @@ impl Shell {
                 .w_full()
                 .flex_none()
                 .items_center()
+                .border_b_1()
+                .border_color(theme::hairline())
                 .mb(px(4.))
                 .children(wide.then(|| arrow("icons/chevron-left.svg", can_left, -1, cx)))
                 .child(
@@ -1420,4 +1432,29 @@ impl Shell {
 
 fn faint_words(words: String) -> Div {
     div().flex_none().max_w(px(140.)).truncate().type_small().text_color(theme::text_faint()).child(words)
+}
+
+fn format_call_log_duration(seconds: u32) -> String {
+    if seconds >= 3600 {
+        let h = seconds / 3600;
+        let m = (seconds % 3600) / 60;
+        if m == 0 { format!("{h} hr") } else { format!("{h} hr {m} min") }
+    } else if seconds >= 60 {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} sec")
+    }
+}
+
+#[cfg(test)]
+mod call_duration_tests {
+    use super::format_call_log_duration;
+
+    #[test]
+    fn call_log_duration_formats_seconds_minutes_and_hours() {
+        assert_eq!(format_call_log_duration(45), "45 sec");
+        assert_eq!(format_call_log_duration(720), "12 min");
+        assert_eq!(format_call_log_duration(3600), "1 hr");
+        assert_eq!(format_call_log_duration(3900), "1 hr 5 min");
+    }
 }

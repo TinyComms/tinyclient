@@ -594,9 +594,9 @@ impl Pane {
         });
         let status_line = match progress {
             Some((_, loaded, total, false)) if loaded > 0 && total > 0 => {
-                format!("Buffered {} of {} · The picture stays this still.", media::size_label(loaded), media::size_label(total))
+                format!("Buffered {} of {} · Video frames unavailable — audio playback only.", media::size_label(loaded), media::size_label(total))
             }
-            _ => "The picture stays this still.".to_owned(),
+            _ => "Video frames unavailable — audio playback only.".to_owned(),
         };
         let scrub = div()
             .id("viewer-scrub")
@@ -852,7 +852,7 @@ impl Pane {
                 .type_ui()
                 .text_color(theme::text_soft())
                 .child(if moving {
-                    "The picture stays this still."
+                    "Video frames unavailable — audio playback only."
                 } else if failed {
                     "Couldn't load the full image"
                 } else {

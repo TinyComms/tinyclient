@@ -194,6 +194,51 @@ pub(crate) fn prove_screen_lock() -> Result<(), &'static str> {
     lock::prove()
 }
 
+/// The lab's message-ux-polish driver. Verifies disappearing-message row suppression and tooltip
+/// grammar, platform monospace inline code, typing row punctuation, ban date formatting, and
+/// unread/day divider ordering.
+pub(crate) fn prove_message_ux_polish() -> Result<(), &'static str> {
+    let now = 1_795_000_000_i64;
+    // 1. A normal message in a 7-day disappearing chat must NOT render a per-row timer badge.
+    if conversation::draw::should_show_inline_expiry(now + 6 * 86_400, now, Some(7 * 86_400)) {
+        return Err("disappearing chat still shows redundant per-message timer for 6d message");
+    }
+    // Urgent (< 1h) or standalone self-destruct messages still surface inline.
+    if !conversation::draw::should_show_inline_expiry(now + 1_800, now, Some(7 * 86_400)) {
+        return Err("urgent (<1h) disappearing message lost its inline timer");
+    }
+    if !conversation::draw::should_show_inline_expiry(now + 6 * 86_400, now, None) {
+        return Err("standalone self-destruct message lost its inline timer");
+    }
+    // 2. Expiry tooltip never says "Disappears in expiring".
+    if conversation::draw::expiry_tooltip(now, now) != "Expiring now" {
+        return Err("expired message tooltip still has broken grammar");
+    }
+    // 3. Inline code uses platform monospace (`theme::MONO`), not hardcoded Menlo.
+    if conversation::tokens::MONO != theme::MONO {
+        return Err("inline code font does not match platform theme::MONO");
+    }
+    // 4. Bare arrows do not render as jumbo emoji.
+    if conversation::rich::jumbo("→", &[]).is_some() {
+        return Err("bare arrow symbol still renders as jumbo emoji");
+    }
+    // 5. Typing row drops duplicate trailing ellipsis while direct preview keeps it.
+    let typist = protocol::Typist { id: "u1".into(), name: "Elyse".into(), until: 0, activity: protocol::Compose::Typing };
+    let wording = composer::typing_wording_for(&[typist.clone()]);
+    if wording.as_ref().map(|(n, r)| format!("{n}{r}")).as_deref() != Some("Elyse is typing") {
+        return Err("typing row still has duplicate trailing ellipsis");
+    }
+    if composer::typing_preview_for(&[typist], false).as_deref() != Some("typing…") {
+        return Err("sidebar/header typing preview lost its ellipsis");
+    }
+    // 6. Ban-until date never prints month 00 for January.
+    let jan = composer::format_ban_until(1_768_478_400, 1_768_000_000);
+    if jan.contains("-00-") {
+        return Err("format_ban_until still prints month 00 for January");
+    }
+    Ok(())
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, MenuItem, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 

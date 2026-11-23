@@ -3184,6 +3184,10 @@ pub enum Request {
         /// workspace's address, and only that account's token is replaced.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resume: Option<String>,
+        /// `personal` asks for a personal Microsoft account (Teams free, teams.live.com).
+        /// Absent is the network's usual sign-in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     /// Reads again the sessions the keychain refused (`Keychain::denied`): the user's "Try
     /// again". Answers `Status` at once; the read goes on behind it.

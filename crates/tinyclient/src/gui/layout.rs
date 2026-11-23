@@ -680,7 +680,22 @@ impl Shell {
                                 .child(name),
                         )
                         .child(div().type_small().text_color(theme::text_soft()).child(line))
-                        .children(failed.map(|(_, why)| div().type_small().text_color(theme::danger()).child(why.clone()))),
+                        .children(failed.map(|(_, why)| div().type_small().text_color(theme::danger()).child(why.clone())))
+                        .when(network == Network::Teams && available && !waiting, |column| {
+                            column.child(
+                                div()
+                                    .id(("teams-personal", ix))
+                                    .type_small()
+                                    .text_color(theme::accent_text())
+                                    .cursor_pointer()
+                                    .child("Personal Microsoft account")
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.sign_in_personal(cx);
+                                    })),
+                            )
+                        }),
                 )
                 .child(action)
         };
@@ -927,6 +942,17 @@ impl Shell {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.close_menu(cx);
                                     this.open_create_server(account.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    if network == Network::Discord && snapshot.accounts_of(network) > 0 {
+                        items.push(menu_separator().into_any_element());
+                        items.push(
+                            menu_item("add-discord", Some("icons/plus.svg"), "Add another Discord account", None)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.sign_in(Network::Discord, cx);
                                 }))
                                 .into_any_element(),
                         );
@@ -1941,7 +1967,7 @@ impl Shell {
     /// The add menu's rows: 48 in the popover, 56 in a phone's sheet.
     fn add_rows(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Vec<gpui::Stateful<Div>> {
         let phone = super::phone::active();
-        let row = |ix: usize, network: Network, title: SharedString, line: SharedString, available: bool| {
+        let row = |ix: usize, network: Network, title: SharedString, line: SharedString, available: bool, personal: bool| {
             let waiting = self.signing_in == Some(network);
             let failed = self.sign_in_failed.as_ref().filter(|(failed, _)| *failed == network).map(|(_, why)| why.clone());
             div()
@@ -1956,7 +1982,13 @@ impl Shell {
                 .when(available && self.signing_in.is_none(), |row| {
                     row.cursor_pointer()
                         .hover(|style| style.bg(theme::selected()))
-                        .on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if personal {
+                                this.sign_in_personal(cx);
+                            } else {
+                                this.sign_in(network, cx);
+                            }
+                        }))
                 })
                 .child(network_icon(network, 24.).when(!available, |icon| icon.opacity(0.4)))
                 .child(
@@ -1978,9 +2010,9 @@ impl Shell {
                 )
         };
         let mut list = Vec::new();
-        let mut add = |network, title: &str, line: &str, available| {
+        let mut add = |network, title: &str, line: &str, available, personal: bool| {
             let ix = list.len() + 1;
-            list.push(row(ix, network, title.to_owned().into(), line.to_owned().into(), available).when(phone, |row| row.h(px(56.))));
+            list.push(row(ix, network, title.to_owned().into(), line.to_owned().into(), available, personal).when(phone, |row| row.h(px(56.))));
         };
         // A phone offers only the networks it can sign in to (`signin::welcome::on_phone`), as
         // its first run does.
@@ -1992,17 +2024,27 @@ impl Shell {
                 } else {
                     "Sign in"
                 };
-                add(network, network.label(), caption, true);
+                add(network, network.label(), caption, true, false);
+                if network == Network::Teams {
+                    let (title, line) = another_account(Network::Teams).unwrap();
+                    add(network, title, line, true, true);
+                }
             } else if network == Network::Slack {
-                add(network, "Add a Slack workspace", "Sign in to another workspace", true);
+                add(network, "Add a Slack workspace", "Sign in to another workspace", true, false);
             } else if network == Network::Telegram {
-                add(network, "Add another Telegram account", "Sign in to another account", true);
+                add(network, "Add another Telegram account", "Sign in to another account", true, false);
+            } else if network == Network::Discord {
+                let (title, line) = another_account(Network::Discord).unwrap();
+                add(network, title, line, true, false);
+            } else if network == Network::Teams {
+                let (title, line) = another_account(Network::Teams).unwrap();
+                add(network, title, line, true, true);
             } else if network == Network::Tiny {
-                add(network, "Add a Tiny server", "Join with a code", true);
+                add(network, "Add a Tiny server", "Join with a code", true, false);
             }
         }
         for network in NETWORK_ORDER.into_iter().filter(|network| !AVAILABLE.contains(network)).filter(offered) {
-            add(network, network.label(), "Not available yet", false);
+            add(network, network.label(), "Not available yet", false, false);
         }
         list
     }
@@ -2696,9 +2738,26 @@ impl Shell {
     }
 }
 
+/// An extra sign-in once the usual one exists. Teams is a personal Microsoft account, not a
+/// second work sign-in. Discord is another Discord account.
+pub(crate) fn another_account(network: Network) -> Option<(&'static str, &'static str)> {
+    match network {
+        Network::Discord => Some(("Add another Discord account", "Sign in to another account")),
+        Network::Teams => Some(("Personal Microsoft account", "Teams free, teams.live.com")),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_account_names_discord_and_personal_teams() {
+        assert_eq!(another_account(Network::Discord), Some(("Add another Discord account", "Sign in to another account")));
+        assert_eq!(another_account(Network::Teams), Some(("Personal Microsoft account", "Teams free, teams.live.com")));
+        assert_eq!(another_account(Network::Slack), None);
+    }
 
     #[test]
     fn discord_columns_keep_a_readable_conversation_and_yield_to_narrow_windows() {

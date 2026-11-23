@@ -1,0 +1,12 @@
+{
+  "id": "message-ux-polish",
+  "title": "Disappearing chat messages keep clean rows without per-message timers, and messaging UI polish holds",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The shared conversation pane and phone header share the same disappearing-message and contrast rules.",
+    "ios": "The phone proof build does not run the desktop window. The shared conversation pane and phone header share the same disappearing-message and contrast rules."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

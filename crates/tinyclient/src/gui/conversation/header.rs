@@ -282,6 +282,7 @@ impl Shell {
                     .gap(px(8.))
                     .children(mixed.then(|| div().flex_none().self_center().mr(px(-2.)).child(network_icon(open.key.network, 14.))))
                     .child(title)
+                    .children(self.discord_account_label(&open.key).map(|name| div().flex_none().type_small().text_color(theme::text_faint()).child(name)))
                     .children(mark(open))
                     .children(role.map(|role| role_chip(&role.name, role.color)))
                     .children(self.encryption_chip(open, cx))
@@ -296,6 +297,19 @@ impl Shell {
             .children(self.meeting_button(open, link, compact, cx))
             .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
             .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).children(add_people).child(search).children(members).children(details).child(windowed))
+    }
+
+    /// The Discord account's name, when two Discord accounts are signed in.
+    fn discord_account_label(&self, key: &Key) -> Option<String> {
+        if key.network != Network::Discord {
+            return None;
+        }
+        let snapshot = self.snapshot.as_ref()?;
+        let signed: Vec<_> = snapshot.accounts.iter().filter(|account| account.key.network == Network::Discord && account.link != Link::SignedOut).collect();
+        if signed.len() < 2 {
+            return None;
+        }
+        signed.iter().find(|account| account.key == key.account()).and_then(|account| (!account.name.is_empty()).then(|| account.name.clone()))
     }
 
     /// Follow button in the header strip for Discord announcement channels.
@@ -376,23 +390,31 @@ impl Shell {
     fn disappearing_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
         let secs = open.disappearing.filter(|&s| s > 0)?;
         let label = protocol::format_disappearing(secs);
+        let tip_words = if open.key.network == Network::Telegram {
+            format!("Auto-delete: {label} · Click to manage")
+        } else {
+            format!("Disappearing messages: {label} · Click to manage")
+        };
         Some(
             div()
                 .id("conversation-disappearing")
                 .flex_none()
                 .self_center()
-                .h(px(18.))
-                .px(px(6.))
-                .rounded(px(999.))
-                .bg(theme::raised())
+                .h(px(20.))
+                .px(px(7.))
+                .rounded_full()
+                .bg(theme::hover())
+                .border_1()
+                .border_color(theme::hairline())
                 .flex()
                 .items_center()
                 .gap(px(4.))
                 .cursor_pointer()
-                .type_small()
+                .type_micro()
+                .font_weight(theme::MEDIUM)
                 .text_color(theme::text_soft())
-                .hover(|style| style.text_color(theme::text()))
-                .tooltip(tip(format!("Disappearing messages: {label}"), None))
+                .hover(|style| style.bg(theme::selected()).border_color(theme::border()).text_color(theme::text()))
+                .tooltip(tip(tip_words, None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
                 .child(glyph("icons/clock.svg", 12., theme::text_soft()))
@@ -502,7 +524,7 @@ fn person_line(line: &crate::gui::people::PeerLine) -> Div {
 
 /// The other person's role on this server. One chip, the most senior. No email.
 fn role_chip(name: &str, color: Option<u32>) -> Div {
-    let tone = color.map(gpui::rgb).unwrap_or(theme::text_soft());
+    let tone = color.map(theme::role_color).unwrap_or(theme::text_soft());
     div()
         .flex_none()
         .self_center()

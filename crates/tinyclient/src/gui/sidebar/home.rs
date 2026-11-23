@@ -124,12 +124,15 @@ pub enum Item {
 impl Item {
     pub fn height(&self) -> f32 {
         match self {
-            Item::Header { first: true, .. } => 24.,
-            Item::UnreadGroupHeader(_) => 32.,
-            Item::UnreadMessage { .. } => 44.,
-            Item::Chat(_) | Item::Voice(_) | Item::Call(_) => 48.,
-            Item::Voicemail(_) => 78.,
-            _ => 28.,
+            Item::Header { first: true, .. } => crate::gui::theme::SECTION_FIRST,
+            Item::Header { first: false, .. } => crate::gui::theme::SECTION,
+            Item::UnreadGroupHeader(_) => crate::gui::theme::row_height(32.),
+            Item::UnreadMessage { .. } => crate::gui::theme::row_height(44.),
+            Item::Chat(_) | Item::Voice(_) | Item::Call(_) | Item::Meeting(_) => {
+                crate::gui::theme::row_height(crate::gui::theme::ROW_TWO)
+            }
+            Item::Voicemail(_) => crate::gui::theme::row_height(78.),
+            _ => crate::gui::theme::row_height(crate::gui::theme::ROW_ONE),
         }
     }
 

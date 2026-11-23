@@ -15,7 +15,7 @@
 //! Nothing here acts for the user unasked. A friend request is answered, a presence set, a
 //! message edited, deleted or reacted to only by the command the shell's request became.
 
-mod discord;
+pub(crate) mod discord;
 pub mod parity;
 
 /// `TINYCLIENT_PROVE=discord-nitro-length`. Nitro's 4,000-character limit, shared by every send path.
@@ -3912,6 +3912,39 @@ pub fn start(account: AccountKey, session: &str, hub: Arc<Hub>) -> Result<Adapte
         return Err(why);
     }
     Ok(Adapter { commands, stop })
+}
+
+/// `TINYCLIENT_PROVE=accounts-wave13`. Two Discord accounts stay apart, and a personal Teams
+/// account uses the consumer host.
+pub fn prove_accounts_wave13() -> Result<(), String> {
+    let first = r#"{"token":"MTAwMA.Gabcde.signature"}"#;
+    let second = r#"{"token":"MjAwMA.Gabcde.signature"}"#;
+    let both = discord::combine(first, second)?;
+    let ids: Vec<String> = discord::accounts(&both)?.into_iter().map(|signed| signed.account).collect();
+    if ids != ["1000", "2000"] {
+        return Err(format!("discord accounts {ids:?}"));
+    }
+    let left = discord::without(&both, "1000").ok_or("signing out dropped the other Discord account")?;
+    let kept = discord::accounts(&left)?;
+    if kept.len() != 1 || kept[0].account != "2000" {
+        return Err("signing out dropped the other Discord account".to_owned());
+    }
+    let personal = teams::cloud::TeamsCloud::parse("personal");
+    let hosts = personal.endpoints();
+    if personal.as_str() != "personal" || hosts.teams != "https://teams.live.com" || hosts.presence != "https://presence.teams.live.com" {
+        return Err("personal Teams hosts".to_owned());
+    }
+    if hosts.ours.iter().any(|host| *host == "teams.microsoft.com") {
+        return Err("a personal account allow-list includes work Teams".to_owned());
+    }
+    if teams::consumer_authz(hosts.teams) != "https://teams.live.com/api/auth/v1.0/authz/consumer" {
+        return Err("consumer authz".to_owned());
+    }
+    let scope = teams::personal_scope();
+    if !scope.starts_with("https://mtsvc.fl.teams.microsoft.com/teams.mt.readwrite ") {
+        return Err(format!("personal scope {scope}"));
+    }
+    Ok(())
 }
 
 /// The lab's teams-markdown driver. See `teams::prove_teams_markdown`.

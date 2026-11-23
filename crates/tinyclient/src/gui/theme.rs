@@ -277,7 +277,7 @@ const DARK: Palette = Palette {
     quiet_fill: 0xffffff1f,
     text: 0xedeef0,
     text_soft: 0xa8abb3,
-    text_faint: 0x858993,
+    text_faint: 0x9095a0,
     text_disabled: 0x53565e,
     scrollbar: 0xffffff33,
     scrollbar_hover: 0xffffff5c,
@@ -853,9 +853,10 @@ pub fn tint(index: usize) -> (Hsla, Hsla) {
     }
 }
 
-/// A color the network packs itself (a Telegram topic's `icon_color`): its RGB drawn as the
-/// tile's fill, letters white over it, exactly the official list. The low 24 bits hold a RGB.
+/// A color the network packs itself (a Telegram topic's `icon_color`): its hue drawn as the
+/// tile's fill, with foreground contrast guaranteed to meet WCAG AA (>= 4.5:1).
 pub fn tint_pack(color: u32) -> (Hsla, Hsla) {
+    use palette::IntoColor;
     let (r, g, b) = ((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
     let (top, low) = (
         [r, g, b].iter().max().copied().unwrap(),
@@ -868,7 +869,29 @@ pub fn tint_pack(color: u32) -> (Hsla, Hsla) {
         _ => (4. + (r as f32 - g as f32) / range / 255.) / 6.,
     };
     let hue = (seat + 1.).fract();
-    (hsla(hue, 0.56, 0.55, 1.), hsla(0., 0., 1., 1.))
+    let sat = 0.56;
+    let base_l = 0.55;
+    let white = rgb(0xffffff);
+    let dark = rgb(0x141414);
+    let fill_rgb: Rgba = hsla(hue, sat, base_l, 1.).into_color();
+    if contrast_ratio(white, fill_rgb) >= 4.5 {
+        return (hsla(hue, sat, base_l, 1.), hsla(0., 0., 1., 1.));
+    }
+    if contrast_ratio(dark, fill_rgb) >= 4.5 {
+        return (hsla(hue, sat, base_l, 1.), hsla(0., 0., 0.08, 1.));
+    }
+    // Mid-luminance transition zone: darken the tile slightly so white ink reaches >= 4.5:1.
+    let (mut lo, mut hi) = (0.20_f32, base_l);
+    for _ in 0..16 {
+        let mid = (lo + hi) * 0.5;
+        let mid_rgb: Rgba = hsla(hue, sat, mid, 1.).into_color();
+        if contrast_ratio(white, mid_rgb) >= 4.5 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (hsla(hue, sat, lo, 1.), hsla(0., 0., 1., 1.))
 }
 
 #[cfg(test)]
@@ -887,7 +910,9 @@ mod tests {
             let canvas = rgb(p.canvas);
             let raised = rgb(p.raised);
             let sidebar = rgb(p.sidebar);
-            for (bg_name, bg) in [("canvas", canvas), ("raised", raised), ("sidebar", sidebar)] {
+            let overlay = rgb(p.overlay);
+            let tooltip = rgb(p.tooltip);
+            for (bg_name, bg) in [("canvas", canvas), ("raised", raised), ("sidebar", sidebar), ("overlay", overlay), ("tooltip", tooltip)] {
                 let c_text = contrast_ratio(rgb(p.text), bg);
                 let c_soft = contrast_ratio(rgb(p.text_soft), bg);
                 let c_faint = contrast_ratio(rgb(p.text_faint), bg);
@@ -899,6 +924,18 @@ mod tests {
             }
             let c_on_accent = contrast_ratio(rgb(p.on_accent), rgb(p.accent));
             assert!(c_on_accent >= 4.5, "{name} on_accent on accent: {c_on_accent:.2} < 4.5");
+        }
+    }
+
+    #[test]
+    fn tint_pack_meets_wcag_aa_across_telegram_topics_and_hues() {
+        use palette::IntoColor;
+        for color in [0x6fb9f0, 0xffd67e, 0xcb86db, 0x8eee98, 0xff93b2, 0xfb6f5f, 0x00ffff, 0xffff00, 0x2f6feb] {
+            let (bg, fg) = tint_pack(color);
+            let bg_rgb: Rgba = bg.into_color();
+            let fg_rgb: Rgba = fg.into_color();
+            let ratio = contrast_ratio(fg_rgb, bg_rgb);
+            assert!(ratio >= 4.5, "tint_pack({color:#06x}) contrast {ratio:.2} < 4.5");
         }
     }
 

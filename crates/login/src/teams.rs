@@ -14,8 +14,9 @@
 //! with the same refresh token is in no client's code as such; it is tried here, while the
 //! user is at the window, and a tenant that refuses is left out.
 //!
-//! Personal accounts are not offered: they are another client id, authority and service, and
-//! the page is asked for `organizations` only.
+//! A personal Microsoft account is a separate sign-in (`teams-personal`): client id
+//! `8ec6bc83-69c8-4392-8f08-b3c986009232`, authority `consumers`, and the consumer scope.
+//! Work and school accounts stay on `organizations`.
 //!
 //! The session printed: `{"client_id", "oid", "name", "upn", "tenants": [{"id", "name",
 //! "refresh_token"}]}`, the user's own tenant first.
@@ -33,8 +34,12 @@ use std::time::{Duration, Instant};
 
 /// Teams' own desktop client, the registration third-party clients sign in as.
 const CLIENT: &str = "1fec8e78-bce4-4aaf-ab1b-5451cc387264";
+/// The client a personal Microsoft account signs in as.
+const PERSONAL_CLIENT: &str = "8ec6bc83-69c8-4392-8f08-b3c986009232";
 /// Work and school accounts of any organization.
 const TENANT: &str = "organizations";
+/// The one scope a personal account asks for.
+const PERSONAL_SCOPE: &str = "https://mtsvc.fl.teams.microsoft.com/teams.mt.readwrite openid profile offline_access";
 /// Guest tenants tried at one sign-in.
 const GUESTS: usize = 8;
 const REFUSED: i32 = 6;
@@ -49,6 +54,8 @@ pub enum Cloud {
     GccHigh,
     Dod,
     China,
+    /// A personal Microsoft account (Teams free).
+    Personal,
 }
 
 impl Cloud {
@@ -57,6 +64,7 @@ impl Cloud {
             "gcc_high" | "gcchigh" | "gcc-high" | "usgov" | "usgov_high" | "usgovhigh" => Cloud::GccHigh,
             "dod" | "usgov_dod" | "usgovdod" | "usdod" => Cloud::Dod,
             "china" | "21vianet" | "cn" | "gallatin" => Cloud::China,
+            "personal" | "consumers" | "live" => Cloud::Personal,
             _ => Cloud::Worldwide,
         }
     }
@@ -67,12 +75,28 @@ impl Cloud {
             Cloud::GccHigh => "gcc_high",
             Cloud::Dod => "dod",
             Cloud::China => "china",
+            Cloud::Personal => "personal",
+        }
+    }
+
+    /// `organizations` for work and school, `consumers` for a personal Microsoft account.
+    pub fn authority(self) -> &'static str {
+        match self {
+            Cloud::Personal => "consumers",
+            Cloud::Worldwide | Cloud::GccHigh | Cloud::Dod | Cloud::China => TENANT,
+        }
+    }
+
+    pub fn client_id(self) -> &'static str {
+        match self {
+            Cloud::Personal => PERSONAL_CLIENT,
+            Cloud::Worldwide | Cloud::GccHigh | Cloud::Dod | Cloud::China => CLIENT,
         }
     }
 
     pub fn login(self) -> &'static str {
         match self {
-            Cloud::Worldwide => "https://login.microsoftonline.com",
+            Cloud::Worldwide | Cloud::Personal => "https://login.microsoftonline.com",
             Cloud::GccHigh | Cloud::Dod => "https://login.microsoftonline.us",
             Cloud::China => "https://login.chinacloudapi.cn",
         }
@@ -84,12 +108,13 @@ impl Cloud {
             Cloud::GccHigh => "https://gov.teams.microsoft.us",
             Cloud::Dod => "https://dod.teams.microsoft.us",
             Cloud::China => "https://teams.microsoftonline.cn",
+            Cloud::Personal => "https://teams.live.com",
         }
     }
 
     pub fn redirect(self) -> &'static str {
         match self {
-            Cloud::Worldwide => "https://login.microsoftonline.com/common/oauth2/nativeclient",
+            Cloud::Worldwide | Cloud::Personal => "https://login.microsoftonline.com/common/oauth2/nativeclient",
             Cloud::GccHigh | Cloud::Dod => "https://login.microsoftonline.us/common/oauth2/nativeclient",
             Cloud::China => "https://login.chinacloudapi.cn/common/oauth2/nativeclient",
         }
@@ -101,11 +126,16 @@ impl Cloud {
             Cloud::GccHigh => "https://gov.teams.microsoft.us/.default openid profile offline_access",
             Cloud::Dod => "https://dod.teams.microsoft.us/.default openid profile offline_access",
             Cloud::China => "https://teams.microsoftonline.cn/.default openid profile offline_access",
+            Cloud::Personal => PERSONAL_SCOPE,
         }
     }
 
     pub fn authz(self) -> String {
-        format!("{}/api/authsvc/v1.0/authz", self.teams())
+        if self == Cloud::Personal {
+            format!("{}/api/auth/v1.0/authz/consumer", self.teams())
+        } else {
+            format!("{}/api/authsvc/v1.0/authz", self.teams())
+        }
     }
 
     /// Detects the Microsoft 365 cloud from a user-realm (`getuserrealm.srf` / `/common/userrealm/`)
@@ -261,9 +291,7 @@ pub fn navigated(url: &str) {
     }
 }
 
-/// The helper binary's Teams site. Ends the process if no sign-in can be made.
-pub fn site() -> Site {
-    let flow = FLOW.get_or_init(|| Flow::new().unwrap_or_else(|code| std::process::exit(code)));
+fn site_of(flow: &Flow) -> Site {
     Site {
         title: TITLE,
         // One per run of the helper, which is one sign-in.
@@ -273,6 +301,18 @@ pub fn site() -> Site {
         cookie: None,
         detour: None,
     }
+}
+
+/// The helper binary's Teams site. Ends the process if no sign-in can be made.
+pub fn site() -> Site {
+    let flow = FLOW.get_or_init(|| Flow::new().unwrap_or_else(|code| std::process::exit(code)));
+    site_of(flow)
+}
+
+/// A personal Microsoft account: `consumers` and teams.live.com, not a work tenant.
+pub fn site_personal() -> Site {
+    let flow = FLOW.get_or_init(|| Flow::for_cloud(Cloud::Personal).unwrap_or_else(|code| std::process::exit(code)));
+    site_of(flow)
 }
 
 /// `Site::read` for the helper binary.
@@ -400,9 +440,11 @@ fn authorize_url(challenge: &str, state: &str) -> String {
 
 fn authorize_url_for(cloud: Cloud, challenge: &str, state: &str) -> String {
     format!(
-        "{}/{TENANT}/oauth2/v2.0/authorize?client_id={CLIENT}&response_type=code&redirect_uri={}&scope={}\
+        "{}/{}/oauth2/v2.0/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}\
          &code_challenge={challenge}&code_challenge_method=S256&state={state}&prompt=select_account",
         cloud.login(),
+        cloud.authority(),
+        cloud.client_id(),
         escaped(cloud.redirect()),
         escaped(cloud.scope()),
     )
@@ -528,7 +570,7 @@ fn asked(sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<
 }
 
 fn token(agent: &ureq::Agent, cloud: Cloud, tenant: &str, grant: &[(&str, &str)]) -> Result<Asked, String> {
-    let mut form = vec![("client_id", CLIENT), ("scope", cloud.scope())];
+    let mut form = vec![("client_id", cloud.client_id()), ("scope", cloud.scope())];
     form.extend_from_slice(grant);
     asked(agent.post(format!("{}/{}/oauth2/v2.0/token", cloud.login(), escaped(tenant))).send_form(form))
 }
@@ -553,10 +595,18 @@ fn guests(listed: &serde_json::Value, home: &str) -> Vec<(String, String)> {
 fn session_for(cloud: Cloud, claims: &serde_json::Value, tenants: &[(String, String, String)]) -> serde_json::Value {
     let tenants: Vec<serde_json::Value> = tenants
         .iter()
-        .map(|(id, name, refresh)| serde_json::json!({"id": id, "name": name, "refresh_token": refresh}))
+        .map(|(id, name, refresh)| {
+            let mut entry = serde_json::json!({"id": id, "name": name, "refresh_token": refresh});
+            if cloud == Cloud::Personal {
+                entry["client_id"] = serde_json::json!(cloud.client_id());
+                entry["personal"] = serde_json::json!(true);
+                entry["cloud"] = serde_json::json!("personal");
+            }
+            entry
+        })
         .collect();
     let mut out = serde_json::json!({
-        "client_id": CLIENT,
+        "client_id": cloud.client_id(),
         "oid": claims["oid"].as_str().unwrap_or(""),
         "name": claims["name"].as_str().unwrap_or(""),
         "upn": claims["preferred_username"].as_str().unwrap_or(""),
@@ -564,6 +614,9 @@ fn session_for(cloud: Cloud, claims: &serde_json::Value, tenants: &[(String, Str
     });
     if cloud != Cloud::Worldwide {
         out["cloud"] = serde_json::Value::String(cloud.as_str().to_owned());
+    }
+    if cloud == Cloud::Personal {
+        out["personal"] = serde_json::json!(true);
     }
     out
 }
@@ -604,7 +657,7 @@ pub fn discover_cloud(hint: &str) -> Cloud {
 fn signed_in_for(cloud: Cloud, code: &str, verifier: &str) -> Ending {
     let agent = agent();
     let grant = [("grant_type", "authorization_code"), ("code", code), ("redirect_uri", cloud.redirect()), ("code_verifier", verifier)];
-    let redeemed = match token(&agent, cloud, TENANT, &grant) {
+    let redeemed = match token(&agent, cloud, cloud.authority(), &grant) {
         Ok(redeemed) => redeemed,
         Err(why) => {
             tracing::warn!("tinyclient-login: Microsoft could not be reached to finish the sign-in: {why}");
@@ -816,5 +869,22 @@ mod tests {
         let saved = session_for(Cloud::GccHigh, &claims, &tenants);
         assert_eq!(saved["cloud"], "gcc_high");
         assert!(session_for(Cloud::Worldwide, &claims, &tenants).get("cloud").is_none());
+
+        let personal = authorize_url_for(Cloud::Personal, "CHALLENGE", "STATE");
+        assert!(personal.contains("/consumers/oauth2/v2.0/authorize?"));
+        assert!(personal.contains("client_id=8ec6bc83-69c8-4392-8f08-b3c986009232"));
+        assert!(personal.contains("teams.mt.readwrite"));
+        assert!(personal.starts_with("https://login.microsoftonline.com/"));
+        let saved = session_for(Cloud::Personal, &claims, &tenants);
+        assert_eq!(saved["cloud"], "personal");
+        assert_eq!(saved["client_id"], PERSONAL_CLIENT);
+        assert_eq!(saved["personal"], true);
+        assert_eq!(saved["tenants"][0]["client_id"], PERSONAL_CLIENT);
+        assert_eq!(saved["tenants"][0]["personal"], true);
+        // An MSA issuer does not look like a sovereign cloud, so the personal choice survives.
+        assert_eq!(
+            Cloud::from_claims(&json!({"iss": "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0"}), Cloud::Personal),
+            Cloud::Personal
+        );
     }
 }

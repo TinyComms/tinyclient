@@ -369,7 +369,7 @@ impl Fake {
             return self.token(tenant.trim_matches('/'), &form(&call.body));
         }
         match path {
-            "/api/authsvc/v1.0/authz" if bearer("spaces") => {
+            "/api/authsvc/v1.0/authz" | "/api/auth/v1.0/authz/consumer" if bearer("spaces") => {
                 let mut authz = self.fixture("authz").unwrap();
                 authz["tokens"]["skypeToken"] = skype.into();
                 ok(authz)
@@ -517,6 +517,7 @@ impl Fake {
         let presented = asked.get("refresh_token").cloned().unwrap_or_default();
         let scope = asked.get("scope").cloned().unwrap_or_default();
         let audience = match scope.as_str() {
+            scope if scope.starts_with("https://mtsvc.fl.teams.microsoft.com/teams.mt.readwrite") => "spaces",
             scope if scope.starts_with("https://api.spaces.skype.com/.default ")
                 || scope.starts_with("https://gov.teams.microsoft.us/.default ")
                 || scope.starts_with("https://dod.teams.microsoft.us/.default ")
@@ -536,8 +537,14 @@ impl Fake {
             scope if scope.starts_with("https://substrate.office.com/.default ") => "substrate",
             _ => return answer("400 Bad Request", json!({"error": "invalid_scope", "error_description": "AADSTS70011: The provided value for the input parameter 'scope' is not valid."})),
         };
+        let personal = scope.starts_with("https://mtsvc.fl.teams.microsoft.com/teams.mt.readwrite");
+        let client_ok = if personal {
+            asked.get("client_id").map(String::as_str) == Some("8ec6bc83-69c8-4392-8f08-b3c986009232")
+        } else {
+            asked.get("client_id").map(String::as_str) == Some("1fec8e78-bce4-4aaf-ab1b-5451cc387264")
+        };
         let shaped = asked.get("grant_type").map(String::as_str) == Some("refresh_token")
-            && asked.get("client_id").map(String::as_str) == Some("1fec8e78-bce4-4aaf-ab1b-5451cc387264")
+            && client_ok
             && scope.ends_with(" openid profile offline_access");
         if tenant == GUEST || !shaped || !presented.starts_with("rt-") {
             return answer("400 Bad Request", json!({
@@ -1727,15 +1734,28 @@ impl World {
         let dir = std::path::absolute(format!("/tmp/tinyclient-teams-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         // What the sign-in helper prints for someone who is also a guest in a second tenant.
-        let mut session = json!({
-            "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "user_agent": agent(),
-            "oid": "00000000-0000-4000-8000-0000000000aa", "name": "Me Myself", "upn": "me@contoso.com",
-            "tenants": [
-                {"id": HOME, "name": "Contoso", "refresh_token": "rt-0"},
-                {"id": GUEST, "name": "Fabrikam", "refresh_token": "rt-guest"},
-            ],
-        });
-        if let Some(cloud) = cloud {
+        // A personal account is one consumer tenant, on the consumer client and scope.
+        let mut session = if cloud == Some("personal") {
+            json!({
+                "client_id": "8ec6bc83-69c8-4392-8f08-b3c986009232", "personal": true, "cloud": "personal",
+                "user_agent": agent(), "oid": "msa-oid", "name": "Pat Live", "upn": "pat@live.com",
+                "tenants": [{
+                    "id": "9188040d-6c67-4c5b-b112-36a304b66dad", "name": "Personal",
+                    "refresh_token": "rt-personal", "client_id": "8ec6bc83-69c8-4392-8f08-b3c986009232",
+                    "personal": true, "cloud": "personal",
+                }],
+            })
+        } else {
+            json!({
+                "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "user_agent": agent(),
+                "oid": "00000000-0000-4000-8000-0000000000aa", "name": "Me Myself", "upn": "me@contoso.com",
+                "tenants": [
+                    {"id": HOME, "name": "Contoso", "refresh_token": "rt-0"},
+                    {"id": GUEST, "name": "Fabrikam", "refresh_token": "rt-guest"},
+                ],
+            })
+        };
+        if let Some(cloud) = cloud.filter(|cloud| *cloud != "personal") {
             session["cloud"] = json!(cloud);
         }
         let log = if std::env::var_os("TINYCLIENT_TEST_LOG").is_some() { Stdio::inherit() } else { Stdio::null() };
@@ -1862,6 +1882,31 @@ impl Drop for World {
 fn ranges(message: &Message) -> Vec<(&str, &Style)> {
     let cut = |span: &protocol::Span| &message.text[span.start as usize..span.end as usize];
     message.spans.iter().map(|span| (cut(span), &span.style)).collect()
+}
+
+#[test]
+fn a_personal_account_asks_the_consumer_authz_and_scope() {
+    let world = World::start_with_cloud(Some("personal"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let authz = world.fake.calls("POST", "/api/auth/v1.0/authz/consumer");
+        let tokens = world.fake.tokens.lock().unwrap().clone();
+        let spaces = tokens.iter().any(|(_, audience, _, _)| audience == "spaces");
+        if !authz.is_empty() && spaces {
+            let token_calls = world.fake.calls("POST", "/oauth2/v2.0/token");
+            let spaces_token = token_calls.iter().find(|call| call.body.contains("teams.mt.readwrite"));
+            let Some(spaces_token) = spaces_token else {
+                panic!("no consumer spaces token among {token_calls:?}");
+            };
+            assert!(spaces_token.body.contains("8ec6bc83-69c8-4392-8f08-b3c986009232"), "{}", spaces_token.body);
+            assert!(!spaces_token.body.contains("api.spaces.skype.com"), "{}", spaces_token.body);
+            assert!(authz.iter().all(|call| call.path.ends_with("/api/auth/v1.0/authz/consumer")));
+            assert!(world.fake.calls("POST", "/api/authsvc/v1.0/authz").is_empty());
+            return;
+        }
+        assert!(Instant::now() < deadline, "personal sign-in never asked the consumer authz");
+        sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]

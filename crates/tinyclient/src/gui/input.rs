@@ -1340,11 +1340,10 @@ impl Shaping {
         let mut rows = Vec::new();
         let mut line_start = 0;
         for line in text.split('\n') {
-            // A phone's placeholder is a single line and the field clips it: end it in an
-            // ellipsis rather than a letter cut in half at the edge. The desktop keeps the
-            // clip it has always had, so its fields do not change.
-            let line = match (placeholder && crate::gui::phone::active(), room) {
-                (true, Some(room)) => fitted(line, room, self, window),
+            // A placeholder is a single line and the field clips it: end it in an ellipsis
+            // rather than cutting a letter in half at the edge on both desktop and phone.
+            let line = match (placeholder, room) {
+                (true, Some(room)) if room > px(0.) => fitted(line, room, self, window),
                 _ => line.to_owned(),
             };
             // Cut points where the color or the underline changes. A Discord draft uses the
@@ -1587,7 +1586,14 @@ impl Element for TextElement {
         let line_height = window.line_height();
         let input = self.input.read(cx);
         let multiline = input.editor.is_multiline();
-        let laid = Rc::new(shaping.lay_out(input, Some(bounds.size.width), window));
+        let initial = shaping.lay_out(input, Some(bounds.size.width), window);
+        // When multiline text scrolls, reserve an 8px right gutter so the 4px scrollbar thumb
+        // never paints over wrapped characters.
+        let laid = if multiline && line_height * initial.rows.len() as f32 > bounds.size.height {
+            Rc::new(shaping.lay_out(input, Some((bounds.size.width - px(8.)).max(px(1.))), window))
+        } else {
+            Rc::new(initial)
+        };
         let empty = input.editor.text().is_empty();
         let selection = if empty { 0..0 } else {
             let selected = input.editor.selection();

@@ -34,7 +34,9 @@ When the server offers `e2ee_calls`, the same MLS group seals Opus and the H.264
 
 A camera is one H.264 layer on the voice connection (rid `100`). Go Live is a second voice connection. It sends the screen at the quality that was picked: 720p at 15 frames a second, 1080p at 30, or 1440p at 60. It does not open a microphone. Watching someone else's share is a third connection that only receives. The voice connection stays up the whole time. The stream's MLS group is the stream server id minus one, not the channel id. On desktop, received Discord video (the active speaker's camera, debounced by 800 ms, or a watched Go Live share) renders in the call picture area above the conversation or in the compact dock preview, one decoded picture at a time.
 
-DAVE seals the picture as well as the voice. The transport encryption is the same AES-GCM or XChaCha the voice already uses. The client offers H.264 and does not offer another video codec. There is no simulcast, no AV1, VP8 or VP9, no system audio on the share, and no clips. A stage is still not joined.
+When you watch a Go Live stream with sound, its Opus audio plays through the call's selected output. The stream tile has its own volume and mute controls. Deafening silences the stream, and muting your microphone leaves it playing. DAVE on the watch connection opens the stream's sound and picture.
+
+DAVE seals the picture as well as the voice. The transport encryption is the same AES-GCM or XChaCha the voice already uses. The client offers H.264 and does not offer another video codec. There is no simulcast, no AV1, VP8 or VP9, no system audio on shares sent by tinyclient, and no clips. A stage is still not joined.
 
 ## Hand-off
 
