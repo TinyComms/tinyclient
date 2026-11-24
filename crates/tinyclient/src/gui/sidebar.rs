@@ -2171,12 +2171,13 @@ impl Shell {
             .and_then(|peer| self.people_state.hub().person(&Key { id: peer.clone(), ..c.key.clone() }))
             .map(|person| person.emoji)
             .filter(|emoji| !emoji.is_empty());
-        // The `4/12` is a native voice channel. A stage trails "Live · n speaking" instead.
-        let count = if stage {
-            None
-        } else {
-            inside.and_then(|row| voice_count(row.total, if c.call == CallSupport::Native { c.limit } else { 0 }))
-        };
+        // A Slack row with a huddle running wears headphones (`02-discord-slack` §4: 14, `text_soft`),
+        // and says who is in it when hovered.
+        let huddle = huddle_live(c.key.network, inside);
+        let hovers = huddle.then(|| inside.map(|inside| super::call::named_in(inside, "huddle"))).flatten();
+        // The `4/12` is a native voice channel. A stage trails "Live · n speaking" instead, and
+        // a Slack row with a huddle its headphones.
+        let count = occupied_count(stage, huddle, inside, if c.call == CallSupport::Native { c.limit } else { 0 });
         let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., faint));
         let (picked, menu_row) = (c.clone(), c.clone());
         let ours = self
@@ -2211,6 +2212,7 @@ impl Shell {
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
             .child(div().flex_1())
             .children(show_join.then(|| self.join_pill(c, cx)))
+            .children(huddle.then(|| glyph("icons/headphones.svg", 14., theme::text_soft())))
             .children(draft)
             .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph(count_icon, 12., faint)).child(div().type_micro().text_color(if soft { theme::text_soft() } else { faint }).child(count))))
             .children(live.map(|line| div().flex_none().type_micro().text_color(faint).child(line)))
@@ -2223,8 +2225,12 @@ impl Shell {
             _ => theme::ROW_TWO,
         };
         let drop = c.clone();
-        list_row(row_id("tree", &c.key), theme::row_height(height), selected, focused, content)
-            .when(c.key.network == Network::Discord && joins_from_list(c), |row| row
+        let row = list_row(row_id("tree", &c.key), theme::row_height(height), selected, focused, content);
+        let row = match hovers {
+            Some(words) => row.tooltip(tip(words, None)),
+            None => row,
+        };
+        row.when(c.key.network == Network::Discord && joins_from_list(c), |row| row
                 .drag_over::<VoiceMove>(|style, _, _, _| style.bg(theme::accent_soft()))
                 .on_drop(cx.listener(move |this, dragged: &VoiceMove, _, cx| {
                     if this.voice_move_rooms(&dragged.channel).iter().any(|room| room.key == drop.key) {
@@ -6903,6 +6909,22 @@ fn voice_count(total: u32, limit: u32) -> Option<(String, bool)> {
     })
 }
 
+/// A Slack conversation with a huddle running: it shows headphones where a voice channel shows
+/// who is in it, as the official app does. No other row does.
+fn huddle_live(network: Network, inside: Option<&Occupants>) -> bool {
+    network == Network::Slack && inside.is_some_and(|inside| inside.total > 0)
+}
+
+/// What a row with people in it trails: the count, `4/12` for a native voice channel with a
+/// limit. A stage trails its live words instead, and a Slack row with a huddle its headphones.
+fn occupied_count(stage: bool, huddle: bool, inside: Option<&Occupants>, limit: u32) -> Option<(String, bool)> {
+    if stage || huddle {
+        None
+    } else {
+        inside.and_then(|row| voice_count(row.total, limit))
+    }
+}
+
 /// A stage channel's trailing words: only who is on stage counts, the audience does not.
 /// Nobody on stage reads as an empty channel, so nothing (`02` §4).
 pub(super) fn discord_voice_status(row: &Conversation) -> Option<String> {
@@ -7337,6 +7359,54 @@ pub(crate) mod tests {
         assert!(!empty_voice_row(ConversationKind::Voice, true, true, true, false));
         // Non-voice rows are untouched.
         assert!(!empty_voice_row(ConversationKind::Channel, true, false, true, false));
+    }
+
+    /// Who is in a huddle, by name.
+    fn seated(names: &[&str]) -> Occupants {
+        Occupants {
+            people: names
+                .iter()
+                .map(|name| protocol::Occupant {
+                    person: row(name, ConversationKind::Channel).key,
+                    name: (*name).to_owned(),
+                    avatar: None,
+                    muted: false,
+                    deafened: false,
+                    server_muted: false,
+                    server_deafened: false,
+                    suppressed: false,
+                    streaming: false,
+                    camera: false,
+                    speaking: false,
+                    hand_raised: false,
+                    is_channel: false,
+                })
+                .collect(),
+            total: names.len() as u32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_slack_row_in_a_huddle_wears_headphones_where_a_voice_row_counts() {
+        let two = seated(&["Ana", "Ben Ito"]);
+        // Slack with a huddle running: the mark, and no speaker count beside it.
+        let live = huddle_live(Network::Slack, Some(&two));
+        assert!(live);
+        assert_eq!(occupied_count(false, live, Some(&two), 0), None);
+        // No huddle, nobody in it, or another network: nothing.
+        assert!(!huddle_live(Network::Slack, None));
+        assert!(!huddle_live(Network::Slack, Some(&Occupants::default())));
+        for network in [Network::Tiny, Network::Discord, Network::Signal, Network::Telegram, Network::Teams, Network::Messages] {
+            assert!(!huddle_live(network, Some(&two)), "{network:?}");
+        }
+        // Any other row with people in it trails what it did.
+        assert_eq!(occupied_count(false, false, Some(&two), 0), Some(("2".to_owned(), false)));
+        assert_eq!(occupied_count(false, false, Some(&two), 12), Some(("2/12".to_owned(), true)));
+        assert_eq!(occupied_count(false, false, None, 12), None);
+        assert_eq!(occupied_count(true, false, Some(&two), 12), None, "a stage trails its live words instead");
+        // The mark stands for who is in it: the row says so when hovered.
+        assert_eq!(super::super::call::named_in(&two, "huddle"), "Ana and Ben are in this huddle");
     }
 
     #[test]

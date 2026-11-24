@@ -967,15 +967,38 @@ fn incoming_action(snapshot: &Snapshot) -> Option<(&Call, bool)> {
 
 /// The names of who is in a conversation's call, for a tooltip: "Iris, Jun and 1 more".
 fn named(occupants: &Occupants) -> String {
+    named_in(occupants, "call")
+}
+
+/// The same, of what they are in: a call, or a Slack huddle.
+pub(in crate::gui) fn named_in(occupants: &Occupants, what: &str) -> String {
     let first = |name: &str| name.split_whitespace().next().unwrap_or(name).to_owned();
     let names: Vec<String> = occupants.people.iter().take(2).map(|who| first(&who.name)).collect();
     let more = (occupants.total as usize).saturating_sub(names.len());
     match (names.as_slice(), more) {
-        ([], _) => format!("{} people are in this call", occupants.total),
-        ([one], 0) => format!("{one} is in this call"),
-        ([one, two], 0) => format!("{one} and {two} are in this call"),
-        (names, more) => format!("{} and {more} more are in this call", names.join(", ")),
+        ([], _) => format!("{} people are in this {what}", occupants.total),
+        ([one], 0) => format!("{one} is in this {what}"),
+        ([one, two], 0) => format!("{one} and {two} are in this {what}"),
+        (names, more) => format!("{} and {more} more are in this {what}", names.join(", ")),
     }
+}
+
+/// What joins a Slack huddle by, in the header and in the bar under it.
+pub(in crate::gui) const JOIN_HUDDLE: &str = "Join in Slack";
+
+/// A Slack conversation whose huddle is running: the header offers joining it in Slack, as a
+/// native row's offers joining the call here. No other row handed off does, and a Slack row
+/// with no huddle keeps its quiet pill.
+fn running_huddle(open: &protocol::Conversation) -> Option<&Occupants> {
+    (open.key.network == Network::Slack && open.call == CallSupport::Handoff)
+        .then_some(open.occupants.as_ref())
+        .flatten()
+        .filter(|inside| inside.total > 0)
+}
+
+/// That pill's words: "Join in Slack · 2".
+fn join_huddle(total: u32) -> String {
+    format!("{JOIN_HUDDLE} · {total}")
 }
 
 /// Starts the `chatd` beside this binary when the window runs from `tinyclient.app` and no chatd
@@ -4013,6 +4036,22 @@ impl Shell {
             // Never says "Call": it is a different object, and it starts nothing here.
             // Slack shows a headphones glyph and "Huddle" so it reads as a call, not just a logo.
             CallSupport::Handoff => {
+                // A Slack huddle that is running is joined in Slack, and the pill says so with
+                // who is in it, the way a native row's running call says "Join call". Until
+                // huddles are carried here (#575), pressing it hands the huddle to Slack.
+                if let Some(there) = running_huddle(open) {
+                    let hint = named_in(there, "huddle");
+                    return Some(
+                        pill.when(!phone, |pill| pill.bg(theme::accent_soft()))
+                            .border_color(gpui::transparent_black())
+                            .text_color(theme::accent())
+                            .hover(|style| style.bg(theme::accent_wash()))
+                            .tooltip(tip(hint, None))
+                            .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx)))
+                            .child(icon("icons/headphones.svg", glyph(14.), theme::accent(), None))
+                            .children(words(join_huddle(there.total).into())),
+                    );
+                }
                 let (glyph_icon, label) = handoff_pill_parts(network);
                 let hint = handoff_tooltip(network);
                 let leading = match glyph_icon {
@@ -4095,6 +4134,66 @@ mod tests {
         assert_eq!(handoff_pill_parts(Network::Teams), (None, "Open in Teams".to_owned()));
         assert_eq!(handoff_toast(Network::Slack), "Opened in Slack");
         assert_eq!(handoff_toast(Network::Teams), "Opened in Teams");
+    }
+
+    /// Who is in a huddle, by name.
+    fn seated(names: &[&str]) -> Occupants {
+        Occupants {
+            people: names
+                .iter()
+                .map(|name| Occupant {
+                    person: key(name),
+                    name: (*name).to_owned(),
+                    avatar: None,
+                    muted: false,
+                    deafened: false,
+                    server_muted: false,
+                    server_deafened: false,
+                    suppressed: false,
+                    streaming: false,
+                    camera: false,
+                    speaking: false,
+                    hand_raised: false,
+                    is_channel: false,
+                })
+                .collect(),
+            total: names.len() as u32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_slack_row_with_a_live_huddle_offers_joining_it_in_slack_and_nothing_else_changes() {
+        let mut row = protocol::Conversation::new(
+            Key { network: Network::Slack, account: "acme".into(), id: "C0GEN".into() },
+            ConversationKind::Channel,
+            "#general",
+        );
+        row.call = CallSupport::Handoff;
+        // No huddle running: the quiet pill, as before.
+        assert!(running_huddle(&row).is_none());
+        row.occupants = Some(seated(&["Ana", "Ben Ito"]));
+        let there = running_huddle(&row).expect("a live huddle");
+        assert_eq!(
+            (join_huddle(there.total), named_in(there, "huddle"), named(there)),
+            ("Join in Slack · 2".to_owned(), "Ana and Ben are in this huddle".to_owned(), "Ana and Ben are in this call".to_owned())
+        );
+        // One person reads as one.
+        assert_eq!(join_huddle(seated(&["Ana"]).total), "Join in Slack · 1");
+        // Another network's hand-off row says what it did.
+        row.key.network = Network::Teams;
+        assert!(running_huddle(&row).is_none());
+        // A Slack row whose call is carried here keeps its own "Join call".
+        row.key.network = Network::Slack;
+        row.call = CallSupport::Native;
+        assert!(running_huddle(&row).is_none());
+        // A huddle nobody is in is no huddle.
+        row.call = CallSupport::Handoff;
+        row.occupants = Some(Occupants::default());
+        assert!(running_huddle(&row).is_none());
+        // With no occupants at all, neither.
+        row.occupants = None;
+        assert!(running_huddle(&row).is_none());
     }
 
     #[test]
