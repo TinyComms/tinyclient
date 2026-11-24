@@ -20,7 +20,12 @@ use protocol::{
     Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, Network, Request,
 };
 
+#[cfg(target_os = "macos")]
 const SETTINGS: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+#[cfg(target_os = "windows")]
+const SETTINGS: &str = "ms-settings:privacy-microphone";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const SETTINGS: &str = "";
 /// Dock insets (8 + 8) plus the card's own padding (9 + 9). The name line is this much
 /// narrower than the sidebar, and nothing else sits on it.
 const CARD_INSET: f32 = 34.;
@@ -1270,8 +1275,8 @@ impl Shell {
 
     /// Compact sidebar dock card shown while the main-pane call stage is open: keeps the call's
     /// identity, lock/signal/duration, any dock-only actions with no twin on the stage bar
-    /// (Ring again, Copy call link, Telegram video-chat options), and Show chat / Leave without
-    /// duplicating mute, deafen, share, camera, or call options.
+    /// (Ring again, Copy call link, Telegram video-chat options), and Leave without duplicating
+    /// mute, deafen, share, camera, call options, or the stage header's Show chat button.
     fn call_compact_stage(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
         let place = subject
             .space
@@ -1312,22 +1317,6 @@ impl Shell {
             .call_tg_actions_button(call, subject, joined, enabled, menu.as_ref(), cx)
             .map(|btn| btn.w(px(34.)).h(px(30.)));
         let in_live_call = in_call(call);
-        let show_chat = worded(
-            "call-dock-show-chat",
-            Some("icons/message-square.svg"),
-            "Show chat",
-            theme::hover(),
-            theme::text(),
-        )
-        .flex_1()
-        .min_w_0()
-        .h(px(30.))
-        .hover(|style| style.bg(theme::selected()))
-        .tooltip(tip("Return to chat while staying in the call", None))
-        .on_click(cx.listener(|this, _, _, cx| {
-            cx.stop_propagation();
-            this.call_close_view(cx);
-        }));
         let end = if in_live_call {
             leave().w(px(40.)).h(px(30.))
         } else {
@@ -1364,11 +1353,10 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .child(show_chat)
                     .children(ring_again)
                     .children(copy_link)
                     .children(tg_actions)
-                    .child(end),
+                    .child(end.ml_auto()),
             )
             .children(self.call_popover(call, subject, Place::Dock, cx))
     }
@@ -1494,7 +1482,7 @@ impl Shell {
                 (260., self.call_person_menu(account.clone(), user_id, name, cx).p(px(6.)))
             }
             (_, Menu::TelegramCall) if joined => {
-                (260., self.telegram_call_menu(call, cx).p(px(6.)))
+                (280., self.telegram_call_menu(call, cx).p(px(6.)))
             }
             _ => return None,
         };
@@ -1503,20 +1491,23 @@ impl Shell {
         Some(
             deferred(
                 div()
-                    .id("call-popover")
                     .absolute()
                     .left(px(-1.))
                     .bottom(relative(1.))
                     .pb(px(6.))
-                    .w(px(width))
-                    .rounded(px(12.))
-                    .bg(theme::overlay())
-                    .border_1()
-                    .border_color(theme::border())
-                    .shadow(theme::shadow_popover())
-                    .occlude()
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
-                    .child(body),
+                    .child(
+                        div()
+                            .id("call-popover")
+                            .w(px(width))
+                            .rounded(px(12.))
+                            .bg(theme::overlay())
+                            .border_1()
+                            .border_color(theme::border())
+                            .shadow(theme::shadow_popover())
+                            .occlude()
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
+                            .child(body),
+                    ),
             )
             .priority(1)
             .into_any_element(),
@@ -1709,9 +1700,7 @@ impl Shell {
             (CallState::Joined, _) if subject.kind == ConversationKind::Group && call.participants.is_empty() => {
                 "Waiting for others".to_owned()
             }
-            _ if call.move_notice.as_ref().is_some_and(|words| !words.is_empty())
-                && std::env::var("TINYCLIENT_SHOT_CALL").ok().as_deref() == Some("moved_notice") =>
-            {
+            _ if call.move_notice.as_ref().is_some_and(|words| !words.is_empty()) => {
                 call.move_notice.clone().unwrap_or_default()
             }
             _ => place.to_owned(),
@@ -2039,20 +2028,20 @@ impl Shell {
             .flex_wrap()
             .items_center()
             .gap(px(4.))
-            .child(mute.when(in_live_call, |button| button.flex_1().min_w_0()))
+            .child(mute.when(in_live_call, |button| button.flex_1().min_w(px(36.))))
             // Deafen is for a call that is up; before that only mute and devices can be preset.
-            .when(in_live_call, |row| row.child(deafen.flex_1().min_w_0()))
-            .children(share.map(|button| button.flex_1().min_w_0()))
-            .children(camera.map(|button| button.flex_1().min_w_0()))
-            .children(raise_hand.map(|button| button.flex_1().min_w_0()))
-            .children(ring_again.map(|button| button.flex_1().min_w_0()))
-            .children(add_people.map(|button| button.flex_1().min_w_0()))
-            .children(tg_actions.map(|button| button.flex_1().min_w_0()))
-            .children(copy_link.map(|button| button.flex_1().min_w_0()))
-            .children(soundboard.map(|button| button.flex_1().min_w_0()))
-            .child(devices.when(in_live_call, |button| button.flex_1().min_w_0()))
+            .when(in_live_call, |row| row.child(deafen.flex_1().min_w(px(36.))))
+            .children(share.map(|button| button.flex_1().min_w(px(36.))))
+            .children(camera.map(|button| button.flex_1().min_w(px(36.))))
+            .children(raise_hand.map(|button| button.flex_1().min_w(px(36.))))
+            .children(ring_again.map(|button| button.flex_1().min_w(px(36.))))
+            .children(add_people.map(|button| button.flex_1().min_w(px(36.))))
+            .children(tg_actions.map(|button| button.flex_1().min_w(px(36.))))
+            .children(copy_link.map(|button| button.flex_1().min_w(px(36.))))
+            .children(soundboard.map(|button| button.flex_1().min_w(px(36.))))
+            .child(devices.when(in_live_call, |button| button.flex_1().min_w(px(36.))))
             .child(
-                end.when(in_live_call, |button| button.flex_1().min_w_0())
+                end.when(in_live_call, |button| button.flex_1().min_w(px(36.)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         if in_live_call {
@@ -2163,7 +2152,9 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx))),
                 Act::Settings => plain("call-settings")
                     .on_click(cx.listener(|_, _, _, cx| {
-                        cx.background_executor().spawn(async { open(SETTINGS) }).detach();
+                        if !SETTINGS.is_empty() {
+                            cx.background_executor().spawn(async { open(SETTINGS) }).detach();
+                        }
                     }))
                     .child("Open System Settings"),
             }

@@ -496,6 +496,12 @@ pub(in crate::gui) fn streams(stage: &Stage, me: &str, sending: Option<Sending>)
     found
 }
 
+/// Screen shares get their own 16:9 tile on the stage grid; webcams render directly inside each
+/// participant's person tile so a camera never appears twice.
+pub(in crate::gui) fn separate_stream_tile(stream: &Stream) -> bool {
+    stream.share
+}
+
 /// Above this many participants, the stage grid keeps active speakers, streams, and `me` up to
 /// this cap so tiles never shrink without bound, and moves silent listeners into a scrollable
 /// roster list underneath.
@@ -946,7 +952,7 @@ mod tests {
             space: None,
             occupied: 3,
         };
-        let stage = Stage::of_call(&group_call, &subject, "me", "Ada");
+        let stage = Stage::of_call(&group_call, &subject, "me", "Ada", None);
         assert!(stage.video, "Signal group calls allow camera and screen share");
         assert_eq!(stage.seats.len(), 3);
         let grace = stage.seats.iter().find(|s| s.id == "grace").unwrap();
@@ -957,5 +963,14 @@ mod tests {
         assert!(alan.sharing);
         let me = stage.seats.iter().find(|s| s.me).unwrap();
         assert!(me.hand_raised && me.reaction.as_deref() == Some("👍"));
+    }
+
+    #[test]
+    fn only_screen_shares_emit_separate_stream_tiles() {
+        let stage = stage_of(vec![seat("ada", false, true), seat("bev", true, false)]);
+        let found = streams(&stage, "me", None);
+        assert_eq!(found.len(), 2);
+        assert!(!separate_stream_tile(&found[0]), "camera renders inside the person tile");
+        assert!(separate_stream_tile(&found[1]), "screen share gets its own stream tile");
     }
 }

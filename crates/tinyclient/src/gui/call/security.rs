@@ -355,7 +355,6 @@ impl Shell {
             let panel = div()
                 .id(("call-security-popover", place as usize))
                 .absolute()
-                .left(px(-4.))
                 .w(px(320.))
                 .rounded(px(12.))
                 .bg(theme::overlay())
@@ -365,7 +364,11 @@ impl Shell {
                 .occlude()
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
                 .child(self.call_security_panel(call, cx));
-            let panel = if place == Place::TopBar { panel.top(px(30.)) } else { panel.bottom(px(30.)) };
+            let panel = if place == Place::TopBar {
+                panel.top(px(30.)).right(px(-4.))
+            } else {
+                panel.bottom(px(30.)).left(px(-4.))
+            };
             indicator = indicator.relative().child(deferred(panel).priority(1));
         }
         Some(indicator.into_any_element())
@@ -639,10 +642,10 @@ impl Shell {
                 .children(SERVER_SEES.iter().map(|seen| words(format!("· {seen}"), theme::text_soft())))
                 .child(words("It cannot hear what is said.".to_owned(), theme::text_soft())),
         );
-        if security.members.is_empty() {
+        if discord || security.members.is_empty() {
             return panel;
         }
-        let mut detail = div().flex().flex_col().gap(px(8.)).child(label(if discord { "VERIFICATION CODE" } else { "SAFETY NUMBERS" }));
+        let mut detail = div().flex().flex_col().gap(px(8.)).child(label("SAFETY NUMBERS"));
         for member in &security.members {
             let name = member_name(call, &member.user_id);
             let mut row = div()

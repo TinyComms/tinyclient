@@ -286,18 +286,21 @@ fn stream_button(id: impl Into<gpui::ElementId>, icon: &'static str, words: impl
         .child(glyph(icon, 15., theme::text()))
 }
 
-/// The red LIVE mark and whose stream it is, at a stream's foot.
-fn caption(words: String, small: bool) -> Div {
+/// Label at a tile or stream's foot. Screen shares carry the red LIVE mark; webcam tiles show
+/// the person's name pill (including in the compact Strip row) without LIVE.
+fn caption(words: String, small: bool, live: bool, lift_for_strip: bool) -> Div {
     div()
         .absolute()
-        .bottom(px(if small { 6. } else { 10. }))
+        .bottom(px(if lift_for_strip { 136. } else if small { 6. } else { 10. }))
         .left(px(if small { 6. } else { 10. }))
-        .max_w(px(if small { 140. } else { 360. }))
+        .max_w(px(if small { 138. } else { 360. }))
         .flex()
         .items_center()
         .gap(px(6.))
-        .child(chip("LIVE", theme::on_accent(), theme::danger_fill()).font_weight(theme::SEMIBOLD))
-        .when(!small, |row| {
+        .when(live, |row| {
+            row.child(chip("LIVE", theme::on_accent(), theme::danger_fill()).font_weight(theme::SEMIBOLD))
+        })
+        .when(!small || !live, |row| {
             row.child(
                 div()
                     .min_w_0()
@@ -499,22 +502,10 @@ impl Shell {
                 div()
                     .min_w_0()
                     .max_w(px(260.))
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .truncate()
-                            .type_title()
-                            .text_color(theme::text())
-                            .child(subject.title.clone()),
-                    )
-                    .children((!call.stage_topic.is_empty()).then(|| {
-                        div().truncate().type_micro().text_color(theme::text_soft()).child(call.stage_topic.clone())
-                    }))
-                    .children(call.activity.as_ref().map(|activity| {
-                        div().truncate().type_micro().text_color(theme::text_soft()).child(super::discord_ux::activity_line(&activity.name))
-                    })),
+                    .truncate()
+                    .type_title()
+                    .text_color(theme::text())
+                    .child(subject.title.clone()),
             )
             .children(place_chip.filter(|_| roomy))
             .children(voice_status.map(|status| self.voice_status_line(&call.conversation, &status, cx)))
@@ -552,16 +543,11 @@ impl Shell {
             }))
         });
         let streams = stage::streams(&stage, &me_id, sending_now(Some(&call)));
-        // Remember an explicit grid choice on this call so an incoming video frame doesn't
-        // immediately restore the automatic direct-call picture-in-picture layout.
-        let grid_choice = window.use_keyed_state(
-            SharedString::from(format!("call-view-grid-choice:{:?}", call.conversation)),
-            cx,
-            |_, _| false,
-        );
-        let auto_peer_video = !*grid_choice.read(cx);
+        let auto_peer_video = self.call_state.grid_choice_for.as_ref() != Some(&call.conversation);
+        let has_peer_video = self.call_peer_video(&stage, &streams, Some(&call)).is_some();
         let focused = stage::still(self.call_state.focus.as_ref(), &stage, &streams).is_some()
-            || (auto_peer_video && self.call_peer_video(&stage, &streams, Some(&call)).is_some());
+            || (auto_peer_video && has_peer_video);
+        let layout_key = call.conversation.clone();
         let layout_toggle = (focused || stage.seats.len() > 1).then(|| {
             let target = streams.iter().find(|stream| !stream.mine && stream.watchable)
                 .or_else(|| streams.iter().find(|stream| stream.mine))
@@ -581,10 +567,15 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if focused {
-                        grid_choice.update(cx, |choice, _| *choice = true);
+                        this.call_state.grid_choice_for = Some(layout_key.clone());
                         this.call_keep_keys(window, cx);
                         this.call_state.focus = None;
                         this.call_sync_watch_now(cx);
+                        cx.notify();
+                    } else if has_peer_video {
+                        this.call_state.grid_choice_for = None;
+                        this.call_state.focus = None;
+                        this.call_keep_keys(window, cx);
                         cx.notify();
                     } else if let Some(stream) = &target {
                         this.call_open_stream(&stream.user_id, stream.mine, window, cx);
@@ -616,7 +607,10 @@ impl Shell {
             .children(voice_details.then(|| icon_button("call-voice-region", "icons/info.svg", false)
                 .tooltip(tip("Connection details", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, _, cx| this.open_discord_voice_settings(details_key.clone(), false, cx)))))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_discord_voice_settings(details_key.clone(), false, cx);
+                }))))
             .children(add_people)
             .children(layout_toggle)
             .children(popout)
@@ -632,7 +626,7 @@ impl Shell {
             None
         };
         let banner = self.call_view_banner_inner(&subject.title, &call, false, cx);
-        let stage_el = self.call_stage_inner(&stage, &people, Some(&call), false, auto_peer_video, cx);
+        let stage_el = self.call_stage_inner(&stage, &people, Some(&call), false, cx);
         let controls = self.call_view_bar(
             Some(&call),
             &ViewBar {
@@ -729,16 +723,19 @@ impl Shell {
                     .into_any_element()
             })
         } else {
-            let word = if matches!(call.state, CallState::Connecting | CallState::RingingOut) {
-                "Cancel"
-            } else {
-                "Leave"
-            };
+            let connecting = matches!(call.state, CallState::Connecting | CallState::RingingOut);
+            let word = if connecting { "Cancel" } else { "Leave" };
             Some(
                 button_with_icon("tiny-banner-leave", ButtonKind::Danger, "icons/phone-off.svg", word)
                     .h(px(30.))
                     .tooltip(tip(word, Some("⌘⇧H")))
-                    .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if connecting {
+                            this.call_leave(cx);
+                        } else {
+                            this.telegram_leave_or_end(cx);
+                        }
+                    }))
                     .into_any_element(),
             )
         };
@@ -840,7 +837,7 @@ impl Shell {
         room_context: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.call_stage_inner(stage, people, call, room_context, true, cx)
+        self.call_stage_inner(stage, people, call, room_context, cx)
     }
 
     fn call_peer_video<'a>(&self, stage: &Stage, streams: &'a [Stream], call: Option<&Call>) -> Option<&'a Stream> {
@@ -859,11 +856,12 @@ impl Shell {
         people: &dyn People,
         call: Option<&Call>,
         room_context: bool,
-        auto_peer_video: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let me = stage.me_id().unwrap_or("");
         let streams = stage::streams(stage, me, sending_now(call));
+        let has_share_tiles = streams.iter().any(stage::separate_stream_tile);
+        let auto_peer_video = call.is_none_or(|c| self.call_state.grid_choice_for.as_ref() != Some(&c.conversation));
         #[cfg(feature = "gui-shot")]
         let shot_focus = super::shot::focus();
         #[cfg(not(feature = "gui-shot"))]
@@ -887,7 +885,7 @@ impl Shell {
                 // Direct 1:1 video call: if the peer has a live frame on screen, draw it large
                 // with my own camera/tile in the corner.
                 if let Some(peer_stream) = auto_peer_video.then(|| self.call_peer_video(stage, &streams, call)).flatten() {
-                    let main = self.call_stream_view(stage, people, peer_stream, call, false, cx);
+                    let main = self.call_stream_view(stage, people, peer_stream, call, false, true, cx);
                     let self_frame = self
                         .call_self_frame(call, false)
                         .or_else(|| self.call_self_frame(call, true));
@@ -914,7 +912,7 @@ impl Shell {
                 }
                 let (grid_seats, roster_seats) =
                     stage::partition_stage(&stage.seats, &streams, me, stage::STAGE_GRID_CAP);
-                let size = Size::grid(avail_w, grid_seats.len(), !streams.is_empty());
+                let size = Size::grid(avail_w, grid_seats.len(), has_share_tiles);
                 let grid_tiles = self.call_tiles_for(
                     stage,
                     people,
@@ -1051,7 +1049,7 @@ impl Shell {
                     &streams,
                     call,
                     Some(&Focus::Person(focus.clone())),
-                    Size::grid(avail_w, stage.seats.len().saturating_sub(1), !streams.is_empty()),
+                    Size::grid(avail_w, stage.seats.len().saturating_sub(1), has_share_tiles),
                     room_context,
                     cx,
                 );
@@ -1076,11 +1074,12 @@ impl Shell {
                     return base.into_any_element();
                 };
                 let strip = self.call_state.strip;
-                let view = self.call_stream_view(stage, people, stream, call, false, cx);
+                let view = self.call_stream_view(stage, people, stream, call, false, false, cx);
                 let row = div()
                     .id("tiny-strip")
                     .max_w_full()
                     .overflow_x_scroll()
+                    .py(px(4.))
                     .flex()
                     .gap(px(8.))
                     .children(self.call_tiles(
@@ -1164,14 +1163,17 @@ impl Shell {
             }
             if let Some(stream) = streams
                 .iter()
-                .find(|stream| stream.user_id == seat.id)
+                .find(|stream| stream.user_id == seat.id && stage::separate_stream_tile(stream))
                 .filter(|stream| shown(Focus::Stream(stream.user_id.clone())))
             {
                 tiles.push(self.call_stream_tile(stage, people, stream, call, size, cx));
             }
         }
         // My stream before the stage lists my seat.
-        for stream in streams.iter().filter(|stream| !seats.iter().any(|seat| seat.id == stream.user_id)) {
+        for stream in streams
+            .iter()
+            .filter(|stream| stage::separate_stream_tile(stream) && !seats.iter().any(|seat| seat.id == stream.user_id))
+        {
             if shown(Focus::Stream(stream.user_id.clone())) {
                 tiles.push(self.call_stream_tile(stage, people, stream, call, size, cx));
             }
@@ -1187,6 +1189,7 @@ impl Shell {
         stream: &Stream,
         call: Option<&Call>,
         size: Size,
+        lift_stop_for_strip: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let kind = if stream.share { PictureKind::Share } else { PictureKind::Camera };
@@ -1251,25 +1254,28 @@ impl Shell {
                     .relative()
                     .child(img(frame).size_full().object_fit(ObjectFit::Contain))
                     .when(!small, |tile| {
-                        let row = div().absolute().left_0().right_0().flex().justify_center();
-                        let row = if matches!(size, Size::Grid(..)) {
-                            row.top(px(8.))
+                        let stop_box = div()
+                            .p(px(2.))
+                            .rounded(px(10.))
+                            .bg(theme::overlay())
+                            .child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()));
+                        let positioned = if matches!(size, Size::Grid(..)) {
+                            div().absolute().top(px(8.)).right(px(8.)).child(stop_box)
                         } else {
-                            row.bottom(px(10.))
+                            div()
+                                .absolute()
+                                .bottom(px(if lift_stop_for_strip { 136. } else { 10. }))
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .justify_center()
+                                .child(stop_box)
                         };
-                        tile.child(
-                            row.child(
-                                div()
-                                    .p(px(2.))
-                                    .rounded(px(10.))
-                                    .bg(theme::overlay())
-                                    .child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())),
-                            ),
-                        )
+                        tile.child(positioned)
                     })
                     .when_some(stream.share.then(|| call.and_then(|call| stage::viewer_line(&call.viewers))).flatten(), |tile, line| {
                         tile.child(
-                            div().absolute().top(px(8.)).left(px(8.)).child(
+                            div().absolute().top(px(8.)).left(px(8.)).max_w(px(if matches!(size, Size::Grid(..)) { 130. } else { 280. })).child(
                                 div()
                                     .h(px(22.))
                                     .px(px(8.))
@@ -1277,9 +1283,14 @@ impl Shell {
                                     .bg(theme::overlay())
                                     .flex()
                                     .items_center()
-                                    .type_micro()
-                                    .text_color(theme::text())
-                                    .child(line),
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .type_micro()
+                                            .text_color(theme::text())
+                                            .child(line),
+                                    ),
                             ),
                         )
                     })
@@ -1313,7 +1324,7 @@ impl Shell {
                     body.child(glyph(
                         if stream.share { "icons/monitor-up.svg" } else { "icons/video.svg" },
                         if small { 18. } else { 36. },
-                        theme::accent_text(),
+                        theme::on_accent(),
                     ))
                 })
                 .when(!small, |body| {
@@ -1323,7 +1334,7 @@ impl Shell {
                             .whitespace_normal()
                             .type_ui()
                             .font_weight(theme::SEMIBOLD)
-                            .text_color(theme::text())
+                            .text_color(theme::on_accent())
                             .child(words),
                     )
                 })
@@ -1334,12 +1345,12 @@ impl Shell {
                             .text_center()
                             .whitespace_normal()
                             .type_small()
-                            .text_color(theme::text_soft())
+                            .text_color(gpui::rgba(0xffffffb3))
                             .child(line),
                     )
                 })
                 .when_some(stream.share.then(|| call.and_then(|call| stage::viewer_line(&call.viewers))).flatten(), |body, line| {
-                    body.child(div().text_center().whitespace_normal().type_small().text_color(theme::text_soft()).child(line))
+                    body.child(div().text_center().whitespace_normal().type_small().text_color(gpui::rgba(0xffffffb3)).child(line))
                 })
                 .when(!small, |body| {
                     body.child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))
@@ -1356,7 +1367,7 @@ impl Shell {
                             .build(),
                     )
                 })
-                .child(div().type_small().text_color(theme::text_soft()).child("Camera on"))
+                .child(div().type_small().text_color(gpui::rgba(0xffffffb3)).child("Camera on"))
                 .into_any_element();
         }
         let since = self
@@ -1415,7 +1426,7 @@ impl Shell {
                         .text_center()
                         .whitespace_normal()
                         .type_small()
-                        .text_color(theme::text_soft())
+                        .text_color(gpui::rgba(0xffffffb3))
                         .child(words),
                 )
                 .children(retry)
@@ -1496,7 +1507,7 @@ impl Shell {
                 None,
             ))
             .on_click(cx.listener(move |this, _, window, cx| this.call_open_stream(&user_id, mine, window, cx)))
-            .child(self.call_stream_body(people, stream, call, size, cx))
+            .child(self.call_stream_body(people, stream, call, size, false, cx))
             .when(can_unwatch_tile, |tile| {
                 tile.child(
                     div()
@@ -1519,11 +1530,14 @@ impl Shell {
             .child(caption(
                 if mine { format!("Your {what}") } else { format!("{name}'s {what}") },
                 small,
+                stream.share,
+                false,
             ))
             .into_any_element()
     }
 
     /// The focused stream, filling the stage (or, `full`, the window).
+    #[allow(clippy::too_many_arguments)]
     fn call_stream_view(
         &self,
         _stage: &Stage,
@@ -1531,9 +1545,11 @@ impl Shell {
         stream: &Stream,
         call: Option<&Call>,
         full: bool,
+        direct_auto: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let strip = self.call_state.strip;
+        let lift_for_strip = !full && !direct_auto && strip.over && !strip.hidden;
         let name = people.name(&stream.user_id);
         let what = if stream.share { "screen" } else { "camera" };
         let user_id = stream.user_id.clone();
@@ -1549,31 +1565,34 @@ impl Shell {
                 ),
             );
         } else {
-            tools = tools
-                .child(
-                    stream_button(
-                        "tiny-stream-people",
-                        "icons/users.svg",
-                        if strip.hidden { "Show participants" } else { "Hide participants" },
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.call_set_strip(stage::Strip { hidden: !strip.hidden, ..strip }, window, cx);
-                    })),
-                )
-                .when(!strip.hidden, |tools| {
-                    tools.child(
+            if !direct_auto {
+                tools = tools
+                    .child(
                         stream_button(
-                            "tiny-stream-over",
-                            "icons/panel-bottom.svg",
-                            if strip.over { "Participants under the stream" } else { "Participants over the stream" },
+                            "tiny-stream-people",
+                            "icons/users.svg",
+                            if strip.hidden { "Show participants" } else { "Hide participants" },
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.call_set_strip(stage::Strip { over: !strip.over, ..strip }, window, cx);
+                            this.call_set_strip(stage::Strip { hidden: !strip.hidden, ..strip }, window, cx);
                         })),
                     )
-                })
+                    .when(!strip.hidden, |tools| {
+                        tools.child(
+                            stream_button(
+                                "tiny-stream-over",
+                                "icons/panel-bottom.svg",
+                                if strip.over { "Participants under the stream" } else { "Participants over the stream" },
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.call_set_strip(stage::Strip { over: !strip.over, ..strip }, window, cx);
+                            })),
+                        )
+                    });
+            }
+            tools = tools
                 .child(
                     stream_button(
                         "tiny-stream-popout",
@@ -1602,8 +1621,9 @@ impl Shell {
                 }),
             ));
         }
+        let popped_out = self.call_popout_open();
         // The pop-out window has the frame: the stage never draws the same picture twice.
-        let body: AnyElement = if self.call_popout_open() {
+        let body: AnyElement = if popped_out {
             div()
                 .size_full()
                 .flex()
@@ -1632,12 +1652,13 @@ impl Shell {
                 )
                 .into_any_element()
         } else {
-            self.call_stream_body(people, stream, call, Size::Big(FOCUS_W), cx).into_any_element()
+            self.call_stream_body(people, stream, call, Size::Big(FOCUS_W), lift_for_strip, cx).into_any_element()
         };
         let volume = call
             .filter(|_| stream.share && !mine)
             .and_then(|call| self.call_stream_volume(call, &user_id, cx))
             .map(|controls| controls.absolute().top(px(10.)).left(px(10.)));
+        let call_key = call.map(|c| c.conversation.clone());
         div()
             .id(if full { "tiny-stream-whole" } else { "tiny-stream-focused" })
             .relative()
@@ -1646,18 +1667,29 @@ impl Shell {
             .w_full()
             .when(full, |view| view.size_full())
             .when(!full, |view| view.rounded(px(12.)).border_1().border_color(theme::hairline()))
-            .bg(gpui::rgb(0x000000))
+            .bg(if popped_out { theme::raised() } else { gpui::rgb(0x000000) })
             .overflow_hidden()
             .when(!full, |view| {
                 view.cursor_pointer()
                     .tooltip(tip("Click to see everyone again (Esc)", None))
-                    .on_click(cx.listener(move |this, _, window, cx| this.call_open_stream(&user_id, mine, window, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if direct_auto {
+                            this.call_state.grid_choice_for = call_key.clone();
+                            this.call_state.focus = None;
+                            this.call_keep_keys(window, cx);
+                            cx.notify();
+                        } else {
+                            this.call_open_stream(&user_id, mine, window, cx);
+                        }
+                    }))
             })
             .child(body)
             .children(volume)
             .child(caption(
                 if mine { format!("Your {what}") } else { format!("{name}'s {what}") },
                 false,
+                stream.share,
+                lift_for_strip,
             ))
             .child(tools)
     }
@@ -1704,10 +1736,11 @@ impl Shell {
         let streams = stage::streams(stage, me, sending_now(call));
         let stream = match stage::still(self.call_state.focus.as_ref(), stage, &streams) {
             Some(Focus::Stream(user_id)) => streams.iter().find(|stream| stream.user_id == *user_id),
-            _ => None,
+            _ => self.call_peer_video(stage, &streams, call),
         };
+        let has_stream = stream.is_some();
         let inside: AnyElement = match stream {
-            Some(stream) => self.call_stream_view(stage, people, stream, call, true, cx).into_any_element(),
+            Some(stream) => self.call_stream_view(stage, people, stream, call, true, false, cx).into_any_element(),
             None => div()
                 .id("call-full-ended-scroll")
                 .flex_1()
@@ -1740,7 +1773,7 @@ impl Shell {
             .top_0()
             .left_0()
             .size_full()
-            .bg(gpui::rgb(0x000000))
+            .bg(if has_stream { gpui::rgb(0x000000) } else { theme::raised() })
             .occlude()
             .flex()
             .child(inside)
@@ -1870,30 +1903,37 @@ impl Shell {
                 if focused { "icons/x.svg" } else { "icons/pin.svg" },
                 if focused { "Stop focusing" } else { "Focus" },
             ));
-        let state_row = div()
-            .h(px(20.))
-            .flex()
-            .items_center()
-            .gap(px(4.))
-            .children(states.first().map(|words| {
-                let danger = words.starts_with("Server") || words.starts_with("Can't");
-                let priority = *words == "Priority speaker";
-                let (fg, bg) = if danger {
-                    (theme::danger(), theme::danger_soft())
-                } else if priority {
-                    (theme::accent_text(), theme::accent_soft())
-                } else {
-                    (theme::text_soft(), theme::hover())
-                };
-                chip(*words, fg, bg)
-            }))
-            .when(local_mute && !me, |row| row.child(chip("Muted for you", theme::warning(), theme::warning_soft())))
-            .children(call.and_then(|call| call.effect.as_ref()).filter(|effect| {
-                effect.user_id == seat.id && super::discord_ux::effect_visible(effect.at, super::now())
-            }).map(|effect| chip(super::discord_ux::effect_label(&effect.emoji), theme::accent_text(), theme::accent_soft())))
-            .when(percent != 100 && !local_mute && !me, |row| {
-                row.child(chip(format!("{percent} %"), theme::text_soft(), theme::hover()))
-            });
+        let effect = call.and_then(|call| call.effect.as_ref()).filter(|effect| {
+            effect.user_id == seat.id && super::discord_ux::effect_visible(effect.at, super::now())
+        });
+        let has_state = states.first().is_some()
+            || (local_mute && !me)
+            || effect.is_some()
+            || (percent != 100 && !local_mute && !me);
+        let state_row = has_state.then(|| {
+            div()
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .children(states.first().map(|words| {
+                    let danger = words.starts_with("Server") || words.starts_with("Can't");
+                    let priority = *words == "Priority speaker";
+                    let (fg, bg) = if danger {
+                        (theme::danger(), theme::danger_soft())
+                    } else if priority {
+                        (theme::accent_text(), theme::accent_soft())
+                    } else {
+                        (theme::text_soft(), theme::hover())
+                    };
+                    chip(*words, fg, bg)
+                }))
+                .when(local_mute && !me, |row| row.child(chip("Muted for you", theme::warning(), theme::warning_soft())))
+                .children(effect.map(|effect| chip(super::discord_ux::effect_label(&effect.emoji), theme::accent_text(), theme::accent_soft())))
+                .when(percent != 100 && !local_mute && !me, |row| {
+                    row.child(chip(format!("{percent} %"), theme::text_soft(), theme::hover()))
+                })
+        });
         let stop_ring = (ringing && stage.key.network == Network::Discord && call.is_some_and(|call| {
             call.participants.iter().any(|who| who.id == seat.id && who.ringing)
         })).then(|| {
@@ -1970,7 +2010,13 @@ impl Shell {
             .tab_index(0)
             .focus_visible(|style| style.shadow(theme::focus_ring()))
             .tooltip(tip(
-                if focused { "Click to stop focusing" } else { "Click to focus. Right-click for more" },
+                if focused {
+                    "Click to stop focusing"
+                } else if room_context || !me {
+                    "Click to focus. Right-click for more"
+                } else {
+                    "Click to focus"
+                },
                 None,
             ))
             .on_click(cx.listener(move |this, _, window, cx| this.call_toggle_focus(&focus_id, window, cx)))
@@ -1994,7 +2040,7 @@ impl Shell {
         let tile = if let Some(frame) = camera_frame {
             base_tile
                 .child(img(frame).size_full().object_fit(ObjectFit::Cover))
-                .child(caption(if me { format!("{name} (You)") } else { name }, small))
+                .child(caption(if me { format!("{name} (You)") } else { name }, small, false, false))
         } else {
             base_tile
                 .child(
@@ -2041,14 +2087,15 @@ impl Shell {
                             .children(stop_ring),
                     )
                 })
-                .when(!small && !ringing, |tile| tile.child(state_row))
+                .when(!small && !ringing, |tile| tile.children(state_row))
         };
+        let has_link = link.is_some();
         tile.children(link)
             .children(seat.reaction.as_ref().filter(|r| !r.is_empty()).map(|emoji| {
                 div()
                     .absolute()
                     .top(px(8.))
-                    .left(px(8.))
+                    .left(px(if has_link { 36. } else { 8. }))
                     .px(px(6.))
                     .py(px(2.))
                     .rounded_full()
@@ -2213,8 +2260,10 @@ impl Shell {
             .on_click(cx.listener(move |this, _, _, cx| {
                 if room_context {
                     this.tiny_leave(cx);
-                } else {
+                } else if connecting {
                     this.call_leave(cx);
+                } else {
+                    this.telegram_leave_or_end(cx);
                 }
             }))
             .child(glyph("icons/phone-off.svg", 18., theme::on_accent()))
@@ -2825,6 +2874,14 @@ impl Shell {
                     .child(
                         div()
                             .id(SharedString::from(format!("sound-star-{id}")))
+                            .size(px(22.))
+                            .rounded(px(6.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::pressed()))
+                            .tooltip(tip(if starred { "Remove from favorites" } else { "Favorite sound" }, None))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
@@ -2957,12 +3014,36 @@ impl Shell {
         true
     }
 
-    /// Steps Escape back out of the call view: first clear stage focus, then leave the call view.
+    /// Steps Escape back out of the call view: first clear stage focus (or exit 1:1 auto-video to
+    /// the duo grid), then leave the call view.
     pub(in crate::gui) fn call_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        let auto_video_call = self.snapshot.as_ref().and_then(|snapshot| {
+            let call = self.call_shown(snapshot)?;
+            let subject = Subject::of(self, snapshot, &call);
+            let row = self.call_conversation_row(snapshot, &call);
+            let peer = row.as_ref().and_then(|row| row.peer.as_deref());
+            let (me_id, me_name) = self.call_me(snapshot, &call);
+            let stage = Stage::of_call(&call, &subject, &me_id, &me_name, peer);
+            let streams = stage::streams(&stage, &me_id, sending_now(Some(&call)));
+            self.call_peer_video(&stage, &streams, Some(&call))
+                .map(|_| call.conversation.clone())
+        });
         if self.call_state.focus.take().is_some() {
+            if let Some(key) = auto_video_call {
+                self.call_state.grid_choice_for = Some(key);
+            }
             self.call_sync_watch_now(cx);
             cx.notify();
             return true;
+        }
+        if let Some(key) = auto_video_call {
+            if self.call_state.view.as_ref() == Some(&key)
+                && self.call_state.grid_choice_for.as_ref() != Some(&key)
+            {
+                self.call_state.grid_choice_for = Some(key);
+                cx.notify();
+                return true;
+            }
         }
         if self.call_state.view.take().is_some() {
             cx.notify();

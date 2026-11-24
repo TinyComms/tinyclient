@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(idle.quick_action, Some(DirectCallAction::Call));
 
         let mut group = Conversation::new(Key::new(&account, "grp-1"), ConversationKind::Group, "Crew");
-        group.occupants = Some(protocol::Occupants { people: Vec::new(), total: 3 });
+        group.occupants = Some(protocol::Occupants { people: Vec::new(), total: 3, ..protocol::Occupants::default() });
         assert!(is_group_direct(&group));
         let live = direct_row_call(&group, None, true);
         assert!(live.live);
