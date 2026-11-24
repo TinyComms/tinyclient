@@ -752,13 +752,18 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .gap(px(6.))
-                .child(glyph("icons/video.svg", 22., theme::text_faint()))
-                .child(div().type_small().text_color(theme::text_soft()).child("Starting camera preview…"))
+                .child(glyph("icons/video.svg", 22., gpui::rgba(0xffffff80)))
+                .child(div().type_small().text_color(gpui::rgba(0xffffffb3)).child("Starting camera preview…"))
                 .into_any_element(),
         };
         let choice = prefs::values().device_choice(CAMERA);
         let items = camera_rows(&choice, &call.cameras, &call.camera_id);
-        let mut list = div().flex().flex_col();
+        let mut list = div()
+            .id("call-camera-preview-list")
+            .max_h(px(220.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
         for (ix, row) in items.into_iter().enumerate() {
             list = list.child(self.call_device_row(Side::Camera, ix, row, cx));
         }
@@ -801,7 +806,7 @@ impl Shell {
             Side::Input => {
                 let words = match (in_call(call), call.muted || call.deafened) {
                     (false, _) => "Microphone level, once the call connects",
-                    (true, true) => "Muted: others can't hear you. Speak to test.",
+                    (true, true) => "Muted · speak to test",
                     (true, false) => "Speak to test your microphone",
                 };
                 (call.level, words)

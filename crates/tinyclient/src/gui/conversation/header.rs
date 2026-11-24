@@ -93,8 +93,6 @@ impl Shell {
         // no Space was reached from the Inbox, which lists every network together. One with a
         // Space says where it is in words.
         let mixed = open.space.is_none();
-        let (back, forward) = (self.can_travel(true), self.can_travel(false));
-        let panel = self.panel_button(window, cx).map(|button| div().flex_none().mr(px(8.)).child(button));
         // A control, not a pill (polish/01): the system's radius and the strip's 28. Under 600
         // of conversation it keeps only its glyph, and the tooltip keeps the words (07 §1).
         let room = self.conversation_room();
@@ -172,23 +170,10 @@ impl Shell {
                 call
             }
         });
-        let travel = |id: &'static str, glyph: &'static str, back: bool, can: bool, words: &'static str, keys: &'static str| {
-            icon_button(id, glyph, false)
-                .aria_label(words)
-                .aria_disabled(!can)
-                .tab_stop(can)
-                .size(px(24.))
-                .when(!can, |button| button.opacity(0.35).cursor_default())
-                .tooltip(tip(words, Some(keys)))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, _, cx| this.travel(back, cx)))
-        };
-        let travel = div()
-            .flex_none()
-            .flex()
-            .gap(px(2.))
-            .child(travel("back", "icons/chevron-left.svg", true, back, "Back", "⌘["))
-            .child(travel("forward", "icons/chevron-right.svg", false, forward, "Forward", "⌘]"));
+        let stage_pill = self.snapshot.as_ref().and_then(|snapshot| self.call_return_stage_pill(snapshot, cx));
+        let controls = self.strip_controls(window, cx);
+        // The window's own buttons sit over the strip's right end: a hairline keeps the actions off them.
+        let window_buttons = chrome::end_pad(End::Conversation, 12.) > 12.;
         // Lit means "this kind is in the pane now". In a channel, Members and Details are two
         // values of one switch; beside a direct conversation Details is the other person.
         let members = (!direct && !teams_channel).then(|| {
@@ -277,8 +262,7 @@ impl Shell {
             .items_center()
             .border_b_1()
             .border_color(theme::hairline())
-            .children(panel)
-            .child(travel)
+            .child(controls)
             .child(
                 div()
                     .id("conversation-face")
@@ -312,8 +296,10 @@ impl Shell {
             .children(self.follow_button(open, cx).map(|follow| div().flex_none().ml(px(8.)).child(follow)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .children(self.meeting_button(open, link, compact, cx))
+            .children(stage_pill.map(|pill| div().flex_none().ml(px(8.)).child(pill)))
             .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
             .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).children(add_people).child(search).children(members).children(details).child(windowed))
+            .when(window_buttons, |bar| bar.child(div().flex_none().ml(px(8.)).w(px(1.)).h(px(16.)).bg(theme::hairline())))
     }
 
     /// The Discord account's name, when two Discord accounts are signed in.

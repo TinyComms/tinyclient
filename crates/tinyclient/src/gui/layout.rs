@@ -275,7 +275,7 @@ impl Shell {
             icon_button("panel", "icons/panel-left.svg", state.floating)
                 .aria_label("Show sidebar")
                 .aria_expanded(state.floating)
-                .size(px(24.))
+                .size(px(28.))
                 .tooltip(tip("Show sidebar", Some("⌘\\")))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)))
@@ -284,24 +284,39 @@ impl Shell {
     }
 
     /// For the conversation strip, after the panel button: back and forward through the
-    /// conversations that were open. Each dims when it leads nowhere.
-    pub(super) fn travel_buttons(&self, cx: &mut Context<Self>) -> [AnyElement; 2] {
+    /// places that were open, as one pair. A button that leads nowhere is dimmed and inert;
+    /// one that leads somewhere says where in its tooltip.
+    pub(super) fn travel_buttons(&self, cx: &mut Context<Self>) -> Div {
         let button = |back: bool| {
-            let (id, icon, words, keys) =
-                if back { ("travel-back", "icons/arrow-left.svg", "Back", "⌘[") } else { ("travel-forward", "icons/arrow-right.svg", "Forward", "⌘]") };
-            let can = self.can_travel(back);
+            let (id, icon, keys) = if back { ("travel-back", "icons/chevron-left.svg", "⌘[") } else { ("travel-forward", "icons/chevron-right.svg", "⌘]") };
+            if !self.can_travel(back) {
+                return div()
+                    .id(id)
+                    .flex_none()
+                    .size(px(28.))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.32)
+                    .child(glyph(icon, 16., theme::text_soft()))
+                    .into_any_element();
+            }
+            let words = match (self.peek_travel_label(back), back) {
+                (Some(place), true) => format!("Back to {place}"),
+                (Some(place), false) => format!("Forward to {place}"),
+                (None, true) => "Back".to_owned(),
+                (None, false) => "Forward".to_owned(),
+            };
             icon_button(id, icon, false)
-                .aria_label(words)
-                .aria_disabled(!can)
-                .tab_stop(can)
-                .size(px(24.))
-                .when(!can, |button| button.opacity(0.4).cursor_default())
+                .aria_label(words.clone())
+                .size(px(28.))
                 .tooltip(tip(words, Some(keys)))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| this.travel(back, cx)))
                 .into_any_element()
         };
-        [button(true), button(false)]
+        div().flex_none().flex().items_center().gap(px(2.)).child(button(true)).child(button(false))
     }
 
     /// The controls that start the conversation strip, in order: the panel button when the
@@ -311,9 +326,9 @@ impl Shell {
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(2.))
+            .gap(px(6.))
             .children(self.panel_button(window, cx))
-            .children(self.travel_buttons(cx))
+            .child(self.travel_buttons(cx))
     }
 
     /// `cmd-\`: in a window wide enough to hold the sidebar it hides or shows it; in a narrower
@@ -2348,6 +2363,8 @@ impl Render for Shell {
             .children(self.call_full_stage(snapshot, cx))
             .children(self.telegram_call_modal(window, cx))
             .children(self.tiny_layer(window, cx))
+            // With no sidebar dock in view (collapsed, hidden, or narrow Tiny page), float incoming calls here.
+            .children(self.call_incoming_overlay(snapshot, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.meeting_layer(cx))
             .children(self.story_viewer_layer(window, cx))

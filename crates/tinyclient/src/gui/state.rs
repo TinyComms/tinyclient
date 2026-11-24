@@ -1055,8 +1055,23 @@ impl Shell {
         if !known {
             self.load_row(key.clone(), cx);
         }
-        self.open = Some(key);
-        self.call_state.view = None;
+        let active_call = self.snapshot.as_ref().and_then(|snapshot| {
+            self.call_shown(snapshot)
+                .filter(|call| !matches!(call.state, protocol::CallState::Failed { .. }))
+                .map(|call| call.conversation)
+        });
+        let keep_stage = super::call::stage_follows(
+            self.call_state.view.is_some(),
+            self.call_state.stage_dismissed_for.as_ref(),
+            active_call.as_ref(),
+            &key,
+        );
+        self.open = Some(key.clone());
+        if keep_stage {
+            self.call_state.view = Some(key);
+        } else {
+            self.call_state.view = None;
+        }
         self.refused = None;
         // A floating sidebar closes on pick.
         self.layout_state.floating = false;

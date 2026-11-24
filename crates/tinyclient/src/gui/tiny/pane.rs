@@ -2,6 +2,7 @@
 //! the member list at the right while it is open and the window has room for it.
 
 use super::members::MEMBERS_WIDTH;
+use super::Modal;
 use crate::gui::chrome::{self, End};
 use crate::gui::components::{glyph, icon_button, pane_title, tip};
 use crate::gui::layout::{drags_window, RAIL_WIDTH, TOP_BAR};
@@ -41,13 +42,12 @@ impl Shell {
         let members = self.tiny_state.members_open && width - MEMBERS_WIDTH - if beside { 0. } else { 260. } >= MAIN_MIN;
 
         let title = match room {
-            Some(room) => div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(
+            Some(room) => {
+                // The sidebar beside the pane already names the server, so the crumb to it is a
+                // small icon; only a pane without its sidebar spells the name out.
+                let home = if beside {
+                    icon_button("tiny-crumb-home", "icons/server.svg", false).size(px(28.)).tooltip(tip(format!("Back to {} home", page.name), None))
+                } else {
                     div()
                         .id("tiny-crumb-home")
                         .flex_none()
@@ -61,15 +61,25 @@ impl Shell {
                         .cursor_pointer()
                         .hover(|style| style.bg(theme::hover()))
                         .tooltip(tip("Server home", None))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|this, _, _, cx| this.tiny_pick_channel(None, cx)))
-                        .child(div().max_w(px(160.)).truncate().type_ui().text_color(theme::text_soft()).child(page.name.clone())),
-                )
-                .child(glyph("icons/chevron-right.svg", 14., theme::text_faint()))
-                .child(glyph("icons/volume-2.svg", 18., if page.mine == Some(room.id.as_str()) { theme::positive() } else { theme::text_soft() }))
-                .child(div().flex_none().max_w(px(240.)).truncate().type_title().text_color(theme::text()).child(room.name.clone()))
-                .child(self.tiny_channel_facts(&page, room))
-                .children(self.tiny_channel_security(room, cx)),
+                        .child(div().max_w(px(160.)).truncate().type_ui().text_color(theme::text_soft()).child(page.name.clone()))
+                };
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        home.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, _, cx| this.tiny_pick_channel(None, cx))),
+                    )
+                    .child(glyph("icons/chevron-right.svg", 14., theme::text_faint()))
+                    .child(glyph("icons/volume-2.svg", 18., if page.mine == Some(room.id.as_str()) { theme::positive() } else { theme::text_soft() }))
+                    .child(div().min_w_0().max_w(px(240.)).truncate().type_title().text_color(theme::text()).child(room.name.clone()))
+                    .child(self.tiny_channel_facts(&page, room, cx))
+                    .children(self.tiny_channel_security(room, cx))
+            }
             None => div()
                 .flex_1()
                 .min_w_0()
@@ -84,6 +94,22 @@ impl Shell {
             .tooltip(tip(if members { "Hide members" } else { "Show members" }, None))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_members(cx)));
+        let invite = page.may.invite.then(|| {
+            icon_button("tiny-invite", "icons/user-plus.svg", false)
+                .tooltip(tip("Invite people", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::Invite, window, cx)))
+        });
+        let copy_link = room.map(|room| {
+            let link = protocol::room_link(&page.community.origin, &room.id)
+                .unwrap_or_else(|| format!("tinyclient://room?server={}&id={}", protocol::join_host(&page.community.origin), room.id));
+            icon_button("tiny-copy-channel-link", "icons/link.svg", false)
+                .tooltip(tip("Copy channel link", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.tiny_copy(link.clone(), "Channel link copied", cx)))
+        });
+        // The window's own buttons sit over this strip's right end: a hairline keeps Members off them.
+        let window_buttons = chrome::end_pad(End::Conversation, 12.) > 12.;
         let bar = drags_window(div())
             .h(px(TOP_BAR))
             .flex_none()
@@ -97,7 +123,8 @@ impl Shell {
             // A phone has no sidebar to hide and goes back with its own gesture.
             .when(!phone, |bar| bar.child(self.strip_controls(window, cx)))
             .child(title)
-            .child(toggle);
+            .child(div().flex_none().flex().items_center().gap(px(4.)).children(copy_link).children(invite).child(toggle))
+            .when(window_buttons, |bar| bar.child(div().flex_none().w(px(1.)).h(px(16.)).bg(theme::hairline())));
         let main = match room {
             Some(room) => self.tiny_channel(&page, room, cx),
             None => self.tiny_home(&page, cx),

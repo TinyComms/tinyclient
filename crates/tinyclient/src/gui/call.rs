@@ -6,7 +6,7 @@
 //! chatd says `Joined`.
 
 mod devices;
-mod dock;
+pub(super) mod dock;
 pub(in crate::gui) mod health;
 mod people;
 mod permission;
@@ -44,7 +44,7 @@ use protocol::{
     AccountKey, Call, CallFailure, CallState, CallSupport, Change, ConversationKind, Key,
     MediaFile, Network, Occupants, Request, Response,
 };
-use std::cell::{Cell, OnceCell};
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::mem::{discriminant, Discriminant};
 use std::rc::Rc;
@@ -426,9 +426,11 @@ pub struct State {
     /// Per-person volume and local mute, keyed by `(AccountKey, user_id)` so it works in any call
     /// regardless of which server page is open.
     pub(in crate::gui) gains: HashMap<(AccountKey, String), (u16, bool)>,
-    /// The volume slider's track bounds, as last drawn, and whose volume is being dragged.
-    pub(in crate::gui) slider: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Per-slider track bounds keyed by `(AccountKey, user_id)`, and whose volume is being dragged.
+    pub(in crate::gui) sliders: Rc<RefCell<HashMap<(AccountKey, String), Bounds<Pixels>>>>,
     pub(in crate::gui) sliding: Option<(AccountKey, String)>,
+    /// Whether the Discord focused-stream volume popover is expanded.
+    pub(in crate::gui) stream_volume_open: bool,
     /// `(conversation, peer_id)` that `call_auto_watch` already asked to watch, so we ask once
     /// per start and respect a manual "Stop watching" until the peer stops and starts again.
     pub(in crate::gui) auto_watch: Option<(Key, String)>,
@@ -441,6 +443,12 @@ pub struct State {
     watch_timer: Option<Task<()>>,
     /// The call whose full call view has the main pane (`gui/call/view.rs`).
     pub(in crate::gui) view: Option<Key>,
+    /// The call whose stage the user closed. It stays closed until a new call starts or they
+    /// choose Show call, and goes when the call ends or moves to another conversation.
+    pub(super) stage_dismissed_for: Option<Key>,
+    /// The 1:1 direct video call where the user explicitly chose the duo grid over automatic
+    /// full-stage peer video. Cleared when the call ends or changes.
+    pub(in crate::gui) grid_choice_for: Option<Key>,
     /// The person drawn large, or the stream filling the stage, pinned by a click on its tile.
     pub(in crate::gui) focus: Option<stage::Focus>,
     /// Where the people go while a stream fills the stage.
@@ -488,6 +496,7 @@ pub(super) struct PopoutSnapshot {
     pub pip_frame: Option<std::sync::Arc<gpui::RenderImage>>,
     pub speaker_name: String,
     pub speaker_speaking: bool,
+    pub speaker_avatar: Option<std::path::PathBuf>,
     pub live_badge: bool,
 }
 
@@ -1135,6 +1144,31 @@ fn call_go_target(key: &Key, is_tiny_room: bool) -> CallGoTarget {
     }
 }
 
+/// Opening `opening` keeps the call stage when it was already up on that live call and the
+/// user has not dismissed it. A different conversation drops the stage.
+pub(super) fn stage_follows(view_open: bool, dismissed: Option<&Key>, active: Option<&Key>, opening: &Key) -> bool {
+    view_open && dismissed != Some(opening) && active == Some(opening)
+}
+
+/// A dismiss sticks only while that same call is still up. A new conversation, or no call, clears it.
+pub(super) fn stage_dismiss_holds(dismissed: Option<&Key>, active: Option<&Key>) -> bool {
+    matches!((dismissed, active), (Some(dismissed), Some(active)) if dismissed == active)
+}
+
+/// Direct and group calls take the main-pane stage. A Tiny voice room is the server's own page.
+pub(super) fn opens_call_stage(is_tiny_room: bool) -> bool {
+    !is_tiny_room
+}
+
+fn call_has_video(call: &Call) -> bool {
+    call.self_view.is_some()
+        || call.share_view.is_some()
+        || call.participants.iter().any(|person| person.camera || person.sharing)
+        || call.video.iter().any(|stream| {
+            matches!(stream.content, protocol::Content::Camera | protocol::Content::Share)
+        })
+}
+
 /// Keyboard action on a participant row in the call card's participant list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowKeyAction {
@@ -1180,6 +1214,12 @@ impl Shell {
         let Change::Call { call, .. } = change else {
             return;
         };
+        if !stage_dismiss_holds(self.call_state.stage_dismissed_for.as_ref(), call.as_ref().map(|call| &call.conversation)) {
+            self.call_state.stage_dismissed_for = None;
+        }
+        if self.call_state.grid_choice_for.as_ref() != call.as_ref().map(|call| &call.conversation) {
+            self.call_state.grid_choice_for = None;
+        }
         let last = call.as_ref().map(|call| (call.conversation.clone(), discriminant(&call.state)));
         if self.call_state.last != last {
             self.call_state.phone.state_changed(call.as_ref(), self.call_state.last.as_ref().map(|(key, _)| key));
@@ -1206,6 +1246,9 @@ impl Shell {
                 state.cued = None;
                 state.auto_watch = None;
                 state.discord_speaker = None;
+                state.grid_choice_for = None;
+                state.stream_volume_open = false;
+                state.sliders.borrow_mut().clear();
                 state.watch_asked = None;
                 state.watch_timer = None;
                 state.view = None;
@@ -1649,7 +1692,10 @@ impl Shell {
     }
 
     pub(in crate::gui) fn call_slide(&mut self, x: f32, cx: &mut Context<Self>) {
-        let (Some((account, user_id)), Some(bounds)) = (self.call_state.sliding.clone(), self.call_state.slider.get()) else {
+        let Some((account, user_id)) = self.call_state.sliding.clone() else {
+            return;
+        };
+        let Some(bounds) = self.call_state.sliders.borrow().get(&(account.clone(), user_id.clone())).copied() else {
             return;
         };
         let at = super::components::slider_value(x, f32::from(bounds.origin.x), f32::from(bounds.size.width));
@@ -1693,23 +1739,55 @@ impl Shell {
         }) {
             return None;
         }
-        Some(div()
-            .id("call-stream-volume")
-            .flex()
-            .flex_col()
+        let account = call.conversation.account();
+        let gain_key = protocol::discord_stream_gain_key(user_id);
+        let (percent, muted) = self.call_gain(&account, &gain_key);
+        let expanded = self.call_state.stream_volume_open;
+        let icon = if muted || percent == 0 { "icons/volume-x.svg" } else { "icons/volume-2.svg" };
+        let summary = if muted { "Muted".to_owned() } else { format!("{percent}%") };
+        let toggle = div()
+            .id("call-stream-volume-toggle")
+            .h(px(28.))
+            .px(px(8.))
             .rounded(px(8.))
-            .bg(theme::overlay())
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::hover()))
+            .tooltip(tip(if expanded { "Hide stream volume" } else { "Stream volume" }, None))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, _, cx| cx.stop_propagation())
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.call_track(event, cx)))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
-            .child(menu_label("Stream volume"))
-            .child(self.call_gain_controls(
-                call.conversation.account(),
-                &protocol::discord_stream_gain_key(user_id),
-                ("Mute stream", "Unmute stream"),
-                cx,
-            )))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_state.stream_volume_open = !this.call_state.stream_volume_open;
+                cx.notify();
+            }))
+            .child(glyph(icon, 14., if muted { theme::warning() } else { theme::text_soft() }))
+            .child(div().type_micro().font_weight(FontWeight::MEDIUM).text_color(theme::text()).child(summary))
+            .child(glyph(if expanded { "icons/chevron-up.svg" } else { "icons/chevron-down.svg" }, 12., theme::text_faint()));
+        Some(
+            div()
+                .id("call-stream-volume")
+                .flex()
+                .flex_col()
+                .rounded(px(8.))
+                .bg(theme::overlay())
+                .border_1()
+                .border_color(theme::overlay_edge())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.call_track(event, cx)))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
+                .child(toggle)
+                .when(expanded, |card| {
+                    card.child(self.call_gain_controls(
+                        account,
+                        &gain_key,
+                        ("Mute stream", "Unmute stream"),
+                        cx,
+                    ))
+                }),
+        )
     }
 
     fn call_gain_controls(&self, account: AccountKey, user_id: &str, labels: (&'static str, &'static str), cx: &mut Context<Self>) -> Div {
@@ -1717,7 +1795,8 @@ impl Shell {
         let (percent, muted) = self.call_gain(&account, user_id);
         let slide_account = account.clone();
         let slide_id = user_id.to_owned();
-        let bounds = self.call_state.slider.clone();
+        let bounds = self.call_state.sliders.clone();
+        let bounds_key = (account.clone(), user_id.to_owned());
         let track = div()
             .id(SharedString::from(format!("call-volume-{user_id}")))
             .relative()
@@ -1731,7 +1810,18 @@ impl Shell {
                 }),
             )
             .child(slider(f32::from(percent) / f32::from(protocol::GAIN_MAX), SLIDER, Some(0.5)))
-            .child(canvas(move |at, _, _| bounds.set(Some(at)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
+            .child(
+                canvas(
+                    move |at, _, _| {
+                        bounds.borrow_mut().insert(bounds_key.clone(), at);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
         let mute_account = account;
         let mute_id = user_id.to_owned();
         let mute_icon = if muted { "icons/volume-2.svg" } else { "icons/volume-x.svg" };
@@ -1952,6 +2042,33 @@ impl Shell {
         self.person_picture(&key, cx)
     }
 
+    /// The active speaker's picture: a Tiny member's file when the call is on a Tiny server,
+    /// otherwise that person's avatar, then the conversation's.
+    fn call_speaker_avatar(
+        &self,
+        call: &Call,
+        speaker: Option<&protocol::Participant>,
+        contact: Option<&MediaFile>,
+    ) -> Option<std::path::PathBuf> {
+        let account = call.conversation.account();
+        if call.conversation.network == Network::Tiny {
+            if let Some(who) = speaker {
+                if let Some(path) = self.tiny_member_picture(&account, &who.id) {
+                    return Some(path);
+                }
+            }
+        }
+        if let Some(who) = speaker {
+            if let Some(file) = who.avatar.as_ref() {
+                let key = Key::new(&account, &who.id);
+                if let Some(path) = self.media_path(&key, Some(file)) {
+                    return Some(path);
+                }
+            }
+        }
+        self.media_path(&call.conversation, contact)
+    }
+
     pub(super) fn call_people_list(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let account = call.conversation.account();
         let people = telegram::sort_call_participants(&call.participants, call.conversation.network == Network::Telegram);
@@ -2158,7 +2275,7 @@ impl Shell {
                     .gap(px(8.))
                     .cursor_pointer()
                     .tab_index(0)
-                    .focus_visible(|style| style.shadow(theme::focus_ring()))
+                    .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                     .hover(|s| s.bg(theme::hover()))
                     .text_size(px(13.))
                     .text_color(if who.speaking { theme::text() } else { theme::text_soft() })
@@ -2285,10 +2402,17 @@ impl Shell {
                     .text_size(px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::text_faint())
-                    .child(format!("{} · {joined_count} {noun}", subject.title.to_uppercase()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(format!("{} · {joined_count} {noun}", subject.title.to_uppercase())),
+                    )
                     .when(can_ring_group || can_add_people, |header| {
                         header.child(
                             div()
+                                .flex_none()
                                 .flex()
                                 .items_center()
                                 .gap(px(4.))
@@ -2705,7 +2829,9 @@ impl Shell {
             .or_else(|| peer_sender.map(|p| p.sharing))
             .unwrap_or(false);
         let peer_kind = if peer_is_share { protocol::PictureKind::Share } else { protocol::PictureKind::Camera };
-        let volume = peer_id
+        let volume = (!compact)
+            .then_some(peer_id)
+            .flatten()
             .filter(|_| peer_is_share)
             .and_then(|id| self.call_stream_volume(call, id, cx))
             .map(|controls| controls.absolute().bottom(px(8.)).left(px(8.)));
@@ -2787,7 +2913,7 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .gap(px(8.))
-                    .child(div().type_small().text_color(theme::text_soft()).child(format!(
+                    .child(div().type_small().text_color(gpui::rgba(0xffffffb3)).child(format!(
                         "{peer_name} is {}",
                         if peer_is_share { "sharing their screen" } else { "on camera" }
                     )))
@@ -2828,6 +2954,7 @@ impl Shell {
         };
         let badge = (main_is_peer && peer_is_share).then(|| {
             div()
+                .flex_none()
                 .px(px(6.))
                 .py(px(1.))
                 .rounded(px(4.))
@@ -2914,6 +3041,7 @@ impl Shell {
                     .absolute()
                     .top(px(8.))
                     .left(px(8.))
+                    .max_w(px(if compact { 160. } else { 320. }))
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -2922,7 +3050,7 @@ impl Shell {
                     .rounded(px(6.))
                     .bg(theme::overlay())
                     .children(badge)
-                    .child(div().type_micro().text_color(theme::text()).child(caption)),
+                    .child(div().min_w_0().truncate().type_micro().text_color(theme::text()).child(caption)),
             )
             .child(
                 div()
@@ -3077,6 +3205,7 @@ impl Shell {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| subject.title.clone());
         let speaker_speaking = speaker.is_some_and(|p| p.speaking);
+        let speaker_avatar = self.call_speaker_avatar(&call, speaker, subject.avatar.as_ref());
         let camera_on = call.self_view.is_some()
             || call.video.iter().any(|v| v.direction == protocol::Direction::Encode && v.content == protocol::Content::Camera);
         let share_on = call.share_view.is_some()
@@ -3093,6 +3222,7 @@ impl Shell {
             pip_frame,
             speaker_name,
             speaker_speaking,
+            speaker_avatar,
             live_badge,
         })
     }
@@ -3429,6 +3559,7 @@ impl Shell {
         if let Some(call) = self.call_now() {
             if call.conversation == conversation && !matches!(call.state, CallState::Failed { .. })
             {
+                self.call_show_stage(&conversation, cx);
                 return;
             }
         }
@@ -3480,6 +3611,7 @@ impl Shell {
     /// it off the main thread: the system's prompt can stay up as long as the user likes.
     fn call_begin(&mut self, requests: Vec<Request>, conversation: Key, cx: &mut Context<Self>) {
         self.call_asked();
+        self.call_show_stage(&conversation, cx);
         // Answering a ring starts mediad, which takes a moment: say so now, not when it is up.
         if requests.iter().any(|request| matches!(request, Request::CallAccept)) {
             self.call_state.connecting = Some(bare_call(conversation.clone(), CallState::Connecting, false, false));
@@ -3617,6 +3749,74 @@ impl Shell {
         values.set(GLOBAL, SOUNDBOARD_FAVORITES, value.clone());
         crate::gui::app::prefs::set_values(values);
         self.call_ask(Request::Set { scope: GLOBAL.to_owned(), key: SOUNDBOARD_FAVORITES.to_owned(), value }, cx);
+    }
+
+    /// Closes the call stage and remembers which call, so Show chat stays in the conversation
+    /// until a new call starts or the user chooses Show call.
+    pub(in crate::gui) fn call_dismiss_view(&mut self, cx: &mut Context<Self>) {
+        let active = self.snapshot.as_ref().and_then(|snapshot| {
+            self.call_shown(snapshot)
+                .filter(|call| !matches!(call.state, CallState::Failed { .. }))
+                .map(|call| call.conversation)
+        });
+        if let Some(key) = active {
+            self.call_state.stage_dismissed_for = Some(key);
+        }
+        self.call_state.view = None;
+        self.call_state.focus = None;
+        cx.notify();
+    }
+
+    /// Opens the main-pane stage for a direct or group call. A Tiny voice room stays on its page.
+    fn call_show_stage(&mut self, conversation: &Key, cx: &mut Context<Self>) {
+        self.call_state.stage_dismissed_for = None;
+        if opens_call_stage(self.tiny_room(conversation).is_some()) {
+            self.call_open_view(conversation.clone(), cx);
+        }
+    }
+
+    /// Header pill back to the stage of the open conversation's live call, once that stage is closed.
+    pub(in crate::gui) fn call_return_stage_pill(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let call = self.call_shown(snapshot).filter(|call| !matches!(call.state, CallState::Failed { .. }))?;
+        if snapshot.open.as_ref().map(|open| &open.key) != Some(&call.conversation) {
+            return None;
+        }
+        if self.call_state.view.as_ref() == Some(&call.conversation) {
+            return None;
+        }
+        let icon_name = if call_has_video(&call) { "icons/video.svg" } else { "icons/phone.svg" };
+        let key = call.conversation.clone();
+        let clock = self.call_stage_clock(&call, cx);
+        let show_count = clock.is_none();
+        let count = call_people_count(&call);
+        Some(
+            div()
+                .id("call-return-stage")
+                .flex_none()
+                .h(px(28.))
+                .px(px(10.))
+                .rounded(px(14.))
+                .bg(theme::positive())
+                .text_color(theme::on_accent())
+                .hover(|style| style.opacity(0.88))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .tooltip(tip("Show call", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.call_state.stage_dismissed_for = None;
+                    this.call_open_view(key.clone(), cx);
+                }))
+                .child(glyph(icon_name, 13., theme::on_accent()))
+                .child("Show call")
+                .children(clock)
+                .when(show_count, |pill| pill.child(count.to_string()))
+                .into_any_element(),
+        )
     }
 
     /// A small header pill while a call is live elsewhere, taking you back to it in one click.
@@ -3979,6 +4179,22 @@ mod tests {
         assert_eq!(target(&snapshot), Some(("peer".to_owned(), false)));
         snapshot.call = Some(call("peer", CallState::RingingOut));
         assert_eq!(target(&snapshot), None);
+    }
+
+    #[test]
+    fn a_dismissed_stage_stays_down_until_the_call_changes() {
+        let lounge = key("lounge");
+        let den = key("den");
+        assert!(stage_follows(true, None, Some(&lounge), &lounge), "an open stage follows its own conversation");
+        assert!(!stage_follows(true, Some(&lounge), Some(&lounge), &lounge), "Show chat keeps the stage closed");
+        assert!(!stage_follows(false, None, Some(&lounge), &lounge), "a closed stage is not invented by opening the chat");
+        assert!(!stage_follows(true, None, Some(&lounge), &den), "another conversation drops the stage");
+        assert!(stage_follows(true, Some(&den), Some(&lounge), &lounge), "a dismiss for a different call does not hide this one");
+        assert!(stage_dismiss_holds(Some(&lounge), Some(&lounge)));
+        assert!(!stage_dismiss_holds(Some(&lounge), Some(&den)), "a moved call forgets the dismiss");
+        assert!(!stage_dismiss_holds(Some(&lounge), None), "a call that ended forgets the dismiss");
+        assert!(opens_call_stage(false), "a direct or group call opens the stage");
+        assert!(!opens_call_stage(true), "a Tiny voice room stays on the server page");
     }
 
     #[test]

@@ -899,9 +899,9 @@ impl Shell {
             if call.can_change_join_muted && !call.rtmp_stream {
                 let next_jm = !call.join_muted;
                 let label = if call.join_muted {
-                    "New participants are muted: On"
+                    "Mute new participants: On"
                 } else {
-                    "New participants are muted: Off"
+                    "Mute new participants: Off"
                 };
                 items = items.child(
                     menu_item(
@@ -932,7 +932,7 @@ impl Shell {
                 ),
             );
         }
-        items
+        div().child(items.id("telegram-call-menu").max_h(px(360.)).overflow_y_scroll())
     }
 
     /// Renders any active Telegram video chat modal dialog above the workspace.
@@ -964,7 +964,14 @@ impl Shell {
                 } else {
                     "Choose your personal account or one of your channels."
                 };
-                let mut rows = div().mt(px(12.)).flex().flex_col().gap(px(4.));
+                let mut rows = div()
+                    .id("tg-join-as-rows")
+                    .mt(px(12.))
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.));
                 for peer in peers {
                     let is_sel = selected.as_deref() == Some(peer.id.as_str());
                     let pid = peer.id.clone();

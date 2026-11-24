@@ -1759,7 +1759,7 @@ impl Shell {
     }
 
     /// The conversation region's width in the last frame; 0 before the first.
-    pub(super) fn conversation_room(&self) -> f32 {
+    pub(in crate::gui) fn conversation_room(&self) -> f32 {
         self.conversation_state.side.room.get()
     }
 

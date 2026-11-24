@@ -3,7 +3,7 @@
 //! Join beside each; and who else is online.
 
 use super::{model, Modal, Page};
-use crate::gui::components::{button, button_disabled, button_with_icon, glyph, Avatar, ButtonKind, Shape};
+use crate::gui::components::{button, button_disabled, button_with_icon, glyph, tip, Avatar, ButtonKind, Shape};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, SharedString};
@@ -117,6 +117,11 @@ impl Shell {
         }
         for room in rooms {
             let mine = page.mine == Some(room.id.as_str());
+            let active_call = self.tiny_call().filter(|call| call.conversation.id == room.id && call.state == protocol::CallState::Joined);
+            let sharing = room.participants.iter().any(|seat| seat.sharing)
+                || active_call.as_ref().is_some_and(|call| call.video.iter().any(|stream| stream.content == protocol::Content::Share));
+            let camera = room.participants.iter().any(|seat| seat.camera)
+                || active_call.as_ref().is_some_and(|call| call.video.iter().any(|stream| matches!(stream.content, protocol::Content::Camera | protocol::Content::Speaker)));
             let faces = div().flex().items_center().gap(px(6.)).children(room.participants.iter().take(8).map(|seat| {
                 let name = model::name_by_id(page.community, &seat.user_id);
                 crate::gui::call::ringed(Avatar::new(&page.key(&seat.user_id), &name, 28.).image_at(page.picture(&seat.user_id)).build(), 28., seat.speaking && !seat.server_muted)
@@ -138,7 +143,11 @@ impl Shell {
             } else {
                 let room_id = room.id.clone();
                 button(SharedString::from(format!("tiny-home-join-{}", room.id)), ButtonKind::Secondary, "Join")
-                    .on_click(cx.listener(move |this, _, _, cx| this.tiny_join(room_id.clone(), cx)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.tiny_join(room_id.clone(), cx);
+                    }))
                     .into_any_element()
             };
             let room_id = room.id.clone();
@@ -165,7 +174,39 @@ impl Shell {
                                     .gap(px(8.))
                                     .child(glyph("icons/volume-2.svg", 16., if mine { theme::positive() } else { theme::text_soft() }))
                                     .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(room.name.clone()))
-                                    .child(div().type_small().text_color(theme::text_faint()).child(model::occupancy(room))),
+                                    .child(div().type_small().text_color(theme::text_faint()).child(model::occupancy(room)))
+                                    .when(sharing, |row| {
+                                        row.child(
+                                            div()
+                                                .id(SharedString::from(format!("tiny-home-sharing-{}", room.id)))
+                                                .flex_none()
+                                                .px(px(6.))
+                                                .h(px(18.))
+                                                .rounded(px(theme::R_CHIP))
+                                                .bg(theme::accent_soft())
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(4.))
+                                                .tooltip(tip("Screen sharing active", None))
+                                                .child(glyph("icons/monitor-up.svg", 11., theme::accent_text()))
+                                                .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::accent_text()).child("Live")),
+                                        )
+                                    })
+                                    .when(camera, |row| {
+                                        row.child(
+                                            div()
+                                                .id(SharedString::from(format!("tiny-home-camera-{}", room.id)))
+                                                .flex_none()
+                                                .px(px(5.))
+                                                .h(px(18.))
+                                                .rounded(px(theme::R_CHIP))
+                                                .bg(theme::accent_soft())
+                                                .flex()
+                                                .items_center()
+                                                .tooltip(tip("Camera on", None))
+                                                .child(glyph("icons/video.svg", 11., theme::accent_text())),
+                                        )
+                                    }),
                             )
                             .child(faces.when(more > 0, |faces| faces.child(div().type_small().text_color(theme::text_faint()).child(format!("+{more}")))))
                             .child(div().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(who)),

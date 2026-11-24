@@ -14,14 +14,18 @@ use crate::gui::components::{glyph, network_icon, tip, Avatar};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme;
 use gpui::{
-    deferred, div, prelude::*, px, relative, AnyElement, Context, Div, FontWeight, Rgba, Stateful,
+    deferred, div, prelude::*, px, relative, AnyElement, Context, Div, FontWeight, MouseButton, Rgba, Stateful,
 };
 use protocol::{
-    Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, Network,
-    Request,
+    Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, Network, Request,
 };
 
+#[cfg(target_os = "macos")]
 const SETTINGS: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+#[cfg(target_os = "windows")]
+const SETTINGS: &str = "ms-settings:privacy-microphone";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const SETTINGS: &str = "";
 /// Dock insets (8 + 8) plus the card's own padding (9 + 9). The name line is this much
 /// narrower than the sidebar, and nothing else sits on it.
 const CARD_INSET: f32 = 34.;
@@ -390,6 +394,29 @@ struct Question {
     go: &'static str,
 }
 
+/// Mirrors `layout::discord_overview_width`, which is private to that module.
+fn discord_column(window: f32, sidebar: f32, hidden: bool, right: Option<f32>, server: bool) -> f32 {
+    const OVERVIEW: f32 = 280.;
+    if server && !hidden && window >= crate::gui::layout::RAIL_WIDTH + sidebar + OVERVIEW + crate::gui::layout::CONVERSATION_MIN + right.unwrap_or(0.) {
+        OVERVIEW
+    } else {
+        0.
+    }
+}
+
+/// "General / Tiny Client Official Server". The server's own title wins over the account host.
+pub(in crate::gui) fn compact_place_label(room: &str, server_title: Option<&str>, account_name: &str) -> String {
+    let server = server_title.map(str::trim).filter(|name| !name.is_empty()).unwrap_or_else(|| account_name.trim());
+    if room.is_empty() {
+        return server.to_owned();
+    }
+    if server.is_empty() {
+        room.to_owned()
+    } else {
+        format!("{room} / {server}")
+    }
+}
+
 fn question(confirm: &Confirm, here: &str) -> Question {
     let verb = if confirm.answer { "answer" } else { "call" };
     Question {
@@ -485,6 +512,138 @@ impl Shell {
                 .border_color(theme::hairline())
                 .children(dock_picture)
                 .child(div().id("call-controls").role(gpui::Role::Group).aria_label("Call controls").child(card)),
+        )
+    }
+
+    /// The sidebar's call dock is on screen: in the row, floating over the pane, or as the
+    /// whole list. A hidden or too-narrow sidebar leaves an incoming call with no dock.
+    fn sidebar_beside(&self, snapshot: &Snapshot) -> bool {
+        if crate::gui::phone::active() {
+            return false;
+        }
+        let state = &self.layout_state;
+        if state.floating {
+            return true;
+        }
+        let Some((_, _, width, _)) = self.frame.get() else {
+            return !state.sidebar_hidden;
+        };
+        let right = state.right.as_ref().filter(|_| !self.pane_tucked()).map(|_| state.right_width);
+        let discord = matches!(
+            &self.sidebar_state.mode,
+            crate::gui::sidebar::Mode::Space(space) if space.network == Network::Discord
+        );
+        let overview = discord_column(width, state.sidebar_width, state.sidebar_hidden, right, discord);
+        let planned = crate::gui::layout::plan(width - overview, state.sidebar_width, state.sidebar_hidden, right);
+        if planned.sidebar.is_some() {
+            return true;
+        }
+        let replaced = planned.right.is_some_and(|(_, replaces)| replaces);
+        // The list, dock included, fills the window only when nothing else has the pane.
+        // A call stage or a Tiny server page replaces that list, so the dock is not there.
+        let list_alone = snapshot.open.is_none()
+            && !state.sidebar_hidden
+            && !replaced
+            && !self.call_view_active(snapshot);
+        if list_alone {
+            let tiny_page = matches!(self.sidebar_state.mode, crate::gui::sidebar::Mode::Network(Network::Tiny)) && self.tiny_open();
+            return !tiny_page;
+        }
+        false
+    }
+
+    /// Incoming call when the sidebar dock is not beside the pane: a card at the top right.
+    pub(in crate::gui) fn call_incoming_overlay(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if crate::gui::phone::active() || self.sidebar_beside(snapshot) {
+            return None;
+        }
+        let ringing = snapshot
+            .ring
+            .as_ref()
+            .filter(|ring| matches!(ring.state, CallState::RingingIn { .. }))
+            .cloned()
+            .or_else(|| self.call_shown(snapshot).filter(|call| matches!(call.state, CallState::RingingIn { .. })))?;
+        let subject = Subject::of(self, snapshot, &ringing);
+        let CallState::RingingIn { from } = &ringing.state else {
+            return None;
+        };
+        let name = if from.is_empty() { subject.title.clone() } else { from.clone() };
+        let video = ringing.participants.iter().any(|person| person.camera)
+            || ringing.video.iter().any(|stream| stream.content == Content::Camera);
+        let line = if video { "Incoming video call" } else { "Incoming voice call" };
+        let account = ringing.conversation.account();
+        let picture = if ringing.conversation.network == Network::Tiny {
+            ringing
+                .participants
+                .first()
+                .and_then(|person| self.tiny_member_picture(&account, &person.id))
+                .or_else(|| self.media_path(&ringing.conversation, subject.avatar.as_ref()))
+        } else {
+            self.media_path(&ringing.conversation, subject.avatar.as_ref()).or_else(|| {
+                ringing.participants.first().and_then(|person| {
+                    person.avatar.as_ref().and_then(|file| self.media_path(&Key::new(&account, &person.id), Some(file)))
+                })
+            })
+        };
+        let decline = worded("call-overlay-decline", Some("icons/phone-off.svg"), "Decline", theme::danger_soft(), theme::danger())
+            .flex_1()
+            .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_decline(cx);
+            }));
+        let accept = worded("call-overlay-accept", Some("icons/phone.svg"), "Accept", theme::positive(), theme::on_accent())
+            .flex_1()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_accept(cx);
+            }));
+        Some(
+            div()
+                .id("call-incoming-overlay")
+                .occlude()
+                .absolute()
+                .top(px(56.))
+                .right(px(16.))
+                .w(px(320.))
+                .p(px(12.))
+                .rounded(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .bg(theme::overlay())
+                .border_1()
+                .border_color(theme::overlay_edge())
+                .shadow(theme::shadow_popover())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(Avatar::new(&ringing.conversation, &name, 40.).image_at(picture).build())
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(14.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::text())
+                                        .child(name),
+                                )
+                                .child(div().text_size(px(12.)).text_color(theme::text_soft()).child(line)),
+                        ),
+                )
+                .child(div().flex().gap(px(8.)).child(decline).child(accept))
+                .into_any_element(),
         )
     }
 
@@ -972,6 +1131,30 @@ impl Shell {
             && protocol::call_pictures(call.conversation.network)
     }
 
+    /// Where the compact bar says the call is. A Tiny server's title replaces the raw host.
+    fn compact_place(&self, call: &Call, subject: &Subject) -> String {
+        if call.conversation.network != Network::Tiny {
+            return match &subject.space {
+                Some(server) => format!("{} / {server}", subject.title),
+                None => subject.title.clone(),
+            };
+        }
+        let account = call.conversation.account();
+        // Copy the title out before reading the account name. The page borrows `self`.
+        let server_title = (self.tiny_state.account.as_ref() == Some(&account))
+            .then(|| self.tiny_page_facts())
+            .flatten()
+            .and_then(|page| page.community.server.as_ref().map(|server| server.name.trim().to_owned()))
+            .filter(|name| !name.is_empty());
+        let account_name = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.account(&account))
+            .map(|status| status.name.clone())
+            .unwrap_or_default();
+        compact_place_label(&subject.title, server_title.as_deref(), &account_name)
+    }
+
     /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,
     /// deafen and the voice settings are in the user panel right under it.
     fn call_compact(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -987,17 +1170,19 @@ impl Shell {
             _ => ("Connecting…", theme::warning()),
         };
         let notice = self.call_state.error.clone().or_else(|| self.call_state.notice.clone().filter(|_| in_call(call)));
-        let clock = if notice.is_some() || call.state == CallState::Joined { None } else { self.call_counter(call, cx) };
-        let place = match &subject.space {
-            Some(server) => format!("{} / {server}", subject.title),
-            None => subject.title.clone(),
-        };
+        let clock = if notice.is_some() && call.state != CallState::Joined { None } else { self.call_counter(call, cx) };
+        let place = self.compact_place(call, subject);
         let key = call.conversation.clone();
         let title = subject.title.clone();
         let words = div()
             .id("call-compact-where")
             .flex_1()
             .min_w_0()
+            .px(px(4.))
+            .py(px(2.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::hover()))
             .flex()
             .flex_col()
             .gap(px(1.))
@@ -1068,6 +1253,7 @@ impl Shell {
             .cursor_pointer()
             .tab_index(0)
             .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .hover(|style| style.border_color(theme::border()))
             .tooltip(tip("Open the call", Some("⌘⇧J")))
             .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &title, cx)))
             .children(waiting.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
@@ -1089,8 +1275,8 @@ impl Shell {
 
     /// Compact sidebar dock card shown while the main-pane call stage is open: keeps the call's
     /// identity, lock/signal/duration, any dock-only actions with no twin on the stage bar
-    /// (Ring again, Copy call link, Telegram video-chat options), and Show chat / Leave without
-    /// duplicating mute, deafen, share, camera, or call options.
+    /// (Ring again, Copy call link, Telegram video-chat options), and Leave without duplicating
+    /// mute, deafen, share, camera, call options, or the stage header's Show chat button.
     fn call_compact_stage(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
         let place = subject
             .space
@@ -1131,22 +1317,6 @@ impl Shell {
             .call_tg_actions_button(call, subject, joined, enabled, menu.as_ref(), cx)
             .map(|btn| btn.w(px(34.)).h(px(30.)));
         let in_live_call = in_call(call);
-        let show_chat = worded(
-            "call-dock-show-chat",
-            Some("icons/message-square.svg"),
-            "Show chat",
-            theme::hover(),
-            theme::text(),
-        )
-        .flex_1()
-        .min_w_0()
-        .h(px(30.))
-        .hover(|style| style.bg(theme::selected()))
-        .tooltip(tip("Return to chat while staying in the call", None))
-        .on_click(cx.listener(|this, _, _, cx| {
-            cx.stop_propagation();
-            this.call_close_view(cx);
-        }));
         let end = if in_live_call {
             leave().w(px(40.)).h(px(30.))
         } else {
@@ -1183,11 +1353,10 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .child(show_chat)
                     .children(ring_again)
                     .children(copy_link)
                     .children(tg_actions)
-                    .child(end),
+                    .child(end.ml_auto()),
             )
             .children(self.call_popover(call, subject, Place::Dock, cx))
     }
@@ -1313,7 +1482,7 @@ impl Shell {
                 (260., self.call_person_menu(account.clone(), user_id, name, cx).p(px(6.)))
             }
             (_, Menu::TelegramCall) if joined => {
-                (260., self.telegram_call_menu(call, cx).p(px(6.)))
+                (280., self.telegram_call_menu(call, cx).p(px(6.)))
             }
             _ => return None,
         };
@@ -1322,20 +1491,23 @@ impl Shell {
         Some(
             deferred(
                 div()
-                    .id("call-popover")
                     .absolute()
                     .left(px(-1.))
                     .bottom(relative(1.))
                     .pb(px(6.))
-                    .w(px(width))
-                    .rounded(px(12.))
-                    .bg(theme::overlay())
-                    .border_1()
-                    .border_color(theme::border())
-                    .shadow(theme::shadow_popover())
-                    .occlude()
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
-                    .child(body),
+                    .child(
+                        div()
+                            .id("call-popover")
+                            .w(px(width))
+                            .rounded(px(12.))
+                            .bg(theme::overlay())
+                            .border_1()
+                            .border_color(theme::border())
+                            .shadow(theme::shadow_popover())
+                            .occlude()
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
+                            .child(body),
+                    ),
             )
             .priority(1)
             .into_any_element(),
@@ -1528,9 +1700,7 @@ impl Shell {
             (CallState::Joined, _) if subject.kind == ConversationKind::Group && call.participants.is_empty() => {
                 "Waiting for others".to_owned()
             }
-            _ if call.move_notice.as_ref().is_some_and(|words| !words.is_empty())
-                && std::env::var("TINYCLIENT_SHOT_CALL").ok().as_deref() == Some("moved_notice") =>
-            {
+            _ if call.move_notice.as_ref().is_some_and(|words| !words.is_empty()) => {
                 call.move_notice.clone().unwrap_or_default()
             }
             _ => place.to_owned(),
@@ -1858,20 +2028,20 @@ impl Shell {
             .flex_wrap()
             .items_center()
             .gap(px(4.))
-            .child(mute.when(in_live_call, |button| button.flex_1().min_w_0()))
+            .child(mute.when(in_live_call, |button| button.flex_1().min_w(px(36.))))
             // Deafen is for a call that is up; before that only mute and devices can be preset.
-            .when(in_live_call, |row| row.child(deafen.flex_1().min_w_0()))
-            .children(share.map(|button| button.flex_1().min_w_0()))
-            .children(camera.map(|button| button.flex_1().min_w_0()))
-            .children(raise_hand.map(|button| button.flex_1().min_w_0()))
-            .children(ring_again.map(|button| button.flex_1().min_w_0()))
-            .children(add_people.map(|button| button.flex_1().min_w_0()))
-            .children(tg_actions.map(|button| button.flex_1().min_w_0()))
-            .children(copy_link.map(|button| button.flex_1().min_w_0()))
-            .children(soundboard.map(|button| button.flex_1().min_w_0()))
-            .child(devices.when(in_live_call, |button| button.flex_1().min_w_0()))
+            .when(in_live_call, |row| row.child(deafen.flex_1().min_w(px(36.))))
+            .children(share.map(|button| button.flex_1().min_w(px(36.))))
+            .children(camera.map(|button| button.flex_1().min_w(px(36.))))
+            .children(raise_hand.map(|button| button.flex_1().min_w(px(36.))))
+            .children(ring_again.map(|button| button.flex_1().min_w(px(36.))))
+            .children(add_people.map(|button| button.flex_1().min_w(px(36.))))
+            .children(tg_actions.map(|button| button.flex_1().min_w(px(36.))))
+            .children(copy_link.map(|button| button.flex_1().min_w(px(36.))))
+            .children(soundboard.map(|button| button.flex_1().min_w(px(36.))))
+            .child(devices.when(in_live_call, |button| button.flex_1().min_w(px(36.))))
             .child(
-                end.when(in_live_call, |button| button.flex_1().min_w_0())
+                end.when(in_live_call, |button| button.flex_1().min_w(px(36.)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         if in_live_call {
@@ -1982,7 +2152,9 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx))),
                 Act::Settings => plain("call-settings")
                     .on_click(cx.listener(|_, _, _, cx| {
-                        cx.background_executor().spawn(async { open(SETTINGS) }).detach();
+                        if !SETTINGS.is_empty() {
+                            cx.background_executor().spawn(async { open(SETTINGS) }).detach();
+                        }
                     }))
                     .child("Open System Settings"),
             }
@@ -2179,6 +2351,21 @@ mod tests {
         let engine = said(CallFailure::Engine, "");
         assert_eq!((engine.title.as_str(), engine.line.as_str()), ("Couldn't connect", "The call engine stopped."));
         assert_eq!(said(CallFailure::Encryption, "").acts, [Act::Handoff]);
+    }
+
+    #[test]
+    fn compact_place_prefers_the_server_title_over_the_raw_host() {
+        assert_eq!(
+            compact_place_label("General", Some("Tiny Client Official Server"), "private.tinyclient.io"),
+            "General / Tiny Client Official Server"
+        );
+        assert_eq!(
+            compact_place_label("General", Some("  "), "private.tinyclient.io"),
+            "General / private.tinyclient.io",
+            "a blank title falls back to the account name"
+        );
+        assert_eq!(compact_place_label("General", None, "private.tinyclient.io"), "General / private.tinyclient.io");
+        assert_eq!(compact_place_label("General", None, "  "), "General");
     }
 
     #[test]

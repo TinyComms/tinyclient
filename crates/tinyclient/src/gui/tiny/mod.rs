@@ -17,7 +17,7 @@
 //! socket (`Change::Tiny`, `Occupants`, `Presence`); nothing here polls, except the connection
 //! numbers while a call is up.
 
-mod channel;
+pub(super) mod channel;
 pub(super) mod column;
 pub(super) mod feed;
 mod home;
@@ -28,7 +28,7 @@ mod menus;
 mod modals;
 pub(super) mod model;
 mod pane;
-mod panel;
+pub(super) mod panel;
 pub(super) mod settings;
 mod setup;
 mod share;
@@ -1076,10 +1076,42 @@ impl Shell {
         self.tiny_state.account.clone()
     }
 
+    /// Closes a text chat so a voice room can take the pane. The caller records history first.
+    fn leave_chat_for_channel(&mut self, cx: &mut Context<Self>) {
+        self.open = None;
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.open = None;
+        }
+        self.call_state.view = None;
+        self.sync_popout_composers(cx);
+    }
+
+    /// Shows `room_id` and closes any text chat covering the server page. History is the caller's.
+    fn show_channel(&mut self, room_id: Option<String>, cx: &mut Context<Self>) {
+        let channel_changes = self.tiny_state.channel != room_id;
+        if channel_changes {
+            self.tiny_state.call_error = None;
+            self.call_state.focus = None;
+        }
+        if channel_changes || self.open.is_some() {
+            self.leave_chat_for_channel(cx);
+        } else {
+            self.call_state.view = None;
+        }
+        self.tiny_state.channel = room_id;
+        cx.notify();
+    }
+
     pub(super) fn tiny_join(&mut self, room_id: String, cx: &mut Context<Self>) {
         let Some(account) = self.with_account() else {
             return;
         };
+        if self.tiny_state.channel.as_deref() != Some(room_id.as_str()) || self.open.is_some() {
+            self.remember();
+            self.leave_chat_for_channel(cx);
+        } else {
+            self.call_state.view = None;
+        }
         self.tiny_state.channel = Some(room_id.clone());
         self.call_asked();
         // Connecting is drawn from the click, not from chatd's first word about the call: chatd
@@ -1207,14 +1239,20 @@ impl Shell {
         self.toast(Some(("icons/check.svg", super::theme::text_soft())), words, cx);
     }
 
+    #[track_caller]
     pub(in crate::gui) fn tiny_pick_channel(&mut self, room_id: Option<String>, cx: &mut Context<Self>) {
-        if self.tiny_state.channel != room_id {
-            self.tiny_state.call_error = None;
-            self.call_state.focus = None;
+        let channel_changes = self.tiny_state.channel != room_id;
+        let leaving_chat = self.open.is_some();
+        if channel_changes || leaving_chat {
+            // `travel` and `call_go` already recorded this place. Remembering again would
+            // drop the forward stack that Back just filled.
+            let caller = std::panic::Location::caller().file();
+            let already_recorded = caller.contains("sidebar.rs") || caller.contains("call.rs");
+            if !already_recorded {
+                self.remember();
+            }
         }
-        self.call_state.view = None;
-        self.tiny_state.channel = room_id;
-        cx.notify();
+        self.show_channel(room_id, cx);
     }
 
     /// Open a `tinyclient://room?server=<host>&id=<id>` link: switch to that server and show the
@@ -1244,14 +1282,22 @@ impl Shell {
             self.toast(None, "You're not signed in to that server.", cx);
             return;
         };
-        self.open = None;
+        let loaded = self.tiny_state.account.as_ref() == Some(&account) && self.tiny_state.community.is_some();
+        let room_here = loaded && self.tiny_state.community.as_ref().is_some_and(|c| c.rooms.iter().any(|r| r.id == room_id));
+        // Already on this server: picking records the open chat, then closes it. `go` closes
+        // that chat first, so Back would never see it.
+        if room_here && matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny)) {
+            self.tiny_pick_channel(Some(room_id.to_owned()), cx);
+            return;
+        }
+        if self.open.is_some() || !matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny)) {
+            self.remember();
+        }
         self.go(Mode::Network(Network::Tiny), cx);
-        if self.tiny_state.account.as_ref() == Some(&account) && self.tiny_state.community.is_some() {
-            if self.tiny_state.community.as_ref().is_some_and(|c| c.rooms.iter().any(|r| r.id == room_id)) {
-                self.tiny_pick_channel(Some(room_id.to_owned()), cx);
-            } else {
-                self.toast(None, "That channel isn't available.", cx);
-            }
+        if room_here {
+            self.show_channel(Some(room_id.to_owned()), cx);
+        } else if loaded {
+            self.toast(None, "That channel isn't available.", cx);
         } else {
             self.tiny_state.pending_room_link = Some((account.clone(), room_id.to_owned()));
             self.prefer_tiny(account, cx);
@@ -1855,6 +1901,8 @@ impl Shell {
         drop(page);
         self.close_modal(cx);
         self.tiny_close_float(cx);
+        // A member call is a direct call: `call_person` reaches `call_start`, which opens the stage.
+        self.call_state.stage_dismissed_for = None;
         self.call_person(&person, cx);
     }
 

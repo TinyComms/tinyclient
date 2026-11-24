@@ -236,6 +236,8 @@ fn control_pill(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label)
         .size(px(30.))
         .rounded_full()
         .bg(fill)
@@ -243,6 +245,8 @@ fn control_pill(
         .items_center()
         .justify_center()
         .cursor_pointer()
+        .tab_index(0)
+        .focus_visible(|s| s.shadow(theme::focus_ring()))
         .hover(|s| s.opacity(0.88))
         .tooltip(tip(label, None))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -271,7 +275,7 @@ impl Render for CallPopout {
             let ring = if data.speaker_speaking {
                 theme::positive()
             } else {
-                theme::hairline()
+                gpui::rgba(0xffffff26)
             };
             div()
                 .size_full()
@@ -286,22 +290,28 @@ impl Render for CallPopout {
                         .rounded_full()
                         .border_2()
                         .border_color(ring)
-                        .child(Avatar::named(&data.speaker_name, 52.).build()),
+                        .child(
+                            Avatar::named(&data.speaker_name, 52.)
+                                .image_at(data.speaker_avatar.clone())
+                                .build(),
+                        ),
                 )
                 .child(
                     div()
                         .type_small()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text())
+                        .text_color(theme::on_accent())
                         .child(data.speaker_name.clone()),
                 )
                 .into_any_element()
         };
 
+        let show_chrome = self.hovered;
+        let show_back_label = f32::from(window.viewport_size().width) >= 300.;
         let pip = data.pip_frame.map(|frame| {
             div()
                 .absolute()
-                .bottom(px(10.))
+                .bottom(px(if show_chrome { 54. } else { 10. }))
                 .right(px(10.))
                 .w(px(72.))
                 .h(px(40.))
@@ -313,7 +323,6 @@ impl Render for CallPopout {
                 .child(img(frame).size_full().object_fit(ObjectFit::Contain))
         });
 
-        let show_chrome = self.hovered;
         let shell_mute = self.shell.clone();
         let shell_cam = self.shell.clone();
         let shell_share = self.shell.clone();
@@ -366,6 +375,8 @@ impl Render for CallPopout {
                 .child(
                     div()
                         .id("call-popout-back")
+                        .role(gpui::Role::Button)
+                        .aria_label("Back to window")
                         .flex_none()
                         .h(px(26.))
                         .px(px(8.))
@@ -376,6 +387,8 @@ impl Render for CallPopout {
                         .items_center()
                         .gap(px(5.))
                         .cursor_pointer()
+                        .tab_index(0)
+                        .focus_visible(|s| s.shadow(theme::focus_ring()))
                         .hover(|s| s.bg(theme::pressed()))
                         .type_micro()
                         .font_weight(FontWeight::MEDIUM)
@@ -383,7 +396,7 @@ impl Render for CallPopout {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|this, _, window, cx| this.close_back(window, cx)))
                         .child(glyph("icons/picture-in-picture-2.svg", 13., theme::text()))
-                        .child("Back to window"),
+                        .when(show_back_label, |btn| btn.child("Back to window")),
                 )
         });
 
@@ -453,7 +466,7 @@ impl Render for CallPopout {
                 "Leave call",
             )
             .on_click(move |_, _, cx| {
-                let _ = shell_leave.update(cx, |shell, cx| shell.call_leave(cx));
+                let _ = shell_leave.update(cx, |shell, cx| shell.telegram_leave_or_end(cx));
             });
 
             div()
