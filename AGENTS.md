@@ -21,6 +21,7 @@ The whole gate is in `docs/quality-gate.md`; the lab's contract is `e2e/README.m
 - Do not paste your own screenshots as proof. The lab records each platform and posts `e2e-proof`.
 - Merging with `--admin` past a missing `e2e-proof` is not allowed once it is required.
 - GLM reviews every pull request (`docs/pr-review.md`) and posts inline findings and the check `Tiny Agents / Code Review`. It is advice, not a gate. Fix a finding or say in the thread why it is wrong; do not resolve it silently.
+- Before a pull request is opened or updated, what `ci.yml` runs for a pull request has been run on `HEAD`: `cargo build --workspace --all-targets --features tinyclient/gui`, then `cargo nextest run --workspace --features tinyclient/gui` with `TINYCLIENT_TEST_MEDIAD` naming the `mediad` that build made, then `cargo test --workspace --doc --features tinyclient/gui`. The `mediad` voice tests need the `openssl` command on `PATH`. On a machine with more logical processors than memory, cap the parallelism (`-j 3`, and `--build-jobs 3` for nextest): under full parallelism the link steps can fail with metadata errors that look like a dependency problem.
 
 The captain's check prints an `e2e:` line: the lab's recorded release suite on the exact `origin/main` SHA. When `e2e/gate.json` has `"release_proof": "enforce"`, a missing one is a `BLOCK`.
 
