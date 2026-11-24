@@ -317,10 +317,18 @@ impl Shell {
                     .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_health(cx)))
             });
         let mic = panel_button("tiny-panel-mic", if muted { "icons/mic-off.svg" } else { "icons/mic.svg" }, muted)
-            .tooltip(tip(if muted { "Unmute" } else { "Mute" }, Some("⌘⇧M")))
+            .tooltip(tip(if muted { "Unmute · Right-click for mic" } else { "Mute · Right-click for mic" }, Some("⌘⇧M")))
+            .on_mouse_down(gpui::MouseButton::Right, cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_toggle_input_menu(cx);
+            }))
             .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_mute(cx)));
         let ears = panel_button("tiny-panel-deafen", if deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" }, deafened)
-            .tooltip(tip(if deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
+            .tooltip(tip(if deafened { "Undeafen · Right-click for speaker" } else { "Deafen · Right-click for speaker" }, Some("⌘⇧D")))
+            .on_mouse_down(gpui::MouseButton::Right, cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_toggle_output_menu(cx);
+            }))
             .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_deafen(cx)));
         let cog = panel_button("tiny-panel-settings", "icons/settings.svg", false)
             .tooltip(tip("Voice settings", Some("⌘,")))

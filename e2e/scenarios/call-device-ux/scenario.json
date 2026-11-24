@@ -1,0 +1,12 @@
+{
+  "id": "call-device-ux",
+  "title": "Focused mic/speaker/camera pickers, right-click & split-pill controls, and non-duplicated call dock",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window; mobile uses its own bottom sheets.",
+    "ios": "The phone proof build does not run the desktop window; mobile uses its own bottom sheets."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

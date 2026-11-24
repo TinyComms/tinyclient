@@ -23,17 +23,107 @@ use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, FontWeight, ObjectFit, SharedString};
 use protocol::settings::{DeviceChoice, CAMERA, GLOBAL, INPUT, OUTPUT};
-use protocol::{AudioDevice, Call, CameraSource, MediaRequest, Request};
+use protocol::{AudioDevice, Call, CallState, CameraSource, MediaRequest, Request};
 use std::time::{Duration, Instant};
 
 /// Segments of a level meter.
 const SEGMENTS: u8 = 12;
+
+/// Maximum scroll height for a single device list inside a focused picker popover.
+const LIST_MAX_H: f32 = 250.;
 
 /// How many of the meter's segments a level of 0 to 100 lights. Any sound at all lights one.
 fn lit(level: Option<u8>) -> u8 {
     match level {
         None | Some(0) => 0,
         Some(level) => (u16::from(level.min(100)) * u16::from(SEGMENTS)).div_ceil(100) as u8,
+    }
+}
+
+/// Which focused device picker a device notice refers to, when a device is stuck or clicked.
+pub(super) fn stuck_device_menu(notice: &str) -> Menu {
+    let lower = notice.to_ascii_lowercase();
+    if lower.contains("speaker") || lower.contains("output") || lower.contains("headphone") || lower.contains("earphone") {
+        Menu::Output { from_hub: false }
+    } else if lower.contains("microphone") || lower.contains("mic") || lower.contains("input") {
+        Menu::Input { from_hub: false }
+    } else {
+        Menu::Devices
+    }
+}
+
+/// Whether `notice` should be shown inside a focused `side` picker.
+fn notice_applies_to(notice: &str, side: Side) -> bool {
+    match (side, stuck_device_menu(notice)) {
+        (Side::Input, Menu::Output { .. }) => false,
+        (Side::Output, Menu::Input { .. }) => false,
+        _ => true,
+    }
+}
+
+/// One-line active device summary for the compact Call Options hub, plus whether it is in a
+/// disconnected/warning state.
+pub(super) fn active_device_summary(
+    choice: &DeviceChoice,
+    listed: &[AudioDevice],
+    in_use: &str,
+) -> (String, bool) {
+    if let DeviceChoice::Device { name, .. } = choice {
+        if !listed.iter().any(|d| choice.is(d, listed)) {
+            return (format!("{name} · not connected"), true);
+        }
+    }
+    if !in_use.is_empty() {
+        if let Some(device) = listed.iter().find(|d| d.id == in_use) {
+            return (device.name.clone(), false);
+        }
+    }
+    match choice {
+        DeviceChoice::Auto => (
+            listed
+                .iter()
+                .find(|d| d.auto)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "Automatic".to_owned()),
+            false,
+        ),
+        DeviceChoice::System => (
+            listed
+                .iter()
+                .find(|d| d.default)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "System default".to_owned()),
+            false,
+        ),
+        DeviceChoice::Device { name, .. } => (name.clone(), false),
+    }
+}
+
+/// One-line active camera summary for the compact Call Options hub, plus whether it is disconnected.
+pub(super) fn active_camera_summary(
+    choice: &DeviceChoice,
+    listed: &[CameraSource],
+    in_use: &str,
+) -> (String, bool) {
+    if let DeviceChoice::Device { name, .. } = choice {
+        if !listed.iter().any(|cam| camera_matches(choice, cam)) {
+            return (format!("{name} · not connected"), true);
+        }
+    }
+    if !in_use.is_empty() {
+        if let Some(cam) = listed.iter().find(|c| c.id == in_use) {
+            return (cam.name.clone(), false);
+        }
+    }
+    match choice {
+        DeviceChoice::Auto | DeviceChoice::System => (
+            listed
+                .first()
+                .map(|cam| cam.name.clone())
+                .unwrap_or_else(|| "System default".to_owned()),
+            false,
+        ),
+        DeviceChoice::Device { name, .. } => (name.clone(), false),
     }
 }
 
@@ -193,7 +283,7 @@ impl Shell {
         if before == menu {
             return;
         }
-        let metered = |m: &Option<Menu>| matches!(m, Some(Menu::Devices | Menu::CameraPreview));
+        let metered = |m: &Option<Menu>| m.as_ref().is_some_and(Menu::metered);
         if metered(&before) && !metered(&menu) {
             self.call_meter(false, cx);
         }
@@ -219,7 +309,7 @@ impl Shell {
         }
     }
 
-    /// Opens `menu`, or closes it when it is the one open.
+    /// Opens `menu`, or closes it when the same menu kind is already open.
     pub(super) fn call_menu_toggle(&mut self, menu: Menu, cx: &mut Context<Self>) {
         // The press that closed it from outside was on its own button: stay closed.
         let just_closed = self
@@ -229,10 +319,61 @@ impl Shell {
             // Only long enough to absorb the button's own click after mouse_down_out closed the
             // popover. 400ms also ate a deliberate reopen after dismissing, so the lock felt dead.
             .is_some_and(|at| at.elapsed() < Duration::from_millis(50));
-        if self.call_state.menu.as_ref() == Some(&menu) || just_closed {
+        if self.call_state.menu.as_ref().is_some_and(|open| open.same_kind(&menu)) || just_closed {
             self.call_menu_set(None, cx);
         } else {
             self.call_menu_set(Some(menu), cx);
+        }
+    }
+
+    /// Right-click shortcut on a microphone button (including the Tiny user panel): opens the
+    /// focused Microphone picker when a call is active, else opens Audio settings.
+    pub(in crate::gui) fn call_toggle_input_menu(&mut self, cx: &mut Context<Self>) {
+        let has_call = self.snapshot.as_ref().and_then(|s| self.call_shown(s)).is_some();
+        if has_call {
+            self.call_menu_toggle(Menu::Input { from_hub: false }, cx);
+        } else {
+            settings::open(settings::Section::Audio, cx);
+        }
+    }
+
+    /// Right-click shortcut on a speaker/deafen button (including the Tiny user panel): opens the
+    /// focused Speaker picker when a call is active, else opens Audio settings.
+    pub(in crate::gui) fn call_toggle_output_menu(&mut self, cx: &mut Context<Self>) {
+        let has_call = self.snapshot.as_ref().and_then(|s| self.call_shown(s)).is_some();
+        if has_call {
+            self.call_menu_toggle(Menu::Output { from_hub: false }, cx);
+        } else {
+            settings::open(settings::Section::Audio, cx);
+        }
+    }
+
+    /// Right-click or chevron click on the Camera button: opens the live preview picker when the
+    /// camera is off and cameras exist, or the compact Camera switcher while the camera is live.
+    pub(super) fn call_camera_picker_toggle(&mut self, call: &Call, camera_on: bool, cx: &mut Context<Self>) {
+        if !camera_on && !call.cameras.is_empty() {
+            self.call_menu_toggle(Menu::CameraPreview, cx);
+        } else {
+            self.call_menu_toggle(Menu::Camera { from_hub: false }, cx);
+        }
+    }
+
+    /// Maps any device/camera/options `Menu` variant to its `(width, body)` popover content, shared
+    /// between the sidebar dock and the call stage control bar.
+    pub(super) fn call_device_popover_body(
+        &self,
+        call: &Call,
+        menu: &Menu,
+        cx: &mut Context<Self>,
+    ) -> Option<(f32, Div)> {
+        let joined = call.state == CallState::Joined;
+        match menu {
+            Menu::Devices => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
+            Menu::Input { from_hub } => Some((320., self.call_input_menu(call, *from_hub, cx).p(px(6.)))),
+            Menu::Output { from_hub } => Some((320., self.call_output_menu(call, *from_hub, cx).p(px(6.)))),
+            Menu::Camera { from_hub } => Some((300., self.call_camera_menu(call, *from_hub, cx).p(px(6.)))),
+            Menu::CameraPreview if joined => Some((284., self.call_camera_preview_menu(call, cx).p(px(8.)))),
+            _ => None,
         }
     }
 
@@ -285,18 +426,20 @@ impl Shell {
         let tag = row.is_virtual.then(|| {
             div()
                 .flex_none()
-                .px(px(4.))
-                .rounded(px(3.))
+                .px(px(5.))
+                .py(px(1.))
+                .rounded(px(4.))
                 .border_1()
                 .border_color(theme::hairline())
                 .text_size(px(10.))
+                .line_height(px(13.))
                 .text_color(theme::text_faint())
                 .child("virtual")
         });
+        let is_meta = matches!(row.choice, DeviceChoice::Auto | DeviceChoice::System);
         let choice = row.choice.clone();
-        div()
+        let base = div()
             .id((group, ix))
-            .h(px(28.))
             .flex_none()
             .px(px(8.))
             .rounded(px(theme::R_CONTROL))
@@ -307,68 +450,291 @@ impl Shell {
             .text_size(px(13.))
             .text_color(if row.chosen { theme::text() } else { theme::text_soft() })
             .hover(|style| style.bg(theme::hover()))
-            .on_click(cx.listener(move |this, _, _, cx| this.call_pick(side, choice.clone(), cx)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_pick(side, choice.clone(), cx);
+            }));
+
+        if is_meta {
+            if let Some(detail) = row.detail {
+                return base
+                    .min_h(px(38.))
+                    .py(px(4.))
+                    .child(radio)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .line_height(px(16.))
+                                    .when(row.chosen, |d| d.font_weight(FontWeight::MEDIUM))
+                                    .child(SharedString::from(row.label)),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .line_height(px(14.))
+                                    .text_color(theme::text_faint())
+                                    .child(detail),
+                            ),
+                    );
+            }
+        }
+
+        let status_pill = row.detail.map(|detail| {
+            let (label, fg, bg) = if detail == "not connected" {
+                ("not connected", theme::warning(), theme::warning_soft())
+            } else if detail == "in use for now" {
+                ("in use", theme::accent_text(), theme::accent_soft())
+            } else {
+                ("", theme::text_faint(), theme::hover())
+            };
+            let text: SharedString = if label.is_empty() { detail.into() } else { label.into() };
+            div()
+                .flex_none()
+                .px(px(5.))
+                .py(px(1.))
+                .rounded(px(4.))
+                .bg(bg)
+                .text_size(px(10.))
+                .line_height(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(fg)
+                .child(text)
+        });
+
+        base.h(px(30.))
             .child(radio)
-            .child(div().flex_none().max_w(px(220.)).truncate().child(SharedString::from(row.label)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(row.chosen, |d| d.font_weight(FontWeight::MEDIUM))
+                    .child(SharedString::from(row.label)),
+            )
             .children(tag)
-            .children(row.detail.map(|detail| {
-                div().flex_1().min_w_0().truncate().text_color(theme::text_faint()).child(detail)
-            }))
+            .children(status_pill)
+    }
+
+    fn call_picker_header(&self, title: &'static str, from_hub: bool, cx: &mut Context<Self>) -> Div {
+        let back = from_hub.then(|| {
+            div()
+                .id("call-device-back")
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()))
+                .child(glyph("icons/arrow-left.svg", 13., theme::text_soft()))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_set(Some(Menu::Devices), cx);
+                }))
+        });
+        div()
+            .h(px(26.))
+            .flex_none()
+            .px(px(6.))
+            .mb(px(2.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .children(back)
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_soft())
+                    .child(title),
+            )
     }
 
     fn call_device_section(&self, side: Side, call: &Call, cx: &mut Context<Self>) -> Div {
-        let (title, listed, in_use, key) = match side {
-            Side::Input => ("MICROPHONE", &call.inputs, &call.input_id, INPUT),
-            Side::Output => ("SPEAKER", &call.outputs, &call.output_id, OUTPUT),
-            Side::Camera => unreachable!("camera section uses call_camera_section"),
+        let (scroll_id, listed, in_use, key) = match side {
+            Side::Input => ("call-input-list", &call.inputs, &call.input_id, INPUT),
+            Side::Output => ("call-output-list", &call.outputs, &call.output_id, OUTPUT),
+            Side::Camera => unreachable!("camera section uses call_camera_menu"),
         };
         let choice = prefs::values().device_choice(key);
         let heading = |words: &'static str| {
             div()
-                .h(px(22.))
+                .h(px(20.))
                 .flex_none()
                 .px(px(8.))
+                .mt(px(4.))
                 .flex()
                 .items_center()
-                .text_size(px(11.))
+                .text_size(px(10.5))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::text_faint())
                 .child(words)
         };
-        let mut section = div().flex().flex_col().child(heading(title));
+        let mut list = div()
+            .id(scroll_id)
+            .max_h(px(LIST_MAX_H))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(1.));
         let mut virtual_heading = false;
         for (ix, row) in rows(&choice, listed, in_use).into_iter().enumerate() {
             if row.is_virtual && !virtual_heading {
                 virtual_heading = true;
-                section = section.child(heading("VIRTUAL · only when picked"));
+                list = list.child(heading("VIRTUAL · only when picked"));
             }
-            section = section.child(self.call_device_row(side, ix, row, cx));
+            list = list.child(self.call_device_row(side, ix, row, cx));
         }
-        section
+        div().flex().flex_col().child(list)
     }
 
-    /// The CAMERA section under SPEAKER when the system lists at least one camera.
-    fn call_camera_section(&self, call: &Call, cx: &mut Context<Self>) -> Option<Div> {
+    /// Focused Microphone picker (opened via right-click/chevron on Mic, or from the hub).
+    pub(super) fn call_input_menu(&self, call: &Call, from_hub: bool, cx: &mut Context<Self>) -> Div {
+        let notice = call
+            .device_notice
+            .as_deref()
+            .filter(|words| notice_applies_to(words, Side::Input))
+            .and_then(|_| self.call_device_notice_row(call));
+        let settings = menu_item("call-input-settings", Some("icons/settings.svg"), "Audio settings…", None)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.call_menu_close(cx);
+                settings::open(settings::Section::Audio, cx);
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .child(self.call_picker_header("MICROPHONE", from_hub, cx))
+            .children(notice)
+            .child(self.call_device_section(Side::Input, call, cx))
+            .child(div().flex_none().mt(px(2.)).child(self.call_level(call, Side::Input)))
+            .child(menu_separator().mx(px(8.)))
+            .child(settings)
+    }
+
+    /// Focused Speaker picker (opened via right-click/chevron on Headphones, or from the hub).
+    pub(super) fn call_output_menu(&self, call: &Call, from_hub: bool, cx: &mut Context<Self>) -> Div {
+        let notice = call
+            .device_notice
+            .as_deref()
+            .filter(|words| notice_applies_to(words, Side::Output))
+            .and_then(|_| self.call_device_notice_row(call));
+        let test = menu_item("call-output-test", Some("icons/volume-2.svg"), "Test speakers", None)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.call_ask(Request::TestSound, cx);
+            }));
+        let settings = menu_item("call-output-settings", Some("icons/settings.svg"), "Audio settings…", None)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.call_menu_close(cx);
+                settings::open(settings::Section::Audio, cx);
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .child(self.call_picker_header("SPEAKER", from_hub, cx))
+            .children(notice)
+            .child(self.call_device_section(Side::Output, call, cx))
+            .child(div().flex_none().mt(px(2.)).child(self.call_level(call, Side::Output)))
+            .child(menu_separator().mx(px(8.)))
+            .child(test)
+            .child(settings)
+    }
+
+    /// Focused Camera picker (opened via right-click/chevron on live Camera, or from the hub).
+    pub(super) fn call_camera_menu(&self, call: &Call, from_hub: bool, cx: &mut Context<Self>) -> Div {
         let choice = prefs::values().device_choice(CAMERA);
         let items = camera_rows(&choice, &call.cameras, &call.camera_id);
-        if items.is_empty() {
-            return None;
-        }
-        let heading = div()
-            .h(px(22.))
+        let list = if items.is_empty() {
+            div()
+                .px(px(8.))
+                .py(px(8.))
+                .text_size(px(12.))
+                .text_color(theme::text_faint())
+                .child("No cameras detected")
+        } else {
+            let mut scroll = div()
+                .id("call-camera-list")
+                .max_h(px(LIST_MAX_H))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(1.));
+            for (ix, row) in items.into_iter().enumerate() {
+                scroll = scroll.child(self.call_device_row(Side::Camera, ix, row, cx));
+            }
+            div().flex().flex_col().child(scroll)
+        };
+        let settings = menu_item("call-camera-settings", Some("icons/settings.svg"), "Video settings…", None)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.call_menu_close(cx);
+                settings::open(settings::Section::Audio, cx);
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .child(self.call_picker_header("CAMERA", from_hub, cx))
+            .child(list)
+            .child(menu_separator().mx(px(8.)))
+            .child(settings)
+    }
+
+    fn call_device_summary_row(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        title: &'static str,
+        summary: String,
+        warning: bool,
+        target: Menu,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .h(px(42.))
             .flex_none()
             .px(px(8.))
+            .rounded(px(theme::R_CONTROL))
             .flex()
             .items_center()
-            .text_size(px(11.))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme::text_faint())
-            .child("CAMERA");
-        let mut section = div().flex().flex_col().child(heading);
-        for (ix, row) in items.into_iter().enumerate() {
-            section = section.child(self.call_device_row(Side::Camera, ix, row, cx));
-        }
-        Some(section)
+            .gap(px(10.))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::hover()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_menu_set(Some(target.clone()), cx);
+            }))
+            .child(glyph(icon, 16., if warning { theme::warning() } else { theme::text_soft() }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .line_height(px(16.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::text())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(11.))
+                            .line_height(px(14.))
+                            .text_color(if warning { theme::warning() } else { theme::text_faint() })
+                            .child(summary),
+                    ),
+            )
+            .child(glyph("icons/chevron-right.svg", 14., theme::text_faint()))
     }
 
     /// Small popover above the Camera button: live preview of the chosen camera, camera list, and
@@ -492,11 +858,16 @@ impl Shell {
         )
     }
 
-    /// "Switch device", after the dock's line when a device stays silent: opens this menu.
+    /// "Switch device", after the dock's line when a device stays silent: opens the relevant picker.
     pub(super) fn call_switch_device(&self, call: &Call, live: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !live || !call.device_stuck {
             return None;
         }
+        let target = call
+            .device_notice
+            .as_deref()
+            .map(stuck_device_menu)
+            .unwrap_or(Menu::Devices);
         Some(
             div()
                 .id("call-switch-device")
@@ -505,17 +876,35 @@ impl Shell {
                 .underline()
                 .text_color(theme::warning())
                 .child("Switch device")
-                .on_click(cx.listener(|this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.call_menu_set(Some(Menu::Devices), cx);
+                    this.call_menu_set(Some(target.clone()), cx);
                 }))
                 .into_any_element(),
         )
     }
 
-    /// What the device menu holds: a notice when something is not as chosen, MICROPHONE with
-    /// its level, SPEAKER with its level, then the speaker test and the settings.
+    /// Compact Call Options hub: active device summary rows (each drills into its focused picker),
+    /// 1:1 peer volume when applicable, speaker test, Discord voice actions, and Call settings.
     pub(super) fn call_devices_menu(&self, call: &Call, cx: &mut Context<Self>) -> Div {
+        let values = prefs::values();
+        let (mic_summary, mic_warn) =
+            active_device_summary(&values.device_choice(INPUT), &call.inputs, &call.input_id);
+        let (spk_summary, spk_warn) =
+            active_device_summary(&values.device_choice(OUTPUT), &call.outputs, &call.output_id);
+        let cam_row = (!call.cameras.is_empty()).then(|| {
+            let (cam_summary, cam_warn) =
+                active_camera_summary(&values.device_choice(CAMERA), &call.cameras, &call.camera_id);
+            self.call_device_summary_row(
+                "call-hub-camera",
+                "icons/video.svg",
+                "Camera",
+                cam_summary,
+                cam_warn,
+                Menu::Camera { from_hub: true },
+                cx,
+            )
+        });
         let row = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref())
             .filter(|row| row.key == call.conversation).cloned()
             .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation));
@@ -560,18 +949,25 @@ impl Shell {
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| this.call_track(event, cx)))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
             .children(self.call_device_notice_row(call))
-            .child(self.call_device_section(Side::Input, call, cx))
-            .child(self.call_level(call, Side::Input))
-            .child(div().flex_none().my(px(4.)).mx(px(8.)).h(px(1.)).bg(theme::hairline()))
-            .child(self.call_device_section(Side::Output, call, cx))
-            .child(self.call_level(call, Side::Output))
-            .children(self.call_camera_section(call, cx).map(|section| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(div().flex_none().my(px(4.)).mx(px(8.)).h(px(1.)).bg(theme::hairline()))
-                    .child(section)
-            }))
+            .child(self.call_device_summary_row(
+                "call-hub-input",
+                "icons/mic.svg",
+                "Microphone",
+                mic_summary,
+                mic_warn,
+                Menu::Input { from_hub: true },
+                cx,
+            ))
+            .child(self.call_device_summary_row(
+                "call-hub-output",
+                "icons/headphones.svg",
+                "Speaker",
+                spk_summary,
+                spk_warn,
+                Menu::Output { from_hub: true },
+                cx,
+            ))
+            .children(cam_row)
             .children(peer_volume)
             .child(menu_separator().mx(px(8.)))
             .child(test)
@@ -688,5 +1084,64 @@ mod tests {
         assert!(should_preview_camera(&one, false), "first use previews before sending");
         assert!(!should_preview_camera(&one, true), "single camera after first use turns on at once");
         assert!(should_preview_camera(&two, true), "multiple cameras always offer the picker and preview");
+    }
+
+    #[test]
+    fn active_device_summary_flags_disconnected_and_resolves_in_use_or_auto() {
+        assert_eq!(active_device_summary(&DeviceChoice::Auto, &listed(), "hs55"), (HEADSET.to_owned(), false));
+        assert_eq!(
+            active_device_summary(&DeviceChoice::System, &listed(), ""),
+            ("Krisp Speaker (Krisp Audio)".to_owned(), false)
+        );
+        let picked = DeviceChoice::device("Microphone (HyperX SoloCast 2)", "hyperx");
+        assert_eq!(
+            active_device_summary(&picked, &listed(), "usb"),
+            ("Microphone (HyperX SoloCast 2) · not connected".to_owned(), true)
+        );
+    }
+
+    #[test]
+    fn active_camera_summary_flags_disconnected_and_resolves_active() {
+        let cams = vec![
+            CameraSource { id: "cam-a".into(), name: "Lyra-CAM_36HW".into(), thumbnail: String::new() },
+            CameraSource { id: "cam-b".into(), name: "Pixel 10 Pro XL".into(), thumbnail: String::new() },
+        ];
+        assert_eq!(active_camera_summary(&DeviceChoice::Auto, &cams, ""), ("Lyra-CAM_36HW".to_owned(), false));
+        assert_eq!(
+            active_camera_summary(&DeviceChoice::device("Pixel 10 Pro XL", "cam-b"), &cams, "cam-b"),
+            ("Pixel 10 Pro XL".to_owned(), false)
+        );
+        assert_eq!(
+            active_camera_summary(&DeviceChoice::device("Missing Cam", "gone"), &cams, "cam-a"),
+            ("Missing Cam · not connected".to_owned(), true)
+        );
+    }
+
+    #[test]
+    fn stuck_device_menu_routes_microphone_and_speaker_notices_to_focused_pickers() {
+        assert_eq!(
+            stuck_device_menu("Microphone (HyperX SoloCast 2) isn't connected. Using fallback."),
+            Menu::Input { from_hub: false }
+        );
+        assert_eq!(
+            stuck_device_menu("Speaker (Headset Earphone) is silent."),
+            Menu::Output { from_hub: false }
+        );
+        assert_eq!(stuck_device_menu("Device switched."), Menu::Devices);
+        assert!(notice_applies_to("Microphone isn't connected", Side::Input));
+        assert!(!notice_applies_to("Microphone isn't connected", Side::Output));
+        assert!(notice_applies_to("Speaker isn't connected", Side::Output));
+        assert!(!notice_applies_to("Speaker isn't connected", Side::Input));
+    }
+
+    #[test]
+    fn menu_metered_and_same_kind_cover_focused_device_pickers() {
+        assert!(Menu::Input { from_hub: false }.metered());
+        assert!(Menu::Output { from_hub: true }.metered());
+        assert!(Menu::Devices.metered());
+        assert!(!Menu::Camera { from_hub: false }.metered());
+        assert!(Menu::Input { from_hub: false }.same_kind(&Menu::Input { from_hub: true }));
+        assert!(Menu::Output { from_hub: false }.same_kind(&Menu::Output { from_hub: true }));
+        assert!(!Menu::Input { from_hub: false }.same_kind(&Menu::Output { from_hub: false }));
     }
 }

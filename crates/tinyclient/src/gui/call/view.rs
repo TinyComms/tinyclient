@@ -119,6 +119,89 @@ pub(in crate::gui) fn bar_button(id: &'static str, icon: &'static str, look: Bar
         .child(glyph(icon, 20., color))
 }
 
+/// Split-pill call bar button (Discord-style): left main action + right chevron device picker.
+/// Both halves share one 44 px pill container; right-clicking anywhere on the pill also opens the
+/// device picker (attached by the caller).
+fn bar_split_button(
+    pill_id: &'static str,
+    main_id: &'static str,
+    chevron_id: &'static str,
+    icon: &'static str,
+    look: BarLook,
+    menu_open: bool,
+    main_label: SharedString,
+    main_shortcut: Option<&'static str>,
+    chevron_label: &'static str,
+    on_main: Option<Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>>,
+    on_menu: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
+    on_right: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static>,
+) -> Stateful<Div> {
+    let (fill, color) = match look {
+        BarLook::Rest => (theme::selected(), theme::text()),
+        BarLook::Off | BarLook::Held => (theme::danger_soft(), theme::danger()),
+        BarLook::On => (theme::accent_soft(), theme::accent()),
+    };
+    let chevron_icon = if menu_open { "icons/chevron-down.svg" } else { "icons/chevron-up.svg" };
+    let main_half = div()
+        .id(main_id)
+        .role(gpui::Role::Button)
+        .aria_label(main_label.clone())
+        .h_full()
+        .pl(px(13.))
+        .pr(px(9.))
+        .rounded_l_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(tip(main_label, main_shortcut))
+        .map(|button| match (look, on_main) {
+            (BarLook::Held, _) | (_, None) => button.opacity(0.55).aria_disabled(true),
+            (_, Some(handler)) => button
+                .cursor_pointer()
+                .tab_index(0)
+                .hover(|style| style.bg(theme::pressed()))
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
+                .on_click(move |ev, window, cx| handler(ev, window, cx)),
+        })
+        .child(glyph(icon, 20., color));
+    let divider = div()
+        .flex_none()
+        .w(px(1.))
+        .h(px(20.))
+        .bg(theme::hairline());
+    let chevron_half = div()
+        .id(chevron_id)
+        .role(gpui::Role::Button)
+        .aria_label(chevron_label)
+        .h_full()
+        .pl(px(6.))
+        .pr(px(10.))
+        .rounded_r_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .tab_index(0)
+        .when(menu_open, |btn| btn.bg(theme::pressed()))
+        .hover(|style| style.bg(theme::pressed()))
+        .focus_visible(|style| style.shadow(theme::focus_ring()))
+        .tooltip(tip(chevron_label, None))
+        .on_click(move |ev, window, cx| on_menu(ev, window, cx))
+        .child(glyph(chevron_icon, 13., color));
+    div()
+        .id(pill_id)
+        .relative()
+        .h(px(44.))
+        .rounded_full()
+        .bg(fill)
+        .flex()
+        .items_center()
+        .on_mouse_down(MouseButton::Right, move |ev, window, cx| on_right(ev, window, cx))
+        .child(main_half)
+        .child(divider)
+        .child(chevron_half)
+}
+
 /// Push to talk, as the pill over the call bar says it: the key to hold, or that it is held.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::gui) enum Talk {
@@ -214,6 +297,22 @@ impl Shell {
             return true;
         }
         self.call_state.view.as_ref() == Some(&call.conversation)
+    }
+
+    /// Whether the main pane is currently rendering `call_view_bar` for the active call (either
+    /// the standalone call view pane or the active Tiny voice room stage).
+    pub(in crate::gui) fn call_stage_bar_visible(&self, snapshot: &Snapshot) -> bool {
+        if self.call_view_active(snapshot) {
+            return true;
+        }
+        let Some(call) = self.call_shown(snapshot) else {
+            return false;
+        };
+        snapshot.open.is_none()
+            && self.tiny_open()
+            && self.tiny_state.account.as_ref() == Some(&call.conversation.account())
+            && self.tiny_state.channel.as_deref() == Some(call.conversation.id.as_str())
+            && self.tiny_room(&call.conversation).is_some()
     }
 
     /// Opens the main-pane call view for `key`.
@@ -1904,22 +2003,69 @@ impl Shell {
             .child(glyph("icons/phone-off.svg", 18., theme::on_accent()))
             .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::on_accent()).child(leave_word))
             .into_any_element();
-        let mute = match opts.held {
-            Some(words) => bar_button("tiny-bar-mute", "icons/mic-off.svg", BarLook::Held).aria_label(words).tooltip(tip(words, None)),
-            None => bar_button(
+        let has_call = call.is_some();
+        let menu = self.call_menu();
+        let input_open = matches!(menu, Some(Menu::Input { .. }));
+        let output_open = matches!(menu, Some(Menu::Output { .. }));
+        let camera_menu_open = matches!(menu, Some(Menu::Camera { .. } | Menu::CameraPreview));
+        let mute_look = if opts.held.is_some() {
+            BarLook::Held
+        } else if muted {
+            BarLook::Off
+        } else {
+            BarLook::Rest
+        };
+        let mute_icon = if opts.held.is_some() || muted { "icons/mic-off.svg" } else { "icons/mic.svg" };
+        let mute_label: SharedString = match opts.held {
+            Some(words) => words.into(),
+            None if muted => "Unmute".into(),
+            None => "Mute".into(),
+        };
+        let mute: Stateful<Div> = if has_call {
+            bar_split_button(
+                "tiny-bar-mute-pill",
                 "tiny-bar-mute",
-                if muted { "icons/mic-off.svg" } else { "icons/mic.svg" },
-                if muted { BarLook::Off } else { BarLook::Rest },
+                "tiny-bar-mute-menu",
+                mute_icon,
+                mute_look,
+                input_open,
+                mute_label,
+                opts.held.is_none().then_some("⌘⇧M"),
+                "Select microphone",
+                opts.held.is_none().then(|| -> Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App)> {
+                    Box::new(cx.listener(move |this, _, _, cx| {
+                        if room_context {
+                            this.tiny_toggle_mute(cx);
+                        } else {
+                            this.call_mute(cx);
+                        }
+                    }))
+                }),
+                Box::new(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::Input { from_hub: false }, cx);
+                })),
+                Box::new(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::Input { from_hub: false }, cx);
+                })),
             )
-            .aria_label(if muted { "Unmute" } else { "Mute" })
-            .tooltip(tip(if muted { "Unmute" } else { "Mute" }, Some("⌘⇧M")))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if room_context {
-                    this.tiny_toggle_mute(cx);
-                } else {
-                    this.call_mute(cx);
-                }
-            })),
+        } else {
+            match opts.held {
+                Some(words) => bar_button("tiny-bar-mute", "icons/mic-off.svg", BarLook::Held)
+                    .aria_label(words)
+                    .tooltip(tip(words, None)),
+                None => bar_button("tiny-bar-mute", mute_icon, mute_look)
+                    .aria_label(mute_label.clone())
+                    .tooltip(tip(mute_label, Some("⌘⇧M")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if room_context {
+                            this.tiny_toggle_mute(cx);
+                        } else {
+                            this.call_mute(cx);
+                        }
+                    })),
+            }
         }
         .when(speaking, |mute| {
             mute.child(
@@ -1933,25 +2079,69 @@ impl Shell {
                     .border_color(theme::positive()),
             )
         });
-        let deafen = if opts.held_ears {
+        let deafen_look = if opts.held_ears {
+            BarLook::Held
+        } else if deafened {
+            BarLook::Off
+        } else {
+            BarLook::Rest
+        };
+        let deafen_icon = if opts.held_ears || deafened {
+            "icons/headphone-off.svg"
+        } else {
+            "icons/headphones.svg"
+        };
+        let deafen_label: SharedString = if opts.held_ears {
+            "A moderator deafened you here".into()
+        } else if deafened {
+            "Undeafen".into()
+        } else {
+            "Deafen".into()
+        };
+        let deafen: Stateful<Div> = if has_call {
+            bar_split_button(
+                "tiny-bar-deafen-pill",
+                "tiny-bar-deafen",
+                "tiny-bar-deafen-menu",
+                deafen_icon,
+                deafen_look,
+                output_open,
+                deafen_label,
+                (!opts.held_ears).then_some("⌘⇧D"),
+                "Select speaker",
+                (!opts.held_ears).then(|| -> Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App)> {
+                    Box::new(cx.listener(move |this, _, _, cx| {
+                        if room_context {
+                            this.tiny_toggle_deafen(cx);
+                        } else {
+                            this.call_deafen(cx);
+                        }
+                    }))
+                }),
+                Box::new(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::Output { from_hub: false }, cx);
+                })),
+                Box::new(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::Output { from_hub: false }, cx);
+                })),
+            )
+        } else if opts.held_ears {
             bar_button("tiny-bar-deafen", "icons/headphone-off.svg", BarLook::Held)
                 .aria_label("A moderator deafened you here")
                 .tooltip(tip("A moderator deafened you here", None))
         } else {
-            bar_button(
-                "tiny-bar-deafen",
-                if deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" },
-                if deafened { BarLook::Off } else { BarLook::Rest },
-            )
-            .aria_label(if deafened { "Undeafen" } else { "Deafen" })
-            .tooltip(tip(if deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if room_context {
-                    this.tiny_toggle_deafen(cx);
-                } else {
-                    this.call_deafen(cx);
-                }
-            }))
+            bar_button("tiny-bar-deafen", deafen_icon, deafen_look)
+                .aria_label(deafen_label.clone())
+                .tooltip(tip(deafen_label, Some("⌘⇧D")))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if room_context {
+                        this.tiny_toggle_deafen(cx);
+                    } else {
+                        this.call_deafen(cx);
+                    }
+                }))
         };
         let joined = call.is_some_and(|call| call.state == CallState::Joined);
         let is_rtmp = call.is_some_and(|call| call.rtmp_stream);
@@ -1984,11 +2174,42 @@ impl Shell {
         let camera_limit = call.and_then(|c| c.video_limit_reason(camera_on));
         let camera = pictures.then(|| {
             let call_cam = call.cloned();
+            let has_cameras = call_cam.as_ref().is_some_and(|c| !c.cameras.is_empty());
             if let Some(reason) = camera_limit {
                 bar_button("tiny-bar-camera", "icons/video.svg", BarLook::Held)
                     .aria_label(reason.clone())
                     .tooltip(tip(reason, None))
+            } else if let Some(call_for_split) = call_cam.filter(|_| has_cameras) {
+                let call_click = call_for_split.clone();
+                let call_menu = call_for_split.clone();
+                let call_right = call_for_split;
+                let cam_label: SharedString =
+                    if camera_on { "Turn camera off" } else { "Turn camera on" }.into();
+                bar_split_button(
+                    "tiny-bar-camera-pill",
+                    "tiny-bar-camera",
+                    "tiny-bar-camera-menu",
+                    "icons/video.svg",
+                    if camera_on { BarLook::On } else { BarLook::Rest },
+                    camera_menu_open,
+                    cam_label,
+                    None,
+                    "Select camera",
+                    Some(Box::new(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_camera_clicked(&call_click, camera_on, cx);
+                    }))),
+                    Box::new(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_camera_picker_toggle(&call_menu, camera_on, cx);
+                    })),
+                    Box::new(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_camera_picker_toggle(&call_right, camera_on, cx);
+                    })),
+                )
             } else {
+                let call_click = call.cloned();
                 bar_button(
                     "tiny-bar-camera",
                     "icons/video.svg",
@@ -1998,7 +2219,7 @@ impl Shell {
                 .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    if let Some(call) = &call_cam {
+                    if let Some(call) = &call_click {
                         this.call_camera_clicked(call, camera_on, cx);
                     } else {
                         this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx);
@@ -2088,15 +2309,13 @@ impl Shell {
                     .tooltip(tip(words, None))
                     .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_health(cx)))
             });
-        let has_call = call.is_some();
-        let menu = self.call_menu();
         let devices = bar_button(
             "tiny-bar-devices",
             "icons/settings.svg",
             if menu == Some(Menu::Devices) { BarLook::On } else { BarLook::Rest },
         )
-        .aria_label("Devices")
-        .tooltip(tip("Devices", None))
+        .aria_label("Call options")
+        .tooltip(tip("Call options", None))
         .on_click(cx.listener(move |this, _, _, cx| {
             if has_call {
                 cx.stop_propagation();
@@ -2119,17 +2338,22 @@ impl Shell {
                 this.call_soundboard_toggle(key.clone(), cx);
             }))
         });
-        let bar_popover = call.and_then(|call| match menu {
-            Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
-            Some(Menu::CameraPreview) => Some((284., self.call_camera_preview_menu(call, cx).p(px(8.)))),
-            Some(Menu::AddPeople) => Some((280., self.call_add_people_menu(call, cx).p(px(6.)))),
-            Some(Menu::Soundboard) => Some((320., self.call_soundboard_body(call, cx).p(px(8.)))),
-            Some(Menu::Person { account, user_id, name }) => {
-                Some((260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.))))
+        let bar_popover = call.and_then(|call| {
+            let open = menu.as_ref()?;
+            if let Some(body) = self.call_device_popover_body(call, open, cx) {
+                return Some(body);
             }
-            Some(Menu::TelegramCall) => Some((260., self.telegram_call_menu(call, cx).p(px(6.)))),
-            _ => None,
+            match open {
+                Menu::AddPeople => Some((280., self.call_add_people_menu(call, cx).p(px(6.)))),
+                Menu::Soundboard => Some((320., self.call_soundboard_body(call, cx).p(px(8.)))),
+                Menu::Person { account, user_id, name } => {
+                    Some((260., self.call_person_menu(account.clone(), user_id, name, cx).p(px(6.))))
+                }
+                _ => None,
+            }
         });
+        let device_notice_click = self.call_refused().is_none()
+            && call.and_then(|c| c.device_notice.as_deref()).is_some();
         let call_error = room_context.then(|| self.tiny_state.call_error.clone()).flatten();
         bar.relative()
             .children(self.call_view_pills(opts.ptt_only, call, opts.held, opts.room_context, cx))
@@ -2172,11 +2396,22 @@ impl Shell {
                 |bar| bar.child(div().type_small().text_color(theme::text_faint()).child(HEADPHONES)),
             )
             .children(refused.map(|detail| {
+                let target = super::devices::stuck_device_menu(&detail);
                 div()
+                    .id("tiny-bar-notice")
                     .max_w(px(520.))
                     .whitespace_normal()
                     .type_small()
                     .text_color(theme::warning())
+                    .when(device_notice_click, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.underline())
+                            .tooltip(tip("Click to switch device", None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_menu_toggle(target.clone(), cx);
+                            }))
+                    })
                     .child(detail)
             }))
             .children(call_error.map(|detail| {
