@@ -112,7 +112,7 @@ pub const ROWS: &[Row] = &[
     row("V4", Audio, "Joining", "Join calls with my microphone muted", &[], &["mute", "muted", "join"]),
     row("V26", Audio, "Joining", "Pop out video when switching apps", &[], &["popout", "pop out", "pip", "picture in picture", "always on top", "share", "call"]),
     row("V27", Audio, "Screen sharing", "Open a screen share when I'm looking at the call", &[], &["screen", "share", "sharing", "watch", "auto", "stream"]),
-    row("V28", Audio, "Screen sharing", "Screen share resolution", &["720p", "1080p", "1440p", "Source"], &["screen", "share", "resolution", "720p", "1080p", "1440p", "4k", "source", "quality"]),
+    row("V32", Audio, "Screen sharing", "Screen share resolution", &["720p", "1080p", "1440p", "Source"], &["screen", "share", "resolution", "720p", "1080p", "1440p", "4k", "source", "quality"]),
     row("V29", Audio, "Screen sharing", "Screen share frame rate", &["15 fps", "30 fps", "60 fps"], &["screen", "share", "fps", "frame rate", "framerate", "hz", "smooth"]),
     row("V30", Audio, "Screen sharing", "Screen share bitrate", &["Low", "Balanced", "Best"], &["screen", "share", "bitrate", "quality", "bandwidth"]),
     row("V31", Audio, "Screen sharing", "Incoming video quality", &["High", "Low", "Off"], &["video", "quality", "receive", "bandwidth", "layer", "data saver"]),
@@ -264,7 +264,7 @@ pub fn kept_by_chatd(id: &str) -> bool {
         id,
         "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "NR" | "NF" | "NK" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
             | "M8"
-            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "P7" | "PS1" | "PS2" | "PS3" | "V1" | "V2" | "V3" | "V4" | "V5" | "V28" | "V6" | "V22" | "V23" | "V24" | "V25" | "V27" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
+            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "P7" | "PS1" | "PS2" | "PS3" | "V1" | "V2" | "V3" | "V4" | "V5" | "V28" | "V29" | "V30" | "V31" | "V32" | "V6" | "V22" | "V23" | "V24" | "V25" | "V27" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
     )
 }
 

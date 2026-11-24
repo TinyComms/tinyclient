@@ -31,7 +31,7 @@ const TRANSLATE_LABELS: [&str; 13] = [
 
 /// Choice sets whose pills do not fit beside their label. Short pairs stay pills.
 pub(super) fn menu_choice(id: &str) -> bool {
-    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "M8" | "P4" | "PS1" | "D2" | "V8" | "V11" | "V21" | "V23" | "V28" | "V29" | "V30" | "V31")
+    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "M8" | "P4" | "PS1" | "D2" | "V8" | "V11" | "V21" | "V23" | "V29" | "V30" | "V31" | "V32")
 }
 
 /// `--settings-choice` names one of these.
@@ -54,10 +54,10 @@ pub(super) fn choice_id(name: &str) -> Option<&'static str> {
         "V11" => "V11",
         "V21" => "V21",
         "V23" => "V23",
-        "V28" => "V28",
         "V29" => "V29",
         "V30" => "V30",
         "V31" => "V31",
+        "V32" => "V32",
         _ => return None,
     })
 }
@@ -82,7 +82,7 @@ fn choice_slot(id: &str) -> usize {
         "V11" => 49,
         "V21" => 50,
         "V23" => 53,
-        "V28" => 54,
+        "V32" => 54,
         "V29" => 55,
         "V30" => 56,
         "V31" => 57,
@@ -148,7 +148,7 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
             let at = CAMERA_QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, CAMERA_QUALITY)).unwrap_or(0);
             (CAMERA_QUALITY_CHOICES.iter().zip(["Auto", "HD (720p)", "Standard (360p)", "Data saver"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 0)
         }
-        "V28" => {
+        "V32" => {
             let at = SHARE_RESOLUTION_CHOICES.iter().position(|w| *w == values.word(GLOBAL, SHARE_RESOLUTION)).unwrap_or(2);
             (SHARE_RESOLUTION_CHOICES.iter().zip(["720p", "1080p", "1440p", "Source"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 2)
         }
@@ -485,7 +485,7 @@ impl SettingsWindow {
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
                 self.group(&["V22", "V23", "V24", "V25"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
                 self.group(&["V4", "V26"], Some("Joining"), window, cx),
-                self.group(&["V27", "V28", "V29", "V30", "V31"], Some("Screen sharing"), window, cx)
+                self.group(&["V27", "V32", "V29", "V30", "V31"], Some("Screen sharing"), window, cx)
                     .child(caption("Defaults for new screen shares and incoming video. You can also adjust resolution, frame rate, and bitrate live from the Share picker.")),
             ],
             Section::Voice => {
@@ -1029,7 +1029,7 @@ impl SettingsWindow {
                 let on = values.on(AUTO_WATCH_SHARE);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, AUTO_WATCH_SHARE, on, false, cx), cx)
             }
-            "V28" => {
+            "V32" => {
                 let at = SHARE_RESOLUTION_CHOICES.iter().position(|w| *w == values.word(GLOBAL, SHARE_RESOLUTION)).unwrap_or(2);
                 let second = Some("Maximum resolution sent when you share your screen or a window.".to_owned());
                 self.menu_choice_row(id, &["720p", "1080p", "1440p", "Source"], at, 2, second, None, cx)
@@ -1401,7 +1401,7 @@ impl SettingsWindow {
                 let stored = (word != "auto").then(|| word.to_owned());
                 self.set(id, GLOBAL.into(), CAMERA_QUALITY, stored, cx);
             }
-            "V28" => {
+            "V32" => {
                 let word = SHARE_RESOLUTION_CHOICES[ix.min(SHARE_RESOLUTION_CHOICES.len() - 1)];
                 let stored = (word != "1440").then(|| word.to_owned());
                 self.set(id, GLOBAL.into(), SHARE_RESOLUTION, stored, cx);
@@ -2801,7 +2801,7 @@ mod tests {
 
     #[test]
     fn long_choice_sets_are_menus_and_the_button_stays_in_the_column() {
-        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "M8", "P4", "PS1", "D2", "V8", "V11", "V21", "V23", "V28", "V29", "V30", "V31"] {
+        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "M8", "P4", "PS1", "D2", "V8", "V11", "V21", "V23", "V29", "V30", "V31", "V32"] {
             assert!(menu_choice(id), "{id}");
         }
         assert_eq!(TRANSLATE_LABELS.len(), TRANSLATE_TO_CHOICES.len());

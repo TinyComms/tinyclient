@@ -218,10 +218,10 @@ fn bad_shapes_are_refused_before_anything_is_sent() {
         assert_eq!(invite_with(account.clone(), TinyInviteOptions { expires_in_secs: Some(5), ..TinyInviteOptions::default() }), said(EXPIRY));
         assert_eq!(override_set(account.clone(), LOBBY.into(), MODS.into(), 1, 1), said(CHECK), "a bit both allowed and denied");
         assert_eq!(log.lock().unwrap().len(), before);
-        // An icon: too big, or not a picture.
+        // An icon: too big (> 16 MiB raw limit), or not a picture.
         let big = std::env::temp_dir().join(format!("tinyclient-icon-big-{}.png", std::process::id()));
         let mut bytes = png();
-        bytes.resize(TINY_ICON_MAX + 1, 0);
+        bytes.resize(16 * 1024 * 1024 + 1, 0);
         std::fs::write(&big, &bytes).unwrap();
         assert_eq!(server_icon(account.clone(), Some(big.to_string_lossy().into_owned())), said(ICON_SIZE));
         let text = std::env::temp_dir().join(format!("tinyclient-icon-text-{}.png", std::process::id()));
