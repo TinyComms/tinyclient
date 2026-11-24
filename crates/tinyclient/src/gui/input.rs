@@ -414,8 +414,7 @@ pub struct TextInput {
     checking: bool,
     edit_menu: Option<EditMenu>,
     /// Discord drafts paint markdown in place. Other fields keep the plain marker dimming.
-    format_discord: bool,
-    format_slack: bool,
+    markup: super::composer::format::Markup,
 }
 
 #[derive(Clone)]
@@ -463,23 +462,14 @@ impl TextInput {
             spell_generation: 0,
             checking: false,
             edit_menu: None,
-            format_discord: false,
-            format_slack: false,
+            markup: super::composer::format::Markup::Off,
         }
     }
 
-    /// Paint Slack markup while this draft is open. Off for every other field.
-    pub fn set_format_slack(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.format_slack != on {
-            self.format_slack = on;
-            cx.notify();
-        }
-    }
-
-    /// Paint Discord markdown while this draft is open. Off for every other field.
-    pub fn set_format_discord(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.format_discord != on {
-            self.format_discord = on;
+    /// Which markers this draft paints and the shortcuts write. Off for every other field.
+    pub(super) fn set_markup(&mut self, markup: super::composer::format::Markup, cx: &mut Context<Self>) {
+        if self.markup != markup {
+            self.markup = markup;
             cx.notify();
         }
     }
@@ -861,11 +851,10 @@ impl TextInput {
     }
 
     fn apply_format(&mut self, kind: super::composer::format::Kind, cx: &mut Context<Self>) {
-        if !(self.format_discord || self.format_slack) || self.secret {
+        if !self.markup.offers(kind) || self.secret {
             return;
         }
-        let apply = if self.format_slack { super::composer::format::slack::apply } else { super::composer::format::apply };
-        let (text, range) = apply(self.editor.text(), self.editor.selection(), kind);
+        let (text, range) = self.markup.apply(self.editor.text(), self.editor.selection(), kind);
         if text == self.editor.text() {
             return;
         }
@@ -885,7 +874,7 @@ impl TextInput {
 
     /// ⌘U is also Attach File. A field that is not a Discord draft gives the key back.
     fn format_underline(&mut self, _: &FormatUnderline, window: &mut Window, cx: &mut Context<Self>) {
-        if self.format_discord {
+        if self.markup.offers(super::composer::format::Kind::Underline) {
             self.apply_format(super::composer::format::Kind::Underline, cx);
         } else {
             window.dispatch_action(Box::new(crate::gui::AttachFile), cx);
@@ -927,7 +916,7 @@ impl TextInput {
             Pasted::Image(image) => cx.emit(InputPaste::Image(image)),
             Pasted::Text => {
                 if let Some(text) = item.text() {
-                    if self.format_discord && !self.secret {
+                    if self.markup == super::composer::format::Markup::Discord && !self.secret {
                         if let Some((next, range)) = super::composer::format::mask_link(self.editor.text(), self.editor.selection(), &text) {
                             let end = self.editor.text().len();
                             self.editor.replace(0..end, &next);
@@ -1356,9 +1345,8 @@ impl Shaping {
         let code_wash: Hsla = theme::field().into_color();
         let spoiler_wash: Hsla = theme::segment().into_color();
         let quote_wash: Hsla = theme::accent_wash().into_color();
-        let formatting = (input.format_discord || input.format_slack) && !input.secret;
-        let paint = if input.format_slack { super::composer::format::slack::paint } else { super::composer::format::paint };
-        let styled = if formatting && !content.is_empty() { paint(content) } else { Vec::new() };
+        let formatting = input.markup.on() && !input.secret;
+        let styled = if formatting && !content.is_empty() { input.markup.paint(content) } else { Vec::new() };
         let mut lines = Vec::new();
         let mut rows = Vec::new();
         let mut line_start = 0;
@@ -1671,7 +1659,7 @@ impl Element for TextElement {
                 )
             })
             .collect();
-        let quotes = if input.format_discord || input.format_slack {
+        let quotes = if input.markup.on() {
             let source = input.editor.text();
             laid.rows
                 .iter()

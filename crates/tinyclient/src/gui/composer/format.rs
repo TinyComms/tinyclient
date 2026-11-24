@@ -21,6 +21,76 @@ pub(in crate::gui) enum Kind {
     Quote,
 }
 
+/// Which markers a draft reads. Each network that takes styles has its own way of writing them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::gui) enum Markup {
+    #[default]
+    Off,
+    Discord,
+    Slack,
+    /// Discord's markers, turned into entities on send.
+    Telegram,
+    /// Discord's markers the Teams adapter already reads, less underline and spoiler.
+    Teams,
+}
+
+impl Markup {
+    pub(in crate::gui) fn of(network: protocol::Network) -> Markup {
+        match network {
+            protocol::Network::Discord => Markup::Discord,
+            protocol::Network::Slack => Markup::Slack,
+            protocol::Network::Telegram => Markup::Telegram,
+            protocol::Network::Teams => Markup::Teams,
+            _ => Markup::Off,
+        }
+    }
+
+    pub(in crate::gui) fn on(self) -> bool {
+        self != Markup::Off
+    }
+
+    /// Whether the network has a way to write `kind`.
+    pub(in crate::gui) fn offers(self, kind: Kind) -> bool {
+        match kind {
+            Kind::Underline | Kind::Spoiler => matches!(self, Markup::Discord | Markup::Telegram),
+            _ => self.on(),
+        }
+    }
+
+    pub(in crate::gui) fn apply(
+        self,
+        text: &str,
+        selection: Range<usize>,
+        kind: Kind,
+    ) -> (String, Range<usize>) {
+        match self {
+            Markup::Slack => slack::apply(text, selection, kind),
+            _ => apply(text, selection, kind),
+        }
+    }
+
+    pub(in crate::gui) fn paint(self, text: &str) -> Vec<Look> {
+        match self {
+            Markup::Slack => slack::paint(text),
+            _ => paint(text),
+        }
+    }
+
+    /// The wire form of a draft: styles moved out of the text where the network wants them
+    /// beside it.
+    pub(in crate::gui) fn fold(
+        self,
+        text: String,
+        spans: Vec<protocol::Span>,
+    ) -> (String, Vec<protocol::Span>) {
+        match self {
+            Markup::Slack => slack::fold(text, spans),
+            Markup::Telegram => fold(text, spans),
+            _ => (text, spans),
+        }
+    }
+}
+
 /// How a slice of the draft is drawn. A marker slice is only dimmed. The other flags stack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::gui) struct Look {
@@ -877,6 +947,103 @@ fn flatten(hits: &[Hit], len: usize) -> Vec<Look> {
     looks
 }
 
+/// Takes the markers out of `text` and returns the styles they asked for, with `spans`
+/// (mentions, emoji) moved to the shorter text. A masked `[label](url)` keeps its brackets:
+/// there is no link span to carry the address.
+fn fold_with(
+    text: String,
+    spans: Vec<protocol::Span>,
+    inline: Inline,
+) -> (String, Vec<protocol::Span>) {
+    let (hits, pairs) = analyze(&text, inline);
+    let masked: Vec<&Range<usize>> = hits
+        .iter()
+        .filter(|hit| matches!(hit.style, Style::Link) && text[hit.range.end..].starts_with("]("))
+        .map(|hit| &hit.range)
+        .collect();
+    let mut cut: Vec<Range<usize>> = hits
+        .iter()
+        .filter(|hit| matches!(hit.style, Style::Marker) && hit.range.start < hit.range.end)
+        .filter(|hit| {
+            !masked
+                .iter()
+                .any(|label| hit.range.end == label.start || hit.range.start == label.end)
+        })
+        .map(|hit| hit.range.clone())
+        .collect();
+    if cut.is_empty() {
+        return (text, spans);
+    }
+    cut.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in cut {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    let map = |point: usize| -> u32 {
+        let mut gone = 0;
+        for range in &merged {
+            if point >= range.end {
+                gone += range.end - range.start;
+            } else if point > range.start {
+                gone += point - range.start;
+            }
+        }
+        (point - gone) as u32
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for range in &merged {
+        out.push_str(&text[at..range.start]);
+        at = range.end;
+    }
+    out.push_str(&text[at..]);
+    let mut folded: Vec<protocol::Span> = spans
+        .into_iter()
+        .map(|span| protocol::Span {
+            start: map(span.start as usize),
+            end: map(span.end as usize),
+            style: span.style,
+        })
+        .collect();
+    for hit in &hits {
+        let style = match hit.style {
+            Style::Bold => protocol::Style::Bold,
+            Style::Italic => protocol::Style::Italic,
+            Style::Underline => protocol::Style::Underline,
+            Style::Strike => protocol::Style::Strike,
+            Style::Spoiler => protocol::Style::Spoiler,
+            Style::Quote => protocol::Style::Quote,
+            Style::Code => match pairs.iter().find(|pair| pair.fence && pair.inner == hit.range) {
+                Some(fence) => {
+                    let open = &text[fence.open.clone()];
+                    let language = open.trim_start_matches('`').trim().to_owned();
+                    protocol::Style::CodeBlock { language }
+                }
+                None => protocol::Style::Code,
+            },
+            _ => continue,
+        };
+        let (start, end) = (map(hit.range.start), map(hit.range.end));
+        if start < end {
+            folded.push(protocol::Span { start, end, style });
+        }
+    }
+    (out, folded)
+}
+
+/// Discord-style markers (`**bold**`, `*italic*`, `__underline__`, `~~strike~~`, `||spoiler||`,
+/// `` `code` ``, `> quote`) turned into style spans, for networks that carry styles beside the
+/// text instead of reading markers themselves.
+pub(in crate::gui) fn fold(
+    text: String,
+    spans: Vec<protocol::Span>,
+) -> (String, Vec<protocol::Span>) {
+    fold_with(text, spans, scan_inline)
+}
+
 /// Slack draft formatting. Slack writes `*bold*`, `_italic_`, `~strike~`, `` `code` `` and `> `
 /// quotes. The markers stay in the field like Discord's, then [`fold`] turns them into style
 /// spans on send, so a message with a mention keeps its formatting too.
@@ -930,67 +1097,7 @@ pub(in crate::gui) mod slack {
         text: String,
         spans: Vec<protocol::Span>,
     ) -> (String, Vec<protocol::Span>) {
-        let (hits, pairs) = analyze(&text, scan_inline);
-        let mut cut: Vec<Range<usize>> = hits
-            .iter()
-            .filter(|hit| matches!(hit.style, Style::Marker) && hit.range.start < hit.range.end)
-            .map(|hit| hit.range.clone())
-            .collect();
-        if cut.is_empty() {
-            return (text, spans);
-        }
-        cut.sort_by_key(|range| range.start);
-        let mut merged: Vec<Range<usize>> = Vec::new();
-        for range in cut {
-            match merged.last_mut() {
-                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
-                _ => merged.push(range),
-            }
-        }
-        let map = |point: usize| -> u32 {
-            let mut gone = 0;
-            for range in &merged {
-                if point >= range.end {
-                    gone += range.end - range.start;
-                } else if point > range.start {
-                    gone += point - range.start;
-                }
-            }
-            (point - gone) as u32
-        };
-        let mut out = String::with_capacity(text.len());
-        let mut at = 0;
-        for range in &merged {
-            out.push_str(&text[at..range.start]);
-            at = range.end;
-        }
-        out.push_str(&text[at..]);
-        let mut folded: Vec<protocol::Span> = spans
-            .into_iter()
-            .map(|span| protocol::Span {
-                start: map(span.start as usize),
-                end: map(span.end as usize),
-                style: span.style,
-            })
-            .collect();
-        for hit in &hits {
-            let style = match hit.style {
-                Style::Bold => protocol::Style::Bold,
-                Style::Italic => protocol::Style::Italic,
-                Style::Strike => protocol::Style::Strike,
-                Style::Quote => protocol::Style::Quote,
-                Style::Code if pairs.iter().any(|pair| pair.fence && pair.inner == hit.range) => {
-                    protocol::Style::CodeBlock { language: String::new() }
-                }
-                Style::Code => protocol::Style::Code,
-                _ => continue,
-            };
-            let (start, end) = (map(hit.range.start), map(hit.range.end));
-            if start < end {
-                folded.push(protocol::Span { start, end, style });
-            }
-        }
-        (out, folded)
+        super::fold_with(text, spans, scan_inline)
     }
 
     fn scan_inline(text: &str, from: usize, to: usize, hits: &mut Vec<Hit>, pairs: &mut Vec<Pair>) {
@@ -1279,6 +1386,56 @@ mod tests {
         let looks = paint(r"\*not italic\*");
         assert!(!looks.iter().any(|look| look.italic));
         assert!(looks.iter().any(|look| look.marker));
+    }
+
+    #[test]
+    fn fold_turns_discord_markers_into_spans_for_telegram() {
+        let (text, spans) = fold("**a** __b__ ||c|| ~~d~~ *e*".to_owned(), Vec::new());
+        assert_eq!(text, "a b c d e");
+        let has = |style: protocol::Style, range: (u32, u32)| {
+            spans.iter().any(|s| s.style == style && (s.start, s.end) == range)
+        };
+        assert!(has(protocol::Style::Bold, (0, 1)));
+        assert!(has(protocol::Style::Underline, (2, 3)));
+        assert!(has(protocol::Style::Spoiler, (4, 5)));
+        assert!(has(protocol::Style::Strike, (6, 7)));
+        assert!(has(protocol::Style::Italic, (8, 9)));
+    }
+
+    #[test]
+    fn fold_keeps_a_masked_link_literal_and_a_fence_language() {
+        let plain = "see [docs](https://example.com) now";
+        assert_eq!(fold(plain.to_owned(), Vec::new()), (plain.to_owned(), Vec::new()));
+        let (text, spans) = fold("```rs\nlet a = 1;\n```".to_owned(), Vec::new());
+        assert_eq!(text, "let a = 1;");
+        assert!(spans
+            .iter()
+            .any(|s| s.style == (protocol::Style::CodeBlock { language: "rs".into() })));
+    }
+
+    #[test]
+    fn each_network_offers_only_the_styles_it_can_write() {
+        use protocol::Network::*;
+        let all = [Kind::Bold, Kind::Italic, Kind::Underline, Kind::Strike, Kind::Code, Kind::Spoiler, Kind::Quote];
+        for network in [Discord, Telegram] {
+            assert!(all.iter().all(|kind| Markup::of(network).offers(*kind)));
+        }
+        for network in [Slack, Teams] {
+            let markup = Markup::of(network);
+            assert!(!markup.offers(Kind::Underline) && !markup.offers(Kind::Spoiler));
+            assert!([Kind::Bold, Kind::Italic, Kind::Strike, Kind::Code, Kind::Quote].iter().all(|kind| markup.offers(*kind)));
+        }
+        assert!(!Markup::of(Signal).on());
+    }
+
+    #[test]
+    fn only_telegram_and_slack_move_markers_into_spans() {
+        let (teams, spans) = Markup::Teams.fold("**a**".to_owned(), Vec::new());
+        assert_eq!((teams.as_str(), spans.len()), ("**a**", 0));
+        let (text, spans) = Markup::Telegram.fold("**a**".to_owned(), Vec::new());
+        assert_eq!((text.as_str(), spans.len()), ("a", 1));
+        let (text, spans) = Markup::Slack.fold("*a*".to_owned(), Vec::new());
+        assert_eq!((text.as_str(), spans.len()), ("a", 1));
     }
 
     #[test]

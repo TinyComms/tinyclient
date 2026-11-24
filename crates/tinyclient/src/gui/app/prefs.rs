@@ -56,6 +56,8 @@ pub struct Choices {
     pub strip_tracking: bool,
     /// M6: misspellings in the message being typed are underlined.
     pub spell: bool,
+    /// M9: the bold, italic and other buttons above the message field.
+    pub format_bar: bool,
     /// M7: fetch and attach a preview card for links sent on Tiny servers.
     pub send_link_previews: bool,
     /// V26: automatically pop out a watched share when the main window loses focus.
@@ -67,7 +69,7 @@ pub struct Choices {
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { appearance: Appearance::System, high_contrast: false, compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, text_previews: true, updates: true, open_at_login: false, tray: false, confirm_links: true, strip_tracking: false, spell: true, send_link_previews: true, auto_popout_call: false, section: Section::Accounts }
+        Choices { appearance: Appearance::System, high_contrast: false, compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, text_previews: true, updates: true, open_at_login: false, tray: false, confirm_links: true, strip_tracking: false, spell: true, format_bar: true, send_link_previews: true, auto_popout_call: false, section: Section::Accounts }
     }
 }
 
@@ -89,6 +91,7 @@ static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     confirm_links: true,
     strip_tracking: false,
     spell: true,
+    format_bar: true,
     send_link_previews: true,
     auto_popout_call: false,
     section: Section::Accounts,
@@ -327,6 +330,7 @@ pub fn parse(text: &str) -> Prefs {
             "confirm_links" => prefs.choices.confirm_links = fields.next() != Some("off"),
             "strip_tracking" => prefs.choices.strip_tracking = fields.next() == Some("on"),
             "spell" => prefs.choices.spell = fields.next() != Some("off"),
+            "format_bar" => prefs.choices.format_bar = fields.next() != Some("off"),
             "send_link_previews" => prefs.choices.send_link_previews = fields.next() != Some("off"),
             "auto_popout_call" => prefs.choices.auto_popout_call = fields.next() == Some("on"),
             "link_ok" => {
@@ -386,7 +390,7 @@ pub fn write(prefs: &Prefs) -> String {
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
     let (choices, default) = (prefs.choices, Choices::default());
-    let lines: [(&str, bool, &str); 19] = [
+    let lines: [(&str, bool, &str); 20] = [
         ("appearance", choices.appearance != default.appearance, choices.appearance.word()),
         ("high_contrast", choices.high_contrast != default.high_contrast, "on"),
         ("density", choices.compact != default.compact, "compact"),
@@ -403,6 +407,7 @@ pub fn write(prefs: &Prefs) -> String {
         ("confirm_links", choices.confirm_links != default.confirm_links, "off"),
         ("strip_tracking", choices.strip_tracking != default.strip_tracking, "on"),
         ("spell", choices.spell != default.spell, "off"),
+        ("format_bar", choices.format_bar != default.format_bar, "off"),
         ("send_link_previews", choices.send_link_previews != default.send_link_previews, "off"),
         ("auto_popout_call", choices.auto_popout_call != default.auto_popout_call, "on"),
         ("settings_section", choices.section != default.section, ""),
@@ -477,7 +482,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { appearance: Appearance::Light, high_contrast: true, compact: true, previews: false, send_link_previews: false, auto_popout_call: true, command_return: true, newest: true, typing: false, emoticons: true, images: false, text_previews: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
+            choices: Choices { appearance: Appearance::Light, high_contrast: true, compact: true, previews: false, send_link_previews: false, auto_popout_call: true, command_return: true, newest: true, typing: false, emoticons: true, images: false, text_previews: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, format_bar: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,
@@ -525,7 +530,7 @@ mod tests {
     #[test]
     fn only_changed_choices_are_written_and_lines_from_a_newer_build_are_kept() {
         let text = write(&Prefs::default());
-        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "text_previews", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell", "login", "tray"] {
+        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "text_previews", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell", "format_bar", "login", "tray"] {
             assert!(!text.contains(name), "{name} is at its default and not written");
         }
         assert!(write(&Prefs { choices: Choices { text_previews: false, ..Choices::default() }, ..Prefs::default() }).contains("text_previews\toff\n"));

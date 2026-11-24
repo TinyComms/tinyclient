@@ -1127,13 +1127,9 @@ impl Composer {
     /// typed here is saved and waits for the next visit. `stored` is the draft on the
     /// conversation's row, which is what a conversation not visited before opens with.
     fn aim(&mut self, target: Target, stored: &str, cx: &mut Context<Self>) {
-        let discord = target.key.network == Network::Discord;
-        let slack = target.key.network == Network::Slack;
+        let markup = format::Markup::of(target.key.network);
         if self.target.as_ref() == Some(&target) && self.offered == stored {
-            self.input.update(cx, |input, cx| {
-                input.set_format_discord(discord, cx);
-                input.set_format_slack(slack, cx);
-            });
+            self.input.update(cx, |input, cx| input.set_markup(markup, cx));
             return;
         }
         let moved = self.target.as_ref().map(|old| &old.key) != Some(&target.key);
@@ -1204,8 +1200,7 @@ impl Composer {
         let silent = controls(&target.can, false).silent;
         self.input.update(cx, |input, cx| {
             input.set_alt_submits(silent);
-            input.set_format_discord(discord, cx);
-            input.set_format_slack(slack, cx);
+            input.set_markup(markup, cx);
         });
         self.maybe_fetch_peer_away(&target, cx);
         self.target = Some(target);
@@ -1937,7 +1932,7 @@ impl Composer {
         let network = target.key.network;
         let emoticons = super::app::prefs::choices().emoticons;
         let (wired, mention_spans) = length::wire_with_spans(&field, &self.tokens, &target.can, emoticons);
-        let (wired, mention_spans) = if network == Network::Slack { format::slack::fold(wired, mention_spans) } else { (wired, mention_spans) };
+        let (wired, mention_spans) = format::Markup::of(network).fold(wired, mention_spans);
         let Some(as_file) = self.stage_over_limit(&field, &wired, &target, cx) else {
             return;
         };
@@ -4217,7 +4212,7 @@ impl Composer {
         }
         let key = target.key.clone();
         let (wire, spans) = length::wire_with_spans(&field, &self.tokens, &target.can, false);
-        let (wire, spans) = if target.key.network == Network::Slack { format::slack::fold(wire, spans) } else { (wire, spans) };
+        let (wire, spans) = format::Markup::of(target.key.network).fold(wire, spans);
         let limit = if has_media || replacement.is_some() { target.can.caption_limit } else { target.can.text_limit };
         if let Some(words) = length::edit_refusal(wire.chars().count(), limit) {
             self.caption = Some((words, Tone::Refused));
@@ -5118,12 +5113,11 @@ impl Composer {
             }))
     }
 
-    /// Bold, italic, and the rest, always shown on a Discord draft. A click does not
+    /// Bold, italic, and the rest, always shown on a draft whose network takes styles. A click does not
     /// steal focus from the field: the card's own press would, so the button stops it.
     fn format_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let network = self.target.as_ref().map(|target| target.key.network);
-        let slack = network == Some(Network::Slack);
-        if network != Some(Network::Discord) && !slack {
+        let markup = self.target.as_ref().map_or(format::Markup::Off, |target| format::Markup::of(target.key.network));
+        if !markup.on() || !super::app::prefs::choices().format_bar {
             return None;
         }
         let phone = crate::gui::phone::active();
@@ -5147,7 +5141,7 @@ impl Composer {
             .items_center()
             .type_small()
             .text_color(theme::text());
-        let offered = buttons.into_iter().filter(|(kind, ..)| !slack || !matches!(kind, format::Kind::Underline | format::Kind::Spoiler));
+        let offered = buttons.into_iter().filter(|(kind, ..)| markup.offers(*kind));
         for (kind, id, label, name, shortcut) in offered {
             bar = bar.child(
                 div()

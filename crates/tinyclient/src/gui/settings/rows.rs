@@ -76,6 +76,7 @@ pub const ROWS: &[Row] = &[
     row("M4", Messages, "", "Convert emoticons to emoji", &[], &["smiley", "emoji", "emoticon", ":)"]),
     row("M5", Messages, "", "Play GIFs and animated stickers", &["Automatically", "On hover", "Never"], &["gif", "animated", "autoplay", "sticker", "motion", "animation"]),
     row("M6", Messages, "", "Check spelling", &[], &["spell", "spelling", "spellcheck", "dictionary", "underline"]),
+    row("M9", Messages, "", "Show formatting bar", &[], &["format", "formatting", "bold", "italic", "toolbar", "bar", "markdown", "strikethrough", "code", "quote"]),
     row("M7", Messages, "", "Show a preview for links I send", &[], &["link", "links", "preview", "previews", "card", "embed", "url", "tiny"]),
     row(
         "M8",
@@ -409,6 +410,7 @@ mod tests {
         assert!(search("keywords").iter().any(|row| row.id == "NK"));
         assert_eq!(not_yet("reactions"), None);
         assert!(search("spell").iter().any(|row| row.id == "M6"), "spell finds Check spelling");
+        assert!(search("formatting").iter().any(|row| row.id == "M9"), "formatting finds Show formatting bar");
         assert_eq!(not_yet("spell"), None);
         // Sounds of your own are built now: the words reach the row that adds one.
         assert_eq!(not_yet("custom sound"), None);
