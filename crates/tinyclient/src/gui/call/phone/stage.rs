@@ -370,7 +370,7 @@ impl Shell {
             .right(px(8.))
             .flex()
             .gap(px(4.))
-            .children(tile.deafened.then(|| chip().px(px(6.)).child(glyph("icons/headphone-off.svg", 13., theme::text_soft()))))
+            .children(tile.deafened.then(|| chip().px(px(6.)).child(glyph("icons/headphone-off.svg", 13., theme::on_accent()))))
             .children(tile.sharing.then(|| chip().px(px(6.)).child(glyph("icons/monitor-up.svg", 13., theme::accent_text()))));
         // Their camera or screen share is on and someone else's picture is the one on screen: Watch theirs.
         let watch = ((tile.camera || tile.sharing) && tile.frame.is_none() && !tile.me).then(|| {
@@ -442,6 +442,7 @@ impl Shell {
         let stage_h = (tall - STRIP_H - 12.).max(120.);
         let stop = div()
             .id("call-phone-stop-watching")
+            .flex_none()
             .h(px(30.))
             .px(px(12.))
             .rounded_full()
@@ -453,8 +454,8 @@ impl Shell {
             .active(|style| style.bg(theme::pressed()))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| this.call_stop_watch_user(cx)))
-            .child(glyph("icons/x.svg", 13., theme::text()))
-            .child(div().phone_stamp().text_color(theme::text()).child("Stop watching"));
+            .child(glyph("icons/x.svg", 13., theme::on_accent()))
+            .child(div().phone_stamp().text_color(theme::on_accent()).child("Stop watching"));
         let screen = div()
             .relative()
             .flex_none()
@@ -480,10 +481,12 @@ impl Shell {
                     .gap(px(8.))
                     .child(
                         chip()
+                            .flex_initial()
+                            .min_w_0()
                             .h(px(30.))
                             .px(px(10.))
                             .child(glyph("icons/monitor-up.svg", 14., theme::accent_text()))
-                            .child(div().min_w_0().truncate().phone_stamp().text_color(gpui::rgb(0xffffff)).child(caption)),
+                            .child(div().min_w_0().truncate().phone_stamp().text_color(theme::on_accent()).child(caption)),
                     )
                     .child(stop),
             );
@@ -554,7 +557,7 @@ impl Shell {
                 super::hooks::flip_camera(!front);
                 cx.notify();
             }))
-            .child(glyph("icons/switch-camera.svg", 15., theme::text()));
+            .child(glyph("icons/switch-camera.svg", 15., theme::on_accent()));
         let size = (wide, tall, controls_h);
         Some(
             div()
@@ -570,6 +573,19 @@ impl Shell {
                 .border_color(theme::border_strong())
                 .shadow(theme::shadow_popover())
                 .p(px(1.))
+                .child(crate::gui::phone::touch_drag(cx.listener(move |this, event: &gpui::TouchDragEvent, _, cx| match event.phase {
+                    gpui::TouchPhase::Started => {
+                        this.call_state.phone.drag = Some(Drag { from: crate::gui::phone::at(event.start_position), by: (0., 0.) });
+                    }
+                    gpui::TouchPhase::Moved => {
+                        if let Some(drag) = this.call_state.phone.drag.as_mut() {
+                            let at = crate::gui::phone::at(event.position);
+                            drag.by = (at.0 - drag.from.0, at.1 - drag.from.1);
+                            cx.notify();
+                        }
+                    }
+                    gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled => this.call_phone_pip_drop(size, cx),
+                })))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {

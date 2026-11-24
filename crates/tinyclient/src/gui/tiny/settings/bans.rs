@@ -69,6 +69,7 @@ pub(in crate::gui::tiny) fn bans(shell: &Shell, facts: &Facts, window: &mut Wind
         table =
             table.child(
                 table_row(SharedString::from(format!("tiny-bans-row-{}", ban.user_id)), false)
+                    .when(ix + 1 == rows.len(), |row| row.border_b_0())
                     .child(
                         div().flex_1().min_w_0().flex().items_center().gap(px(10.)).child(Avatar::new(&key, &name, 32.).image_at(facts.picture(&ban.user_id)).build()).child(
                             div()

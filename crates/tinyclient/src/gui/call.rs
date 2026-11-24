@@ -3855,7 +3855,7 @@ impl Shell {
     /// The header pill, by what the open conversation can do (07 §1). Its look is the capability:
     /// a filled pill calls from here, an outlined one with the network's icon opens the official
     /// app, and a conversation that can do neither has none.
-    pub(super) fn call_pill(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(super) fn call_pill(&self, snapshot: &Snapshot, compact: bool, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         ensure_keys(cx);
         ensure_daemon();
         let open = snapshot.open.as_ref()?;
@@ -3878,14 +3878,26 @@ impl Shell {
                 .justify_center()
                 .cursor_pointer()
                 .active(|style| style.bg(theme::pressed()))
+        } else if compact {
+            div()
+                .id("call")
+                .group("call-pill")
+                .flex_none()
+                .size(px(theme::CONTROL))
+                .rounded(px(theme::R_CONTROL))
+                .border_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
         } else {
             div()
                 .id("call")
                 .group("call-pill")
                 .flex_none()
-                .h(px(30.))
+                .h(px(theme::CONTROL))
                 .px(px(12.))
-                .rounded(px(15.))
+                .rounded(px(theme::R_CONTROL))
                 .border_1()
                 .flex()
                 .items_center()
@@ -3896,7 +3908,7 @@ impl Shell {
         }
         // Keep the press from also dragging the window.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let words = |words: SharedString| (!phone).then_some(words);
+        let words = |words: SharedString| (!phone && !compact).then_some(words);
         let glyph = |size: f32| if phone { 16. } else { size };
 
         // On a phone my own call is a screen of its own: the strip's glyph goes back to it.
@@ -4015,7 +4027,7 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx)))
                         .child(leading)
                         .children(words(label.into()))
-                        .children((!phone).then(|| icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None))),
+                        .children((!phone && !compact).then(|| icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None))),
                 )
             }
             CallSupport::Restricted => Some(

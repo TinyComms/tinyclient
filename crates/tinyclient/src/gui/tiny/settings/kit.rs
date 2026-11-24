@@ -60,7 +60,7 @@ pub(in crate::gui::tiny) fn security_wrap(words: &str) -> String {
 
 /// The active encryption step has the same surface and radius as other settings cards.
 pub(in crate::gui::tiny) fn security_card() -> Div {
-    card().min_w_0().max_w_full().shadow(theme::shadow_tooltip())
+    card().min_w_0().max_w_full()
 }
 
 /// A labelled encryption section, with a familiar icon rather than more explanatory copy.

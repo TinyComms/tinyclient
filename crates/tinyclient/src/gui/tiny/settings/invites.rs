@@ -112,6 +112,7 @@ pub(in crate::gui::tiny) fn invites(shell: &Shell, facts: &Facts, window: &mut W
             revocable(community, invite).then(|| button(("tiny-invites-revoke", ix), ButtonKind::Ghost, "Revoke").on_click(cx.listener(move |this, _, _, cx| this.tiny_revoke(id.clone(), cx))));
         table = table.child(
             table_row(SharedString::from(format!("tiny-invites-row-{}", invite.id)), false)
+                .when(ix + 1 == community.invites.len(), |row| row.border_b_0())
                 .child(
                     div()
                         .flex_1()

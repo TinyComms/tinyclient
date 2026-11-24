@@ -75,19 +75,24 @@ impl Shell {
             }))
         });
         let accept = round("call-phone-accept", "icons/phone.svg", "Accept", Look::Accept, 72.).on_click(cx.listener(|this, _, _, cx| this.call_accept(cx)));
-        div()
-            .size_full()
+        let landscape = tokens::landscape();
+        let top_pad = tokens::safe_top() + if landscape { 16. } else { 72. };
+        let bottom_pad = tokens::safe_bottom() + if landscape { 16. } else { 36. };
+        let body = div()
+            .w_full()
+            .min_h_full()
+            .pl(px(tokens::safe_left()))
+            .pr(px(tokens::safe_right()))
             .flex()
             .flex_col()
             .items_center()
-            .bg(theme::over(gpui::Rgba { alpha: 0.10, ..theme::positive() }, theme::canvas()))
-            .child(div().flex_none().h(px(tokens::safe_top() + 72.)))
+            .child(div().flex_none().h(px(top_pad)))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .mb(px(36.))
+                    .mb(px(if landscape { 12. } else { 36. }))
                     .phone_preview()
                     .text_color(theme::text_soft())
                     .child(network_icon(network, 14.))
@@ -96,30 +101,36 @@ impl Shell {
             .child(lead)
             .child(
                 div()
-                    .mt(px(28.))
+                    .mt(px(if landscape { 12. } else { 28. }))
                     .px(px(24.))
                     .max_w_full()
                     .text_center()
                     .whitespace_normal()
                     .line_clamp(2)
-                    .text_size(px(tokens::scaled(30.)))
-                    .line_height(px(tokens::scaled(36.)))
+                    .text_size(px(tokens::scaled(if landscape { 24. } else { 30. })))
+                    .line_height(px(tokens::scaled(if landscape { 30. } else { 36. })))
                     .font_weight(theme::SEMIBOLD)
                     .child(subject.title.clone()),
             )
             .child(div().mt(px(8.)).px(px(24.)).phone_row().text_color(theme::text_soft()).child(line))
-            .child(div().flex_1())
+            .child(div().flex_1().min_h(px(16.)))
             .child(
                 div()
                     .w_full()
-                    .px(px(36.))
-                    .pb(px(tokens::safe_bottom() + 36.))
+                    .max_w(px(360.))
+                    .px(px(24.))
+                    .pb(px(bottom_pad))
                     .flex()
                     .justify_between()
-                    .child(decline.flex_none().w(px(88.)))
-                    .children(video.map(|video| video.flex_none().w(px(88.))))
-                    .child(accept.flex_none().w(px(88.))),
-            )
+                    .gap(px(12.))
+                    .child(decline.flex_1().max_w(px(88.)))
+                    .children(video.map(|video| video.flex_1().max_w(px(88.))))
+                    .child(accept.flex_1().max_w(px(88.))),
+            );
+        div()
+            .size_full()
+            .bg(theme::over(gpui::Rgba { alpha: 0.10, ..theme::positive() }, theme::canvas()))
+            .child(div().id("call-phone-incoming-scroll").size_full().overflow_y_scroll().child(body))
     }
 
     /// A call that did not happen: what went wrong in words, then what can be done about it.

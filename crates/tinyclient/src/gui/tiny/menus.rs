@@ -111,7 +111,9 @@ impl Shell {
         };
         let facts: PersonMenu = model::person_menu(page.community, user_id);
         let name = model::name_of(member);
-        let color = model::color_of(page.community, member).map(gpui::rgb).unwrap_or(theme::text());
+        let color = model::color_of(page.community, member)
+            .map(|c| theme::role_color_on(c, theme::overlay(), 4.5))
+            .unwrap_or(theme::text());
         let open_name = user_id.to_owned();
         let role_line = if facts.me {
             "You".to_owned()

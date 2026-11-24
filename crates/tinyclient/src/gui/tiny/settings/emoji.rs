@@ -251,6 +251,15 @@ pub(in crate::gui::tiny) fn emoji(shell: &Shell, facts: &Facts, window: &mut Win
                             }))),
                     )
                 })
+                .when(renaming.is_some(), |row| {
+                    row.child(button("tiny-emoji-cancel-rename", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(o) = this.tiny_state.settings.as_mut() {
+                            o.emoji.renaming = None;
+                        }
+                        this.tiny_state.settings_fields.emoji_name.update(cx, |i, cx| i.set_text("", cx));
+                        cx.notify();
+                    })))
+                })
                 .child(if let Some(id) = renaming.clone() {
                     button("tiny-emoji-save-rename", ButtonKind::Primary, "Save name")
                         .on_click(cx.listener(move |this, _, _, cx| this.tiny_emoji_rename(id.clone(), cx)))
@@ -274,6 +283,7 @@ pub(in crate::gui::tiny) fn emoji(shell: &Shell, facts: &Facts, window: &mut Win
             let shown_name = if item.kind == "sticker" { item.name.clone() } else { format!(":{}:", item.name) };
             list = list.child(
                 table_row(("tiny-emoji-row", ix), false)
+                    .when(ix + 1 == draft.items.len(), |row| row.border_b_0())
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(shown_name))
                     .child(cell(90., item.kind.clone(), theme::text_soft()))
                     .child(

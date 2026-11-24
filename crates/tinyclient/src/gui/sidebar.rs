@@ -32,7 +32,7 @@ use super::state::{Shell, Snapshot, SpaceTree, TROUBLE_SHOWN};
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, Div, Entity, FocusHandle, FontWeight, ListAlignment, ListState,
+    div, prelude::*, px, uniform_list, Context, Div, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListState,
     MouseButton, ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, Window,
 };
 use history::History;
@@ -2382,7 +2382,7 @@ impl Shell {
         out
     }
 
-    fn title_strip(&self, mode: &Mode, cx: &mut Context<Self>) -> Div {
+    fn title_strip(&self, mode: &Mode, window: &Window, cx: &mut Context<Self>) -> Div {
         let strip = drags_window(div()).h(px(theme::STRIP)).flex_none().pl(px(theme::PANE_PAD)).pr(px(chrome::end_pad(End::List, 12.))).flex().items_center().gap(px(8.));
         let quiet = |button: Stateful<Div>| button.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         let back = |id: &'static str, words: String, cx: &mut Context<Self>| {
@@ -2426,17 +2426,13 @@ impl Shell {
                 .children(place.map(|place| div().flex_none().max_w(px(120.)).truncate().type_small().text_color(theme::text_faint()).child(place)))
                 .children(new_post)
                 .when_some(field, |strip, input| {
+                    let focused = input.focus_handle(cx).is_focused(window);
                     strip.child(
-                        div()
-                            .w(px(180.))
-                            .flex_none()
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded(px(theme::R_CONTROL))
-                            .bg(theme::canvas())
-                            .border_1()
-                            .border_color(theme::border())
-                            .child(input),
+                        crate::gui::components::search_field(focused)
+                            .flex_1()
+                            .min_w(px(120.))
+                            .max_w(px(220.))
+                            .child(div().flex_1().min_w_0().child(input)),
                     )
                 });
         }
@@ -2988,7 +2984,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn browse_channels_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn browse_channels_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.browse_channels.as_ref()?;
         let space_row = self.spaces.iter().find(|s| s.key == modal.space);
         let opt_in_on = space_row.is_some_and(|s| s.opt_in_channels);
@@ -3103,15 +3099,17 @@ impl Shell {
 
         let space_all = modal.space.clone();
         let space_muted = modal.space.clone();
+        let filter_focused = modal.filter.focus_handle(cx).is_focused(window);
         let card = div()
             .id("browse-channels-card")
             .w(px(480.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -3121,7 +3119,8 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().type_title().text_color(theme::text()).child(format!("Browse channels · {}", modal.space_name)))
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().truncate().type_title().text_color(theme::text()).child(format!("Browse channels · {}", modal.space_name)))
                     .child(icon_button("browse-channels-close", "icons/x.svg", false).on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_state.browse_channels = None;
                         cx.notify();
@@ -3160,15 +3159,8 @@ impl Shell {
                     ),
             )
             .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(modal.filter.clone()),
+                crate::gui::components::search_field(filter_focused)
+                    .child(div().flex_1().min_w_0().child(modal.filter.clone())),
             )
             .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
             .child(list);
@@ -3178,7 +3170,8 @@ impl Shell {
                 .id("browse-channels-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -3234,10 +3227,11 @@ impl Shell {
             .w(px(360.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -3268,7 +3262,8 @@ impl Shell {
                 .id("leave-space-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -3420,10 +3415,11 @@ impl Shell {
             .w(px(420.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -3671,7 +3667,8 @@ impl Shell {
                 .id("create-invite-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -3889,10 +3886,11 @@ impl Shell {
             .w(px(380.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -3930,7 +3928,8 @@ impl Shell {
                 .id("conference-link-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -4052,7 +4051,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn join_server_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn join_server_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.join_server.as_ref()?;
         let is_teams = modal.account.network == Network::Teams;
         let modal_title = if is_teams { "Join a team" } else { "Join a server" };
@@ -4092,30 +4091,25 @@ impl Shell {
         } else {
             "Join"
         };
+        let input_focused = modal.input.focus_handle(cx).is_focused(window);
         let card = div()
             .id("join-server-card")
             .w(px(380.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(div().type_title().text_color(theme::text()).child(title))
             .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(modal.input.clone()),
+                crate::gui::components::field(input_focused)
+                    .child(div().flex_1().min_w_0().child(modal.input.clone())),
             )
             .children(preview_box)
             .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
@@ -4150,7 +4144,8 @@ impl Shell {
                 .id("join-server-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -4253,7 +4248,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn create_server_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn create_server_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.create_server.as_ref()?;
         let trimmed = modal.name.read(cx).text().trim().chars().count();
         let ready = (2..=100).contains(&trimmed) && !modal.busy;
@@ -4312,15 +4307,17 @@ impl Shell {
                     }),
                 ))
             });
+        let name_focused = modal.name.focus_handle(cx).is_focused(window);
         let card = div()
             .id("create-server-card")
             .w(px(400.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -4328,15 +4325,8 @@ impl Shell {
             .child(div().type_title().text_color(theme::text()).child("Create a server"))
             .child(div().type_small().text_color(theme::text_soft()).child("Name"))
             .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(modal.name.clone()),
+                crate::gui::components::field(name_focused)
+                    .child(div().flex_1().min_w_0().child(modal.name.clone())),
             )
             .child(div().type_small().text_color(theme::text_soft()).child("Picture (optional)"))
             .child(icon_row)
@@ -4369,7 +4359,8 @@ impl Shell {
                 .id("create-server-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -4715,10 +4706,11 @@ impl Shell {
             .w(px(440.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -4728,7 +4720,8 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().type_title().text_color(theme::text()).child(format!("{space_name} · Events")))
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().truncate().type_title().text_color(theme::text()).child(format!("{space_name} · Events")))
                     .child(icon_button("space-events-close", "icons/x.svg", false).on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_state.events_modal = None;
                         cx.notify();
@@ -4741,7 +4734,8 @@ impl Shell {
                 .id("space-events-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -4927,7 +4921,7 @@ impl Shell {
         });
     }
 
-    pub(in crate::gui) fn server_gate_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn server_gate_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.server_gate.as_ref()?;
         let gate = modal.gate.clone();
         let busy = modal.busy;
@@ -4998,15 +4992,10 @@ impl Shell {
                         }
                         "TEXT_INPUT" | "PARAGRAPH" => {
                             if let Some(input) = texts.get(index).and_then(|input| input.clone()) {
+                                let focused = input.focus_handle(cx).is_focused(window);
                                 row = row.child(
-                                    div()
-                                        .px(px(8.))
-                                        .py(px(6.))
-                                        .rounded(px(theme::R_CONTROL))
-                                        .bg(theme::canvas())
-                                        .border_1()
-                                        .border_color(theme::border())
-                                        .child(input),
+                                    crate::gui::components::field(focused)
+                                        .child(div().flex_1().min_w_0().child(input)),
                                 );
                             }
                         }
@@ -5052,10 +5041,11 @@ impl Shell {
             .max_w_full()
             .max_h(px(560.))
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -5102,7 +5092,8 @@ impl Shell {
                 .id("server-gate-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -5343,7 +5334,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn create_channel_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn create_channel_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.create_channel.as_ref()?;
         let ready = !modal.name.read(cx).text().trim().is_empty();
         let is_discord = modal.space.network == Network::Discord;
@@ -5356,15 +5347,8 @@ impl Shell {
         let is_telegram = modal.space.network == Network::Telegram;
         let is_private = modal.private;
         let field_wrap = |input: Entity<crate::gui::input::TextInput>| {
-            div()
-                .px(px(8.))
-                .py(px(6.))
-                .rounded(px(theme::R_CONTROL))
-                .bg(theme::canvas())
-                .border_1()
-                .border_color(theme::border())
-                .type_ui()
-                .child(input)
+            let focused = input.focus_handle(cx).is_focused(window);
+            crate::gui::components::field(focused).child(div().flex_1().min_w_0().child(input))
         };
         let is_teams = modal.space.network == Network::Teams;
         let card = div()
@@ -5372,10 +5356,11 @@ impl Shell {
             .w(px(360.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -5420,6 +5405,9 @@ impl Shell {
                     .child(
                         div()
                             .id("create-chan-private")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
                             .type_small()
                             .text_color(if is_private { theme::accent_text() } else { theme::text_faint() })
                             .cursor_pointer()
@@ -5430,7 +5418,20 @@ impl Shell {
                                     cx.notify();
                                 }
                             }))
-                            .child(if is_private { "☑ Private channel" } else { "☐ Private channel" }),
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(14.))
+                                    .rounded(px(3.))
+                                    .border_1()
+                                    .border_color(if is_private { theme::accent() } else { theme::border_strong() })
+                                    .when(is_private, |b| b.bg(theme::accent()))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(is_private, |b| b.child(glyph("icons/check.svg", 10., theme::on_accent()))),
+                            )
+                            .child("Private channel"),
                     ),
             )
             .when(is_teams, |card| {
@@ -5468,6 +5469,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -5543,33 +5545,28 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn create_category_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn create_category_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.create_category.as_ref()?;
         let ready = !modal.name.read(cx).text().trim().is_empty() && !modal.busy;
+        let name_focused = modal.name.focus_handle(cx).is_focused(window);
         let card = div()
             .id("create-category-card")
             .w(px(360.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(div().type_title().text_color(theme::text()).child("Create category"))
             .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(modal.name.clone()),
+                crate::gui::components::field(name_focused)
+                    .child(div().flex_1().min_w_0().child(modal.name.clone())),
             )
             .children(modal.error.as_ref().map(|e| div().type_small().text_color(theme::danger()).child(e.clone())))
             .child(
@@ -5596,6 +5593,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -5624,14 +5622,14 @@ impl Shell {
             if let Some((start, (name, id, _))) = token {
                 let file = protocol::MediaFile::new(format!("emoji:{id}"), protocol::MediaKind::Emoji);
                 let image = self.people_state.hub().file(&channel.account(), &file, cx).path.map(std::path::PathBuf::from);
-                line = line.child(div().truncate().whitespace_nowrap().child(fragment[..start].to_owned()));
+                line = line.child(div().min_w_0().truncate().whitespace_nowrap().child(fragment[..start].to_owned()));
                 line = if let Some(image) = image {
                     line.child(gpui::img(image).flex_none().size(px(14.)))
                 } else {
                     line.child(div().flex_none().child(format!(":{name}:")))
                 };
             } else {
-                line = line.child(div().truncate().whitespace_nowrap().child(fragment.to_owned()));
+                line = line.child(div().min_w_0().truncate().whitespace_nowrap().child(fragment.to_owned()));
             }
         }
         line
@@ -5675,22 +5673,60 @@ impl Shell {
         }).detach();
     }
 
-    pub(super) fn voice_status_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(super) fn voice_status_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.voice_status.as_ref()?;
-        Some(div().id("voice-status-backdrop").absolute().inset_0().bg(theme::scrim())
-            .flex().items_center().justify_center()
-            .child(div().id("voice-status-card").p(px(16.)).w(px(380.)).max_w_full()
-                .bg(theme::overlay()).rounded(px(theme::R_FLOAT)).flex().flex_col().gap(px(8.))
-                .child(div().type_title().child("Set channel status"))
-                .child(div().p(px(8.)).bg(theme::canvas()).child(modal.input.clone()))
-                .children(modal.error.iter().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
-                .child(div().flex().justify_end().gap(px(8.))
-                    .child(button("voice-status-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar_state.voice_status = None;
-                        cx.notify();
-                    })))
-                    .child(button("voice-status-save", ButtonKind::Primary, if modal.saving { "Saving…" } else { "Save" })
-                        .when(!modal.saving, |button| button.on_click(cx.listener(|this, _, _, cx| this.save_voice_status(cx))))))))
+        let input_focused = modal.input.focus_handle(cx).is_focused(window);
+        Some(
+            div()
+                .id("voice-status-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.voice_status = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("voice-status-card")
+                        .p(px(16.))
+                        .w(px(380.))
+                        .max_w_full()
+                        .bg(theme::overlay())
+                        .rounded(px(theme::R_MODAL))
+                        .border_1()
+                        .border_color(theme::overlay_edge())
+                        .shadow(theme::shadow_modal())
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(div().type_title().child("Set channel status"))
+                        .child(
+                            crate::gui::components::field(input_focused)
+                                .child(div().flex_1().min_w_0().child(modal.input.clone())),
+                        )
+                        .children(modal.error.iter().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(button("voice-status-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                                    this.sidebar_state.voice_status = None;
+                                    cx.notify();
+                                })))
+                                .child(
+                                    button("voice-status-save", ButtonKind::Primary, if modal.saving { "Saving…" } else { "Save" })
+                                        .when(!modal.saving, |button| button.on_click(cx.listener(|this, _, _, cx| this.save_voice_status(cx)))),
+                                ),
+                        ),
+                ),
+        )
     }
 
     pub(super) fn discord_voice_row(&self, key: &Key) -> Option<Conversation> {
@@ -5794,14 +5830,42 @@ impl Shell {
                     this.send_voice_move(&target, Some(key.clone()), cx);
                 }))
         }).collect::<Vec<_>>();
-        Some(div().id("voice-move-backdrop").absolute().inset_0().bg(theme::scrim()).flex().items_center().justify_center()
-            .child(div().p(px(16.)).w(px(380.)).max_w_full().bg(theme::overlay()).rounded(px(theme::R_FLOAT))
-                .child(div().type_title().child(if target.name.is_empty() { "Move to channel".to_owned() } else { format!("Move {}", target.name) }))
-                .child(div().id("voice-move-rooms").max_h(px(280.)).overflow_y_scroll().children(choices))
-                .child(button("voice-move-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+        Some(
+            div()
+                .id("voice-move-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.sidebar_state.voice_move = None;
                     cx.notify();
-                })))))
+                }))
+                .child(
+                    div()
+                        .p(px(16.))
+                        .w(px(380.))
+                        .max_w_full()
+                        .bg(theme::overlay())
+                        .rounded(px(theme::R_MODAL))
+                        .border_1()
+                        .border_color(theme::overlay_edge())
+                        .shadow(theme::shadow_modal())
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(div().type_title().child(if target.name.is_empty() { "Move to channel".to_owned() } else { format!("Move {}", target.name) }))
+                        .child(div().id("voice-move-rooms").max_h(px(280.)).overflow_y_scroll().children(choices))
+                        .child(div().flex().justify_end().child(button("voice-move-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar_state.voice_move = None;
+                            cx.notify();
+                        })))),
+                ),
+        )
     }
 
     pub(super) fn open_edit_channel(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
@@ -5986,7 +6050,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn edit_channel_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn edit_channel_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.edit_channel.as_ref()?;
         let ready = !modal.name.read(cx).text().trim().is_empty() && !modal.busy;
         let is_category = modal.is_category;
@@ -6002,21 +6066,15 @@ impl Shell {
             None => "Category: None".to_owned(),
         };
         let field = |label: &'static str, input: Entity<crate::gui::input::TextInput>| {
+            let focused = input.focus_handle(cx).is_focused(window);
             div()
                 .flex()
                 .flex_col()
                 .gap(px(4.))
                 .child(div().type_small().text_color(theme::text_soft()).child(label))
                 .child(
-                    div()
-                        .px(px(8.))
-                        .py(px(6.))
-                        .rounded(px(theme::R_CONTROL))
-                        .bg(theme::canvas())
-                        .border_1()
-                        .border_color(theme::border())
-                        .type_ui()
-                        .child(input),
+                    crate::gui::components::field(focused)
+                        .child(div().flex_1().min_w_0().child(input)),
                 )
         };
         let card = div()
@@ -6024,10 +6082,11 @@ impl Shell {
             .w(px(400.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -6075,6 +6134,9 @@ impl Shell {
                             row.child(
                                 div()
                                     .id("edit-chan-nsfw")
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
                                     .type_small()
                                     .text_color(if nsfw { theme::accent_text() } else { theme::text_faint() })
                                     .cursor_pointer()
@@ -6085,7 +6147,20 @@ impl Shell {
                                             cx.notify();
                                         }
                                     }))
-                                    .child(if nsfw { "☑ Age-restricted (NSFW)" } else { "☐ Age-restricted (NSFW)" }),
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .size(px(14.))
+                                            .rounded(px(3.))
+                                            .border_1()
+                                            .border_color(if nsfw { theme::accent() } else { theme::border_strong() })
+                                            .when(nsfw, |b| b.bg(theme::accent()))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(nsfw, |b| b.child(glyph("icons/check.svg", 10., theme::on_accent()))),
+                                    )
+                                    .child("Age-restricted (NSFW)"),
                             )
                         }),
                 )
@@ -6115,6 +6190,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -6339,10 +6415,11 @@ impl Shell {
             .max_w_full()
             .max_h(px(560.))
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -6385,6 +6462,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -6471,19 +6549,21 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn delete_channel_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn delete_channel_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.delete_channel.as_ref()?;
         let matches_name = modal.confirm.read(cx).text().trim() == modal.name && !modal.busy;
         let kind_word = if modal.is_category { "category" } else { "channel" };
+        let confirm_focused = modal.confirm.focus_handle(cx).is_focused(window);
         let card = div()
             .id("delete-channel-card")
             .w(px(400.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -6496,15 +6576,8 @@ impl Shell {
                     .child(format!("This permanently deletes the {kind_word}. Type \"{}\" to confirm.", modal.name)),
             )
             .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(modal.confirm.clone()),
+                crate::gui::components::field(confirm_focused)
+                    .child(div().flex_1().min_w_0().child(modal.confirm.clone())),
             )
             .children(modal.error.as_ref().map(|e| div().type_small().text_color(theme::danger()).child(e.clone())))
             .child(
@@ -6531,6 +6604,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -6542,17 +6616,19 @@ impl Shell {
         )
     }
 
-    pub(in crate::gui) fn folder_edit_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn folder_edit_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.folder_edit.as_ref()?;
+        let name_focused = modal.name.focus_handle(cx).is_focused(window);
         let card = div()
             .id("folder-edit-card")
             .w(px(360.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -6560,15 +6636,8 @@ impl Shell {
             .child(div().type_title().text_color(theme::text()).child("Rename folder"))
             .child(div().type_small().text_color(theme::text_faint()).child("An empty name clears the folder name."))
             .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(modal.name.clone()),
+                crate::gui::components::field(name_focused)
+                    .child(div().flex_1().min_w_0().child(modal.name.clone())),
             )
             .child(
                 div()
@@ -6594,6 +6663,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -6605,7 +6675,7 @@ impl Shell {
         )
     }
 
-    pub(in crate::gui) fn forum_post_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn forum_post_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.forum_post.as_ref()?;
         let title = modal.title.clone();
         let text = modal.text.clone();
@@ -6652,24 +6722,31 @@ impl Shell {
             attached = attached.child(
                 div()
                     .id(("forum-file", index))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
                     .type_small()
                     .text_color(theme::text_soft())
                     .cursor_pointer()
                     .hover(|style| style.underline())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| this.remove_forum_file(index, cx)))
-                    .child(format!("{name}  ×")),
+                    .child(div().min_w_0().truncate().child(name))
+                    .child(glyph("icons/x.svg", 12., theme::text_faint())),
             );
         }
+        let title_focused = title.focus_handle(cx).is_focused(window);
+        let text_focused = text.focus_handle(cx).is_focused(window);
         let card = div()
             .id("forum-post-card")
             .w(px(420.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -6679,27 +6756,15 @@ impl Shell {
                 card.child(div().type_small().text_color(theme::text_soft()).child(guidelines))
             })
             .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(title),
+                crate::gui::components::field(title_focused)
+                    .child(div().flex_1().min_w_0().child(title)),
             )
             .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
+                crate::gui::components::field(text_focused)
                     .h(px(96.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(text),
+                    .py(px(6.))
+                    .items_start()
+                    .child(div().flex_1().min_w_0().h_full().child(text)),
             )
             .child(chips)
             .child(attached)
@@ -6731,6 +6796,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -6747,7 +6813,7 @@ impl Shell {
         self.sidebar_state.width.set(width);
         div().w(px(width)).h_full().flex_none().bg(theme::sidebar()).border_r_1().border_color(theme::hairline()).child(
             div().id("discord-overview").size_full().flex().flex_col()
-                .child(self.title_strip(&Mode::Network(Network::Discord), cx))
+                .child(self.title_strip(&Mode::Network(Network::Discord), window, cx))
                 .child(self.jump_strip(cx))
                 .child(div().flex_1().min_h_0().child(self.home_list(snapshot, window, cx)))
         )
@@ -6797,7 +6863,7 @@ impl Shell {
             // the status bar and the home indicator.
             .when(!phone, |sidebar| sidebar.border_r_1().border_color(theme::hairline()))
             .when(phone, |sidebar| sidebar.pt(px(super::phone::tokens::safe_top())).pb(px(super::phone::tokens::safe_bottom())))
-            .child(self.title_strip(&self.sidebar_state.mode, cx))
+            .child(self.title_strip(&self.sidebar_state.mode, window, cx))
             .when(!people && !tiny, |sidebar| sidebar.child(self.jump_strip(cx)))
             .children(tabs)
             .when(!banners.is_empty(), |sidebar| sidebar.child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(banners)))
@@ -6953,26 +7019,26 @@ fn refused(answer: &std::io::Result<Response>) -> Option<String> {
 /// How the Inbox title strip fits at this sidebar width
 /// (`docs/superpowers/specs/2026-11-02-inbox-strip-fit-design.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct InboxStripFit {
-    stacked: bool,
-    counts: bool,
-    mark_all: bool,
+pub(super) struct InboxStripFit {
+    pub stacked: bool,
+    pub counts: bool,
+    pub mark_all: bool,
 }
 
 /// Squeeze ladder for the Inbox strip: fixed title never truncates; counts, mark-all, then stack.
-fn inbox_strip_fit(width: f32, phone: bool, text_scale: f32, has_unread: bool) -> InboxStripFit {
-    // Phone large type always stacks. Desktop stacks below 280 so All/Unread/Mentions stay whole.
-    let stacked = (phone && text_scale > 1.25) || (!phone && width < 280.);
-    // Phone keeps its ≥310 one-line count rule. Desktop: counts at ≥360 one-line, or ≥270 when stacked.
+pub(super) fn inbox_strip_fit(width: f32, phone: bool, text_scale: f32, has_unread: bool) -> InboxStripFit {
+    // Phone large type always stacks. Desktop stacks below 370 so All/Unread/Mentions/Activity + mark-all stay whole.
+    let stacked = (phone && text_scale > 1.25) || (!phone && width < 370.);
+    // Phone keeps its ≥310 one-line count rule. Desktop: counts at ≥390 one-line, or ≥270 when stacked.
     let counts = if phone {
         !stacked && width >= 310.
     } else if stacked {
         width >= 270.
     } else {
-        width >= 360.
+        width >= 390.
     };
     // Mark-all stays out of the phone strip; on desktop it yields before the title or filters.
-    let mark_all = has_unread && !phone && (stacked || width >= 300.);
+    let mark_all = has_unread && !phone && (stacked || width >= 370.);
     InboxStripFit { stacked, counts, mark_all }
 }
 
@@ -7278,12 +7344,13 @@ pub(crate) mod tests {
         let full = inbox_strip_fit(400., false, 1., true);
         assert_eq!(full, InboxStripFit { stacked: false, counts: true, mark_all: true });
 
-        // Default 316: counts drop so Inbox + segments + mark-all fit on one line.
-        let mid = inbox_strip_fit(316., false, 1., true);
-        assert_eq!(mid, InboxStripFit { stacked: false, counts: false, mark_all: true });
+        // Wide one-line below 390: counts drop so Inbox + 4 segments + mark-all fit on one line.
+        let one_line_no_counts = inbox_strip_fit(380., false, 1., true);
+        assert_eq!(one_line_no_counts, InboxStripFit { stacked: false, counts: false, mark_all: true });
 
-        let lean = inbox_strip_fit(290., false, 1., true);
-        assert_eq!(lean, InboxStripFit { stacked: false, counts: false, mark_all: false });
+        // Default 316: stacks so Activity and mark-all never clip; counts stay on the second row.
+        let mid = inbox_strip_fit(316., false, 1., true);
+        assert_eq!(mid, InboxStripFit { stacked: true, counts: true, mark_all: true });
 
         // Minimum sidebar: stack; mark-all on the title row; counts when the second row has room.
         let narrow = inbox_strip_fit(260., false, 1., true);

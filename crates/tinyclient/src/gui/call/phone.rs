@@ -186,6 +186,8 @@ impl Look {
 
 /// A round button `size` across with a glyph in it, and its label under it.
 pub(super) fn round(id: impl Into<ElementId>, icon: &'static str, label: impl Into<gpui::SharedString>, look: Look, size: f32) -> Stateful<Div> {
+    let label: gpui::SharedString = label.into();
+    let has_label = !label.is_empty();
     let (fill, color, words) = look.colors();
     let pressed = match look {
         Look::End => Rgba { alpha: 0.8, ..theme::danger_fill() },
@@ -200,7 +202,7 @@ pub(super) fn round(id: impl Into<ElementId>, icon: &'static str, label: impl In
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(6.))
+        .when(has_label, |el| el.gap(px(6.)))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
@@ -216,16 +218,18 @@ pub(super) fn round(id: impl Into<ElementId>, icon: &'static str, label: impl In
                 .when(look != Look::Unavailable, |button| button.active(move |style| style.bg(pressed)))
                 .child(glyph(icon, (size * 0.42).round(), color)),
         )
-        .child(
-            div()
-                .max_w_full()
-                .truncate()
-                .text_size(px(tokens::scaled(12.)))
-                .line_height(px(16.))
-                .font_weight(theme::MEDIUM)
-                .text_color(words)
-                .child(label.into()),
-        )
+        .when(has_label, |el| {
+            el.child(
+                div()
+                    .max_w_full()
+                    .truncate()
+                    .text_size(px(tokens::scaled(12.)))
+                    .line_height(px(tokens::scaled(16.)))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(words)
+                    .child(label),
+            )
+        })
 }
 
 /// Extra header lines for a stage topic and an activity.
@@ -505,6 +509,8 @@ impl Shell {
         div()
             .size_full()
             .relative()
+            .pl(px(tokens::safe_left()))
+            .pr(px(tokens::safe_right()))
             .flex()
             .flex_col()
             .child(div().flex_none().h(px(tokens::safe_top())))
@@ -781,7 +787,13 @@ impl Shell {
             .border_color(theme::hairline())
             .cursor_pointer()
             .child(div().h(px(tokens::status_bar())));
-        let row = div().h(px(BAR)).pl(px(14.)).pr(px(8.)).flex().items_center().gap(px(10.));
+        let row = div()
+            .h(px(BAR))
+            .pl(px(14. + tokens::safe_left()))
+            .pr(px(8. + tokens::safe_right()))
+            .flex()
+            .items_center()
+            .gap(px(10.));
         let Some(call) = self.call_shown(snapshot) else {
             // The other side ended it: said for a few seconds.
             let ended = self.call_phone_ended()?;

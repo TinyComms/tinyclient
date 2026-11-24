@@ -1,0 +1,12 @@
+{
+  "id": "ui-wave2-polish",
+  "title": "UI Audit Wave 2: shell overlays, sidebar/header, settings, Tiny server, Discord admin, and mobile polish",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window; mobile-specific fixes are verified via unit tests and phone form checks.",
+    "ios": "The phone proof build does not run the desktop window; mobile-specific fixes are verified via unit tests and phone form checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -565,7 +565,7 @@ impl Shell {
         .detach();
     }
 
-    fn webhook_row(&self, space: &Key, hook: &SpaceWebhook, renaming: Option<&(String, Entity<TextInput>)>, cx: &mut Context<Self>) -> Div {
+    fn webhook_row(&self, space: &Key, hook: &SpaceWebhook, renaming: Option<&(String, Entity<TextInput>)>, window: &Window, cx: &mut Context<Self>) -> Div {
         let id = hook.id.clone();
         let is_renaming = renaming.is_some_and(|(rid, _)| rid == &hook.id);
         let channel_label = if hook.channel_name.is_empty() {
@@ -600,7 +600,8 @@ impl Shell {
                     .gap(px(2.))
                     .when(is_renaming, |col| {
                         let input = renaming.map(|(_, e)| e.clone()).unwrap();
-                        col.child(input)
+                        let focused = gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window);
+                        col.child(super::components::field(focused).child(div().flex_1().min_w_0().child(input)))
                     })
                     .when(!is_renaming, |col| {
                         col.child(div().type_ui().text_color(theme::text()).truncate().child(hook.name.clone()))
@@ -655,6 +656,7 @@ impl Shell {
         roles: &[SpaceRoleChoice],
         can_manage: bool,
         renaming: Option<&(String, Entity<TextInput>)>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let id = emoji.id.clone();
@@ -701,7 +703,8 @@ impl Shell {
                     .gap(px(2.))
                     .when(is_renaming, |col| {
                         let input = renaming.map(|(_, e)| e.clone()).unwrap();
-                        col.child(input)
+                        let focused = gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window);
+                        col.child(super::components::field(focused).child(div().flex_1().min_w_0().child(input)))
                     })
                     .when(!is_renaming, |col| {
                         col.child(div().type_ui().text_color(theme::text()).truncate().child(format!(":{}:", emoji.name)))
@@ -771,7 +774,7 @@ impl Shell {
             })
     }
 
-    fn sticker_row(&self, space: &Key, sticker: &SpaceSticker, can_manage: bool, renaming: Option<&(String, Entity<TextInput>)>, cx: &mut Context<Self>) -> Div {
+    fn sticker_row(&self, space: &Key, sticker: &SpaceSticker, can_manage: bool, renaming: Option<&(String, Entity<TextInput>)>, window: &Window, cx: &mut Context<Self>) -> Div {
         let id = sticker.id.clone();
         let is_renaming = renaming.is_some_and(|(rid, _)| rid == &sticker.id);
         let edit_id = id.clone();
@@ -807,7 +810,8 @@ impl Shell {
                     .gap(px(2.))
                     .when(is_renaming, |col| {
                         let input = renaming.map(|(_, e)| e.clone()).unwrap();
-                        col.child(input)
+                        let focused = gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window);
+                        col.child(super::components::field(focused).child(div().flex_1().min_w_0().child(input)))
                     })
                     .when(!is_renaming, |col| {
                         col.child(div().type_ui().text_color(theme::text()).truncate().child(sticker.name.clone()))
@@ -845,7 +849,7 @@ impl Shell {
             })
     }
 
-    pub(in crate::gui) fn discord_admin_modal(&self, _window: &mut Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn discord_admin_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.discord_admin.modal.as_ref()?;
         let space = modal.space.clone();
         let channels: Vec<(String, String)> = self
@@ -900,9 +904,9 @@ impl Shell {
             div().py(px(16.)).type_small().text_color(theme::danger()).child(err.clone())
         } else {
             match modal.tab {
-                Tab::Integrations => self.render_integrations_tab(modal, &space, &channels, cx),
-                Tab::Emoji => self.render_emoji_tab(modal, &space, cx),
-                Tab::Stickers => self.render_stickers_tab(modal, &space, cx),
+                Tab::Integrations => self.render_integrations_tab(modal, &space, &channels, window, cx),
+                Tab::Emoji => self.render_emoji_tab(modal, &space, window, cx),
+                Tab::Stickers => self.render_stickers_tab(modal, &space, window, cx),
             }
         };
 
@@ -912,10 +916,11 @@ impl Shell {
             .max_w_full()
             .max_h(px(560.))
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(12.))
@@ -926,13 +931,15 @@ impl Shell {
                     .items_center()
                     .gap(px(8.))
                     .child(glyph("icons/settings.svg", 16., theme::text_soft()))
-                    .child(div().flex_1().type_title().text_color(theme::text()).truncate().child(modal.space_name.clone()))
-                    .child(button("discord-admin-close", ButtonKind::Secondary, "Close").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.discord_admin.modal = None;
-                            cx.notify();
-                        },
-                    ))),
+                    .child(div().flex_1().min_w_0().type_title().text_color(theme::text()).truncate().child(modal.space_name.clone()))
+                    .child(
+                        super::components::icon_button("discord-admin-close", "icons/x.svg", false)
+                            .aria_label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discord_admin.modal = None;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(tabs)
             .child(div().id("discord-admin-scroll").flex_1().min_h_0().overflow_y_scroll().child(body));
@@ -942,7 +949,8 @@ impl Shell {
                 .id("discord-admin-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -959,6 +967,7 @@ impl Shell {
         modal: &Modal,
         space: &Key,
         channels: &[(String, String)],
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let Some(page) = &modal.integrations else {
@@ -1001,12 +1010,18 @@ impl Shell {
                 }
                 wh_section = wh_section.child(picker);
             }
+            let wh_focused = gpui::Focusable::focus_handle(modal.webhook_name.read(cx), cx).is_focused(window);
             wh_section = wh_section.child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(div().flex_1().child(modal.webhook_name.clone()))
+                    .child(
+                        super::components::field(wh_focused)
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().flex_1().min_w_0().child(modal.webhook_name.clone())),
+                    )
                     .child(button("wh-create", ButtonKind::Primary, "New webhook").on_click(cx.listener(|this, _, _, cx| {
                         this.create_discord_webhook(cx);
                     }))),
@@ -1015,7 +1030,7 @@ impl Shell {
                 wh_section = wh_section.child(div().type_small().text_color(theme::text_faint()).child("No webhooks yet."));
             } else {
                 for hook in &page.webhooks {
-                    wh_section = wh_section.child(self.webhook_row(space, hook, modal.renaming_webhook.as_ref(), cx));
+                    wh_section = wh_section.child(self.webhook_row(space, hook, modal.renaming_webhook.as_ref(), window, cx));
                 }
             }
             content = content.child(wh_section);
@@ -1148,7 +1163,7 @@ impl Shell {
         content
     }
 
-    fn render_emoji_tab(&self, modal: &Modal, space: &Key, cx: &mut Context<Self>) -> Div {
+    fn render_emoji_tab(&self, modal: &Modal, space: &Key, window: &Window, cx: &mut Context<Self>) -> Div {
         let Some(expr) = &modal.expressions else {
             return div();
         };
@@ -1161,12 +1176,18 @@ impl Shell {
             )),
         );
         if expr.can_create {
+            let em_focused = gpui::Focusable::focus_handle(modal.emoji_name.read(cx), cx).is_focused(window);
             content = content.child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(div().flex_1().child(modal.emoji_name.clone()))
+                    .child(
+                        super::components::field(em_focused)
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().flex_1().min_w_0().child(modal.emoji_name.clone())),
+                    )
                     .child(button("emoji-upload", ButtonKind::Primary, "Upload emoji…").on_click(cx.listener(
                         |this, _, _, cx| this.pick_and_upload_emoji(cx),
                     ))),
@@ -1176,13 +1197,13 @@ impl Shell {
             content = content.child(div().type_small().text_color(theme::text_faint()).child("No custom emoji yet."));
         } else {
             for emoji in &expr.emojis {
-                content = content.child(self.emoji_row(space, emoji, &expr.roles, expr.can_manage, modal.renaming_emoji.as_ref(), cx));
+                content = content.child(self.emoji_row(space, emoji, &expr.roles, expr.can_manage, modal.renaming_emoji.as_ref(), window, cx));
             }
         }
         content
     }
 
-    fn render_stickers_tab(&self, modal: &Modal, space: &Key, cx: &mut Context<Self>) -> Div {
+    fn render_stickers_tab(&self, modal: &Modal, space: &Key, window: &Window, cx: &mut Context<Self>) -> Div {
         let Some(expr) = &modal.expressions else {
             return div();
         };
@@ -1195,6 +1216,9 @@ impl Shell {
             )),
         );
         if expr.can_create {
+            let name_focused = gpui::Focusable::focus_handle(modal.sticker_name.read(cx), cx).is_focused(window);
+            let tags_focused = gpui::Focusable::focus_handle(modal.sticker_tags.read(cx), cx).is_focused(window);
+            let desc_focused = gpui::Focusable::focus_handle(modal.sticker_desc.read(cx), cx).is_focused(window);
             content = content.child(
                 div()
                     .flex()
@@ -1205,15 +1229,30 @@ impl Shell {
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .child(div().flex_1().child(modal.sticker_name.clone()))
-                            .child(div().flex_1().child(modal.sticker_tags.clone())),
+                            .child(
+                                super::components::field(name_focused)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().flex_1().min_w_0().child(modal.sticker_name.clone())),
+                            )
+                            .child(
+                                super::components::field(tags_focused)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().flex_1().min_w_0().child(modal.sticker_tags.clone())),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .child(div().flex_1().child(modal.sticker_desc.clone()))
+                            .child(
+                                super::components::field(desc_focused)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().flex_1().min_w_0().child(modal.sticker_desc.clone())),
+                            )
                             .child(button("sticker-upload", ButtonKind::Primary, "Upload sticker…").on_click(cx.listener(
                                 |this, _, _, cx| this.pick_and_upload_sticker(cx),
                             ))),
@@ -1224,7 +1263,7 @@ impl Shell {
             content = content.child(div().type_small().text_color(theme::text_faint()).child("No custom stickers yet."));
         } else {
             for sticker in &expr.stickers {
-                content = content.child(self.sticker_row(space, sticker, expr.can_manage, modal.renaming_sticker.as_ref(), cx));
+                content = content.child(self.sticker_row(space, sticker, expr.can_manage, modal.renaming_sticker.as_ref(), window, cx));
             }
         }
         content

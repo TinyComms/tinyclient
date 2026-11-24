@@ -105,16 +105,9 @@ pub(in crate::gui) struct Open {
     pub role_confirm_admin: bool,
 }
 
-fn field_box(input: Entity<TextInput>) -> Div {
-    div()
-        .px(px(8.))
-        .py(px(6.))
-        .rounded(px(theme::R_CONTROL))
-        .bg(theme::canvas())
-        .border_1()
-        .border_color(theme::border())
-        .type_ui()
-        .child(input)
+fn field_box(input: Entity<TextInput>, window: &gpui::Window, cx: &Context<Shell>) -> Div {
+    let focused = gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window);
+    super::components::field(focused).child(div().flex_1().min_w_0().child(input))
 }
 
 impl Shell {
@@ -669,7 +662,7 @@ impl Shell {
         cx.notify();
     }
 
-    pub(in crate::gui) fn discord_settings_layer(&self, _window: &mut Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn discord_settings_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let open = self.discord_settings.open.as_ref()?;
         let mut tabs = div().w(px(176.)).flex_none().border_r_1().border_color(theme::border()).p(px(12.)).flex().flex_col().gap(px(4.));
         tabs = tabs.child(
@@ -720,10 +713,10 @@ impl Shell {
         }
 
         let content: AnyElement = match open.tab {
-            Tab::Overview => self.discord_overview_tab(open, cx).into_any_element(),
+            Tab::Overview => self.discord_overview_tab(open, window, cx).into_any_element(),
             Tab::Invites => self.discord_invites_tab(open, cx).into_any_element(),
-            Tab::Events => self.discord_events_tab(open, cx).into_any_element(),
-            Tab::Roles => self.discord_roles_tab(open, cx).into_any_element(),
+            Tab::Events => self.discord_events_tab(open, window, cx).into_any_element(),
+            Tab::Roles => self.discord_roles_tab(open, window, cx).into_any_element(),
         };
 
         let panel = div()
@@ -732,10 +725,11 @@ impl Shell {
             .max_w_full()
             .h(px(580.))
             .max_h_full()
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .overflow_hidden()
             .flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -762,7 +756,7 @@ impl Shell {
                                 Tab::Events => "Scheduled events",
                                 Tab::Roles => "Roles",
                             }))
-                            .child(icon_button("ds-close", "icons/x.svg", false).on_click(cx.listener(|this, _, _, cx| {
+                            .child(icon_button("ds-close", "icons/x.svg", false).aria_label("Close").on_click(cx.listener(|this, _, _, cx| {
                                 this.close_discord_settings(cx);
                             }))),
                     )
@@ -787,7 +781,8 @@ impl Shell {
                 .id("discord-settings-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui::rgba(0x0000_0066))
+                .bg(theme::scrim())
+                .occlude()
                 .p(px(24.))
                 .flex()
                 .items_center()
@@ -799,7 +794,8 @@ impl Shell {
         )
     }
 
-    fn discord_overview_tab(&self, open: &Open, cx: &mut Context<Self>) -> Div {
+    fn discord_overview_tab(&self, open: &Open, window: &Window, cx: &mut Context<Self>) -> Div {
+        let field_box = |input: Entity<TextInput>| field_box(input, window, cx);
         let tree = self.trees.get(&open.space);
         let text_channels: Vec<(String, String)> = tree
             .map(|t| {
@@ -821,9 +817,11 @@ impl Shell {
             .unwrap_or_default();
 
         let mut sys_bar = div().flex().flex_wrap().gap(px(6.));
+        let sys_none = open.system_channel_id.is_empty();
         sys_bar = sys_bar.child(
-            segment("ds-sys-none", "None", open.system_channel_id.is_empty())
+            segment("ds-sys-none", "None", sys_none)
                 .px(px(8.))
+                .when(!sys_none, |s| s.bg(theme::hover()).border_1().border_color(theme::border()))
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Some(o) = this.discord_settings.open.as_mut() {
                         o.system_channel_id.clear();
@@ -837,6 +835,7 @@ impl Shell {
             sys_bar = sys_bar.child(
                 segment(("ds-sys-ch", ix), format!("#{}", title.trim_start_matches('#')), selected)
                     .px(px(8.))
+                    .when(!selected, |s| s.bg(theme::hover()).border_1().border_color(theme::border()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(o) = this.discord_settings.open.as_mut() {
                             o.system_channel_id = chosen.clone();
@@ -847,9 +846,11 @@ impl Shell {
         }
 
         let mut afk_bar = div().flex().flex_wrap().gap(px(6.));
+        let afk_none = open.afk_channel_id.is_empty();
         afk_bar = afk_bar.child(
-            segment("ds-afk-none", "None", open.afk_channel_id.is_empty())
+            segment("ds-afk-none", "None", afk_none)
                 .px(px(8.))
+                .when(!afk_none, |s| s.bg(theme::hover()).border_1().border_color(theme::border()))
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Some(o) = this.discord_settings.open.as_mut() {
                         o.afk_channel_id.clear();
@@ -863,6 +864,7 @@ impl Shell {
             afk_bar = afk_bar.child(
                 segment(("ds-afk-ch", ix), title.clone(), selected)
                     .px(px(8.))
+                    .when(!selected, |s| s.bg(theme::hover()).border_1().border_color(theme::border()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(o) = this.discord_settings.open.as_mut() {
                             o.afk_channel_id = chosen.clone();
@@ -1442,7 +1444,8 @@ impl Shell {
         .detach();
     }
 
-    fn discord_roles_tab(&self, open: &Open, cx: &mut Context<Self>) -> Div {
+    fn discord_roles_tab(&self, open: &Open, window: &Window, cx: &mut Context<Self>) -> Div {
+        let field_box = |input: Entity<TextInput>| field_box(input, window, cx);
         if !open.roles_loaded {
             return div().type_small().text_color(theme::text_soft()).child("Loading roles…");
         }
@@ -1675,7 +1678,8 @@ impl Shell {
             .child(div().type_small().text_color(theme::text()).child(label))
     }
 
-    fn discord_events_tab(&self, open: &Open, cx: &mut Context<Self>) -> Div {
+    fn discord_events_tab(&self, open: &Open, window: &Window, cx: &mut Context<Self>) -> Div {
+        let field_box = |input: Entity<TextInput>| field_box(input, window, cx);
         let events = self.sidebar_state.space_events.get(&open.space).cloned().unwrap_or_default();
         let voice_channels: Vec<(String, String)> = self
             .trees
@@ -1716,6 +1720,7 @@ impl Shell {
             ch_bar = ch_bar.child(
                 segment(("ds-ev-ch", ix), title.clone(), selected)
                     .px(px(8.))
+                    .when(!selected, |s| s.bg(theme::hover()).border_1().border_color(theme::border()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(o) = this.discord_settings.open.as_mut() {
                             o.event_channel_id = chosen.clone();

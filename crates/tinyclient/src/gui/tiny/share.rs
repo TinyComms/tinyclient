@@ -299,7 +299,12 @@ impl Shell {
                     }))))
         });
         // A small picture of the share, posted to Discord outside the encrypted stream.
-        let preview = share_preview_offered().then(|| {
+        let is_discord_call = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.call.as_ref())
+            .is_some_and(|call| call.conversation.network == protocol::Network::Discord);
+        let preview = (share_preview_offered() && is_discord_call).then(|| {
             div()
                 .mt(px(10.))
                 .flex()

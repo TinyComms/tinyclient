@@ -2040,7 +2040,7 @@ fn crumb(base: &'static str, cx: &mut Context<Shell>) -> AnyElement {
 
 /// The message search's pane: what was asked, and the cache's hits, newest first. A cache row
 /// says "cached". A direct-message hit Discord itself returned says "Discord".
-fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
+fn draw_search(shell: &Shell, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
     let Some(page) = shell.conversation_state.side.search.as_ref() else {
         return div().into_any_element();
     };
@@ -2054,10 +2054,24 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         .gap(px(8.))
         .border_b_1()
         .border_color(theme::hairline())
-        .child(glyph("icons/search.svg", 14., theme::text_soft()))
         .child(match field {
-            Some(field) => div().flex_1().min_w_0().child(field).into_any_element(),
-            None => div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(page.words.clone()).into_any_element(),
+            Some(field) => {
+                let focused = field.focus_handle(cx).is_focused(window);
+                crate::gui::components::search_field(focused)
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().flex_1().min_w_0().child(field))
+                    .into_any_element()
+            }
+            None => div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(glyph("icons/search.svg", 14., theme::text_soft()))
+                .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(page.words.clone()))
+                .into_any_element(),
         });
     // The scope's chips: the conversation open now, its Space, Discord's direct messages, or
     // the whole cache. One is the scope asked; a chip that cannot be asked is not drawn.

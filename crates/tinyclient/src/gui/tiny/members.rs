@@ -85,7 +85,9 @@ impl Shell {
         if let Some(presence) = page.online(&member.user_id) {
             avatar = avatar.presence(presence, theme::sidebar());
         }
-        let color = model::color_of(page.community, member).map(gpui::rgb).unwrap_or(theme::text());
+        let color = model::color_of(page.community, member)
+            .map(|c| theme::role_color_on(c, theme::sidebar(), 4.5))
+            .unwrap_or(theme::text());
         let seat = self.member_seat(page, member);
         let second: Option<AnyElement> = if member.timeout_until.is_some() {
             Some(div().min_w_0().truncate().type_small().text_color(theme::warning()).child("Timed out").into_any_element())
@@ -170,7 +172,9 @@ impl Shell {
         if let Some(presence) = page.online(&member.user_id) {
             avatar = avatar.presence(presence, theme::overlay());
         }
-        let color = model::color_of(page.community, member).map(gpui::rgb).unwrap_or(theme::text());
+        let color = model::color_of(page.community, member)
+            .map(|c| theme::role_color_on(c, theme::overlay(), 4.5))
+            .unwrap_or(theme::text());
         let roles = model::roles_of(page.community, member);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64);
         let joined = protocol::tiny_unix(&member.created_at).map(crate::gui::time::date);

@@ -2,7 +2,7 @@
 
 use super::controls::{row, rule};
 use super::SettingsWindow;
-use crate::gui::components::{button, ButtonKind};
+use crate::gui::components::{button, glyph, ButtonKind};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, SharedString};
 use protocol::{
@@ -137,7 +137,14 @@ fn entries(list: List, answer: std::io::Result<Response>) -> Result<Vec<Entry>, 
 }
 
 fn link_row(id: (&'static str, usize), label: &'static str, detail: Option<SharedString>, url: &'static str) -> Div {
-    row(label, detail, button(id, ButtonKind::Secondary, "Open in Discord ↗").on_click(move |_, _, cx| cx.open_url(url)))
+    row(
+        label,
+        detail,
+        button(id, ButtonKind::Secondary, "Open in Discord")
+            .gap(px(5.))
+            .child(glyph("icons/external-link.svg", 13., theme::text_soft()))
+            .on_click(move |_, _, cx| cx.open_url(url)),
+    )
 }
 
 impl SettingsWindow {

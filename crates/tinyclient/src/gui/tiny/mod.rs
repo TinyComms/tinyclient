@@ -285,6 +285,7 @@ pub struct State {
     label_input: Entity<TextInput>,
     reason_input: Entity<TextInput>,
     search_input: Entity<TextInput>,
+    new_direct_input: Entity<TextInput>,
     /// Last-read encryption status for an account, used by the Create channel modal.
     e2ee_status: Option<(AccountKey, protocol::E2eeStatus)>,
 
@@ -305,6 +306,7 @@ impl State {
         let label_input = cx.new(|cx| TextInput::new("Who it's for (optional)", cx));
         let reason_input = cx.new(|cx| TextInput::new("Reason (optional, goes in the audit log)", cx));
         let search_input = cx.new(|cx| TextInput::new("Search members", cx));
+        let new_direct_input = cx.new(|cx| TextInput::new("Search members", cx));
         for input in [&name_input, &topic_input] {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Submit => this.submit_name(cx),
@@ -315,7 +317,7 @@ impl State {
             })
             .detach();
         }
-        for input in [&name_input, &topic_input, &label_input, &reason_input] {
+        for input in [&name_input, &topic_input, &label_input, &reason_input, &new_direct_input] {
             cx.subscribe(input, |this, _, event: &InputKey, cx| {
                 if *event == InputKey::Escape {
                     this.close_modal(cx);
@@ -323,12 +325,14 @@ impl State {
             })
             .detach();
         }
-        cx.subscribe(&search_input, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Changed) {
-                cx.notify();
-            }
-        })
-        .detach();
+        for input in [&search_input, &new_direct_input] {
+            cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Changed) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
         let settings_fields = settings::Fields::new(cx);
         State {
             seen: false,
@@ -381,6 +385,7 @@ impl State {
             label_input,
             reason_input,
             search_input,
+            new_direct_input,
             e2ee_status: None,
             settings: None,
             settings_fields,
@@ -1854,8 +1859,8 @@ impl Shell {
                 None
             }
             Modal::NewDirect => {
-                self.tiny_state.search_input.update(cx, |input, cx| input.set_text("", cx));
-                Some(self.tiny_state.search_input.clone())
+                self.tiny_state.new_direct_input.update(cx, |input, cx| input.set_text("", cx));
+                Some(self.tiny_state.new_direct_input.clone())
             }
             _ => None,
         };

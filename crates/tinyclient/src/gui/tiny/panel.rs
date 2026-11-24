@@ -24,9 +24,11 @@ pub(super) enum StatsTab {
 }
 
 /// One of the panel's three buttons. `off` draws it struck through in `danger`.
-fn panel_button(id: &'static str, icon: &'static str, off: bool) -> Stateful<Div> {
+fn panel_button(id: &'static str, icon: &'static str, off: bool, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label)
         .flex_none()
         .size(px(32.))
         .rounded(px(theme::R_CONTROL))
@@ -35,8 +37,8 @@ fn panel_button(id: &'static str, icon: &'static str, off: bool) -> Stateful<Div
         .justify_center()
         .cursor_pointer()
         .tab_index(0)
-        .when(off, |button| button.bg(theme::danger_soft()))
-        .hover(|style| style.bg(theme::hover()))
+        .when(off, |button| button.bg(theme::danger_soft()).hover(|style| style.bg(theme::danger_soft()).opacity(0.88)))
+        .when(!off, |button| button.hover(|style| style.bg(theme::hover())))
         .active(|style| style.bg(theme::pressed()))
         .focus_visible(|style| style.shadow(theme::focus_ring()))
         .child(glyph(icon, 18., if off { theme::danger() } else { theme::text_soft() }))
@@ -348,21 +350,21 @@ impl Shell {
                     .tooltip(tip(status_tip, None))
                     .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_health(cx)))
             });
-        let mic = panel_button("tiny-panel-mic", if muted { "icons/mic-off.svg" } else { "icons/mic.svg" }, muted)
+        let mic = panel_button("tiny-panel-mic", if muted { "icons/mic-off.svg" } else { "icons/mic.svg" }, muted, if muted { "Unmute" } else { "Mute" })
             .tooltip(tip(if muted { "Unmute · Right-click for mic" } else { "Mute · Right-click for mic" }, Some("⌘⇧M")))
             .on_mouse_down(gpui::MouseButton::Right, cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.call_toggle_input_menu(cx);
             }))
             .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_mute(cx)));
-        let ears = panel_button("tiny-panel-deafen", if deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" }, deafened)
+        let ears = panel_button("tiny-panel-deafen", if deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" }, deafened, if deafened { "Undeafen" } else { "Deafen" })
             .tooltip(tip(if deafened { "Undeafen · Right-click for speaker" } else { "Deafen · Right-click for speaker" }, Some("⌘⇧D")))
             .on_mouse_down(gpui::MouseButton::Right, cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.call_toggle_output_menu(cx);
             }))
             .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_deafen(cx)));
-        let cog = panel_button("tiny-panel-settings", "icons/settings.svg", false)
+        let cog = panel_button("tiny-panel-settings", "icons/settings.svg", false, "Voice settings")
             .tooltip(tip("Voice settings", Some("⌘,")))
             .on_click(|_, _, cx| crate::gui::settings::open(crate::gui::settings::Section::Voice, cx));
         Some(
@@ -379,8 +381,14 @@ impl Shell {
                 .child(
                     div()
                         .id("tiny-my-avatar")
+                        .role(gpui::Role::Button)
+                        .aria_label("Change your picture")
+                        .tab_index(0)
                         .flex_none()
+                        .rounded_full()
                         .cursor_pointer()
+                        .hover(|style| style.opacity(0.85))
+                        .focus_visible(|style| style.shadow(theme::focus_ring()))
                         .tooltip(tip("Change your picture", None))
                         .on_click(cx.listener(|this, _, _, cx| this.tiny_pick_avatar(cx)))
                         .child(avatar.build()),

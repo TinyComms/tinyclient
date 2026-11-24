@@ -379,7 +379,7 @@ fn editor(shell: &Shell, facts: &Facts, role: &TinyRole, window: &mut Window, cx
     }
     if !role.default {
         column = column.child(if mine {
-            section("Role name").child(kit::input(&fields.role_name, Some(360.), window, cx))
+            section("Role name").child(kit::input(&fields.role_name, None, window, cx).max_w(px(360.)))
         } else {
             section("Role name").child(div().type_ui().text_color(theme::text()).child(role.name.clone()))
         });

@@ -531,15 +531,13 @@ impl Shell {
             return div().into_any_element();
         };
         let shown = if overlay.page.visible(facts) { overlay.page } else { Page::Overview };
-        let mut nav = div()
-            .w(px(232.))
-            .h_full()
-            .flex_none()
-            .bg(theme::sidebar())
-            .border_r_1()
-            .border_color(theme::hairline())
-            .pt(px(48.))
+        let mut nav_items = div()
+            .id("tiny-settings-nav-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .px(px(12.))
+            .pb(px(16.))
             .flex()
             .flex_col()
             .gap(px(1.))
@@ -557,13 +555,18 @@ impl Shell {
         for page in Page::ALL.into_iter().filter(|page| page.visible(facts)) {
             if page.group() != group {
                 group = page.group();
-                nav = nav.child(div().h(px(28.)).px(px(8.)).pb(px(4.)).flex().items_end().type_micro().text_color(theme::text_faint()).child(group.to_uppercase()));
+                nav_items = nav_items.child(div().h(px(28.)).px(px(8.)).pb(px(4.)).flex().items_end().type_micro().text_color(theme::text_faint()).child(group.to_uppercase()));
             }
             let on = page == shown;
             let danger = page == Page::Danger;
-            nav = nav.child(
+            nav_items = nav_items.child(
                 div()
                     .id(SharedString::from(format!("tiny-settings-nav-{}", page.label())))
+                    .role(gpui::Role::Tab)
+                    .aria_label(page.label())
+                    .aria_selected(on)
+                    .tab_index(0)
+                    .focus_visible(|style| style.shadow(theme::focus_ring()))
                     .h(px(32.))
                     .px(px(8.))
                     .rounded(px(theme::R_CONTROL))
@@ -578,39 +581,73 @@ impl Shell {
                     .child(div().type_ui().text_color(if danger { theme::danger() } else if on { theme::text() } else { theme::text_soft() }).child(page.label())),
             );
         }
+        let nav = div()
+            .w(px(232.))
+            .h_full()
+            .flex_none()
+            .bg(theme::sidebar())
+            .border_r_1()
+            .border_color(theme::hairline())
+            .flex()
+            .flex_col()
+            .child(crate::gui::layout::drags_window(div().h(px(48.)).w_full().flex_none()))
+            .child(nav_items);
         let body = self.tiny_settings_body(shown, facts, window, cx);
         let dirty = self.tiny_settings_dirty(cx);
         let close = div()
             .id("tiny-settings-close")
+            .role(gpui::Role::Button)
+            .aria_label("Close server settings")
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .h(px(32.))
+            .px(px(10.))
+            .rounded(px(theme::R_CONTROL))
+            .border_1()
+            .border_color(theme::border())
+            .hover(|style| style.bg(theme::hover()))
             .flex()
-            .flex_col()
             .items_center()
-            .gap(px(4.))
+            .gap(px(6.))
             .cursor_pointer()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| this.tiny_close_settings(cx)))
-            .child(
-                div()
-                    .size(px(36.))
-                    .rounded_full()
-                    .border_2()
-                    .border_color(theme::border_strong())
-                    .hover(|style| style.bg(theme::hover()))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(glyph("icons/x.svg", 18., theme::text_soft())),
-            )
+            .child(glyph("icons/x.svg", 14., theme::text_soft()))
             .child(div().type_micro().text_color(theme::text_faint()).child("ESC"));
+        let header = crate::gui::layout::drags_window(div())
+            .h(px(48.))
+            .w_full()
+            .flex_none()
+            .pl(px(40.))
+            .pr(px(chrome::corner_pad(window, 24.)))
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(theme::hairline())
+            .child(div().type_title().text_color(theme::text()).child(shown.label()))
+            .child(close);
         let content = div()
             .flex_1()
             .min_w_0()
             .h_full()
             .relative()
+            .flex()
+            .flex_col()
             .bg(theme::canvas())
+            .child(header)
             .child(
-                crate::gui::components::scroll_frame("tiny-settings-scroll-frame", overlay.scroll.clone(), div().id("tiny-settings-scroll").size_full().overflow_y_scroll().track_scroll(&overlay.scroll).child(div().w_full().max_w(px(740.)).px(px(40.)).pt(px(48.)).pb(px(120.)).child(body))),
+                div().flex_1().min_h_0().child(crate::gui::components::scroll_frame(
+                    "tiny-settings-scroll-frame",
+                    overlay.scroll.clone(),
+                    div()
+                        .id("tiny-settings-scroll")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&overlay.scroll)
+                        .child(div().w_full().max_w(px(740.)).px(px(40.)).pt(px(24.)).pb(px(120.)).child(body)),
+                )),
             )
-            .child(div().absolute().top(px(44.)).right(px(chrome::corner_pad(window, 28.))).child(close))
             .when(dirty || overlay.error.is_some(), |content| {
                 content.child(div().absolute().bottom(px(20.)).left(px(40.)).right(px(40.)).flex().child(unsaved_bar(overlay.saving, overlay.error.clone(), self.tiny_settings_save_button(overlay.page), cx)))
             });
@@ -722,7 +759,6 @@ impl Shell {
                         .child(unsaved_bar(overlay.saving, overlay.error.clone(), self.tiny_settings_save_button(overlay.page), cx)),
                 )
             })
-            .child(div().flex_none().h(px(tokens::safe_bottom())))
             // The back swipe from the left edge, as every pushed page has.
             .child(self.phone_edge(cx));
         Some(page.into_any_element())
