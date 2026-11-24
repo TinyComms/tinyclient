@@ -193,9 +193,19 @@ pub fn toast_width(window_width: f32) -> f32 {
 pub fn placed(id: impl Into<ElementId>, place: Place, layer: Layer, window: &Window, content: impl IntoElement) -> AnyElement {
     let viewport = window.viewport_size();
     let limit = max_height(place, (f32::from(viewport.width), f32::from(viewport.height)));
-    let body = div().id(id).flex_none().max_h(px(limit)).overflow_y_scroll().rounded(px(theme::R_FLOAT))
-        // The scroll clips what it holds, so the floating shadow is drawn by the wrapper.
-        .shadow(theme::shadow_popover())
+    let (radius, shadow) = match (layer, place) {
+        (Layer::Modal, _) | (_, Place::Center) => (theme::R_MODAL, theme::shadow_modal()),
+        _ => (theme::R_FLOAT, theme::shadow_popover()),
+    };
+    let body = div()
+        .id(id)
+        .flex_none()
+        .max_h(px(limit))
+        .overflow_hidden()
+        .overflow_y_scroll()
+        .rounded(px(radius))
+        // The scroll clips what it holds on both axes, so the single floating shadow is drawn here.
+        .shadow(shadow)
         .child(content);
     deferred(Placed { place, child: Some(body.into_any_element()) }).priority(layer as usize).into_any_element()
 }

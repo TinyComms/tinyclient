@@ -22,10 +22,9 @@ mod table;
 // One decoder and one picture budget for the whole window, shared with the conversation.
 pub(in crate::gui) use crate::gui::conversation::images;
 
-use palette::IntoColor;
 use crate::frames;
 use crate::gui::anim::{self, Play};
-use crate::gui::components::{field, glyph, menu, menu_item, placed, segment, segmented, Layer, Place};
+use crate::gui::components::{glyph, menu, menu_item, placed, segment, segmented, Layer, Place};
 use crate::gui::input::{self, InputEvent, InputGrid, InputKey, TextInput};
 use crate::gui::people::ask_later;
 use crate::gui::theme::{self, Type};
@@ -1033,8 +1032,12 @@ impl Picker {
         Some(div().flex_none().h(px(TABS)).px(px(self.side())).pt(px(6.)).child(control).into_any_element())
     }
 
-    fn search_band(&self) -> AnyElement {
-        let field = field(true).w_full().child(glyph("icons/search.svg", 14., theme::text_faint())).child(div().flex_1().min_w_0().child(self.input.clone()));
+    fn search_band(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let focused = self.input.focus_handle(cx).is_focused(window);
+        let field = crate::gui::components::field_on(focused, theme::overlay())
+            .w_full()
+            .child(glyph("icons/search.svg", 14., theme::text_faint()))
+            .child(div().flex_1().min_w_0().child(self.input.clone()));
         div().flex_none().h(px(SEARCH)).px(px(self.side())).pb(px(8.)).flex().items_end().child(field).into_any_element()
     }
 
@@ -1054,7 +1057,16 @@ impl Picker {
         };
         // A phone's sheet spreads the sections across the grid's width.
         let wide = self.width > WIDTH + 0.5;
-        let strip = div().flex_none().h(px(STRIP)).px(px(self.side())).flex().items_center().gap(px(2.)).when(wide, |strip| strip.justify_between()).overflow_hidden();
+        let strip = div()
+            .id("picker-strip")
+            .flex_none()
+            .h(px(STRIP))
+            .px(px(self.side()))
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .when(wide, |strip| strip.justify_between())
+            .overflow_x_scroll();
         match self.tab {
             Tab::Emoji if self.query(cx).is_empty() => {
                 let mut strip = strip;
@@ -1127,7 +1139,7 @@ impl Picker {
     fn thumb(&mut self, path: &str, size: f32, glyph: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
         let edge = (size * 2.).ceil() as u32;
         match self.images.get(path, edge, None, cx, Self::decoded) {
-            Picture::Ready(image) => div().size(px(size)).child(anim::picture(image, ObjectFit::Fill, 4., Play::Inline)).into_any_element(),
+            Picture::Ready(image) => div().size(px(size)).child(anim::picture(image, ObjectFit::Contain, 4., Play::Inline)).into_any_element(),
             _ => standin(glyph.unwrap_or(""), size),
         }
     }
@@ -1185,7 +1197,7 @@ impl Picker {
                         Cell::Custom(ix) => {
                             let path = self.customs.get(*ix as usize).and_then(|custom| custom.file.as_ref()?.path.clone());
                             match path.map(|path| self.images.get(&path, 48, None, cx, Self::decoded)) {
-                                Some(Picture::Ready(image)) => div().size(px(GLYPH)).child(anim::picture(image, ObjectFit::Fill, 0., Play::Inline)).into_any_element(),
+                                Some(Picture::Ready(image)) => div().size(px(GLYPH)).child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)).into_any_element(),
                                 _ => standin("", GLYPH),
                             }
                         }
@@ -1350,7 +1362,7 @@ impl Picker {
                                 // A neutral tile until the picture lands; never a cut-off name.
                                 match (path, custom) {
                                     (Some(path), _) => match self.images.get(&path, edge, None, cx, Self::decoded) {
-                                        Picture::Ready(image) => div().size(px(24.)).child(anim::picture(image, ObjectFit::Fill, 0., Play::Inline)).into_any_element(),
+                                        Picture::Ready(image) => div().size(px(24.)).child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)).into_any_element(),
                                         _ => standin("", 24.),
                                     },
                                     (None, Some(custom)) => {
@@ -1444,7 +1456,7 @@ impl Picker {
                             .id(("add-pack", ix))
                             .flex_none()
                             .cursor_pointer()
-                            .text_color(theme::accent())
+                            .text_color(theme::accent_text())
                             .child("Add")
                             .on_click(cx.listener(move |this, _, _, cx| this.add_pack(set.clone(), cx))),
                     )
@@ -1479,7 +1491,7 @@ impl Picker {
                         Picture::Ready(image) => div()
                             .w(px(if gifs { w } else { STICKER - 8. }))
                             .h(px(if gifs { h } else { STICKER - 8. }))
-                            .child(anim::picture(image, ObjectFit::Fill, theme::R_CONTROL, Play::Inline))
+                            .child(anim::picture(image, if gifs { ObjectFit::Fill } else { ObjectFit::Contain }, theme::R_CONTROL, Play::Inline))
                             .into_any_element(),
                         _ => tile(),
                     }
@@ -1510,13 +1522,13 @@ impl Picker {
                     .right(px(4.))
                     .size(px(24.))
                     .rounded(px(theme::R_CONTROL))
-                    .bg(gpui::rgba(0x00000099))
+                    .bg(theme::media_chip())
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
                     .tooltip(crate::gui::components::tip(star_tip, None))
-                    .child(glyph("icons/star.svg", 14., if star_lit { theme::warning().into_color() } else { gpui::white() }))
+                    .child(glyph("icons/star.svg", 14., if star_lit { gpui::rgb(0xffc44d) } else { theme::on_media() }))
                     // The star is not the cell: a click here never sends.
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1538,7 +1550,6 @@ impl Picker {
                     .justify_center()
                     .cursor_pointer()
                     .when(item.locked, |cell| cell.opacity(0.45))
-                    .when(selected || hovered, |cell| cell.border_2().border_color(if selected { theme::focus() } else { theme::border_strong() }))
                     .when(!gifs, |cell| cell.hover(|style| style.bg(theme::selected())))
                     .on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_item(at, *on, cx)))
                     .on_mouse_down(
@@ -1563,6 +1574,16 @@ impl Picker {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.emit_item(at, false, cx)))
                     .child(picture)
+                    .when(selected || hovered, |cell| {
+                        cell.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded(px(theme::R_CONTROL))
+                                .border_2()
+                                .border_color(if selected { theme::focus() } else { theme::border_strong() }),
+                        )
+                    })
                     .children(star),
             );
         }
@@ -1801,13 +1822,13 @@ impl Render for Picker {
                 Tab::Emoji => div().h(px(grid_height)).w_full().child(crate::gui::components::scroll_frame("picker-emoji-scroll-frame", self.scroll.clone(), uniform_list("picker-emoji", self.rows.len(), cx.processor(Self::emoji_rows))
                     .track_scroll(&self.scroll)
                     .size_full()
-                    .px(px(self.grid_pad())))).into_any_element(),
+                    .px(px(self.grid_pad()))).keyboard(false)).into_any_element(),
                 // The list lays its rows edge to edge: the padding is its holder's.
                 _ => div()
                     .h(px(grid_height))
                     .w_full()
                     .px(px(PAD))
-                    .child(crate::gui::components::scroll_frame("picker-items-scroll-frame", self.items_list.clone(), list(self.items_list.clone(), cx.processor(Self::item_row)).size_full()))
+                    .child(crate::gui::components::scroll_frame("picker-items-scroll-frame", self.items_list.clone(), list(self.items_list.clone(), cx.processor(Self::item_row)).size_full()).keyboard(false))
                     .into_any_element(),
             },
         };
@@ -1832,7 +1853,7 @@ impl Render for Picker {
             )
             .children(tabs)
             .when(self.setup.tabs.len() < 2, |picker| picker.pt(px(6.)))
-            .child(self.search_band())
+            .child(self.search_band(window, cx))
             .children(strip)
             .child(grid)
             .child(self.footer_band(cx))

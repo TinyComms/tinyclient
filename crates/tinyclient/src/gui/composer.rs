@@ -2827,11 +2827,9 @@ impl Composer {
                 .unwrap_or(dest)
                 .trim();
             let label = if dest.is_empty() || dest == "Thread" {
-                if on { "☑ Also send to channel".to_owned() } else { "☐ Also send to channel".to_owned() }
-            } else if on {
-                format!("☑ Also send to {dest}")
+                "Also send to channel".to_owned()
             } else {
-                format!("☐ Also send to {dest}")
+                format!("Also send to {dest}")
             };
             bar = bar.child(
                 div()
@@ -2840,6 +2838,9 @@ impl Composer {
                     .py(px(2.))
                     .rounded(px(theme::R_CONTROL))
                     .bg(theme::raised())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
                     .type_small()
                     .text_color(if on { theme::accent_text() } else { theme::text_faint() })
                     .cursor_pointer()
@@ -2848,6 +2849,11 @@ impl Composer {
                         this.broadcast = !this.broadcast;
                         cx.notify();
                     }))
+                    .child(glyph(
+                        if on { "icons/square-check.svg" } else { "icons/square.svg" },
+                        13.,
+                        if on { theme::accent_text() } else { theme::text_faint() },
+                    ))
                     .child(label),
             );
         }
@@ -2965,7 +2971,7 @@ impl Composer {
         .detach();
     }
 
-    fn thread_composer_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn thread_composer_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let form = self.thread_composer.as_ref()?;
         let ready = !form.name.read(cx).text().trim().is_empty();
         let durations: [(u32, &'static str); 4] = [(60, "1h"), (1440, "24h"), (4320, "3d"), (10080, "1w")];
@@ -2997,6 +3003,9 @@ impl Composer {
             let priv_on = form.private;
             div()
                 .id("thread-toggle-private")
+                .flex()
+                .items_center()
+                .gap(px(4.))
                 .type_small()
                 .text_color(if priv_on { theme::accent_text() } else { theme::text_soft() })
                 .cursor_pointer()
@@ -3010,18 +3019,17 @@ impl Composer {
                         }
                     }
                 }))
-                .child(if priv_on { "☑ Private thread" } else { "☐ Private thread" })
+                .child(glyph(
+                    if priv_on { "icons/square-check.svg" } else { "icons/square.svg" },
+                    13.,
+                    if priv_on { theme::accent_text() } else { theme::text_soft() },
+                ))
+                .child("Private thread")
         });
-        let field_box = |input: Entity<TextInput>| {
-            div()
-                .px(px(8.))
-                .py(px(4.))
-                .rounded(px(theme::R_CONTROL))
-                .bg(theme::canvas())
-                .border_1()
-                .border_color(theme::hairline())
-                .type_ui()
-                .child(input)
+        let field_box = |input: Entity<TextInput>, cx: &Context<Self>| {
+            let focused = input.focus_handle(cx).is_focused(window);
+            crate::gui::components::field_on(focused, theme::raised())
+                .child(div().flex_1().min_w_0().child(input))
         };
         Some(
             div()
@@ -3035,8 +3043,8 @@ impl Composer {
                 .flex_col()
                 .gap(px(6.))
                 .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("New thread"))
-                .child(field_box(form.name.clone()))
-                .child(field_box(form.first_message.clone()))
+                .child(field_box(form.name.clone(), cx))
+                .child(field_box(form.first_message.clone(), cx))
                 .child(
                     div()
                         .flex()
@@ -3173,7 +3181,7 @@ impl Composer {
         .detach();
     }
 
-    fn thread_settings_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn thread_settings_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let form = self.thread_settings.as_ref()?;
         let target = self.target.as_ref()?;
         let can_manage = target.rights.manage_threads;
@@ -3223,22 +3231,16 @@ impl Composer {
                     .child(label),
             );
         }
+        let rename_focused = form.name.focus_handle(cx).is_focused(window);
         let rename_row = div()
             .flex()
             .items_center()
             .gap(px(6.))
             .child(
-                div()
+                crate::gui::components::field_on(rename_focused, theme::raised())
                     .flex_1()
                     .min_w_0()
-                    .px(px(8.))
-                    .py(px(4.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::hairline())
-                    .type_ui()
-                    .child(form.name.clone()),
+                    .child(div().flex_1().min_w_0().child(form.name.clone())),
             )
             .child(
                 button("thread-rename-save", if name_ready { ButtonKind::Primary } else { ButtonKind::Ghost }, "Rename")
@@ -3388,7 +3390,7 @@ impl Composer {
         .detach();
     }
 
-    fn poll_composer_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn poll_composer_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let form = self.poll_composer.as_ref()?;
         let can_add = form.options.len() < form.max_options;
         let can_remove = form.options.len() > 2;
@@ -3396,22 +3398,16 @@ impl Composer {
             && form.options.iter().filter(|o| !o.read(cx).text().trim().is_empty()).count() >= 2;
         let mut opt_rows = div().flex().flex_col().gap(px(4.));
         for (idx, opt) in form.options.iter().enumerate() {
+            let opt_focused = opt.focus_handle(cx).is_focused(window);
             let row = div()
                 .flex()
                 .items_center()
                 .gap(px(6.))
                 .child(
-                    div()
+                    crate::gui::components::field_on(opt_focused, theme::raised())
                         .flex_1()
                         .min_w_0()
-                        .px(px(8.))
-                        .py(px(4.))
-                        .rounded(px(theme::R_CONTROL))
-                        .bg(theme::canvas())
-                        .border_1()
-                        .border_color(theme::hairline())
-                        .type_ui()
-                        .child(opt.clone()),
+                        .child(div().flex_1().min_w_0().child(opt.clone())),
                 )
                 .when(can_remove, |el| {
                     el.child(
@@ -3445,7 +3441,7 @@ impl Composer {
                 div()
                     .id("poll-add-opt")
                     .type_small()
-                    .text_color(theme::accent())
+                    .text_color(theme::accent_text())
                     .cursor_pointer()
                     .hover(|s| s.underline())
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -3465,8 +3461,11 @@ impl Composer {
             left = left.child(
                 div()
                     .id("poll-toggle-multi")
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
                     .type_small()
-                    .text_color(if mult { theme::accent() } else { theme::text_faint() })
+                    .text_color(if mult { theme::accent_text() } else { theme::text_faint() })
                     .cursor_pointer()
                     .hover(|s| s.underline())
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -3475,7 +3474,12 @@ impl Composer {
                             cx.notify();
                         }
                     }))
-                    .child(if mult { "☑ Multiple choices" } else { "☐ Multiple choices" }),
+                    .child(glyph(
+                        if mult { "icons/square-check.svg" } else { "icons/square.svg" },
+                        13.,
+                        if mult { theme::accent_text() } else { theme::text_faint() },
+                    ))
+                    .child("Multiple choices"),
             );
         }
         if let Some(duration) = form.duration_secs {
@@ -3483,7 +3487,7 @@ impl Composer {
             left = left.child(div()
                 .id("poll-duration")
                 .type_small()
-                .text_color(theme::accent())
+                .text_color(theme::accent_text())
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(form) = this.poll_composer.as_mut() {
@@ -3525,15 +3529,8 @@ impl Composer {
                 .gap(px(6.))
                 .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Create a poll"))
                 .child(
-                    div()
-                        .px(px(8.))
-                        .py(px(5.))
-                        .rounded(px(theme::R_CONTROL))
-                        .bg(theme::canvas())
-                        .border_1()
-                        .border_color(theme::hairline())
-                        .type_ui()
-                        .child(form.question.clone()),
+                    crate::gui::components::field_on(form.question.focus_handle(cx).is_focused(window), theme::raised())
+                        .child(div().flex_1().min_w_0().child(form.question.clone())),
                 )
                 .child(opt_rows)
                 .child(footer),
@@ -3709,7 +3706,7 @@ impl Composer {
         .detach();
     }
 
-    fn location_composer_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn location_composer_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let form = self.location_composer.as_ref()?;
         let target = self.target.as_ref()?;
         let phone = crate::gui::phone::active();
@@ -3750,15 +3747,8 @@ impl Composer {
                 .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child("Share live location for:"))
                 .child(div().flex().flex_wrap().items_center().gap(px(6.)).children(presets))
                 .children(is_direct.then(|| {
-                    div()
-                        .px(px(8.))
-                        .py(px(5.))
-                        .rounded(px(theme::R_CONTROL))
-                        .bg(theme::canvas())
-                        .border_1()
-                        .border_color(theme::hairline())
-                        .type_ui()
-                        .child(form.proximity.clone())
+                    crate::gui::components::field_on(form.proximity.focus_handle(cx).is_focused(window), theme::raised())
+                        .child(div().flex_1().min_w_0().child(form.proximity.clone()))
                 }))
                 .children(selected.map(|secs| {
                     button("live-loc-start", ButtonKind::Primary, if form.sending { "Starting…" } else { "Start live location" })
@@ -3780,15 +3770,8 @@ impl Composer {
                 .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(heading))
                 .child(div().type_small().text_color(theme::text_faint()).child(note))
                 .child(
-                    div()
-                        .px(px(8.))
-                        .py(px(5.))
-                        .rounded(px(theme::R_CONTROL))
-                        .bg(theme::canvas())
-                        .border_1()
-                        .border_color(theme::hairline())
-                        .type_ui()
-                        .child(form.coords.clone()),
+                    crate::gui::components::field_on(form.coords.focus_handle(cx).is_focused(window), theme::raised())
+                        .child(div().flex_1().min_w_0().child(form.coords.clone())),
                 )
                 .children(live_row)
                 .children(form.error.as_ref().map(|err| {
@@ -4947,9 +4930,10 @@ impl Composer {
         };
         Some(
             div()
-                .h(px(28.))
+                .min_h(px(36.))
                 .mb(px(6.))
                 .px(px(12.))
+                .py(px(4.))
                 .rounded(px(theme::R_FLOAT))
                 .border_1()
                 .border_color(theme::border())
@@ -5103,7 +5087,7 @@ impl Composer {
             .rounded(px(theme::R_FLOAT))
             .bg(if expired { theme::danger_soft() } else { theme::raised() })
             .border_1()
-            .border_color(if expired { theme::danger_soft() } else { theme::border() })
+            .border_color(if expired { theme::danger() } else { theme::border() })
             .flex()
             .items_center()
             .gap(px(8.))
@@ -5257,7 +5241,7 @@ impl Composer {
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .hover(|style| style.bg(theme::hover()))
+            .hover(|style| style.bg(theme::selected()))
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| {
                 if this.editing.is_some() {
@@ -5283,7 +5267,7 @@ impl Composer {
                     .items_center()
                     .gap(px(4.))
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::hover()))
+                    .hover(|style| style.bg(theme::selected()))
                     .font_weight(theme::MEDIUM)
                     .text_color(theme::accent_text())
                     .child("Replace file")
@@ -5315,7 +5299,7 @@ impl Composer {
                 .items_center()
                 .gap(px(2.))
                 .cursor_pointer()
-                .hover(|style| style.bg(theme::hover()))
+                .hover(|style| style.bg(theme::selected()))
                 .font_weight(theme::MEDIUM)
                 .text_color(if on { theme::accent_text() } else { theme::text_soft() })
                 .child("@")
@@ -5804,7 +5788,7 @@ impl Composer {
             .aria_label(if self.editing.is_some() { "Save edited message" } else { "Send message" })
             .aria_disabled(!ready)
             .when(ready, |send| send.tab_index(0))
-            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
+            .focus_visible(|style| style.shadow(theme::focus_ring_gap(theme::canvas())))
             .relative()
             .h(px(card_control()))
             .min_w(px(card_control()))
@@ -5907,6 +5891,7 @@ impl Composer {
         div()
             .min_h(px(card_height()))
             .rounded(px(theme::R_FLOAT))
+            .overflow_hidden()
             .bg(theme::over(theme::raised(), theme::canvas()))
             .border_1()
             .border_color(match (armed, focused) {
@@ -6123,6 +6108,7 @@ impl Composer {
                         .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(description)),
                 );
             }
+            let list = list.id("composer-slash-scroll").max_h(px(260.)).overflow_y_scroll();
             return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(list)).priority(1).into_any_element());
         }
         if let Some(slash) = self.slash.as_ref().filter(|slash| !slash.rows.is_empty()) {
@@ -6188,6 +6174,7 @@ impl Composer {
                         }),
                 );
             }
+            let panel = panel.id("composer-slash-rows-scroll").max_h(px(260.)).overflow_y_scroll();
             return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(panel)).priority(1).into_any_element());
         }
         if self.colon.as_ref().is_some_and(|colon| !colon.cells.is_empty()) {
@@ -6205,7 +6192,10 @@ impl Composer {
                     _ => None,
                 }
             };
-            let drawn = colon::draw(colon, customs, tone, image, pick);
+            let drawn = colon::draw(colon, customs, tone, image, pick)
+                .id("composer-colon-scroll")
+                .max_h(px(260.))
+                .overflow_y_scroll();
             return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
         }
         if let Some(slash) = self.app_slash.as_ref().filter(|slash| !slash.is_empty()) {
@@ -6221,7 +6211,10 @@ impl Composer {
         let pick = move |row: usize, _: &mut Window, cx: &mut App| {
             let _ = this.update(cx, |this, cx| this.complete(row, cx));
         };
-        let drawn = complete::draw(list, &self.hub, pick, cx);
+        let drawn = complete::draw(list, &self.hub, pick, cx)
+            .id("composer-complete-scroll")
+            .max_h(px(260.))
+            .overflow_y_scroll();
         Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element())
     }
 
@@ -6261,7 +6254,6 @@ impl Composer {
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
-            .shadow(theme::shadow_popover())
             .overflow_hidden()
             .occlude()
             .child(picking.picker.clone())
@@ -6381,14 +6373,20 @@ impl Composer {
                             items = items.child(menu_item_disabled(row_id, None, format!("✨ {}", item.name), Some("Premium")));
                         } else {
                             let id = item.id.clone();
-                            let picked = (self.effect.as_deref() == Some(item.id.as_str())).then_some("✓");
-                            items = items.child(menu_item(row_id, None, format!("✨ {}", item.name), picked).on_click(cx.listener(
-                                move |this, _, _, cx| {
+                            let picked = self.effect.as_deref() == Some(item.id.as_str());
+                            items = items.child(
+                                menu_item(
+                                    row_id,
+                                    Some(if picked { "icons/check.svg" } else { crate::gui::components::NO_GLYPH }),
+                                    format!("✨ {}", item.name),
+                                    None,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.effect = Some(id.clone());
                                     this.send_menu = false;
                                     cx.notify();
-                                },
-                            )));
+                                })),
+                            );
                         }
                     }
                 }
@@ -6867,17 +6865,21 @@ impl Render for Composer {
         let show_typing = locked.is_none();
         let body = match locked {
             Some(locked) => self.bar(locked, target.key.network, cx),
-            None => self.card(focus.is_focused(window), window, cx),
+            None => self.card(
+                focus.is_focused(window) || self.subject.focus_handle(cx).is_focused(window),
+                window,
+                cx,
+            ),
         };
         let anchors = self.anchors.clone();
-        // The row sits over the card's text, not its edge; hidden when the composer is locked.
-        dock.when(show_typing, |dock| dock.child(div().pl(px(13.)).child(self.typing.clone())))
-            .children(self.ooo_banner(&target, cx))
+        // The row sits directly over the card's text, below any banners/panels; hidden when locked.
+        dock.children(self.ooo_banner(&target, cx))
             .children(self.send_options_bar(cx))
-            .children(self.poll_composer_panel(cx))
-            .children(self.location_composer_panel(cx))
-            .children(self.thread_composer_panel(cx))
-            .children(self.thread_settings_panel(cx))
+            .children(self.poll_composer_panel(window, cx))
+            .children(self.location_composer_panel(window, cx))
+            .children(self.thread_composer_panel(window, cx))
+            .children(self.thread_settings_panel(window, cx))
+            .when(show_typing, |dock| dock.child(div().pl(px(13.)).child(self.typing.clone())))
             .child(div().relative().children(undo).child(body).children(self.popover(cx)))
             .children(self.caption_line(&target, cx))
             .children(self.bot_strip(&target, window, cx))

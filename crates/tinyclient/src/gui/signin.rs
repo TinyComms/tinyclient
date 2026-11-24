@@ -1101,6 +1101,15 @@ impl Sheet {
             .into_any_element()
     }
 
+    fn secondary(&self, id: &'static str, label: impl Into<SharedString>, act: fn(&mut Sheet, &mut Context<Sheet>), cx: &Context<Sheet>) -> gpui::AnyElement {
+        if self.busy {
+            return page::wide(button_disabled(label).h(px(32.))).into_any_element();
+        }
+        page::wide(button(id, ButtonKind::Secondary, label).h(px(32.)))
+            .on_click(cx.listener(move |this, _, _, cx| act(this, cx)))
+            .into_any_element()
+    }
+
     /// A link that answers the step. It does nothing while an answer is awaited.
     fn answer_link(&self, id: &'static str, words: &'static str, input: fn() -> SignInInput, cx: &Context<Sheet>) -> Stateful<Div> {
         link(id, words).on_click(cx.listener(move |this, _, _, cx| this.answer(input(), cx)))
@@ -1329,7 +1338,7 @@ impl Sheet {
             .child(bullets);
         // Recovery stays in Telegram's own app. Emailing a code would be `auth.recoverPassword`,
         // which with no new settings deletes the cloud password (#542).
-        let aside = div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app.");
+        let aside = div().type_ui().text_color(theme::text_soft()).child("Forgot it? Reset it in the Telegram app.");
         div()
             .flex()
             .flex_col()
@@ -1535,8 +1544,8 @@ impl Sheet {
                     .child(account.map_or_else(|| div().into_any_element(), IntoElement::into_any_element))
                     .child(if existing {
                         buttons().child(self.cancel("Cancel", cx))
+                            .child(self.secondary("signin-replace", "Sign in again", Sheet::send_invite_confirmed, cx))
                             .child(self.primary("Open existing server", Sheet::open_existing_invite, cx))
-                            .child(self.primary("Sign in again", Sheet::send_invite_confirmed, cx))
                     } else {
                         buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_invite, cx))
                     }),
@@ -1979,7 +1988,15 @@ pub(in crate::gui) fn code_tile(code: Rc<qr::Qr>) -> Div {
         },
     )
     .size(px(CODE_ROOM));
-    div().flex_none().size(px(TILE)).rounded(px(TILE_RADIUS)).bg(rgb(QR_PAPER)).p(px(TILE_PAD)).child(squares)
+    div()
+        .flex_none()
+        .size(px(TILE))
+        .rounded(px(TILE_RADIUS))
+        .bg(rgb(QR_PAPER))
+        .border_1()
+        .border_color(theme::hairline())
+        .p(px(TILE_PAD))
+        .child(squares)
 }
 
 fn ink() -> Rgba {
@@ -2082,16 +2099,22 @@ impl Render for Sheet {
         if phone::active() {
             return root.child(fade_in("signin-page", 160, page::page(body, cx)));
         }
+        let max_h = (f32::from(window.viewport_size().height) - 32.).max(240.);
         root.child(scrim()).child(
             div()
                 .absolute()
                 .top_0()
                 .left_0()
                 .size_full()
+                .p(px(16.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(fade_in("signin-sheet", 160, panel().child(body))),
+                .child(fade_in(
+                    "signin-sheet",
+                    160,
+                    panel().id("signin-panel-scroll").max_h(px(max_h)).overflow_y_scroll().child(body),
+                )),
         )
     }
 }

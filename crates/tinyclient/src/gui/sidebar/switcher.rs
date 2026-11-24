@@ -1087,7 +1087,7 @@ impl Shell {
             (Target::Person(person), Some((adding, picked))) => {
                 let already = adding.fixed.iter().any(|fixed| fixed.key == person.key);
                 let picked = picked.iter().any(|pick| pick.key == person.key);
-                let words = if already { "Already in" } else if picked { "✓ Added" } else { "Add" };
+                let words = if already { "Already in" } else if picked { "Added" } else { "Add" };
                 Some(
                     div()
                         .id(("add-grp", ix))
@@ -1095,8 +1095,12 @@ impl Shell {
                         .py(px(2.))
                         .rounded(px(theme::R_CONTROL))
                         .bg(if picked { theme::accent() } else { theme::raised() })
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
                         .type_small()
                         .text_color(if picked { theme::on_accent() } else if already { theme::text_faint() } else { theme::text_soft() })
+                        .when(picked, |el| el.child(glyph("icons/check.svg", 12., theme::on_accent())))
                         .child(words),
                 )
             }
@@ -1117,12 +1121,16 @@ impl Shell {
                         .py(px(2.))
                         .rounded(px(theme::R_CONTROL))
                         .bg(if picked { theme::accent() } else { theme::raised() })
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
                         .type_small()
                         .text_color(if picked { theme::on_accent() } else { theme::text_soft() })
                         .cursor_pointer()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_group_person(who.clone(), cx)))
-                        .child(if picked { "✓ Group" } else { "+ Group" })
+                        .when(picked, |el| el.child(glyph("icons/check.svg", 12., theme::on_accent())))
+                        .child(if picked { "Group" } else { "+ Group" })
                 })
             }
             _ => None,
@@ -1254,9 +1262,7 @@ impl Shell {
             None
         };
         let marks = self.marks_shown();
-        // The list is as tall as whole rows that fit, so the last one on show is never cut.
-        let room = frame.h - 52. - 32. - 10.;
-        let mut rows = div().id("hits").p(px(4.)).pb(px(6.)).max_h(px(room.max(ROW * 2.))).overflow_y_scroll().track_scroll(&switcher.scroll).flex().flex_col();
+        let mut rows = div().id("hits").p(px(4.)).pb(px(6.)).size_full().overflow_y_scroll().track_scroll(&switcher.scroll).flex().flex_col();
         for (ix, hit) in switcher.hits.iter().enumerate() {
             let label = hit.section.map(|section| {
                 div().h(px(HEADER)).px(px(10.)).pb(px(4.)).flex().items_end().type_micro().text_color(theme::text_soft()).child(section)
@@ -1267,7 +1273,7 @@ impl Shell {
         let sheet = div()
             .w(px(frame.w))
             .when(!phone, |sheet| {
-                sheet.rounded(px(theme::R_MODAL)).bg(theme::overlay()).border_1().border_color(theme::overlay_edge()).shadow(theme::shadow_modal())
+                sheet.max_h(px(frame.h)).rounded(px(theme::R_MODAL)).bg(theme::overlay()).border_1().border_color(theme::overlay_edge()).shadow(theme::shadow_modal())
             })
             .when(phone, |sheet| {
                 sheet.h_full().bg(theme::sidebar()).pt(px(crate::gui::phone::tokens::safe_top())).pb(px(crate::gui::phone::tokens::safe_bottom()))
@@ -1332,7 +1338,7 @@ impl Shell {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| this.toggle_added_person(who.clone(), cx)))
                             .child(person.name.clone())
-                            .child(div().text_color(theme::text_faint()).child("×")),
+                            .child(glyph("icons/x.svg", 11., theme::text_faint())),
                     );
                 }
                 let ready = !switcher.group_people.is_empty();
@@ -1375,7 +1381,7 @@ impl Shell {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group_person(who.clone(), cx)))
                             .child(person.name.clone())
-                            .child(div().text_color(theme::text_faint()).child("×")),
+                            .child(glyph("icons/x.svg", 11., theme::text_faint())),
                     );
                 }
                 let discord_group = switcher.group_people.first().is_some_and(|p| p.key.network == Network::Discord);
@@ -1403,17 +1409,13 @@ impl Shell {
                                 .items_center()
                                 .gap(px(8.))
                                 .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .px(px(8.))
-                                        .py(px(4.))
-                                        .rounded(px(theme::R_CONTROL))
-                                        .bg(theme::canvas())
-                                        .border_1()
-                                        .border_color(theme::hairline())
-                                        .type_small()
-                                        .child(switcher.group_title.clone()),
+                                    crate::gui::components::field_on(
+                                        switcher.group_title.focus_handle(cx).is_focused(window),
+                                        theme::overlay(),
+                                    )
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().flex_1().min_w_0().child(switcher.group_title.clone())),
                                 )
                                 .child(
                                     crate::gui::components::button(
@@ -1427,7 +1429,7 @@ impl Shell {
                 )
             })
             .children(said.map(|words| div().h(px(ROW)).flex_none().px(px(16.)).flex().items_center().type_ui().text_color(theme::text_soft()).child(words)))
-            .child(crate::gui::components::scroll_frame("switcher-scroll-frame", switcher.scroll.clone(), rows).fit_content().keyboard(false))
+            .child(div().flex_1().min_h_0().child(crate::gui::components::scroll_frame("switcher-scroll-frame", switcher.scroll.clone(), rows).fit_content().keyboard(false)))
             // The keys it names are a keyboard's; a phone has none.
             .when(!phone, |sheet| sheet.child(
                 div()

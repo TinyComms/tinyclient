@@ -166,10 +166,10 @@ fn bar_button(id: impl Into<ElementId>, which: Icon) -> Stateful<Div> {
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .hover(|style| style.bg(theme::hover()))
-        .active(|style| style.bg(theme::pressed()))
+        .hover(|style| style.bg(gpui::rgba(0xffffff1a)))
+        .active(|style| style.bg(gpui::rgba(0xffffff29)))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(icon(which, 16., theme::text()))
+        .child(icon(which, 16., theme::on_media()))
 }
 
 fn side_button(id: impl Into<ElementId>, which: Icon) -> Stateful<Div> {
@@ -850,7 +850,7 @@ impl Pane {
                 .into_any_element(),
             None => div()
                 .type_ui()
-                .text_color(theme::text_soft())
+                .text_color(theme::on_media_soft())
                 .child(if moving {
                     "Video frames unavailable — audio playback only."
                 } else if failed {
@@ -916,11 +916,11 @@ impl Pane {
             .justify_center()
             .gap(px(4.))
             .type_small()
-            .text_color(theme::text_soft())
+            .text_color(theme::on_media_soft())
             .child(div().max_w_full().child(caption))
             // A phone has the width for two lines of what was said, and no wider window to read it in.
             .children(said.map(|said| {
-                div().max_w_full().when(!phone, |line| line.truncate()).when(phone, |line| line.line_clamp(2).text_center()).text_color(theme::text()).child(said)
+                div().max_w_full().when(!phone, |line| line.truncate()).when(phone, |line| line.line_clamp(2).text_center()).text_color(theme::on_media()).child(said)
             }))
             .children(note.map(|note| {
                 let line = div().id("viewer-note").text_color(theme::accent_text());
@@ -947,7 +947,7 @@ impl Pane {
             // A phone's viewer is the whole screen, black, as its own photos are.
             .bg(if phone { gpui::rgb(0x000000) } else { tokens::scrim() })
             .font_family(theme::FONT)
-            .text_color(theme::text())
+            .text_color(theme::on_media())
             .occlude()
             // A drag that began on the picture goes on wherever the pointer is.
             .on_mouse_move(cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
@@ -987,8 +987,8 @@ impl Pane {
         div()
             .h(px(TOP_BAR))
             .flex_none()
-            // Clear of the window's own buttons.
-            .pl(px(84.))
+            // Clear of the traffic lights on macOS; standard edge padding on Windows/Linux.
+            .pl(px(if cfg!(target_os = "macos") { 84. } else { 16. }))
             .pr(px(chrome::corner_pad(window, 12.)))
             .flex()
             .items_center()
@@ -1000,8 +1000,8 @@ impl Pane {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(div().truncate().type_ui().font_weight(theme::SEMIBOLD).child(sender.clone()))
-                    .child(div().truncate().type_micro().font_weight(theme::REGULAR).text_color(theme::text_soft()).child(facts.join(" · "))),
+                    .child(div().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::on_media()).child(sender.clone()))
+                    .child(div().truncate().type_micro().font_weight(theme::REGULAR).text_color(theme::on_media_soft()).child(facts.join(" · "))),
             )
             .child(
                 bar_button("zoom-out", Icon::ZoomOut)
@@ -1019,9 +1019,9 @@ impl Pane {
                     .items_center()
                     .justify_center()
                     .type_ui()
-                    .text_color(theme::text())
+                    .text_color(theme::on_media())
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::hover()))
+                    .hover(|style| style.bg(gpui::rgba(0xffffff1a)))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .tooltip(tip(if asked.is_some() { "Fit to window" } else { "Actual size" }, Some(if asked.is_some() { "⌘0" } else { "⌘1" })))
                     .on_click(cx.listener(move |this, _, _, cx| this.zoom(if asked.is_some() { None } else { Some(1.) }, cx)))
@@ -1048,15 +1048,15 @@ impl Pane {
                     .items_center()
                     .type_small()
                     .font_weight(theme::MEDIUM)
-                    .text_color(theme::text())
+                    .text_color(theme::on_media())
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::hover()))
+                    .hover(|style| style.bg(gpui::rgba(0xffffff1a)))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .tooltip(tip("Actual size", Some("⌘1")))
                     .on_click(cx.listener(|this, _, _, cx| this.zoom(Some(1.), cx)))
                     .child("1:1"),
             )
-            .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).flex_none().bg(theme::hairline()))
+            .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).flex_none().bg(gpui::rgba(0xffffff24)))
             .child(
                 bar_button("copy", Icon::Copy)
                     .tooltip(tip("Copy image", Some("⌘C")))
@@ -1119,8 +1119,8 @@ impl Pane {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(div().truncate().phone_row().font_weight(theme::SEMIBOLD).child(sender.to_owned()))
-                            .child(div().truncate().phone_stamp().font_weight(theme::REGULAR).text_color(theme::text_soft()).child(facts.join(" · "))),
+                            .child(div().truncate().phone_row().font_weight(theme::SEMIBOLD).text_color(theme::on_media()).child(sender.to_owned()))
+                            .child(div().truncate().phone_stamp().font_weight(theme::REGULAR).text_color(theme::on_media_soft()).child(facts.join(" · "))),
                     )
                     .child(action("copy", Icon::Copy).on_click(cx.listener(|this, _, _, cx| this.copy_viewed(cx))))
                     .child(trailing),

@@ -292,22 +292,29 @@ fn list_row_in(
     // A finger has no hover: on a phone the row shows its press instead.
     let phone = super::phone::active();
     // A fixed height clips a cover that wraps. Growing rows take their height from the content.
-    let content = if grow { content.w_full() } else { content.size_full() };
-    let face = content
+    // Wrap `content` inside the stateful row face so a caller's `.group(...)` on `content` is
+    // preserved rather than overwritten by `"list-row"`.
+    let inner = if grow { content.w_full() } else { content.size_full() }
+        .flex()
+        .items_center();
+    let face = div()
+        .id("row-face")
+        .group("list-row")
+        .map(|face| if grow { face.w_full() } else { face.size_full() })
         .px(px(8.))
         .rounded(px(theme::R_CONTROL))
         .flex()
         .items_center()
         .when(selected, |row| row.bg(theme::selected()))
         // Rows abut, so the keyboard's ring is inset, over any fill.
-        .when(focused, |row| row.shadow(theme::focus_ring_inset()));
+        .when(focused, |row| row.shadow(theme::focus_ring_inset()))
+        .child(inner);
     let row = div().id(id).w_full();
     let row = if grow { row.min_h(px(height)) } else { row.h(px(height)) };
     let row = row.px(px(theme::INSET)).py(px(1.)).cursor_pointer();
     // The face must be stateful: GPUI only keeps `hover_state` and notifies on enter/leave when
     // the hovered element has an id. Hover on an anonymous child painted the fill only when
     // something else happened to redraw, so the highlight lagged and skipped rows (R18).
-    let face = face.id("row-face").group("list-row");
     if phone && !selected {
         row.child(face.active(|style| style.bg(theme::pressed())))
     } else if !selected {
@@ -444,6 +451,12 @@ pub fn button(id: impl Into<ElementId>, kind: ButtonKind, label: impl Into<Share
     button_styled(id, kind, label.clone(), button_shell(label))
 }
 
+/// A styled 28 pt button shell with no initial text child, so callers can compose custom
+/// icon/truncating-label children while still giving assistive tech a real `aria_label`.
+pub(in crate::gui) fn button_bare(id: impl Into<ElementId>, kind: ButtonKind, label: impl Into<SharedString>) -> Stateful<Div> {
+    button_styled(id, kind, label.into(), button_box())
+}
+
 /// A button led by a 16 pt glyph: 10 on the icon side, 12 on the text side.
 pub fn button_with_icon(
     id: impl Into<ElementId>,
@@ -509,9 +522,9 @@ pub fn icon_button(id: impl Into<ElementId>, icon: &'static str, toggled: bool) 
 
 // Fields.
 
-/// The box of a text field: the caller puts the input inside. Focus is a `focus` border and a
-/// 3 pt halo, always shown, because a field with the caret in it is where typing goes.
-pub fn field(focused: bool) -> Div {
+/// The box of a text field on `surface`: the caller puts the input inside. Focus is a `focus`
+/// border and a 3 pt halo, always shown, because a field with the caret in it is where typing goes.
+pub fn field_on(focused: bool, surface: Rgba) -> Div {
     div()
         .h(px(theme::CONTROL))
         .px(px(8.))
@@ -525,11 +538,16 @@ pub fn field(focused: bool) -> Div {
         .map(|field| {
             if focused {
                 // Opaque, or the halo would show through the field as a fill.
-                field.bg(theme::over(theme::field(), theme::canvas())).border_color(theme::focus()).shadow(theme::field_halo())
+                field.bg(theme::over(theme::field(), surface)).border_color(theme::focus()).shadow(theme::field_halo())
             } else {
                 field.border_color(theme::border()).hover(|style| style.border_color(theme::border_strong()))
             }
         })
+}
+
+/// The box of a text field on the canvas surface.
+pub fn field(focused: bool) -> Div {
+    field_on(focused, theme::canvas())
 }
 
 /// A field whose value was refused. Put [`field_error_line`] 4 below it.

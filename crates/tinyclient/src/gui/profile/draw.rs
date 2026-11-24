@@ -173,7 +173,7 @@ pub fn action(id: impl Into<ElementId>, kind: crate::gui::components::ButtonKind
         crate::gui::components::ButtonKind::Primary => theme::on_accent(),
         _ => theme::text_soft(),
     };
-    crate::gui::components::button(id, kind, "")
+    crate::gui::components::button_bare(id, kind, words.clone())
         .flex_1()
         .min_w_0()
         .overflow_hidden()
@@ -446,27 +446,43 @@ pub fn heads_up_line(words: &HeadsUpWords) -> Div {
 
 /// An on/off switch, 32 × 18. On is accent.
 pub fn switch(id: impl Into<ElementId>, on: bool) -> Stateful<Div> {
+    let track = if on {
+        theme::accent()
+    } else if theme::is_light() {
+        gpui::rgba(0x00000029)
+    } else {
+        theme::selected()
+    };
+    let hover = if on { theme::accent_hover() } else { theme::border_strong() };
     div()
         .id(id)
+        .role(gpui::Role::Switch)
+        .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
+        .tab_index(0)
         .flex_none()
         .w(px(32.))
         .h(px(18.))
-        .p(px(2.))
+        .p(px(if on { 2. } else { 1. }))
         .rounded(px(9.))
         .cursor_pointer()
-        .bg(if on { theme::accent() } else { theme::selected() })
+        .bg(track)
+        .when(!on, |track| track.border_1().border_color(theme::border_strong()))
+        .hover(move |style| style.bg(hover))
+        .focus_visible(|style| style.shadow(theme::focus_ring_gap(theme::canvas())))
         .flex()
         .when(on, |track| track.justify_end())
         .child(div().size(px(14.)).rounded(px(7.)).bg(theme::on_accent()))
 }
 
-/// "Notifications" left, the control right, 28 high.
+/// "Notifications" left, the control right, wrapping cleanly when narrow.
 pub fn notifications_row(control: impl IntoElement) -> Div {
     div()
-        .h(px(theme::ROW_ONE))
+        .min_h(px(theme::ROW_ONE))
         .flex()
+        .flex_wrap()
         .items_center()
         .justify_between()
+        .gap(px(6.))
         .type_ui()
         .child("Notifications")
         .child(control)

@@ -432,8 +432,7 @@ impl Pane {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(theme::on_accent())
-                            .child(if on { "✓" } else { "" }),
+                            .children(on.then(|| crate::gui::components::glyph("icons/check.svg", 12., theme::on_accent()))),
                     )
                     .child(format!("Don't ask again for {}", dest.domain_shown))
                     .on_click(cx.listener(|this, _, _, cx| {

@@ -298,15 +298,16 @@ impl LogsWindow {
                     Some(Level::Debug | Level::Trace) => theme::text_faint(),
                     Some(Level::Info) | None => theme::text(),
                 };
+                let row_h = f32::from(theme::sized(ROW)).ceil().max(ROW);
                 div()
-                    .h(px(ROW))
+                    .h(px(row_h))
                     .px(px(16.))
                     .flex()
                     .items_center()
                     .whitespace_nowrap()
                     .font_family(theme::MONO)
                     .text_size(theme::sized(12.))
-                    .line_height(px(ROW))
+                    .line_height(px(row_h))
                     .when(every, |row| row.child(div().flex_none().w(px(SOURCE_COLUMN)).text_color(theme::text_faint()).child(line.source.name())))
                     .child(div().flex_none().text_color(color).child(SharedString::from(line.text.clone())))
                     .into_any_element()
@@ -316,7 +317,11 @@ impl LogsWindow {
 
     fn toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.search.focus_handle(cx).is_focused(window);
-        let field = search_field(focused).w(px(240.)).child(div().flex_1().min_w_0().child(self.search.clone()));
+        let field = search_field(focused)
+            .flex_1()
+            .min_w(px(140.))
+            .max_w(px(240.))
+            .child(div().flex_1().min_w_0().child(self.search.clone()));
         let mut levels = segmented();
         for level in Level::SHOWN {
             levels = levels.child(segment(SharedString::from(format!("level-{}", level.name())), level.name(), self.filter.level == level).on_click(
@@ -329,6 +334,7 @@ impl LogsWindow {
         let hide_noise = self.filter.hide_noise;
         let noise = div()
             .id("noise")
+            .flex_none()
             .flex()
             .items_center()
             .gap(px(8.))
@@ -359,7 +365,7 @@ impl LogsWindow {
             .child(field)
             .child(levels)
             .child(noise)
-            .child(div().flex_1())
+            .child(div().flex_1().min_w_0())
             .child(pause)
             .child(button("copy", ButtonKind::Secondary, "Copy visible").on_click(cx.listener(|this, _, _, cx| this.copy_visible(cx))))
             .child(button("save", ButtonKind::Secondary, "Save debug log").on_click(cx.listener(|this, _, _, cx| this.save(cx))))
@@ -411,6 +417,7 @@ impl LogsWindow {
             .child(
                 div()
                     .id("verbose")
+                    .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -419,9 +426,8 @@ impl LogsWindow {
                     .child(div().type_ui().text_color(theme::text()).child("Verbose logging"))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_verbose(!on, cx))),
             )
-            .child(div().type_small().text_color(theme::text_faint()).child(VERBOSE_NOTE))
-            .child(div().flex_1())
-            .child(div().type_small().text_color(theme::text_faint()).child(format!("{shown} of {kept} lines")))
+            .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(VERBOSE_NOTE))
+            .child(div().flex_none().type_small().text_color(theme::text_faint()).child(format!("{shown} of {kept} lines")))
             .child(button("reveal", ButtonKind::Ghost, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| {
                 cx.reveal_path(&protocol::log_policy::logs_dir());
             })))

@@ -330,7 +330,18 @@ pub struct Hooks {
 pub fn draw(shared: &Shared, network: Network, has_pins: bool, hub: &Hub, width: f32, hooks: Hooks, cx: &mut App) -> Div {
     let Hooks { pick, search, open_in } = hooks;
     let pick = std::rc::Rc::new(pick);
-    let bar = div().h(px(32.)).px(px(theme::PANE_PAD)).flex().items_end().gap(px(16.)).border_b_1().border_color(theme::hairline()).children(
+    let bar = div()
+        .id("shared-tabs")
+        .h(px(32.))
+        .min_w_0()
+        .overflow_x_scroll()
+        .px(px(theme::PANE_PAD))
+        .flex()
+        .items_end()
+        .gap(px(16.))
+        .border_b_1()
+        .border_color(theme::hairline())
+        .children(
         tabs_for(network, has_pins).into_iter().enumerate().map(|(ix, tab)| {
             let on = shared.tab == tab;
             let words = match tab {
@@ -349,6 +360,7 @@ pub fn draw(shared: &Shared, network: Network, has_pins: bool, hub: &Hub, width:
             let pick = pick.clone();
             div()
                 .id(("shared-tab", ix))
+                .flex_none()
                 .h(px(32.))
                 .flex()
                 .items_center()
@@ -432,9 +444,9 @@ fn list(shared: &Shared, hub: &Hub, width: f32, cx: &mut App) -> Div {
                                 .bottom(px(4.))
                                 .px(px(4.))
                                 .rounded(px(3.))
-                                .bg(gpui::rgba(0x00000099))
+                                .bg(theme::media_chip())
                                 .type_micro()
-                                .text_color(theme::text())
+                                .text_color(theme::on_media())
                                 .child(duration(attachment.duration))
                         }))
                         // CONTRACT: the media viewer (design 03) has no entry point the pane can

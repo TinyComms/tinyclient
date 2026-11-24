@@ -973,9 +973,6 @@ impl TextInput {
     }
 
     fn on_right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.editor.is_multiline() {
-            return;
-        }
         window.focus(&self.focus_handle, cx);
         self.is_selecting = false;
         let offset = self.index_for_mouse_position(event.position);
@@ -983,10 +980,20 @@ impl TextInput {
         let clipboard = cx.read_from_clipboard();
         let entries = clipboard.as_ref().map_or(&[][..], |item| item.entries());
         let paste = pasted(entries);
-        let can_paste = !matches!(paste, Pasted::Nothing);
-        let has_image = !matches!(paste, Pasted::Image(_))
+        let can_paste = if self.secret || !self.editor.is_multiline() {
+            clipboard.as_ref().and_then(|item| item.text()).is_some()
+        } else {
+            !matches!(paste, Pasted::Nothing)
+        };
+        let has_image = self.editor.is_multiline()
+            && !self.secret
+            && !matches!(paste, Pasted::Image(_))
             && entries.iter().any(|entry| matches!(entry, ClipboardEntry::Image(_)));
-        let miss = self.misses.iter().find(|miss| miss.range.start <= offset && offset <= miss.range.end).cloned();
+        let miss = if self.editor.is_multiline() && !self.secret {
+            self.misses.iter().find(|miss| miss.range.start <= offset && offset <= miss.range.end).cloned()
+        } else {
+            None
+        };
         self.edit_menu = Some(EditMenu { at: event.position, can_paste, has_image, miss });
         cx.stop_propagation();
         cx.notify();
@@ -999,16 +1006,20 @@ impl TextInput {
         let item = |id, label, shortcut, enabled| {
             if enabled { menu_item(id, None, label, shortcut) } else { menu_item_disabled(id, None, label, shortcut) }
         };
-        let cut = item("input-cut", "Cut", Some("⌘X"), selected).when(selected, |row| row.on_click(cx.listener(|this, _, window, cx| {
-            this.edit_menu = None;
-            this.cut(&Cut, window, cx);
-            cx.notify();
-        })));
-        let copy = item("input-copy", "Copy", Some("⌘C"), selected).when(selected, |row| row.on_click(cx.listener(|this, _, window, cx| {
-            this.edit_menu = None;
-            this.copy(&Copy, window, cx);
-            cx.notify();
-        })));
+        let cut = (!self.secret).then(|| {
+            item("input-cut", "Cut", Some("⌘X"), selected).when(selected, |row| row.on_click(cx.listener(|this, _, window, cx| {
+                this.edit_menu = None;
+                this.cut(&Cut, window, cx);
+                cx.notify();
+            })))
+        });
+        let copy = (!self.secret).then(|| {
+            item("input-copy", "Copy", Some("⌘C"), selected).when(selected, |row| row.on_click(cx.listener(|this, _, window, cx| {
+                this.edit_menu = None;
+                this.copy(&Copy, window, cx);
+                cx.notify();
+            })))
+        });
         let paste = item("input-paste", "Paste", Some("⌘V"), can_paste).when(can_paste, |row| row.on_click(cx.listener(|this, _, window, cx| {
             this.edit_menu = None;
             this.paste(&Paste, window, cx);
@@ -1035,8 +1046,8 @@ impl TextInput {
         if !spell.is_empty() {
             menu = menu.children(spell).child(menu_separator());
         }
-        let menu = menu.child(cut).child(copy).child(paste).children(picture).child(menu_separator()).child(all);
-        Some(deferred(anchored().position(at).snap_to_window().child(menu)).priority(2).into_any_element())
+        let menu = menu.children(cut).children(copy).child(paste).children(picture).child(menu_separator()).child(all);
+        Some(deferred(anchored().position(at).snap_to_window().child(menu)).priority(super::components::place::Layer::Menu as usize).into_any_element())
     }
 
     fn spell_rows(&self, miss: &super::spell::Miss, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1747,7 +1758,6 @@ impl Render for TextInput {
             .aria_label(if self.editor.is_multiline() { "Message".into() } else { self.placeholder.clone() })
             .aria_placeholder(self.placeholder.clone())
             .when(!self.secret, |input| input.aria_value(self.editor.text().to_owned()))
-            .focus_visible(|style| style.shadow(crate::gui::theme::focus_ring_inset()))
             .flex()
             .flex_1()
             .min_w_0()
@@ -2094,5 +2104,16 @@ mod tests {
         assert_eq!(marked("  > quoted *text*"), [">", "*", "*"]);
         assert_eq!(marked("```rust"), ["```"]);
         assert_eq!(marked("naïve **café** 👍"), ["**", "**"]);
+    }
+
+    #[test]
+    fn single_line_context_caret_and_secret_export_policy() {
+        let mut single = super::Editor::new(false);
+        single.set_text("hello world");
+        single.select_all();
+        super::context_caret(&mut single, 3);
+        assert_eq!(single.selected_text(), "hello world");
+        assert_eq!(super::exported_text(single.selected_text(), false).as_deref(), Some("hello world"));
+        assert_eq!(super::exported_text(single.selected_text(), true), None);
     }
 }

@@ -11,7 +11,7 @@ pub(in crate::gui) mod profile;
 use super::card::Float;
 use super::presence::Ring;
 use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence, Hub, Scene};
-use crate::gui::components::{button, glyph, icon_button, search_field, sensitive_cover, tip, ButtonKind};
+use crate::gui::components::{button, glyph, icon_button, sensitive_cover, tip, ButtonKind};
 use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::layout::{RightKind, RightPane};
 use crate::gui::state::Shell;
@@ -900,7 +900,10 @@ impl InfoPane {
                                         .text_color(theme::text_faint())
                                         .child("Only Discord friends can be added (creates a group DM, up to 10 people)."),
                                 )
-                                .child(input.clone())
+                                .child(
+                                    crate::gui::components::field_on(input.focus_handle(cx).is_focused(window), theme::raised())
+                                        .child(div().flex_1().min_w_0().child(input.clone())),
+                                )
                                 .child(
                                     div()
                                         .flex()
@@ -1067,7 +1070,12 @@ impl InfoPane {
                                 .flex()
                                 .items_center()
                                 .gap(px(6.))
-                                .child(search_field(focused).flex_1().min_w_0().line_height(px(18.)).child(input.clone()))
+                                .child(
+                                    crate::gui::components::field(focused)
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(div().flex_1().min_w_0().child(input.clone())),
+                                )
                                 .when(dirty && !self.note_saving, |row| {
                                     row.child(
                                         button("info-note-save", ButtonKind::Secondary, "Save")
@@ -1665,7 +1673,7 @@ impl Render for InfoPane {
                 Some(self.person_body(&person, space.as_ref(), window, cx))
             }
             Some(Subject::Conversation(_)) => self.row.clone().map(|row| profile::details::conversation(self, &row, window, cx)),
-            Some(Subject::Space(key)) => Some(profile::details::space(self, &key, cx)),
+            Some(Subject::Space(key)) => Some(profile::details::space(self, &key, window, cx)),
         };
         div().size_full().child(crate::gui::components::scroll::scroll_page("info-scroll-frame", div().id("info-scroll").size_full().overflow_y_scroll().children(body)))
     }

@@ -335,18 +335,26 @@ where
                     .min_w_0()
                     .child(
                         div()
+                            .flex_none()
+                            .max_w(px(160.))
+                            .min_w_0()
+                            .truncate()
                             .type_small()
                             .font_weight(theme::SEMIBOLD)
                             .text_color(theme::text())
                             .child(format!("/{}", cmd.name)),
                     );
                 if !sig.is_empty() {
-                    head = head.child(div().type_micro().text_color(theme::text_faint()).child(sig));
+                    head = head.child(div().flex_1().min_w_0().truncate().type_micro().text_color(theme::text_faint()).child(sig));
                 }
                 if !cmd.app_name.is_empty() {
                     head = head.child(
                         div()
                             .ml_auto()
+                            .flex_none()
+                            .max_w(px(100.))
+                            .min_w_0()
+                            .truncate()
                             .type_micro()
                             .text_color(theme::text_faint())
                             .child(cmd.app_name.clone()),
@@ -402,6 +410,8 @@ where
                         .cursor_pointer()
                         .when(selected, |d| d.bg(theme::selected()))
                         .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
+                        .min_w_0()
+                        .truncate()
                         .type_small()
                         .text_color(theme::text())
                         .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
@@ -414,7 +424,7 @@ where
             }
         }
     }
-    panel.into_any_element()
+    panel.id("composer-app-slash-scroll").max_h(px(260.)).overflow_y_scroll().into_any_element()
 }
 
 #[cfg(test)]

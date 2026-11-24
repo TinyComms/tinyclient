@@ -9,7 +9,7 @@ use super::components::{button, glyph, icon_button, scrim, ButtonKind};
 use super::input::TextInput;
 use super::state::Shell;
 use super::theme::{self, Type};
-use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, Entity, MouseButton, Task, Window};
+use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, Entity, Focusable, MouseButton, Task, Window};
 use protocol::{AccountKey, Key, PeerStoryRing, Request, Response, Story, StoryMediaKind};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -513,7 +513,7 @@ impl Shell {
     }
 
     /// Renders the full-screen Story Viewer overlay when open.
-    pub(in crate::gui) fn story_viewer_layer(&self, _window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(in crate::gui) fn story_viewer_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let viewer = self.story_state.viewer.as_ref()?;
         let total = viewer.stories.len();
         let cur = viewer.current();
@@ -596,10 +596,10 @@ impl Shell {
                         .object_fit(gpui::ObjectFit::Contain),
                 );
             } else {
-                let kind_label = match story.media_kind {
-                    StoryMediaKind::Photo => "Photo story",
-                    StoryMediaKind::Video => "Video story",
-                    StoryMediaKind::Unsupported => "Story",
+                let (kind_icon, kind_label) = match story.media_kind {
+                    StoryMediaKind::Photo => ("icons/image.svg", "Photo story"),
+                    StoryMediaKind::Video => ("icons/play.svg", "Video story"),
+                    StoryMediaKind::Unsupported => ("icons/image.svg", "Story"),
                 };
                 stage = stage.child(
                     div()
@@ -607,7 +607,7 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .gap(px(6.))
-                        .child(glyph("icons/play.svg", 24., theme::text_soft()))
+                        .child(glyph(kind_icon, 24., theme::text_soft()))
                         .child(div().type_ui().text_color(theme::text_soft()).child(kind_label)),
                 );
             }
@@ -649,6 +649,13 @@ impl Shell {
                     .bg(if selected { theme::accent_wash() } else { theme::raised() })
                     .border_1()
                     .border_color(if selected { theme::accent() } else { theme::hairline() })
+                    .hover(|style| {
+                        style.bg(if selected {
+                            theme::accent_soft()
+                        } else {
+                            theme::over(theme::hover(), theme::raised())
+                        })
+                    })
                     .type_ui()
                     .child(emoji)
                     .on_click(cx.listener(move |this, _, _, cx| this.story_react(chosen.clone(), cx)))
@@ -656,21 +663,16 @@ impl Shell {
         );
 
         let reply_row = cur.is_some_and(|s| !s.own).then(|| {
+            let reply_focused = viewer.reply_input.focus_handle(cx).is_focused(window);
             div()
                 .flex()
                 .items_center()
                 .gap(px(6.))
                 .child(
-                    div()
+                    crate::gui::components::field_on(reply_focused, theme::overlay())
                         .flex_1()
                         .min_w_0()
-                        .px(px(10.))
-                        .py(px(6.))
-                        .rounded(px(theme::R_CONTROL))
-                        .bg(theme::raised())
-                        .border_1()
-                        .border_color(theme::hairline())
-                        .child(viewer.reply_input.clone()),
+                        .child(div().flex_1().min_w_0().child(viewer.reply_input.clone())),
                 )
                 .child(
                     button("story-reply-send", ButtonKind::Primary, if viewer.reply_sending { "Sending…" } else { "Reply" })
@@ -680,15 +682,16 @@ impl Shell {
 
         let card = div()
             .id("story-viewer-modal")
-            .w(px(420.))
+            .w_full()
             .max_w(px(420.))
             .max_h(px(660.))
+            .overflow_hidden()
             .p(px(14.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
-            .shadow(theme::shadow_pane())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -712,9 +715,10 @@ impl Shell {
                                     .flex()
                                     .items_center()
                                     .gap(px(6.))
-                                    .child(div().type_ui().font_weight(theme::SEMIBOLD).truncate().child(viewer.author_name.clone()))
+                                    .child(div().min_w_0().type_ui().font_weight(theme::SEMIBOLD).truncate().child(viewer.author_name.clone()))
                                     .child(
                                         div()
+                                            .flex_none()
                                             .px(px(5.))
                                             .py(px(1.))
                                             .rounded(px(theme::R_CONTROL))
@@ -745,7 +749,15 @@ impl Shell {
                     ),
             )
             .child(media_box)
-            .children(caption.map(|text| div().type_ui().text_color(theme::text()).child(text)))
+            .children(caption.map(|text| {
+                div()
+                    .id("story-caption-scroll")
+                    .max_h(px(96.))
+                    .overflow_y_scroll()
+                    .type_ui()
+                    .text_color(theme::text())
+                    .child(text)
+            }))
             .child(reactions)
             .children(reply_row)
             .children(
@@ -759,6 +771,7 @@ impl Shell {
             div()
                 .absolute()
                 .inset_0()
+                .p(px(16.))
                 .flex()
                 .items_center()
                 .justify_center()

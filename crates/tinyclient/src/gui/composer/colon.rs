@@ -73,7 +73,7 @@ pub fn draw(
         };
         let face = match custom {
             Some(custom) => match custom_image(custom) {
-                Some(image) => div().size(px(20.)).child(anim::picture(image, ObjectFit::Fill, 0., Play::Inline)).into_any_element(),
+                Some(image) => div().size(px(20.)).child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)).into_any_element(),
                 None => div().size(px(20.)).rounded(px(4.)).bg(theme::raised()).into_any_element(),
             },
             None => div().w(px(22.)).text_size(px(18.)).line_height(px(22.)).child(emoji::text_of(cell, tone, customs)).into_any_element(),
@@ -99,7 +99,16 @@ pub fn draw(
             })
             .child(face)
             .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(emoji::name_of(cell, customs)))
-            .children(custom.filter(|custom| !custom.pack.is_empty()).map(|custom| div().flex_none().type_small().text_color(theme::text_soft()).child(custom.pack.clone())))
+            .children(custom.filter(|custom| !custom.pack.is_empty()).map(|custom| {
+                div()
+                    .flex_none()
+                    .max_w(px(110.))
+                    .min_w_0()
+                    .truncate()
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .child(custom.pack.clone())
+            }))
     }))
 }
 

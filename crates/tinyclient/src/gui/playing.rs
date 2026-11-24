@@ -309,6 +309,9 @@ impl Shell {
         });
         let button = div()
             .id("now-playing-toggle")
+            .role(gpui::Role::Button)
+            .aria_label(if playing { "Pause" } else { "Play" })
+            .tab_index(0)
             .flex_none()
             .size(px(28.))
             .rounded_full()
@@ -317,6 +320,8 @@ impl Shell {
             .items_center()
             .justify_center()
             .cursor_pointer()
+            .hover(|style| style.bg(theme::accent_halo()))
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
             .tooltip(tip(if playing { "Pause" } else { "Play" }, None))
             .child(super::conversation::player_glyph(playing, 12., theme::accent_text()))
             .on_click(cx.listener(|this, _, _, cx| {
@@ -331,11 +336,19 @@ impl Shell {
             }));
         let words = div()
             .id("now-playing-words")
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(title.clone()))
+            .tab_index(0)
             .flex_1()
             .min_w_0()
+            .px(px(4.))
+            .py(px(2.))
+            .rounded(px(theme::R_CONTROL))
             .flex()
             .flex_col()
             .cursor_pointer()
+            .hover(|style| style.bg(theme::hover()))
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .child(div().truncate().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(SharedString::from(title)))
             .child(
                 div()
@@ -347,6 +360,9 @@ impl Shell {
             .on_click(cx.listener(move |this, _, _, cx| this.select(key.clone(), &name, cx)));
         let close = div()
             .id("now-playing-stop")
+            .role(gpui::Role::Button)
+            .aria_label("Stop")
+            .tab_index(0)
             .flex_none()
             .size(px(24.))
             .rounded(px(theme::R_CONTROL))
@@ -355,6 +371,7 @@ impl Shell {
             .justify_center()
             .cursor_pointer()
             .hover(|style| style.bg(theme::hover()))
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
             .tooltip(tip("Stop", None))
             .child(glyph("icons/x.svg", 14., theme::text_soft()))
             .on_click(cx.listener(|this, _, _, cx| this.play_stop(cx)));
@@ -369,8 +386,9 @@ impl Shell {
                 .border_color(theme::hairline())
                 .child(
                     div()
-                        .h(px(40.))
+                        .min_h(px(40.))
                         .px(px(6.))
+                        .py(px(4.))
                         .rounded(px(theme::R_CONTROL))
                         .bg(theme::raised())
                         .flex()

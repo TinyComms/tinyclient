@@ -9,7 +9,7 @@ use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence,
 use crate::gui::components::place::{placed, Layer, Place};
 use crate::gui::components::{
     button, button_with_icon, fade_in, menu, menu_item, menu_item_danger, menu_item_more, menu_label, menu_separator,
-    modal_body, modal_buttons, network_icon, scrim, search_field, sensitive_cover, Avatar, ButtonKind, Shape as Plate,
+    modal_body, modal_buttons, network_icon, scrim, sensitive_cover, Avatar, ButtonKind, Shape as Plate,
 };
 use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::state::Shell;
@@ -826,7 +826,12 @@ impl Floating {
                                 .flex()
                                 .items_center()
                                 .gap(px(4.))
-                                .child(search_field(focused).flex_1().min_w_0().line_height(px(18.)).child(input.clone()))
+                                .child(
+                                    crate::gui::components::field_on(focused, theme::overlay())
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(div().flex_1().min_w_0().child(input.clone())),
+                                )
                                 .when(dirty && !self.note_saving, |row| {
                                     row.child(
                                         button("card-note-save", ButtonKind::Secondary, "Save")
@@ -1712,9 +1717,11 @@ impl Floating {
                     .child(format!("Only you see this nickname for {} (@{}).", person.name, person.handle)),
             )
             .children(self.nick_input.clone().map(|input| {
-                div()
-                    .mt(px(12.))
-                    .child(search_field(focused).w_full().line_height(px(18.)).child(input))
+                div().mt(px(12.)).child(
+                    crate::gui::components::field_on(focused, theme::overlay())
+                        .w_full()
+                        .child(div().flex_1().min_w_0().child(input)),
+                )
             }))
             .children(
                 self.nick_error

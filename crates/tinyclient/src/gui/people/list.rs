@@ -908,7 +908,7 @@ impl PeopleList {
                 });
             });
         let title = div()
-            .h(px(18.))
+            .min_h(px(18.))
             .flex()
             .items_center()
             .gap(px(6.))
@@ -917,20 +917,21 @@ impl PeopleList {
         // The actions sit on a patch of the row's own color, which follows the row under the pointer.
         let rest = if selected { theme::over(theme::selected(), theme::sidebar()) } else { theme::sidebar() };
         let hovered = if selected { rest } else { theme::over(theme::hover(), theme::sidebar()) };
-        let trailing = match person.relation {
-            Relation::Incoming | Relation::Outgoing => self.request_actions(ix, person, cx),
-            Relation::Blocked => {
-                let unblock = person.clone();
-                div()
-                    .flex_none()
-                    .when(self.relating.contains(&person.key), |el| el.opacity(0.45))
-                    .child(
-                        button(("unblock", ix), ButtonKind::Secondary, "Unblock")
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, _, cx| this.relate(&unblock, RelateAction::Unblock, cx))),
-                    )
-            }
-            _ => self.hover_actions(ix, person, cx).invisible().group_hover("person", |style| style.visible()),
+        let inline_unblock = (person.relation == Relation::Blocked).then(|| {
+            let unblock = person.clone();
+            div()
+                .flex_none()
+                .when(self.relating.contains(&person.key), |el| el.opacity(0.45))
+                .child(
+                    button(("unblock", ix), ButtonKind::Secondary, "Unblock")
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| this.relate(&unblock, RelateAction::Unblock, cx))),
+                )
+        });
+        let overlay_trailing = match person.relation {
+            Relation::Incoming | Relation::Outgoing => Some(self.request_actions(ix, person, cx)),
+            Relation::Blocked => None,
+            _ => Some(self.hover_actions(ix, person, cx).invisible().group_hover("person", |style| style.visible())),
         };
         let target = person.clone();
         let (menu_of, menu_shell) = (person.key.clone(), self.shell.clone());
@@ -971,20 +972,22 @@ impl PeopleList {
                         .child(title)
                         .when(!second.is_empty(), |text| text.child(div().truncate().type_small().text_color(theme::text_soft()).child(second))),
                 )
+                .children(inline_unblock)
                 // Over the end of the text, on the row's own color, so nothing reflows.
-                .child(
+                .children(overlay_trailing.map(|trailing| {
                     trailing
                         .absolute()
                         .right(px(4.))
-                        .top(px(9.))
+                        .top_0()
+                        .bottom_0()
                         .pl(px(8.))
                         .rounded(px(theme::R_CONTROL))
                         .bg(rest)
                         .group_hover("person", move |style| style.bg(hovered))
                         .flex()
                         .items_center()
-                        .gap(px(2.)),
-                ),
+                        .gap(px(2.))
+                })),
         )
     }
 
@@ -1175,11 +1178,10 @@ impl PeopleList {
                             .items_center()
                             .gap(px(6.))
                             .child(
-                                search_field(focused)
+                                crate::gui::components::field_on(focused, theme::sidebar())
                                     .flex_1()
                                     .min_w_0()
-                                    .line_height(px(18.))
-                                    .child(self.add_friend_input.clone()),
+                                    .child(div().flex_1().min_w_0().child(self.add_friend_input.clone())),
                             )
                             .child(
                                 button(
