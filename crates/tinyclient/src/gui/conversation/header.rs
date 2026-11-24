@@ -137,8 +137,8 @@ impl Shell {
                 .role(gpui::Role::Button)
                 .aria_label(label)
                 .tab_index(0)
-                .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
-                .h(px(26.))
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
+                .h(px(theme::CONTROL))
                 .px(px(8.))
                 .rounded(px(theme::R_CONTROL))
                 .border_1()
@@ -162,13 +162,8 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, _, cx| this.open_server_gate(space.clone(), cx)))
         });
         let live_hint = self.snapshot.as_ref().and_then(|snapshot| self.call_live_hint(snapshot, cx));
-        let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
-            let call = call.h(px(28.)).rounded(px(theme::R_CONTROL)).whitespace_nowrap();
-            if compact {
-                call.w(px(28.)).px(px(6.)).overflow_hidden()
-            } else {
-                call
-            }
+        let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, compact, cx)).map(|call| {
+            call.whitespace_nowrap()
         });
         let stage_pill = self.snapshot.as_ref().and_then(|snapshot| self.call_return_stage_pill(snapshot, cx));
         let controls = self.strip_controls(window, cx);
@@ -214,8 +209,11 @@ impl Shell {
             .child(open.title.clone());
         let title = if direct {
             title
+                .px(px(4.))
+                .mx(px(-4.))
+                .rounded(px(theme::R_CONTROL))
                 .tab_index(0)
-                .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
                 .cursor_pointer()
                 .hover(|style| style.underline())
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -332,8 +330,12 @@ impl Shell {
         Some(
             div()
                 .id("announcement-follow")
+                .role(gpui::Role::Button)
+                .aria_label("Follow")
+                .tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
                 .flex_none()
-                .h(px(26.))
+                .h(px(theme::CONTROL))
                 .px(px(10.))
                 .rounded(px(theme::R_CONTROL))
                 .bg(theme::field())
@@ -373,12 +375,13 @@ impl Shell {
                 .id("conversation-encryption")
                 .flex_none()
                 .self_center()
-                .h(px(18.))
+                .h(px(20.))
                 .flex()
                 .items_center()
                 .gap(px(4.))
                 .cursor_pointer()
-                .type_small()
+                .type_micro()
+                .font_weight(theme::MEDIUM)
                 .text_color(tone)
                 .hover(|style| style.text_color(theme::text()))
                 .tooltip(tip(open.encryption.explained(), None))
@@ -444,14 +447,15 @@ impl Shell {
                 .id("conversation-meeting")
                 .flex_none()
                 .self_center()
-                .h(px(18.))
-                .px(px(6.))
-                .rounded(px(999.))
+                .h(px(20.))
+                .px(px(7.))
+                .rounded_full()
                 .bg(theme::raised())
                 .flex()
                 .items_center()
                 .gap(px(4.))
-                .type_small()
+                .type_micro()
+                .font_weight(theme::MEDIUM)
                 .text_color(theme::text_soft())
                 .when(can_join, |chip| {
                     chip.cursor_pointer()
@@ -531,15 +535,15 @@ fn role_chip(name: &str, color: Option<u32>) -> Div {
     div()
         .flex_none()
         .self_center()
-        .h(px(18.))
-        .px(px(6.))
-        .rounded(px(9.))
+        .h(px(20.))
+        .px(px(7.))
+        .rounded_full()
         .bg(theme::hover())
         .flex()
         .items_center()
         .gap(px(4.))
         .child(div().size(px(6.)).flex_none().rounded_full().bg(tone))
-        .child(div().type_small().text_color(theme::text()).child(name.to_owned()))
+        .child(div().type_micro().font_weight(theme::MEDIUM).text_color(theme::text()).child(name.to_owned()))
 }
 
 /// One path glyph everywhere: `›`.
@@ -566,12 +570,14 @@ fn mark(c: &Conversation) -> Option<Div> {
         div()
             .flex_none()
             .self_center()
-            .px(px(4.))
+            .h(px(20.))
+            .px(px(6.))
             .rounded(px(theme::R_CHIP))
             .border_1()
             .border_color(color)
-            .text_size(px(11.))
-            .line_height(px(14.))
+            .flex()
+            .items_center()
+            .type_micro()
             .font_weight(theme::MEDIUM)
             .text_color(color)
             .child(words),

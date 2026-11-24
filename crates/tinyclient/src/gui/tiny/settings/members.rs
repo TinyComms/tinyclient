@@ -194,7 +194,11 @@ pub(in crate::gui::tiny) fn members(shell: &Shell, facts: &Facts, window: &mut W
                                 .on_click(cx.listener(move |this, _, _, cx| this.tiny_members_bulk(id.clone(), add, cx)))
                                 .child(div().size(px(8.)).rounded_full().bg(dot))
                                 .child(div().flex_1().type_ui().text_color(theme::text()).child(role.name.clone()))
-                                .child(div().type_small().text_color(theme::text_faint()).child(if changes == 0 { "no change".to_owned() } else { format!("{changes} change") })),
+                                .child(div().type_small().text_color(theme::text_faint()).child(match changes {
+                                    0 => "no change".to_owned(),
+                                    1 => "1 change".to_owned(),
+                                    n => format!("{n} changes"),
+                                })),
                         );
                     }
                     wrap = wrap.child(dropdown(list, cx));

@@ -36,7 +36,7 @@ impl Shell {
     /// The desktop strip at a phone's size: back where the desktop has its travel buttons, the
     /// conversation's picture and title, the call, then Members and Details as the desktop
     /// strip has them. Under it the banner when the link is in trouble.
-    pub(in crate::gui) fn phone_strip(&self, open: &Conversation, link: Link, _window: &Window, cx: &mut Context<Self>) -> Div {
+    pub(in crate::gui) fn phone_strip(&self, open: &Conversation, link: Link, window: &Window, cx: &mut Context<Self>) -> Div {
         let direct = open.kind == ConversationKind::Direct;
         let size = 28.;
         // The face its row in the sidebar wears, so the page and the row it came from match.
@@ -75,7 +75,10 @@ impl Shell {
                 .role(gpui::Role::Button)
                 .aria_label(format!("Encryption: {}", phone_words(open.encryption)))
                 .tab_index(0)
-                .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
+                .px(px(4.))
+                .mx(px(-4.))
+                .rounded(px(theme::R_CONTROL))
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
                 .flex_initial()
                 .min_w_0()
                 .flex()
@@ -124,19 +127,31 @@ impl Shell {
         }
         // The call is one of the strip's glyphs (`call_pill` draws it so on a phone): 44 pt, no
         // box, beside Members and Details.
-        let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx));
+        let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, false, cx));
+        let meeting = self.meeting_button(open, link, true, cx);
         let action = |id: &'static str, icon: &'static str| {
             icon_button(id, icon, false).size(px(tokens::TOUCH)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         };
-        let members = (!direct).then(|| action("phone-members", "icons/users.svg").aria_label("Members")
+        let mut members = (!direct).then(|| action("phone-members", "icons/users.svg").aria_label("Members")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_member_list(cx))));
         // "Add people" on a Tiny direct message or group; the picker is the full-height sheet.
-        let add_people = self.can_add_people(open).then(|| {
+        let mut add_people = self.can_add_people(open).then(|| {
             let conversation = open.clone();
             action("phone-add-people", "icons/user-plus.svg")
                 .aria_label("Add people")
                 .on_click(cx.listener(move |this, _, window, cx| this.open_add_people(&conversation, window, cx)))
         });
+        // On narrow 360 pt phones, cap trailing actions at 3 so the title stays readable;
+        // Add people and Members remain reachable inside Details.
+        if f32::from(window.viewport_size().width) <= 360. {
+            let count = |add: bool, mem: bool| usize::from(call.is_some()) + usize::from(meeting.is_some()) + usize::from(add) + usize::from(mem) + 1;
+            if count(add_people.is_some(), members.is_some()) > 3 {
+                add_people = None;
+            }
+            if count(add_people.is_some(), members.is_some()) > 3 {
+                members = None;
+            }
+        }
         let details = action("phone-details", if direct { "icons/user.svg" } else { "icons/info.svg" })
             .aria_label(if direct { "Profile details" } else { "Conversation details" })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)));
@@ -182,7 +197,7 @@ impl Shell {
                     }),
             )
             .children(call)
-            .children(self.meeting_button(open, link, true, cx))
+            .children(meeting)
             .children(add_people)
             .children(members)
             .child(details);

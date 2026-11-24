@@ -230,7 +230,9 @@ impl Shell {
         let mut grid = div().flex().flex_wrap().gap(px(8.));
         for member in &people {
             let name = model::name_of(member);
-            let color = model::color_of(page.community, member).map(gpui::rgb).unwrap_or(theme::text());
+            let color = model::color_of(page.community, member)
+                .map(|c| theme::role_color_on(c, theme::raised(), 4.5))
+                .unwrap_or(theme::text());
             let menu_id = member.user_id.clone();
             let open_id = member.user_id.clone();
             grid = grid.child(

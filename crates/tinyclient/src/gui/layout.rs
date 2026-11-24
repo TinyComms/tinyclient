@@ -549,32 +549,18 @@ impl Shell {
             .children(pane.count.map(|count| {
                 div().flex_none().type_ui().text_color(theme::text_faint()).child(count.to_string())
             }));
-        // Over the conversation it stands for, the pane is a page with a heading: the person or
-        // channel it belongs to is centred over the body, not tucked into the crumb beside the
-        // title, where it reads as a path instead of a name.
+        // Over the conversation it stands for, the pane is a page with a heading: place the
+        // conversation name in flex flow so it never overlaps the back button or pane title.
         let heading = back_to.filter(|_| replaces).map(|name| {
             div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .top_0()
-                .h(px(TOP_BAR))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .min_w_0()
-                        .max_w(px((width * 0.5).max(80.)))
-                        .truncate()
-                        .type_ui()
-                        .font_weight(theme::MEDIUM)
-                        .text_color(theme::text_soft())
-                        .child(name),
-                )
+                .min_w_0()
+                .max_w(px((width * 0.4).max(80.)))
+                .truncate()
+                .type_ui()
+                .font_weight(theme::MEDIUM)
+                .text_color(theme::text_soft())
+                .child(name)
         });
-        // The strip's own padding sits on an inner row, so a heading can centre on the whole pane
-        // rather than on what the window's buttons leave of it.
         let row = div()
             .h_full()
             .pl(px(theme::PANE_PAD))
@@ -605,15 +591,15 @@ impl Shell {
                         .on_click(cx.listener(|this, _, _, cx| this.pop_out_open_thread(cx))),
                 )
             })
-            .child(title);
+            .child(title)
+            .children(heading);
         let strip = drags_window(div())
             .relative()
             .h(px(TOP_BAR))
             .flex_none()
             .border_b_1()
             .border_color(theme::hairline())
-            .child(row)
-            .children(heading);
+            .child(row);
         let resizable = !replaces;
         Some(
             div()
@@ -668,7 +654,8 @@ impl Shell {
             };
             div()
                 .id(("network", ix))
-                .h(px(64.))
+                .min_h(px(64.))
+                .py(px(10.))
                 .px(px(16.))
                 .flex()
                 .items_center()
@@ -703,6 +690,7 @@ impl Shell {
                                     .type_small()
                                     .text_color(theme::accent_text())
                                     .cursor_pointer()
+                                    .hover(|s| s.underline())
                                     .child("Personal Microsoft account")
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -737,32 +725,41 @@ impl Shell {
             .child(drags_window(div().h(px(TOP_BAR)).flex_none()))
             .child(
                 div()
+                    .id("first-run-scroll")
                     .flex_1()
-                    .pb(px(TOP_BAR))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .child(brand_mark(theme::BRAND_MARK))
-                    .child(div().mt(px(16.)).type_headline().child("Welcome to tinyclient"))
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
                     .child(
                         div()
-                            .mt(px(6.))
-                            .mb(px(28.))
-                            .px(px(24.))
-                            .max_w(px(360.))
-                            .text_align(gpui::TextAlign::Center)
-                            .type_body()
-                            .text_color(theme::text_soft())
-                            .child("Sign in to one network to start. Add the others whenever you like."),
-                    )
-                    .child(card)
-                    .child(
-                        div()
-                            .mt(px(16.))
-                            .type_small()
-                            .text_color(theme::text_faint())
-                            .child(crate::host::sign_in_kept()),
+                            .w_full()
+                            .min_h_full()
+                            .pb(px(TOP_BAR))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .child(brand_mark(theme::BRAND_MARK))
+                            .child(div().mt(px(16.)).type_headline().child("Welcome to tinyclient"))
+                            .child(
+                                div()
+                                    .mt(px(6.))
+                                    .mb(px(28.))
+                                    .px(px(24.))
+                                    .max_w(px(360.))
+                                    .text_align(gpui::TextAlign::Center)
+                                    .type_body()
+                                    .text_color(theme::text_soft())
+                                    .child("Sign in to one network to start. Add the others whenever you like."),
+                            )
+                            .child(card)
+                            .child(
+                                div()
+                                    .mt(px(16.))
+                                    .type_small()
+                                    .text_color(theme::text_faint())
+                                    .child(crate::host::sign_in_kept()),
+                            ),
                     ),
             )
     }
@@ -791,8 +788,8 @@ impl Shell {
     fn menu_layer(&self, snapshot: &Snapshot, sidebar: f32, overview: f32, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let open = self.layout_state.menu.as_ref()?;
         let tall = f32::from(window.viewport_size().height);
-        // The rail's add button and own avatar, and the sidebar strip's trailing button.
-        let rail_button = |from_bottom: f32| place::anchor(16., tall - from_bottom - 40., 40., 40.);
+        // The rail's add button and own avatar, anchored to the full rail width so popovers open outside the rail.
+        let rail_button = |from_bottom: f32| place::anchor(0., tall - from_bottom - 40., RAIL_WIDTH, 40.);
         let strip_left = RAIL_WIDTH + if matches!(open, Menu::Space(_)) { overview } else { 0. };
         let strip_width = if overview > 0. && matches!(open, Menu::Network(_)) { overview } else { sidebar };
         let strip_button = place::anchor(strip_left + strip_width - 12. - 28., 12., 28., 28.);
@@ -2183,7 +2180,7 @@ impl Render for Shell {
                 .on_action(|_: &super::AddAccount, _, _| {})
                 .on_key_down(cx.listener(|_, _, _, cx| cx.stop_propagation()))
                 .child(cover);
-            return if phone_form { locked_root } else { locked_root.children(window_chrome(window)) };
+            return if phone_form && super::phone::HANDHELD { locked_root } else { locked_root.children(window_chrome(window)) };
         }
         let root = self
             .keys(div(), cx)
@@ -2237,7 +2234,12 @@ impl Render for Shell {
         let width = f32::from(window.viewport_size().width);
         if phone_form {
             if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
-                return root.child(self.first_run(snapshot, cx));
+                let first = root.child(self.first_run(snapshot, cx));
+                return if super::phone::HANDHELD {
+                    first
+                } else {
+                    first.children(window_chrome(window))
+                };
             }
             // A phone has no window buttons to clear, and every pane it shows is the whole
             // screen: never beside the conversation, so sticky Details waits until asked.
@@ -2247,12 +2249,14 @@ impl Render for Shell {
             let root = root.child(screen);
             #[cfg(any(target_os = "android", target_os = "ios"))]
             let root = root.children(self.phone_share_layer(window, cx));
+            let root = self.mount_shared_modals(root, window, cx);
             return root
                 .children(self.telegram_call_modal(window, cx))
                 .children(self.meeting_layer(cx))
                 .children(self.story_viewer_layer(window, cx))
                 .children(self.toast_layer(width, cx))
                 .children(super::settings::phone_page(window, cx))
+                .when(!super::phone::HANDHELD, |root| root.children(window_chrome(window)))
                 .children(self.streamer_mark(window, cx));
         }
         if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
@@ -2289,21 +2293,27 @@ impl Render for Shell {
         };
         chrome::set_end(end, window);
 
-        let desktop = root.child(self.rail(snapshot, window, cx))
-            .when(overview > 0., |root| root.child(self.discord_overview(snapshot, overview, window, cx)))
+        let live_bar = self.live_location_bar(cx);
+        let main_row = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .child(self.rail(snapshot, window, cx))
+            .when(overview > 0., |row| row.child(self.discord_overview(snapshot, overview, window, cx)))
             .children(plan.sidebar.map(|width| {
                 self.sidebar(snapshot, width, window, cx).child(self.resize_handle(Edge::Sidebar, cx))
             }))
-            .when(list_alone, |root| {
+            .when(list_alone, |row| {
                 // A narrow window has no pane beside the list. Tiny draws its people in the
                 // page, since the sidebar is not there.
                 if matches!(self.sidebar_state.mode, super::sidebar::Mode::Network(Network::Tiny)) && self.tiny_open() {
-                    root.child(div().flex_1().min_w_0().h_full().child(self.tiny_page(false, window, cx)))
+                    row.child(div().flex_1().min_w_0().h_full().child(self.tiny_page(false, window, cx)))
                 } else {
-                    root.child(self.sidebar(snapshot, width - RAIL_WIDTH, window, cx))
+                    row.child(self.sidebar(snapshot, width - RAIL_WIDTH, window, cx))
                 }
             })
-            .when(!replaced && !list_alone, |root| {
+            .when(!replaced && !list_alone, |row| {
                 let pane = match (&snapshot.open, self.keychain_state(window, cx)) {
                     (_, Some(waiting)) => waiting,
                     (_, None) if call_view => self.call_view_pane(snapshot, window, cx),
@@ -2311,9 +2321,14 @@ impl Render for Shell {
                     (None, None) if self.tiny_open() => self.tiny_page(plan.sidebar.is_some() || floating, window, cx),
                     (None, None) => self.nothing_open(window, cx),
                 };
-                root.child(div().flex_1().min_w_0().h_full().child(pane))
+                row.child(div().flex_1().min_w_0().h_full().child(pane))
             })
-            .children(plan.right.and_then(|(width, replaces)| self.right_pane(width, replaces, window, cx)))
+            .children(plan.right.and_then(|(width, replaces)| self.right_pane(width, replaces, window, cx)));
+
+        let desktop = root
+            .flex_col()
+            .children(live_bar.map(|bar| div().flex_none().w_full().pr(px(chrome::width(window))).child(bar)))
+            .child(main_row)
             .children(self.banner_layer(plan.sidebar, cx))
             .when(floating, |root| {
                 let width = state.sidebar_width.min(width - RAIL_WIDTH);
@@ -2338,31 +2353,21 @@ impl Render for Shell {
                 )
             })
             .children(self.switcher(window, cx))
-            .children(self.create_channel_modal(cx))
-            .children(self.create_invite_modal(cx))
-            .children(self.create_category_modal(cx))
-            .children(self.edit_channel_modal(cx))
-            .children(self.voice_status_modal(cx))
+            .children(self.create_channel_modal(window, cx))
+            .children(self.create_category_modal(window, cx))
+            .children(self.edit_channel_modal(window, cx))
+            .children(self.voice_status_modal(window, cx))
             .children(self.voice_move_modal(cx))
             .children(self.voice_settings_modal(cx))
             .children(self.move_channels_modal(cx))
-            .children(self.delete_channel_modal(cx))
-            .children(self.folder_edit_modal(cx))
-            .children(self.forum_post_modal(cx))
-            .children(self.join_server_modal(cx))
-            .children(self.conference_link_modal(cx))
-            .children(self.create_server_modal(cx))
-            .children(self.events_modal(cx))
-            .children(self.server_gate_modal(cx))
-            .children(self.leave_space_modal(cx))
-            .children(self.discord_settings_layer(window, cx))
-            .children(self.browse_channels_modal(cx))
-            .children(self.discord_admin_layer(cx))
-            .children(self.discord_admin_modal(window, cx))
-            .children(self.link_ask_modal(window, cx))
+            .children(self.delete_channel_modal(window, cx))
+            .children(self.folder_edit_modal(window, cx))
+            .children(self.forum_post_modal(window, cx))
+            .children(self.browse_channels_modal(window, cx))
+            .children(self.discord_admin_layer(window, cx));
+        let desktop = self.mount_shared_modals(desktop, window, cx)
             .children(self.call_full_stage(snapshot, cx))
             .children(self.telegram_call_modal(window, cx))
-            .children(self.tiny_layer(window, cx))
             // With no sidebar dock in view (collapsed, hidden, or narrow Tiny page), float incoming calls here.
             .children(self.call_incoming_overlay(snapshot, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
@@ -2371,11 +2376,6 @@ impl Render for Shell {
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))
             .children(self.streamer_mark(window, cx));
-        let desktop = if let Some(live_bar) = self.live_location_bar(cx) {
-            desktop.child(div().absolute().top_0().left(px(RAIL_WIDTH)).right_0().child(live_bar))
-        } else {
-            desktop
-        };
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let desktop = desktop.children(self.phone_share_layer(window, cx));
         desktop
@@ -2383,18 +2383,34 @@ impl Render for Shell {
 }
 
 impl Shell {
+    /// Modals that can open on both desktop and phone roots.
+    fn mount_shared_modals<E: ParentElement>(&self, root: E, window: &mut Window, cx: &mut Context<Self>) -> E {
+        root.children(self.create_invite_modal(cx))
+            .children(self.join_server_modal(window, cx))
+            .children(self.conference_link_modal(cx))
+            .children(self.create_server_modal(window, cx))
+            .children(self.events_modal(cx))
+            .children(self.server_gate_modal(window, cx))
+            .children(self.leave_space_modal(cx))
+            .children(self.discord_settings_layer(window, cx))
+            .children(self.discord_admin_modal(window, cx))
+            .children(self.link_ask_modal(window, cx))
+            .children(self.tiny_layer(window, cx))
+    }
+
     /// The only thing drawn while the screen lock is held. A ring can still be answered.
     fn lock_cover(&mut self, ringing: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let error = super::lock::unlock_error();
         let asking = super::lock::asking();
         #[cfg(target_os = "linux")]
-        let phrase = {
+        let (phrase, phrase_focused) = {
             let phrase = self.lock_field(cx);
             let phrase_focus = gpui::Focusable::focus_handle(phrase.read(cx), cx);
             if !self.lock_focus.is_focused(window) && !phrase_focus.is_focused(window) {
                 window.focus(&phrase_focus, cx);
             }
-            phrase
+            let focused = phrase_focus.is_focused(window);
+            (phrase, focused)
         };
         #[cfg(not(target_os = "linux"))]
         if !self.lock_focus.is_focused(window) {
@@ -2409,30 +2425,46 @@ impl Shell {
             .bg(theme::canvas())
             .flex()
             .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(12.))
-            .px(px(24.))
-            .child(div().type_title().child("tinyclient is locked"))
-            .child(div().max_w(px(420.)).type_small().text_color(theme::text_soft()).child(super::lock::CAPTION))
-            .when(ringing, |cover| {
-                cover.child(
-                    div()
-                        .flex()
-                        .gap(px(8.))
-                        .child(button("lock-answer", ButtonKind::Primary, "Answer").on_click(cx.listener(|this, _, _, cx| this.call_accept(cx))))
-                        .child(button("lock-decline", ButtonKind::Secondary, "Decline").on_click(cx.listener(|this, _, _, cx| this.call_decline(cx)))),
-                )
-            })
-            .when(cfg!(target_os = "linux"), |cover| {
-                #[cfg(target_os = "linux")]
-                let cover = cover.child(div().w(px(240.)).child(phrase));
-                cover
-            })
+            .child(drags_window(div().h(px(TOP_BAR)).w_full().flex_none()))
             .child(
-                button("lock-unlock", ButtonKind::Primary, if asking { "Asking the system…" } else { "Unlock" }).on_click(cx.listener(|this, _, _, cx| this.unlock_screen(cx))),
+                div()
+                    .flex_1()
+                    .pb(px(TOP_BAR))
+                    .px(px(24.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(12.))
+                    .child(div().type_title().child("tinyclient is locked"))
+                    .child(
+                        div()
+                            .max_w(px(420.))
+                            .text_align(gpui::TextAlign::Center)
+                            .type_small()
+                            .text_color(theme::text_soft())
+                            .child(super::lock::CAPTION),
+                    )
+                    .when(ringing, |cover| {
+                        cover.child(
+                            div()
+                                .flex()
+                                .gap(px(8.))
+                                .child(button("lock-answer", ButtonKind::Primary, "Answer").on_click(cx.listener(|this, _, _, cx| this.call_accept(cx))))
+                                .child(button("lock-decline", ButtonKind::Secondary, "Decline").on_click(cx.listener(|this, _, _, cx| this.call_decline(cx)))),
+                        )
+                    })
+                    .when(cfg!(target_os = "linux"), |cover| {
+                        #[cfg(target_os = "linux")]
+                        let cover = cover.child(super::components::field(phrase_focused).w(px(240.)).child(phrase));
+                        cover
+                    })
+                    .child(
+                        button("lock-unlock", ButtonKind::Primary, if asking { "Asking the system…" } else { "Unlock" })
+                            .on_click(cx.listener(|this, _, _, cx| this.unlock_screen(cx))),
+                    )
+                    .when(!error.is_empty(), |cover| cover.child(div().type_small().text_color(theme::danger()).child(error))),
             )
-            .when(!error.is_empty(), |cover| cover.child(div().type_small().text_color(theme::danger()).child(error)))
     }
 
     #[cfg(target_os = "linux")]
@@ -2509,16 +2541,24 @@ impl Shell {
         .detach();
     }
 
-    /// The title-bar mark while Streamer mode is on. One click stores Off.
+    /// The status mark while Streamer mode is on. One click stores Off.
     fn streamer_mark(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !super::streamer::is_active() {
             return None;
         }
+        let phone = super::phone::active();
+        let no_rail = self.snapshot.as_ref().is_some_and(|s| s.signed_in().is_empty());
         let chip = div()
             .id("streamer-off")
             .absolute()
-            .top(px(12.))
-            .right(px(chrome::width(window) + 12.))
+            .map(|el| {
+                if phone {
+                    el.top(px(super::phone::tokens::safe_top() + 8.))
+                        .right(px(if super::phone::HANDHELD { 12. } else { chrome::width(window) + 12. }))
+                } else {
+                    el.bottom(px(12.)).left(px(if no_rail { 12. } else { RAIL_WIDTH + 12. }))
+                }
+            })
             .occlude()
             .h(px(28.))
             .px(px(10.))
@@ -2526,9 +2566,10 @@ impl Shell {
             .items_center()
             .gap(px(6.))
             .rounded(px(theme::R_CONTROL))
-            .bg(theme::hover())
+            .bg(theme::overlay())
             .border_1()
             .border_color(theme::border())
+            .shadow(theme::shadow_popover())
             .type_small()
             .font_weight(theme::MEDIUM)
             .text_color(theme::text())
@@ -2690,8 +2731,7 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(theme::on_accent())
-                            .child(if on { "✓" } else { "" }),
+                            .when(on, |box_| box_.child(glyph("icons/check.svg", 12., theme::on_accent()))),
                     )
                     .child(format!("Don't ask again for {}", dest.domain_shown))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -2730,12 +2770,12 @@ impl Shell {
             .justify_center()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_link_ask(cx)))
             .child(fade_in("shell-link-ask-panel", 160, panel));
-        Some(gpui::deferred(gpui::anchored().position(gpui::point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(gpui::deferred(gpui::anchored().position(gpui::point(px(0.), px(0.))).child(scrim)).priority(Layer::Modal as usize).into_any_element())
     }
 
     /// The toasts, 16 from the bottom-right: the crash toast stays until dismissed and sits
     /// above any other.
-    fn toast_layer(&self, window_width: f32, cx: &mut Context<Self>) -> Option<Div> {
+    fn toast_layer(&self, window_width: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
         let width = place::toast_width(window_width);
         let crash = self.crash_toast(width, cx);
         let update = self.update_toast(width, cx);
@@ -2762,18 +2802,17 @@ impl Shell {
         }
         // On a phone the toast clears the home indicator.
         let bottom = 16. + if super::phone::active() { super::phone::tokens::safe_bottom() } else { 0. };
-        Some(
-            div()
-                .absolute()
-                .right(px(16.))
-                .bottom(px(bottom))
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .children(toast)
-                .children(update.map(|update| fade_in("update-toast", 160, div().child(update))))
-                .children(crash.map(|crash| fade_in("crash-toast", 160, div().child(crash)))),
-        )
+        let stack = div()
+            .absolute()
+            .right(px(16.))
+            .bottom(px(bottom))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .children(toast)
+            .children(update.map(|update| fade_in("update-toast", 160, div().child(update))))
+            .children(crash.map(|crash| fade_in("crash-toast", 160, div().child(crash))));
+        Some(gpui::deferred(stack).priority(Layer::Toast as usize).into_any_element())
     }
 }
 

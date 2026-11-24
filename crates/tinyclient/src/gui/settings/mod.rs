@@ -10,7 +10,7 @@ mod accounts;
 mod discord;
 pub(in crate::gui) mod controls;
 mod notify;
-mod pages;
+pub(in crate::gui) mod pages;
 mod phone_page;
 pub mod rows;
 mod tiny;
@@ -1169,7 +1169,17 @@ impl SettingsWindow {
                 field.child(
                     div()
                         .id("search-clear")
+                        .role(gpui::Role::Button)
+                        .aria_label("Clear search")
+                        .tab_index(0)
+                        .size(px(20.))
+                        .rounded(px(theme::R_CHIP))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .focus_visible(|s| s.shadow(theme::focus_ring()))
                         .child(glyph("icons/x.svg", 14., theme::text_faint()))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.query.clear();
@@ -1235,6 +1245,8 @@ impl SettingsWindow {
                     .pl(px(28.))
                     .flex()
                     .items_center()
+                    .border_b_1()
+                    .border_color(theme::hairline())
                     .type_title()
                     .text_color(theme::text())
                     .child(heading),
@@ -1340,7 +1352,7 @@ impl Render for SettingsWindow {
         if self.phone {
             return self.phone_render(window, cx);
         }
-        let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, cx));
+        let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, window, cx));
         let menu = self.picker.and_then(|picker| self.device_menu(picker, window, cx)).or_else(|| self.choice.and_then(|id| self.choice_menu(id, window, cx)));
         let toast = self.log_note.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(4)).map(|(_, note)| {
             div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(

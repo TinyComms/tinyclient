@@ -4,7 +4,7 @@
 
 use super::controls::{caption, card, group_label, rule};
 use super::{Confirm, SettingsWindow};
-use crate::gui::components::{button, link_word, network_icon, ButtonKind};
+use crate::gui::components::{button, field, glyph, icon_button, link_word, network_icon, ButtonKind};
 use crate::gui::layout::NETWORK_ORDER;
 use crate::gui::phone::{self, tokens::{self, PhoneType}};
 use crate::gui::theme::{self, Type};
@@ -885,7 +885,9 @@ impl SettingsWindow {
                             )),
                     )
                     .child(
-                        button("teams-manage-sessions", ButtonKind::Secondary, "Manage sessions ↗")
+                        button("teams-manage-sessions", ButtonKind::Secondary, "Manage sessions")
+                            .gap(px(5.))
+                            .child(glyph("icons/external-link.svg", 13., theme::text_soft()))
                             .on_click(|_, _, cx| crate::gui::conversation::links::open_external_link("https://myaccount.microsoft.com/", cx)),
                     ),
             )
@@ -1104,30 +1106,30 @@ impl SettingsWindow {
             let up_btn = (f_ix > 0).then(|| {
                 let mut next = order_ids.clone();
                 next.swap(f_ix - 1, f_ix);
-                button(("tg-folder-up", ix * 100 + f_ix), ButtonKind::Ghost, "↑").on_click(cx.listener(
-                    move |this, _, _, cx| {
+                icon_button(("tg-folder-up", ix * 100 + f_ix), "icons/chevron-up.svg", false)
+                    .aria_label("Move folder up")
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         let req = protocol::Request::FoldersReorder { account: acc_up.clone(), order: next.clone() };
                         let acc = acc_up.clone();
                         this.off_thread(cx, move || crate::client::ask(&req), move |this, _, cx| {
                             this.tg_folders_requested.remove(&acc);
                             this.load_telegram_folders(acc, cx);
                         });
-                    },
-                ))
+                    }))
             });
             let down_btn = (f_ix + 1 < folders.len()).then(|| {
                 let mut next = order_ids.clone();
                 next.swap(f_ix, f_ix + 1);
-                button(("tg-folder-down", ix * 100 + f_ix), ButtonKind::Ghost, "↓").on_click(cx.listener(
-                    move |this, _, _, cx| {
+                icon_button(("tg-folder-down", ix * 100 + f_ix), "icons/chevron-down.svg", false)
+                    .aria_label("Move folder down")
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         let req = protocol::Request::FoldersReorder { account: acc_down.clone(), order: next.clone() };
                         let acc = acc_down.clone();
                         this.off_thread(cx, move || crate::client::ask(&req), move |this, _, cx| {
                             this.tg_folders_requested.remove(&acc);
                             this.load_telegram_folders(acc, cx);
                         });
-                    },
-                ))
+                    }))
             });
             let del_btn = button(("tg-folder-del", ix * 100 + f_ix), ButtonKind::Ghost, "Delete").on_click(cx.listener(
                 move |this, _, _, cx| {
@@ -1160,17 +1162,10 @@ impl SettingsWindow {
             .items_center()
             .gap(px(6.))
             .child(
-                div()
+                field(false)
                     .flex_1()
-                    .h(px(28.))
-                    .px(px(8.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::field())
-                    .border_1()
-                    .border_color(theme::border())
-                    .flex()
-                    .items_center()
-                    .child(name_input.clone()),
+                    .min_w_0()
+                    .child(div().flex_1().min_w_0().child(name_input.clone())),
             )
             .child(button(("tg-folder-add", ix), ButtonKind::Secondary, "Create folder").on_click(cx.listener(
                 move |this, _, _, cx| {
@@ -1406,28 +1401,18 @@ impl SettingsWindow {
     }
 
     /// Own-profile editor modal: shows only fields supported by `account.can`.
-    pub(super) fn edit_profile_modal(&self, account: &AccountStatus, cx: &mut Context<Self>) -> Div {
+    pub(super) fn edit_profile_modal(&self, account: &AccountStatus, window: &Window, cx: &mut Context<Self>) -> Div {
         let network = network_name(account.key.network);
         let key = account.key.clone();
         let can = account.can;
         let field_box = |label: &'static str, input: gpui::Entity<crate::gui::input::TextInput>| {
+            let focused = gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window);
             div()
                 .flex()
                 .flex_col()
                 .gap(px(4.))
                 .child(div().type_small().text_color(theme::text_soft()).child(label))
-                .child(
-                    div()
-                        .h(px(30.))
-                        .px(px(8.))
-                        .rounded(px(theme::R_CONTROL))
-                        .bg(theme::field())
-                        .border_1()
-                        .border_color(theme::border())
-                        .flex()
-                        .items_center()
-                        .child(input),
-                )
+                .child(field(focused).child(div().flex_1().min_w_0().child(input)))
         };
         let mut fields = div().flex().flex_col().gap(px(10.));
         if can.profile_name {
@@ -1697,9 +1682,12 @@ impl SettingsWindow {
                     .justify_between()
                     .child(div().type_small().text_color(theme::text_faint()).child("Username & email"))
                     .child(
-                        button("profile-open-discord", ButtonKind::Ghost, "Change in Discord ↗").on_click(|_, _, cx| {
-                            cx.open_url("https://discord.com/channels/@me");
-                        }),
+                        button("profile-open-discord", ButtonKind::Ghost, "Change in Discord")
+                            .gap(px(5.))
+                            .child(glyph("icons/external-link.svg", 13., theme::text_soft()))
+                            .on_click(|_, _, cx| {
+                                cx.open_url("https://discord.com/channels/@me");
+                            }),
                     ),
             );
         }
@@ -1740,9 +1728,17 @@ impl SettingsWindow {
             this.confirm = None;
             cx.notify();
         }));
-        crate::gui::components::modal(format!("Edit {network} profile"))
-            .child(fields)
-            .child(crate::gui::components::modal_buttons().child(cancel).child(save))
+        let panel = crate::gui::components::modal(format!("Edit {network} profile"))
+            .child(
+                div()
+                    .id("edit-profile-fields")
+                    .mt(px(10.))
+                    .max_h(px(380.))
+                    .overflow_y_scroll()
+                    .child(fields),
+            )
+            .child(crate::gui::components::modal_buttons().child(cancel).child(save));
+        super::modal_layer(panel, cx)
     }
 }
 

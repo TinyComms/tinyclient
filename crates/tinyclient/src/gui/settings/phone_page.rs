@@ -187,6 +187,8 @@ impl SettingsWindow {
         div()
             .flex_none()
             .pt(px(tokens::safe_top()))
+            .pl(px(tokens::safe_left()))
+            .pr(px(tokens::safe_right()))
             .bg(theme::sidebar())
             .shadow(tokens::top_highlight())
             .border_b_1()
@@ -327,7 +329,7 @@ impl SettingsWindow {
     /// The page: the bar, then the list or one section, scrolling under it.
     pub(super) fn phone_render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         self.width = f32::from(window.viewport_size().width);
-        let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, cx));
+        let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, window, cx));
         let toast = self.copied.filter(|at| at.elapsed() < std::time::Duration::from_secs(4)).map(|_| {
             div().absolute().bottom(px(tokens::safe_bottom() + 16.)).left_0().right_0().flex().justify_center().child(
                 crate::gui::components::toast(Some(("icons/check.svg", theme::text_soft())), "Copied").w(px(200.)),
@@ -373,7 +375,14 @@ impl SettingsWindow {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(div().px(px(tokens::GUTTER)).pt(px(20.)).pb(px(bottom)).child(body)),
+                    .child(
+                        div()
+                            .pl(px(tokens::GUTTER + tokens::safe_left()))
+                            .pr(px(tokens::GUTTER + tokens::safe_right()))
+                            .pt(px(20.))
+                            .pb(px(bottom))
+                            .child(body),
+                    ),
             )
             .children(toast)
             .children(modal)

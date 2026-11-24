@@ -897,10 +897,12 @@ pub(in crate::gui::tiny) fn encryption(
         recovery = recovery.child(
             div()
                 .flex()
+                .items_center()
                 .gap(px(8.))
                 .child(kit::input(&fields.recovery_check, None, window, cx).flex_1().min_w_0().max_w_full())
                 .child(
                     button("tiny-e2ee-check", ButtonKind::Ghost, "Check")
+                        .h(px(36.))
                         .on_click(cx.listener(|this, _, _, cx| this.tiny_e2ee_check(cx))),
                 ),
         );

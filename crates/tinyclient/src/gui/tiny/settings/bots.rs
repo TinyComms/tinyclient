@@ -206,7 +206,7 @@ pub(in crate::gui::tiny) fn bots(shell: &Shell, _facts: &Facts, window: &mut Win
     if let Some(token) = draft.token.clone() {
         let copied = token.clone();
         page = page.child(
-            kit::card().child(
+            kit::card().p(px(14.)).child(
                 div()
                     .flex()
                     .flex_col()
@@ -214,9 +214,11 @@ pub(in crate::gui::tiny) fn bots(shell: &Shell, _facts: &Facts, window: &mut Win
                     .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Copy this token now. It will not be shown again."))
                     .child(div().whitespace_normal().type_small().font_family(theme::MONO).text_color(theme::text()).child(token))
                     .child(
-                        button("tiny-bots-copy", ButtonKind::Secondary, "Copy token").on_click(cx.listener(move |_, _, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
-                        })),
+                        div().flex().child(
+                            button("tiny-bots-copy", ButtonKind::Secondary, "Copy token").on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
+                            })),
+                        ),
                     ),
             ),
         );
@@ -229,6 +231,7 @@ pub(in crate::gui::tiny) fn bots(shell: &Shell, _facts: &Facts, window: &mut Win
         let on = grant_on(draft, scope);
         grants = grants.child(
             kit::switch_row(("tiny-bots-grant", ix), help, scope, on, !draft.loading)
+                .when(ix + 1 == GRANTS.len(), |row| row.border_b_0())
                 .on_click(cx.listener(move |this, _, _, cx| this.tiny_bot_grant(scope, cx))),
         );
     }
@@ -256,6 +259,7 @@ pub(in crate::gui::tiny) fn bots(shell: &Shell, _facts: &Facts, window: &mut Win
         });
         table = table.child(
             table_row(SharedString::from(format!("tiny-bots-row-{}", bot.id)), false)
+                .when(ix + 1 == draft.rows.len(), |row| row.border_b_0())
                 .child(div().flex_1().min_w_0().truncate().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(bot.name.clone()))
                 .child(cell(220., can, theme::text_soft()))
                 .child(div().flex_none().w(px(72.)).flex().justify_end().children(revoke)),

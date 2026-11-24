@@ -73,7 +73,15 @@ pub(super) fn page(body: Div, cx: &Context<Sheet>) -> Div {
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .child(div().px(px(SIDE)).pb(px(bottom)).flex().flex_col().child(body)),
+                .child(
+                    div()
+                        .pl(px(SIDE + tokens::safe_left()))
+                        .pr(px(SIDE + tokens::safe_right()))
+                        .pb(px(bottom))
+                        .flex()
+                        .flex_col()
+                        .child(body),
+                ),
         )
 }
 

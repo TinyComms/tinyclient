@@ -243,7 +243,7 @@ impl Shell {
         // A call is the whole phone while it shows (`call::phone`), over everything else.
         if let Some(call) = self.call_phone_screen(snapshot, window, cx) {
             return div().size_full().relative().flex().flex_col().bg(theme::canvas()).text_color(theme::text()).child(call)
-                .children(self.voice_status_modal(cx))
+                .children(self.voice_status_modal(window, cx))
                 .children(matches!(self.layout_state.menu, Some(crate::gui::layout::Menu::VoiceOccupant(..)))
                     .then(|| self.phone_menu(snapshot, window, cx)).flatten())
                 .children(self.voice_move_modal(cx))
@@ -252,10 +252,20 @@ impl Shell {
         // Minimised, it is a bar under the status bar, and every screen starts under that bar.
         let bar = self.call_phone_bar(snapshot, cx);
         let live_loc_bar = self.live_location_bar(cx);
-        tokens::take_top(bar.is_some());
+        let (left, right_inset) = (tokens::safe_left(), tokens::safe_right());
+        let live_loc_top = live_loc_bar.map(|inner| {
+            div()
+                .flex_none()
+                .w_full()
+                .bg(theme::sidebar())
+                .when(bar.is_none(), |el| el.child(div().flex_none().h(px(tokens::status_bar()))))
+                .child(div().pl(px(left)).pr(px(right_inset)).child(inner))
+        });
+        tokens::take_top(bar.is_some() || live_loc_top.is_some());
         let right = self.layout_state.right.is_some() && !self.pane_tucked();
         // Server Settings, when a page of it is open (Encryption, from a conversation's strip).
         let tiny_settings = self.tiny_settings_phone_page(window, cx);
+        let is_home = self.keychain_state(window, cx).is_none() && tiny_settings.is_none() && !right && snapshot.open.is_none();
         let screen: AnyElement = match self.keychain_state(window, cx) {
             Some(waiting) if snapshot.open.is_none() => self.phone_page(waiting).into_any_element(),
             _ if tiny_settings.is_some() => tiny_settings.unwrap_or_else(|| div().into_any_element()),
@@ -267,7 +277,6 @@ impl Shell {
         tokens::take_top(false);
         // A phone on its side keeps its screens clear of the cutout and the rounded corners at
         // the sides; the sheets and the switcher over them span the screen, as the platform's do.
-        let (left, right) = (tokens::safe_left(), tokens::safe_right());
         div()
             .size_full()
             .relative()
@@ -276,21 +285,29 @@ impl Shell {
             .bg(theme::canvas())
             .text_color(theme::text())
             .children(bar)
-            .children(live_loc_bar)
-            .child(div().flex_1().min_h_0().pl(px(left)).pr(px(right)).bg(theme::sidebar()).child(screen))
+            .children(live_loc_top)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .pl(px(left))
+                    .pr(px(right_inset))
+                    .bg(if is_home { theme::sidebar() } else { theme::canvas() })
+                    .child(screen),
+            )
             .children(self.switcher(window, cx))
-            .children(self.create_channel_modal(cx))
-            .children(self.create_category_modal(cx))
-            .children(self.edit_channel_modal(cx))
-            .children(self.voice_status_modal(cx))
+            .children(self.create_channel_modal(window, cx))
+            .children(self.create_category_modal(window, cx))
+            .children(self.edit_channel_modal(window, cx))
+            .children(self.voice_status_modal(window, cx))
             .children(self.voice_move_modal(cx))
             .children(self.voice_settings_modal(cx))
             .children(self.move_channels_modal(cx))
-            .children(self.delete_channel_modal(cx))
-            .children(self.browse_channels_modal(cx))
-            .children(self.discord_admin_layer(cx))
-            .children(self.folder_edit_modal(cx))
-            .children(self.forum_post_modal(cx))
+            .children(self.delete_channel_modal(window, cx))
+            .children(self.browse_channels_modal(window, cx))
+            .children(self.discord_admin_layer(window, cx))
+            .children(self.folder_edit_modal(window, cx))
+            .children(self.forum_post_modal(window, cx))
             .children(self.phone_slack_sheet(window, cx))
             .children(self.phone_menu(snapshot, window, cx))
     }
@@ -505,9 +522,8 @@ impl Shell {
             })))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, _| {
                     this.phone_state.arm_edge(f32::from(event.position.x));
-                    cx.stop_propagation();
                 }),
             )
     }

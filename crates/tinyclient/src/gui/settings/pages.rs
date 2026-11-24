@@ -30,12 +30,12 @@ const TRANSLATE_LABELS: [&str; 13] = [
 ];
 
 /// Choice sets whose pills do not fit beside their label. Short pairs stay pills.
-pub(super) fn menu_choice(id: &str) -> bool {
-    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "M8" | "P4" | "PS1" | "D2" | "V8" | "V11" | "V21" | "V23" | "V29" | "V30" | "V31" | "V32")
+pub(in crate::gui) fn menu_choice(id: &str) -> bool {
+    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "NR" | "M5" | "M8" | "LK" | "P4" | "PS1" | "D2" | "V8" | "V11" | "V21" | "V23" | "V29" | "V30" | "V31" | "V32")
 }
 
 /// `--settings-choice` names one of these.
-pub(super) fn choice_id(name: &str) -> Option<&'static str> {
+pub(in crate::gui) fn choice_id(name: &str) -> Option<&'static str> {
     Some(match name {
         "S2" => "S2",
         "S3" => "S3",
@@ -45,8 +45,10 @@ pub(super) fn choice_id(name: &str) -> Option<&'static str> {
         "NL" => "NL",
         "N6" => "N6",
         "N7" => "N7",
+        "NR" => "NR",
         "M5" => "M5",
         "M8" => "M8",
+        "LK" => "LK",
         "P4" => "P4",
         "PS1" => "PS1",
         "D2" => "D2",
@@ -73,8 +75,10 @@ fn choice_slot(id: &str) -> usize {
         "NL" => 21,
         "N6" => 16,
         "N7" => 17,
+        "NR" => 59,
         "M5" => 25,
         "M8" => 52,
+        "LK" => 58,
         "P4" => 34,
         "PS1" => 51,
         "D2" => 42,
@@ -110,6 +114,15 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
     let pairs = |labels: &[&str]| labels.iter().map(|label| ((*label).to_owned(), (*label).to_owned())).collect::<Vec<_>>();
     Some(match id {
         "M5" => (pairs(&["Automatically", "On hover", "Never"]), anim::autoplay() as usize, 0),
+        "LK" => {
+            let at = match crate::gui::lock::policy().away {
+                crate::gui::lock::Away::Off => 0,
+                crate::gui::lock::Away::Minute => 1,
+                crate::gui::lock::Away::Five => 2,
+                crate::gui::lock::Away::Hour => 3,
+            };
+            (pairs(&["Off", "After 1 minute", "After 5 minutes", "After 1 hour"]), at, 0)
+        }
         "P4" => {
             let days = values.number(KEEP_DAYS);
             let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
@@ -137,8 +150,8 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
         }
         "V8" => (pairs(&["Voice activation", "Push to talk"]), usize::from(values.on(PUSH_TO_TALK)), 0),
         "V11" => {
-            let at = NOISE_CHOICES.iter().position(|w| *w == values.word(GLOBAL, NOISE_SUPPRESSION)).unwrap_or(1);
-            (NOISE_CHOICES.iter().zip(["Off", "Standard", "High", "Enhanced"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 1)
+            let at = NOISE_CHOICES.iter().position(|w| *w == values.word(GLOBAL, NOISE_SUPPRESSION)).unwrap_or(3);
+            (NOISE_CHOICES.iter().zip(["Off", "Standard", "High", "Enhanced"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 3)
         }
         "V21" => {
             let at = QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, VOICE_QUALITY)).unwrap_or(1);
@@ -708,43 +721,46 @@ impl SettingsWindow {
                     let next = if is_socks { None } else { Some("socks5".to_owned()) };
                     this.set("GN2", GLOBAL.into(), keys::PROXY_SCHEME, next, cx);
                 }));
-                let host_field = div()
-                    .w(px(120.))
-                    .h(px(28.))
-                    .px(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::field())
-                    .border_1()
-                    .border_color(theme::border())
-                    .flex()
-                    .items_center()
-                    .child(self.proxy_host.clone());
-                let port_field = div()
-                    .w(px(56.))
-                    .h(px(28.))
-                    .px(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::field())
-                    .border_1()
-                    .border_color(theme::border())
-                    .flex()
-                    .items_center()
-                    .child(self.proxy_port.clone());
+                let host_focused = gpui::Focusable::focus_handle(self.proxy_host.read(cx), cx).is_focused(window);
+                let port_focused = gpui::Focusable::focus_handle(self.proxy_port.read(cx), cx).is_focused(window);
+                let host_field = crate::gui::components::field(host_focused)
+                    .flex_1()
+                    .min_w(px(140.))
+                    .child(div().flex_1().min_w_0().child(self.proxy_host.clone()));
+                let port_field = crate::gui::components::field(port_focused)
+                    .w(px(72.))
+                    .child(div().flex_1().min_w_0().child(self.proxy_port.clone()));
                 let save = button("gn2-save", ButtonKind::Secondary, "Save").on_click(cx.listener(|this, _, _, cx| {
                     let host = this.proxy_host.read(cx).text().trim().to_owned();
                     let port = this.proxy_port.read(cx).text().trim().to_owned();
                     this.set("GN2", GLOBAL.into(), keys::PROXY_HOST, (!host.is_empty()).then_some(host), cx);
                     this.set("GN2", GLOBAL.into(), keys::PROXY_PORT, (!port.is_empty()).then_some(port), cx);
                 }));
-                let control = div()
+                div()
+                    .px(px(12.))
+                    .py(px(10.))
                     .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(scheme_btn)
-                    .child(host_field)
-                    .child(port_field)
-                    .child(save);
-                row(label, Some("Fails closed if host or port is missing.".into()), control)
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().type_ui().text_color(theme::text()).child(label))
+                            .child(div().type_small().text_color(theme::text_soft()).child("Fails closed if host or port is missing.")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(scheme_btn)
+                            .child(host_field)
+                            .child(port_field)
+                            .child(save),
+                    )
             }
             "S1" => {
                 let on = values.on(SOUNDS);
@@ -869,10 +885,7 @@ impl SettingsWindow {
                     crate::gui::lock::Away::Hour => 3,
                 };
                 let second = (cfg!(target_os = "linux") && policy.hash.is_empty()).then(|| "Set a passphrase below. Until then the lock stays off.".to_owned());
-                self.segmented_row(id, &["Off", "After 1 minute", "After 5 minutes", "After 1 hour"], at, 0, second, |this, ix, cx| {
-                    let away = [crate::gui::lock::Away::Off, crate::gui::lock::Away::Minute, crate::gui::lock::Away::Five, crate::gui::lock::Away::Hour][ix];
-                    this.set_lock(|policy| policy.away = away, cx);
-                }, cx)
+                self.menu_choice_row(id, &["Off", "After 1 minute", "After 5 minutes", "After 1 hour"], at, 0, second, None, cx)
             }
             "LS" => {
                 let on = crate::gui::lock::policy().on_screen_lock;
@@ -883,11 +896,23 @@ impl SettingsWindow {
                 let set = !crate::gui::lock::policy().hash.is_empty();
                 let second = if set { "Set. The lock can use it.".to_owned() } else { "None set. The lock stays off until there is one.".to_owned() };
                 let phrase = self.lock_phrase.clone();
+                let phrase_focused = gpui::Focusable::focus_handle(phrase.read(cx), cx).is_focused(window);
                 wide_row(
                     label,
                     Some(second.into()),
-                    div().flex().items_center().gap(px(8.)).w(px(280.)).child(phrase).child(
-                        button("LP", ButtonKind::Secondary, if set { "Remove" } else { "Save" }).on_click(cx.listener(move |this, _, _, cx| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .w(px(280.))
+                        .child(
+                            crate::gui::components::field(phrase_focused)
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().flex_1().min_w_0().child(phrase)),
+                        )
+                        .child(
+                            button("LP", ButtonKind::Secondary, if set { "Remove" } else { "Save" }).on_click(cx.listener(move |this, _, _, cx| {
                             if set {
                                 this.set_lock(|policy| policy.set_passphrase(""), cx);
                             } else {
@@ -1080,6 +1105,8 @@ impl SettingsWindow {
                 None,
                 div()
                     .flex()
+                    .flex_wrap()
+                    .justify_end()
                     .gap(px(8.))
                     .child(button("B2-view", ButtonKind::Secondary, "View logs").on_click(cx.listener(|_, _, _, cx| crate::gui::logs::open(cx))))
                     // Three buttons do not fit at the column's width; the one under Copy keeps it.
@@ -1109,7 +1136,7 @@ impl SettingsWindow {
                     cx.notify();
                 })),
             ),
-            _ => self.notify_row(id, cx).unwrap_or_else(div),
+            _ => self.notify_row(id, window, cx).unwrap_or_else(div),
         };
         let _ = window;
         let lit = self.highlight == Some(id);
@@ -1368,6 +1395,10 @@ impl SettingsWindow {
         }
         match id {
             "M5" => self.set_autoplay([Autoplay::Always, Autoplay::Hover, Autoplay::Never][ix], cx),
+            "LK" => {
+                let away = [crate::gui::lock::Away::Off, crate::gui::lock::Away::Minute, crate::gui::lock::Away::Five, crate::gui::lock::Away::Hour][ix.min(3)];
+                self.set_lock(|policy| policy.away = away, cx);
+            }
             "P4" => self.pick_retention(KEEP_DAYS_CHOICES[ix], cx),
             "PS1" => {
                 let word = STREAMER_MODE_CHOICES[ix.min(STREAMER_MODE_CHOICES.len() - 1)];
@@ -2313,10 +2344,10 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    pub(super) fn modal(&mut self, confirm: &Confirm, cx: &mut Context<Self>) -> Div {
+    pub(super) fn modal(&mut self, confirm: &Confirm, window: &Window, cx: &mut Context<Self>) -> Div {
         match confirm.clone() {
             Confirm::SignOut(account) => self.sign_out_modal(&account, cx),
-            Confirm::EditProfile(account) => self.edit_profile_modal(&account, cx),
+            Confirm::EditProfile(account) => self.edit_profile_modal(&account, window, cx),
             Confirm::TinyEverywhere(account) => self.tiny_everywhere_modal(&account, cx),
             Confirm::TinyDeleteAccount(account) => self.tiny_delete_account_modal(&account, cx),
             Confirm::Retention { days, prunable } => modal_panel(
@@ -2801,7 +2832,7 @@ mod tests {
 
     #[test]
     fn long_choice_sets_are_menus_and_the_button_stays_in_the_column() {
-        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "M8", "P4", "PS1", "D2", "V8", "V11", "V21", "V23", "V29", "V30", "V31", "V32"] {
+        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "NR", "M5", "M8", "LK", "P4", "PS1", "D2", "V8", "V11", "V21", "V23", "V29", "V30", "V31", "V32"] {
             assert!(menu_choice(id), "{id}");
         }
         assert_eq!(TRANSLATE_LABELS.len(), TRANSLATE_TO_CHOICES.len());

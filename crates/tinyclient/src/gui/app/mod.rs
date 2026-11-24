@@ -489,12 +489,25 @@ impl Shell {
         let action = button("update-act", ButtonKind::Ghost, label).h(px(24.)).px(px(8.)).text_color(theme::text()).on_click(cx.listener(|this, _, _, cx| {
             this.update_alert_act(cx);
         }));
-        let close = div().id("update-close").flex_none().cursor_pointer().child(glyph("icons/x.svg", 14., theme::text_faint())).on_click(
-            cx.listener(|this, _, _, cx| {
+        let close = div()
+            .id("update-close")
+            .role(gpui::Role::Button)
+            .aria_label("Dismiss")
+            .tab_index(0)
+            .flex_none()
+            .size(px(24.))
+            .rounded(px(theme::R_CONTROL))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::hover()))
+            .focus_visible(|s| s.shadow(theme::focus_ring()))
+            .child(glyph("icons/x.svg", 14., theme::text_faint()))
+            .on_click(cx.listener(|this, _, _, cx| {
                 this.layout_state.update_alert = false;
                 cx.notify();
-            }),
-        );
+            }));
         Some(
             toast(Some(("icons/download.svg", theme::accent())), words)
                 .w(px(width))
@@ -521,8 +534,18 @@ impl Shell {
         );
         let close = div()
             .id("crash-close")
+            .role(gpui::Role::Button)
+            .aria_label("Dismiss")
+            .tab_index(0)
             .flex_none()
+            .size(px(24.))
+            .rounded(px(theme::R_CONTROL))
+            .flex()
+            .items_center()
+            .justify_center()
             .cursor_pointer()
+            .hover(|s| s.bg(theme::hover()))
+            .focus_visible(|s| s.shadow(theme::focus_ring()))
             .child(glyph("icons/x.svg", 14., theme::text_faint()))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.crashed = None;
@@ -692,13 +715,15 @@ impl Shell {
         Some(
             div()
                 .absolute()
-                .left(px(layout::RAIL_WIDTH))
+                .left(px(layout::RAIL_WIDTH + 12.))
                 .top(px(theme::STRIP + 8.))
                 .w(px(360.))
-                .px(px(theme::INSET))
-                .pt(px(8.))
-                .pb(px(8.))
-                .bg(theme::sidebar())
+                .p(px(theme::INSET))
+                .rounded(px(theme::R_CARD))
+                .bg(theme::overlay())
+                .border_1()
+                .border_color(theme::border())
+                .shadow(theme::shadow_popover())
                 .occlude()
                 .child(line),
         )

@@ -133,9 +133,11 @@ pub(in crate::gui::tiny) fn voice(shell: &Shell, facts: &Facts, window: &mut Win
         })
         .collect();
     ordered.dedup_by(|a, b| a.id == b.id);
-    for room in ordered {
+    let room_count = ordered.len();
+    for (ix, room) in ordered.into_iter().enumerate() {
         rows = rows.child(
             table_row(SharedString::from(format!("tiny-voice-room-{}", room.id)), false)
+                .when(ix + 1 == room_count, |row| row.border_b_0())
                 .min_h(px(40.))
                 .child(
                     div()

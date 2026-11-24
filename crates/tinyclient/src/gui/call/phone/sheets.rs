@@ -250,11 +250,6 @@ impl Shell {
                 row("call-phone-more-echo", "icons/volume-2.svg", "Echo cancellation", Some(if echo { "On: no headphones needed".into() } else { "Off: wear headphones".into() }), Some(switch(echo)))
                     .on_click(cx.listener(move |this, _, _, cx| this.call_phone_switch(ECHO_CANCELLATION, !echo, cx))),
             )
-            .child(div().h(px(8.)))
-            .child(row("call-phone-more-settings", "icons/settings.svg", "Call settings", None, Some(chevron())).on_click(cx.listener(|this, _, _, cx| {
-                this.call_phone_close_sheet(cx);
-                crate::gui::settings::open(crate::gui::settings::Section::Audio, cx);
-            })))
     }
 
     /// Where the sound plays and which microphone hears me, with the microphone's level.

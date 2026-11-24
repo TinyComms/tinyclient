@@ -393,9 +393,13 @@ pub(in crate::gui::tiny) fn overview(shell: &Shell, facts: &Facts, window: &mut 
         if scans && editable {
             let on = draft.allow_archives.unwrap_or(server.allow_archives);
             uploads = uploads.child(
-                switch_row("tiny-allow-archives", "Allow archives", "Zip, 7z, rar, tar and gzip can be sent. Off, they are refused.", on, true).on_click(cx.listener(move |this, _, _, cx| {
-                    this.tiny_overview_draft(cx, move |overlay| overlay.overview.allow_archives = Some(!on));
-                })),
+                super::kit::card().child(
+                    switch_row("tiny-allow-archives", "Allow archives", "Zip, 7z, rar, tar and gzip can be sent. Off, they are refused.", on, true)
+                        .border_b_0()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tiny_overview_draft(cx, move |overlay| overlay.overview.allow_archives = Some(!on));
+                        })),
+                ),
             );
         }
         page = page.child(uploads);

@@ -160,13 +160,13 @@ pub(in crate::gui::tiny) fn reports(shell: &Shell, facts: &Facts, window: &mut W
     if let Some(detail) = &draft.selected {
         page = page.child(detail_card(shell, facts, detail, draft.working, draft.detail_error.as_deref(), window, cx));
     } else if draft.reading {
-        page = page.child(card().child(div().type_small().text_color(theme::text_faint()).child("Loading report…")));
+        page = page.child(card().p(px(14.)).child(div().type_small().text_color(theme::text_faint()).child("Loading report…")));
     }
 
     let mut list = card();
     if draft.rows.is_empty() {
         let msg = if draft.loading { "Loading reports…" } else { "No reports match these filters." };
-        list = list.child(div().type_small().text_color(theme::text_faint()).child(msg));
+        list = list.p(px(14.)).child(div().type_small().text_color(theme::text_faint()).child(msg));
     } else {
         for (ix, row) in draft.rows.iter().enumerate() {
             let selected = draft.selected.as_ref().is_some_and(|d| d.summary.id == row.id);
@@ -288,7 +288,7 @@ fn detail_card(
             })),
     );
 
-    let mut body = card().child(header);
+    let mut body = card().p(px(16.)).gap(px(14.)).child(header);
 
     if let Some(err) = error {
         body = body.child(div().type_small().text_color(theme::danger()).child(err.to_owned()));

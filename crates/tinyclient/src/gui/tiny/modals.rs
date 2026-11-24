@@ -71,7 +71,7 @@ impl Shell {
     }
 
     fn new_direct_modal(&self, page: &Page, window: &Window, cx: &mut Context<Self>) -> Div {
-        let query = self.tiny_state.search_input.read(cx).text().trim().to_lowercase();
+        let query = self.tiny_state.new_direct_input.read(cx).text().trim().to_lowercase();
         let mut members: Vec<&protocol::TinyMember> = page
             .community
             .members
@@ -115,7 +115,7 @@ impl Shell {
         }
         modal("New direct message")
             .child(words("Choose someone on this server to message."))
-            .child(div().mt(px(12.)).child(self.input_box(&self.tiny_state.search_input, window, cx)))
+            .child(div().mt(px(12.)).child(self.input_box(&self.tiny_state.new_direct_input, window, cx)))
             .child(list)
             .child(
                 div()
@@ -325,7 +325,15 @@ impl Shell {
                     actions = actions.child(button("tiny-profile-close", ButtonKind::Secondary, "Close").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))));
                     modal("Profile").w(px(400.)).child(div().mt(px(16.)).child(self.tiny_person_card(page, member, true))).child(actions)
                 }
-                None => modal("Profile").child(words("They are no longer on this server.")),
+                None => modal("Profile")
+                    .child(words("They are no longer on this server."))
+                    .child(
+                        div()
+                            .mt(px(16.))
+                            .flex()
+                            .justify_end()
+                            .child(button("tiny-profile-missing-close", ButtonKind::Secondary, "Close").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
+                    ),
             },
             Modal::SignOut { erase } => {
                 let erase = *erase;

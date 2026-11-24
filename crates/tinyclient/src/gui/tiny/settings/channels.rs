@@ -597,7 +597,7 @@ fn category_editor(shell: &Shell, facts: &Facts, category: &TinyCategory, window
             .child(kit::count(count)),
     );
     column = column.child(if facts.may.categories {
-        section("Category name").child(kit::input(&fields.category_name, Some(360.), window, cx))
+        section("Category name").child(kit::input(&fields.category_name, None, window, cx).max_w(px(360.)))
     } else {
         section("Category name").child(div().type_ui().child(category.name.clone()))
     });
@@ -638,7 +638,7 @@ fn room_editor(shell: &Shell, facts: &Facts, room: &TinyRoom, window: &mut Windo
         ),
     );
     column = column.child(if renames {
-        section("Channel name").child(kit::input(&fields.room_name, Some(360.), window, cx))
+        section("Channel name").child(kit::input(&fields.room_name, None, window, cx).max_w(px(360.)))
     } else {
         section("Channel name").child(div().type_ui().child(room.name.clone()))
     });
@@ -717,11 +717,12 @@ fn room_editor(shell: &Shell, facts: &Facts, room: &TinyRoom, window: &mut Windo
             section("Bitrate").child(div().type_small().text_color(theme::text_soft()).child("Higher sounds better and takes more of everyone's connection.")).child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(16.))
                     .child(track)
-                    .child(div().w(px(72.)).type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(format!("{kbps} kb/s")))
-                    .child(div().type_small().text_color(theme::text_faint()).child(quality)),
+                    .child(div().flex_none().w(px(72.)).type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(format!("{kbps} kb/s")))
+                    .child(div().min_w_0().whitespace_normal().type_small().text_color(theme::text_faint()).child(quality)),
             ),
         );
         let video = draft.video.unwrap_or(room.video_enabled);
@@ -815,7 +816,7 @@ fn channel_editor(shell: &Shell, facts: &Facts, channel: &TinyChannel, window: &
             })),
     );
     column = column.child(if can_manage {
-        section("Channel name").child(kit::input(&fields.room_name, Some(360.), window, cx))
+        section("Channel name").child(kit::input(&fields.room_name, None, window, cx).max_w(px(360.)))
     } else {
         section("Channel name").child(div().type_ui().child(channel.name.clone()))
     });

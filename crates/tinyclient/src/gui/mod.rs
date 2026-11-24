@@ -313,6 +313,41 @@ pub(crate) fn prove_tiny_call_ux() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The lab's ui-wave2-polish driver. Verifies Wave 2 invariants: desktop phone-form safe insets
+/// default to zero, Inbox stacks below 370 px so Activity + Mark all read do not clip, Lock timer
+/// (LK) and Reaction notifications (NR) use dropdown menus, and overlay z-layers stay ordered.
+pub(crate) fn prove_ui_wave2_polish() -> Result<(), &'static str> {
+    if !phone::HANDHELD {
+        if phone::tokens::safe_top() != 0.
+            || phone::tokens::safe_bottom() != 0.
+            || phone::tokens::safe_left() != 0.
+            || phone::tokens::safe_right() != 0.
+        {
+            return Err("desktop narrow window reported nonzero simulated phone safe insets");
+        }
+    }
+    let mid = sidebar::inbox_strip_fit(316., false, 1., true);
+    if !mid.stacked || !mid.mark_all {
+        return Err("desktop inbox strip did not stack at 316 px to avoid clipping Activity");
+    }
+    let wide = sidebar::inbox_strip_fit(400., false, 1., true);
+    if wide.stacked || !wide.counts || !wide.mark_all {
+        return Err("desktop inbox strip did not stay single-line at 400 px");
+    }
+    if !settings::pages::menu_choice("LK") || settings::pages::choice_id("LK") != Some("LK") {
+        return Err("Lock timer (LK) was not converted to a dropdown menu");
+    }
+    if !settings::pages::menu_choice("NR") || settings::pages::choice_id("NR") != Some("NR") {
+        return Err("Reaction notifications (NR) was not converted to a dropdown menu");
+    }
+    if !(components::place::Layer::Modal as usize > components::place::Layer::Toast as usize
+        && components::place::Layer::Toast as usize > components::place::Layer::Float as usize)
+    {
+        return Err("overlay z-order priorities were not strictly ordered");
+    }
+    Ok(())
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, MenuItem, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 

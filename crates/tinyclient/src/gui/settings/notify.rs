@@ -190,7 +190,7 @@ impl SettingsWindow {
     }
 
     /// The rows of this module, by id; `None` for anyone else's.
-    pub(super) fn notify_row(&mut self, id: &'static str, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn notify_row(&mut self, id: &'static str, window: &gpui::Window, cx: &mut Context<Self>) -> Option<Div> {
         let values = prefs::values();
         if let Some((key, default)) = switch_of(id) {
             let on = values.on(key);
@@ -232,7 +232,7 @@ impl SettingsWindow {
         Some(match id {
             "N7" => self.pause_row(&values, cx),
             "N13" => self.test_row(cx),
-            "NK" => self.keywords_row(cx),
+            "NK" => self.keywords_row(window, cx),
             "SV" => row(rows::find(id).map_or("", |row| row.label), None, self.slider_control(id, cx)),
             _ => return None,
         })
@@ -244,18 +244,11 @@ impl SettingsWindow {
         self.set("NK", GLOBAL.into(), keys::NOTIFY_KEYWORDS, stored, cx);
     }
 
-    fn keywords_row(&mut self, cx: &mut Context<Self>) -> Div {
-        let field = div()
+    fn keywords_row(&mut self, window: &gpui::Window, cx: &mut Context<Self>) -> Div {
+        let focused = gpui::Focusable::focus_handle(self.notify_keywords.read(cx), cx).is_focused(window);
+        let field = crate::gui::components::field(focused)
             .w(px(190.))
-            .h(px(28.))
-            .px(px(8.))
-            .rounded(px(theme::R_CONTROL))
-            .bg(theme::field())
-            .border_1()
-            .border_color(theme::border())
-            .flex()
-            .items_center()
-            .child(self.notify_keywords.clone());
+            .child(div().flex_1().min_w_0().child(self.notify_keywords.clone()));
         let save = button("nk-save", ButtonKind::Secondary, "Save")
             .on_click(cx.listener(|this, _, _, cx| this.save_keywords(cx)));
         let control = div().flex().items_center().gap(px(6.)).child(field).child(save);

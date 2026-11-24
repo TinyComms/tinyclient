@@ -500,11 +500,13 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn discord_admin_layer(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        self.channel_permissions_modal(cx).or_else(|| self.audit_log_modal(cx)).or_else(|| self.safety_modal(cx))
+    pub(in crate::gui) fn discord_admin_layer(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        self.channel_permissions_modal(window, cx)
+            .or_else(|| self.audit_log_modal(window, cx))
+            .or_else(|| self.safety_modal(window, cx))
     }
 
-    fn audit_log_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    fn audit_log_modal(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.discord_admin_state.audit.as_ref()?;
         let title = format!("Audit log · {}", modal.name);
         let selected = modal.action;
@@ -607,16 +609,18 @@ impl Shell {
 
         let loading = modal.loading;
         let more = modal.more && !modal.entries.is_empty();
+        let person_focused = gpui::Focusable::focus_handle(modal.person.read(cx), cx).is_focused(window);
         let card = div()
             .id("discord-audit-card")
             .w(px(640.))
             .max_w_full()
             .max_h(px(640.))
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -626,11 +630,16 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(title))
-                    .child(icon_button("discord-audit-close", "icons/x.svg", false).size(px(24.)).on_click(cx.listener(|this, _, _, cx| {
-                        this.discord_admin_state.audit = None;
-                        cx.notify();
-                    }))),
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().truncate().type_title().text_color(theme::text()).child(title))
+                    .child(
+                        icon_button("discord-audit-close", "icons/x.svg", false)
+                            .aria_label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discord_admin_state.audit = None;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -638,17 +647,10 @@ impl Shell {
                     .items_center()
                     .gap(px(8.))
                     .child(
-                        div()
+                        super::components::field(person_focused)
                             .flex_1()
                             .min_w_0()
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded(px(theme::R_CONTROL))
-                            .bg(theme::canvas())
-                            .border_1()
-                            .border_color(theme::border())
-                            .type_small()
-                            .child(modal.person.clone()),
+                            .child(div().flex_1().min_w_0().child(modal.person.clone())),
                     )
                     .child(button("discord-audit-apply", ButtonKind::Secondary, "Apply").on_click(cx.listener(|this, _, _, cx| this.reload_audit_log(false, cx)))),
             )
@@ -670,6 +672,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -681,7 +684,7 @@ impl Shell {
         )
     }
 
-    fn channel_permissions_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    fn channel_permissions_modal(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.discord_admin_state.perms.as_ref()?;
         let title = modal
             .info
@@ -835,7 +838,7 @@ impl Shell {
                     let is_allow = !is_deny && (draft_allow & bit != 0);
                     let is_inherit = !is_deny && !is_allow;
                     let eff = effective_self & bit != 0;
-                    let pill = |id: SharedString, label: &'static str, active: bool, active_bg: gpui::Rgba| {
+                    let pill = |id: SharedString, label: &'static str, active: bool, active_bg: gpui::Rgba, active_fg: gpui::Rgba| {
                         div()
                             .id(id)
                             .px(px(6.))
@@ -843,7 +846,7 @@ impl Shell {
                             .rounded(px(theme::R_CONTROL))
                             .bg(if active { active_bg } else { theme::raised() })
                             .type_micro()
-                            .text_color(if active { theme::text() } else { theme::text_soft() })
+                            .text_color(if active { active_fg } else { theme::text_soft() })
                             .cursor_pointer()
                             .child(label)
                     };
@@ -886,7 +889,7 @@ impl Shell {
                                     .items_center()
                                     .gap(px(4.))
                                     .child(
-                                        pill(SharedString::from(format!("perm-deny-{ix}")), "Deny", is_deny, theme::danger())
+                                        pill(SharedString::from(format!("perm-deny-{ix}")), "Deny", is_deny, theme::danger(), theme::on_accent())
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 if let Some(m) = this.discord_admin_state.perms.as_mut() {
                                                     m.draft_allow &= !bit;
@@ -897,7 +900,7 @@ impl Shell {
                                             })),
                                     )
                                     .child(
-                                        pill(SharedString::from(format!("perm-inh-{ix}")), "Inherit", is_inherit, theme::selected())
+                                        pill(SharedString::from(format!("perm-inh-{ix}")), "Inherit", is_inherit, theme::selected(), theme::text())
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 if let Some(m) = this.discord_admin_state.perms.as_mut() {
                                                     m.draft_allow &= !bit;
@@ -908,7 +911,7 @@ impl Shell {
                                             })),
                                     )
                                     .child(
-                                        pill(SharedString::from(format!("perm-allow-{ix}")), "Allow", is_allow, theme::accent())
+                                        pill(SharedString::from(format!("perm-allow-{ix}")), "Allow", is_allow, theme::accent(), theme::on_accent())
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 if let Some(m) = this.discord_admin_state.perms.as_mut() {
                                                     m.draft_deny &= !bit;
@@ -1019,15 +1022,8 @@ impl Shell {
                                         .gap(px(4.))
                                         .child(div().type_micro().text_color(theme::text_faint()).child("Add member by ID"))
                                         .child(
-                                            div()
-                                                .px(px(6.))
-                                                .py(px(4.))
-                                                .rounded(px(theme::R_CONTROL))
-                                                .bg(theme::canvas())
-                                                .border_1()
-                                                .border_color(theme::border())
-                                                .type_small()
-                                                .child(modal.add_member.clone()),
+                                            super::components::field(gpui::Focusable::focus_handle(modal.add_member.read(cx), cx).is_focused(window))
+                                                .child(div().flex_1().min_w_0().child(modal.add_member.clone())),
                                         )
                                         .child(
                                             button("perm-add-member", ButtonKind::Secondary, "Add member").on_click(
@@ -1068,10 +1064,11 @@ impl Shell {
             .w(px(760.))
             .max_w_full()
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -1081,13 +1078,16 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().type_title().text_color(theme::text()).child(title))
-                    .child(icon_button("discord-perms-close", "icons/x.svg", false).size(px(24.)).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.discord_admin_state.perms = None;
-                            cx.notify();
-                        }),
-                    )),
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().truncate().type_title().text_color(theme::text()).child(title))
+                    .child(
+                        icon_button("discord-perms-close", "icons/x.svg", false)
+                            .aria_label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discord_admin_state.perms = None;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(body)
             .children(modal.error.as_ref().map(|e| div().type_small().text_color(theme::danger()).child(e.clone())))
@@ -1117,6 +1117,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1438,7 +1439,7 @@ impl Shell {
         .detach();
     }
 
-    fn safety_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    fn safety_modal(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.discord_admin_state.safety.as_ref()?;
         let title = format!("Safety setup · {}", modal.name);
         let loaded = modal.loaded;
@@ -1572,34 +1573,37 @@ impl Shell {
             .flex_col()
             .gap(px(8.))
             .child(div().type_small().text_color(theme::text()).child(if modal.creating { "New rule" } else { "Edit rule" }))
-            .child(field_box("Name", modal.name_input.clone()))
+            .child(field_box("Name", modal.name_input.clone(), window, cx))
             .child(toggle_line(cx, "safety-enabled", "Enabled", modal.draft_enabled, |m| &mut m.draft_enabled))
             .when(modal.creating, |col| col.child(div().flex().flex_wrap().gap(px(6.)).children(triggers)))
             .when(!modal.creating, |col| col.child(div().type_small().text_color(theme::text_faint()).child(trigger_label)))
             .when(modal.draft_trigger == 1 || modal.draft_trigger == 6, |col| {
-                col.child(field_box("Keywords", modal.words.clone())).child(field_box("Patterns", modal.patterns.clone())).child(field_box("Allow list", modal.allow.clone()))
+                col.child(field_box("Keywords", modal.words.clone(), window, cx))
+                    .child(field_box("Patterns", modal.patterns.clone(), window, cx))
+                    .child(field_box("Allow list", modal.allow.clone(), window, cx))
             })
             .when(modal.draft_trigger == 4, |col| {
-                col.child(div().flex().flex_wrap().gap(px(6.)).children(presets)).child(field_box("Allow list", modal.allow.clone()))
+                col.child(div().flex().flex_wrap().gap(px(6.)).children(presets))
+                    .child(field_box("Allow list", modal.allow.clone(), window, cx))
             })
             .when(modal.draft_trigger == 5, |col| {
-                col.child(field_box("Mention limit", modal.mention_limit.clone()))
+                col.child(field_box("Mention limit", modal.mention_limit.clone(), window, cx))
                     .child(toggle_line(cx, "safety-raid", "Mention raid protection", modal.draft_raid, |m| &mut m.draft_raid))
             })
             .child(div().type_micro().text_color(theme::text_faint()).child("Actions"))
             .when(modal.draft_trigger != 6, |col| {
                 col.child(toggle_line(cx, "safety-block", "Block message", modal.draft_block, |m| &mut m.draft_block)).when(modal.draft_block, |col| {
-                    col.child(field_box("Block message", modal.block_message.clone()))
+                    col.child(field_box("Block message", modal.block_message.clone(), window, cx))
                         .child(div().type_micro().text_color(theme::text_faint()).child("Shown to the member. Not a command."))
                 })
             })
             .child(toggle_line(cx, "safety-alert", "Alert a channel", modal.draft_alert, |m| &mut m.draft_alert))
-            .when(modal.draft_alert, |col| col.child(field_box("Alert channel", modal.alert_channel.clone())))
+            .when(modal.draft_alert, |col| col.child(field_box("Alert channel", modal.alert_channel.clone(), window, cx)))
             .when(can_timeout, |col| col.child(toggle_line(cx, "safety-timeout", "Time the member out", modal.draft_timeout, |m| &mut m.draft_timeout)))
-            .when(can_timeout && modal.draft_timeout, |col| col.child(field_box("Timeout seconds", modal.timeout_seconds.clone())))
+            .when(can_timeout && modal.draft_timeout, |col| col.child(field_box("Timeout seconds", modal.timeout_seconds.clone(), window, cx)))
             .when(modal.draft_trigger == 6, |col| col.child(toggle_line(cx, "safety-quarantine", "Block member", modal.draft_quarantine, |m| &mut m.draft_quarantine)))
-            .child(field_box("Exempt roles", modal.exempt_roles.clone()))
-            .child(field_box("Exempt channels", modal.exempt_channels.clone()))
+            .child(field_box("Exempt roles", modal.exempt_roles.clone(), window, cx))
+            .child(field_box("Exempt channels", modal.exempt_channels.clone(), window, cx))
             .child(
                 div()
                     .flex()
@@ -1621,10 +1625,11 @@ impl Shell {
             .max_w_full()
             .max_h(px(720.))
             .p(px(16.))
-            .rounded(px(theme::R_FLOAT))
+            .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
             .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -1634,11 +1639,16 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(title))
-                    .child(icon_button("discord-safety-close", "icons/x.svg", false).size(px(24.)).on_click(cx.listener(|this, _, _, cx| {
-                        this.discord_admin_state.safety = None;
-                        cx.notify();
-                    }))),
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().truncate().type_title().text_color(theme::text()).child(title))
+                    .child(
+                        icon_button("discord-safety-close", "icons/x.svg", false)
+                            .aria_label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discord_admin_state.safety = None;
+                                cx.notify();
+                            })),
+                    ),
             )
             .children(modal.error.as_ref().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
             .child(
@@ -1691,6 +1701,7 @@ impl Shell {
                 .absolute()
                 .inset_0()
                 .bg(theme::scrim())
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1723,23 +1734,14 @@ fn toggle_line(
     }))
 }
 
-fn field_box(label: &str, input: Entity<TextInput>) -> Div {
+fn field_box(label: &str, input: Entity<TextInput>, window: &gpui::Window, cx: &Context<Shell>) -> Div {
+    let focused = gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window);
     div()
         .flex()
         .flex_col()
         .gap(px(4.))
         .child(div().type_micro().text_color(theme::text_faint()).child(label.to_owned()))
-        .child(
-            div()
-                .px(px(8.))
-                .py(px(4.))
-                .rounded(px(theme::R_CONTROL))
-                .bg(theme::canvas())
-                .border_1()
-                .border_color(theme::border())
-                .type_small()
-                .child(input),
-        )
+        .child(super::components::field(focused).child(div().flex_1().min_w_0().child(input)))
 }
 
 fn blank_rule() -> AutomodRule {
