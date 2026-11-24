@@ -878,9 +878,11 @@ impl Chat {
 
     /// A row as the shell is told it: what is stored, and who is in it right now.
     fn row(&self, mut conversation: Conversation) -> Conversation {
+        // A Slack conversation can hold a huddle, which is handed off rather than native, so
+        // the network names it here.
         if conversation.kind == ConversationKind::Voice
             || conversation.call == CallSupport::Native
-            || conversation.key.network == Network::Telegram
+            || matches!(conversation.key.network, Network::Telegram | Network::Slack)
         {
             conversation.occupants = self.hub.occupants(&conversation.key);
         }
@@ -9071,6 +9073,30 @@ mod tests {
             assert!(std::path::Path::new(&path).is_file());
             assert_eq!(avatar.bytes, bytes);
         }
+    }
+
+    #[test]
+    fn a_slack_row_carries_its_huddles_people_and_other_handoff_rows_stay_as_they_were() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let slack = AccountKey { network: Network::Slack, account: "acme".into() };
+        let teams = AccountKey { network: Network::Teams, account: "contoso".into() };
+        let handoff = protocol::CallSupport::Handoff;
+        store.set_account(&slack, "Acme", "U0ME").unwrap();
+        store.set_account(&teams, "Contoso", "ada").unwrap();
+        store.upsert_conversation(&slack, &ConversationRow { call: handoff, ..ConversationRow::new("C0GEN", ConversationKind::Channel, "#general") }).unwrap();
+        store.upsert_conversation(&teams, &ConversationRow { call: handoff, ..ConversationRow::new("19:meeting", ConversationKind::Channel, "Standup") }).unwrap();
+        let chat = super::Chat::new(store);
+        let inside = protocol::Occupants { total: 2, ..Default::default() };
+        let general = Key::new(&slack, "C0GEN");
+        let standup = Key::new(&teams, "19:meeting");
+        chat.hub.set_occupants(general.clone(), inside.clone());
+        chat.hub.set_occupants(standup.clone(), inside.clone());
+        let general = chat.hub.store().conversation(&general).unwrap().unwrap();
+        let standup = chat.hub.store().conversation(&standup).unwrap().unwrap();
+        // A Slack huddle is handed to Slack, and the row is where the shell learns it is running.
+        assert_eq!(chat.row(general).occupants.as_ref().map(|inside| inside.total), Some(2));
+        // A Teams meeting chat is handed off too, and nothing there lists who is in it.
+        assert!(chat.row(standup).occupants.is_none());
     }
 
     #[test]

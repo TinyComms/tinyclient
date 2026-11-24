@@ -689,6 +689,13 @@ pub(super) fn prove_custom_emoji() -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a message's room object is a huddle's: the subtype says so, or the room does.
+/// Slack's old calls (`sh_room_created`) have a room too, and are not huddles. The card and the
+/// conversation's row agree on this one rule.
+pub(super) fn is_huddle(subtype: Option<&str>, room: &Value) -> bool {
+    room.is_object() && subtype != Some("sh_room_created") && (subtype == Some("huddle_thread") || room[super::huddle::field::FAMILY] == "huddle")
+}
+
 /// Slack updates the same room message when the huddle ends. The active list may then
 /// be empty, so the history is what tells us who joined.
 fn huddle_note(room: &Value) -> CallNote {
@@ -2046,9 +2053,7 @@ impl Slack {
         let system = subtype.is_some_and(|subtype| SYSTEM.contains(&subtype));
         let room = &event["room"];
         // Slack's old calls have a room object too. Only huddles get its summary card.
-        let huddle = (room.is_object() && subtype != Some("sh_room_created")
-            && (subtype == Some("huddle_thread") || room["call_family"] == "huddle"))
-            .then(|| huddle_note(room));
+        let huddle = is_huddle(subtype, room).then(|| huddle_note(room));
         if let Some(note) = &huddle {
             let people = std::iter::once(&note.caller_id)
                 .chain(note.participants.iter().take(THREAD_FACES))

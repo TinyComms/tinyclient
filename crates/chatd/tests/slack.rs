@@ -2563,6 +2563,66 @@ fn slack_huddle_history_opens_its_thread_and_links_its_notes() {
 }
 
 #[test]
+fn a_huddles_channel_lists_who_is_in_it_as_they_join_and_leave() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let in_the_huddle = |world: &World, total: u32| {
+        world.until(&format!("the huddle's channel to list {total}"), || {
+            world.conversation(&general)?.occupants.filter(|inside| inside.total == total)
+        })
+    };
+    fn who(inside: &protocol::Occupants) -> Vec<&str> {
+        inside.people.iter().map(|person| person.name.as_str()).collect()
+    }
+    assert!(world.conversation(&general).unwrap().occupants.is_none(), "no huddle has started");
+
+    // Ana starts a huddle: the message that carries the room, as the card reads it.
+    let huddle = "1760000800.000800";
+    let room = |who: &[&str]| {
+        json!({
+            "id": "R0HUD", "created_by": "U0ANA", "date_start": 1760000800, "channels": ["C0GEN"],
+            "participants": who, "has_ended": false, "call_family": "huddle", "thread_root_ts": huddle,
+        })
+    };
+    world.fake.push(ALPHA, json!({
+        "type": "message", "subtype": "huddle_thread", "user": "USLACKBOT", "channel": "C0GEN", "team": "T01ALPHA",
+        "ts": huddle, "event_ts": huddle, "room": room(&["U0ANA"]),
+    }));
+    let one = in_the_huddle(&world, 1);
+    assert_eq!(who(&one), ["Ana"]);
+    assert_eq!(one.people[0].person, alpha("U0ANA"));
+    assert!(one.people[0].avatar.is_some(), "the face on the row is Ana's own");
+
+    // Ben joins: the socket says so, carrying the room as it stands now.
+    world.fake.push(ALPHA, json!({
+        "type": "sh_room_join", "user": "U0BEN", "channel": "C0GEN", "event_ts": "1760000850.000000",
+        "room": room(&["U0ANA", "U0BEN"]),
+    }));
+    let two = in_the_huddle(&world, 2);
+    assert_eq!(who(&two), ["Ana", "Ben Ito"]);
+
+    // He leaves again: this one names him and the channel, and nothing else.
+    world.fake.push(ALPHA, json!({"type": "sh_room_leave", "user": "U0BEN", "channel": "C0GEN", "event_ts": "1760000900.000000"}));
+    let one = in_the_huddle(&world, 1);
+    assert_eq!(who(&one), ["Ana"]);
+
+    // The huddle ends: Slack updates the same message.
+    world.fake.push(ALPHA, json!({
+        "type": "message", "subtype": "message_changed", "hidden": true, "channel": "C0GEN",
+        "ts": "1760001100.000000", "event_ts": "1760001100.000000",
+        "message": {
+            "type": "message", "subtype": "huddle_thread", "user": "USLACKBOT", "channel": "C0GEN", "ts": huddle,
+            "room": {
+                "id": "R0HUD", "created_by": "U0ANA", "date_start": 1760000800, "date_end": 1760001100, "channels": ["C0GEN"],
+                "participants": [], "has_ended": true, "call_family": "huddle",
+            },
+        },
+    }));
+    world.until("the huddle's channel to be empty again", || world.conversation(&general)?.occupants.is_none().then_some(()));
+}
+
+#[test]
 fn a_message_with_no_replies_can_start_its_thread() {
     let world = World::start();
     world.ready();

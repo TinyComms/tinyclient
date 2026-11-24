@@ -11,6 +11,7 @@
 //! and messages go to the store as they are parsed.
 
 mod emoji;
+mod huddle;
 mod info;
 mod message;
 mod people;
@@ -347,6 +348,9 @@ struct State {
     /// Followed thread conversation ids (`C0…:root_ts`) learned from `subscriptions.thread.getView`,
     /// `conversations.replies`, `FollowThread`, and live `thread_subscribed` / `thread_unsubscribed` events.
     followed_threads: HashSet<String>,
+    /// Conversations with a huddle running, and who is in it (`huddle`). Only what the socket
+    /// sends and what a page read anyway says; nothing is asked of Slack for them.
+    rooms: HashMap<String, huddle::Room>,
 }
 
 /// Remote draft metadata tracked so subsequent edits call `drafts.update` and clears call `drafts.delete`.
@@ -1345,6 +1349,10 @@ impl Slack {
             // Unverified: `user_huddle_changed` and `user_status_changed` carry it as
             // `user_change` does (the community's reading).
             "user_change" | "user_huddle_changed" | "user_status_changed" => self.user_changed(&event["user"]),
+            huddle::JOIN | huddle::LEAVE | huddle::UPDATE => {
+                self.room_event(event);
+                Ok(())
+            }
             "member_joined_channel" | "member_left_channel" => {
                 self.member_moved(event);
                 Ok(())
@@ -1475,6 +1483,9 @@ impl Slack {
         let Some(mut message) = self.message(channel, event) else {
             return Ok(());
         };
+        // Before the message is stored: the shell reads the row again as the message lands, and
+        // the huddle's people are to be on it by then.
+        self.rooms_read(channel, std::slice::from_ref(event));
         let root = event["thread_ts"].as_str().filter(|root| *root != message.id);
         // Ephemeral messages ("Only visible to you") are never written to persistent channel history.
         if message.ephemeral {
@@ -1576,6 +1587,9 @@ impl Slack {
         let Some(message) = self.message(channel, inner) else {
             return Ok(());
         };
+        // The huddle's own message as Slack changes it: who joined, who left, that it ended.
+        // Read before the shell is told, so the row already says it when it is read again.
+        self.rooms_read(channel, std::slice::from_ref(inner));
         let root = inner["thread_ts"].as_str().unwrap_or(&message.id);
         let reply = root != message.id;
         let in_channel = !reply || inner["subtype"] == "thread_broadcast";
