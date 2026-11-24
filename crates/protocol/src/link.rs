@@ -566,6 +566,16 @@ fn pct_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A Slack id as Slack writes one in an address (`T01ALPHA`, `C0GENERIC`, `D0DIRECT`): an
+/// upper-case letter, then up to 31 more letters or digits. A message carries these, so nothing
+/// else is taken for one: no lower case, no dot, slash, percent sign or encoding.
+fn slack_id(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    (2..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_uppercase()
+        && bytes.iter().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
 /// Extracts the invite hash from a Telegram invite link:
 /// `https://t.me/+<hash>`, `https://t.me/joinchat/<hash>`, `telegram.me/...`, `telegram.dog/...`,
 /// `tg://join?invite=<hash>`, or bare `+<hash>` pasted into the join dialog.
@@ -617,6 +627,15 @@ pub fn telegram_invite_hash(raw: &str) -> Option<String> {
 /// A `t.me` or `tg://` `start` payload: 1 to 64 letters, digits, `_`, or `-`.
 fn telegram_start_param(raw: &str) -> bool {
     (1..=64).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The address Slack's own "Copy huddle link" gives for a conversation's huddle, which the
+/// official app opens: `https://app.slack.com/huddle/TEAM/CHANNEL`. [`parse_network_link`] reads
+/// it back. The one place the address is made: chatd's hand-off and the window's "Copy huddle
+/// link" both call it. Not verified against a real workspace that it starts the huddle rather
+/// than only opening the conversation, or what it does when no huddle is running (#576).
+pub fn slack_huddle_link(team: &str, channel: &str) -> String {
+    format!("https://app.slack.com/huddle/{team}/{channel}")
 }
 
 /// Parses a message or conversation link for any supported network (the inverse of `message_link`).
@@ -700,6 +719,25 @@ pub fn parse_network_link(raw: &str) -> Option<NetworkLink> {
             message_id,
             thread_id,
         });
+    }
+
+    // Slack huddle: https://app.slack.com/huddle/{team}/{channel}. Another person writes it into
+    // a message, so only Slack's own host with nothing on it but the two ids is one; the rest of
+    // that host's addresses go on to the archive branch as they did.
+    if scheme == "https" && host == "app.slack.com" && segments.first().copied() == Some("huddle") {
+        // Read on the path as it came, empty parts included: `/T/C/` and `/T/C/x` are not `/T/C`.
+        let path: Vec<&str> = parsed.path_segments().map(|path| path.collect()).unwrap_or_default();
+        let plain = parsed.port().is_none() && parsed.username().is_empty() && parsed.password().is_none();
+        return match path.as_slice() {
+            ["huddle", team, channel] if plain && slack_id(team) && slack_id(channel) => Some(NetworkLink {
+                network: crate::Network::Slack,
+                space: Some((*team).to_owned()),
+                channel: (*channel).to_owned(),
+                message_id: None,
+                thread_id: None,
+            }),
+            _ => None,
+        };
     }
 
     // Slack web archive: https://{team}.slack.com/archives/{channel}[/p{ts}][?thread_ts={tts}]
@@ -1493,6 +1531,82 @@ mod tests {
         assert_eq!(telegram_invite_hash("+BareHash"), Some("BareHash".into()));
         assert_eq!(telegram_invite_hash("https://t.me/rustlang"), None);
         assert_eq!(telegram_invite_hash("https://example.com/+not_tg"), None);
+    }
+
+    #[test]
+    fn a_huddle_link_names_its_workspace_and_channel() {
+        use crate::Network;
+
+        assert_eq!(
+            parse_network_link("https://app.slack.com/huddle/T01ALPHA/C0GENERIC"),
+            Some(NetworkLink {
+                network: Network::Slack,
+                space: Some("T01ALPHA".into()),
+                channel: "C0GENERIC".into(),
+                message_id: None,
+                thread_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn only_slacks_own_host_with_two_ids_is_a_huddle_link() {
+        use crate::Network;
+
+        // Another person writes the address into a message: only Slack's own host, with nothing
+        // on it but the two ids, is read as one.
+        let long = format!("https://app.slack.com/huddle/T01ALPHA/C{}", "0".repeat(40));
+        for other in [
+            "https://app.slack.com/huddle/T01ALPHA/C0GENERIC/extra",
+            "https://app.slack.com/huddle/T01ALPHA/C0GENERIC/",
+            "https://app.slack.com/huddle/T01ALPHA/C0GENERIC/..",
+            "https://app.slack.com/huddle/T01ALPHA/C0GENERIC/.",
+            "https://app.slack.com/huddle//C0GENERIC",
+            "https://app.slack.com/huddle/T01ALPHA",
+            "https://app.slack.com/huddle",
+            "https://app.slack.com/client/T01ALPHA/C0GENERIC",
+            "https://app.slack.com/huddle/T01ALPHA/C0..GENERIC",
+            "https://app.slack.com/huddle/T01ALPHA/C0%2FGENERIC",
+            "https://app.slack.com/huddle/T01ALPHA/C0_GENERIC",
+            "https://app.slack.com/huddle/t01alpha/c0generic",
+            "https://app.slack.com/huddle/1TEAM/C0GENERIC",
+            "https://app.slack.com/huddle/T01ALPHA/C",
+            long.as_str(),
+            "https://evil.app.slack.com/huddle/T01ALPHA/C0GENERIC",
+            "https://app.slack.com.evil.example/huddle/T01ALPHA/C0GENERIC",
+            "https://app.slack.com@evil.example/huddle/T01ALPHA/C0GENERIC",
+            "https://evil@app.slack.com/huddle/T01ALPHA/C0GENERIC",
+            "https://app.slack.com:8443/huddle/T01ALPHA/C0GENERIC",
+            "http://app.slack.com/huddle/T01ALPHA/C0GENERIC",
+            "slack://huddle/T01ALPHA/C0GENERIC",
+        ] {
+            assert_eq!(parse_network_link(other), None, "{other}");
+        }
+        // The same address however it was pasted: a tracking parameter, a fragment, spaces
+        // around it, the host in capitals, and a huddle in a direct conversation.
+        let channel = |id: &str| Some(NetworkLink {
+            network: Network::Slack,
+            space: Some("T01ALPHA".into()),
+            channel: id.into(),
+            message_id: None,
+            thread_id: None,
+        });
+        assert_eq!(parse_network_link(" https://app.slack.com/huddle/T01ALPHA/C0GENERIC?utm_source=x#now "), channel("C0GENERIC"));
+        assert_eq!(parse_network_link("https://APP.SLACK.COM/huddle/T01ALPHA/D0DIRECT"), channel("D0DIRECT"));
+        // Nothing else on that host moved: an archive address still reads as it did.
+        let archives = parse_network_link("https://app.slack.com/archives/C9/p1700000000123456").unwrap();
+        assert_eq!((archives.network, archives.channel.as_str()), (Network::Slack, "C9"));
+    }
+
+    #[test]
+    fn the_huddle_address_is_built_in_one_place_and_reads_back() {
+        use crate::Network;
+
+        assert_eq!(slack_huddle_link("T01ALPHA", "C0GENERIC"), "https://app.slack.com/huddle/T01ALPHA/C0GENERIC");
+        let built = slack_huddle_link("T01ALPHA", "C0GENERIC");
+        let parsed = parse_network_link(&built).unwrap();
+        assert_eq!((parsed.network, parsed.space.as_deref(), parsed.channel.as_str()), (Network::Slack, Some("T01ALPHA"), "C0GENERIC"));
+        assert_eq!((parsed.message_id, parsed.thread_id), (None, None), "a huddle is a conversation's, not a message's");
     }
 
     #[test]
