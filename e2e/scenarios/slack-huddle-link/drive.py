@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Drive the real desktop app against an invented Slack workspace: copy a huddle link from a
+row's menu, then follow the address a message carries into the huddle's conversation.
+
+Env from the lab: E2E_OUT, E2E_T0, E2E_APP_DIR. The drivers use PyAutoGUI, Tesseract, and
+something that reads the clipboard: PowerShell's Get-Clipboard on Windows, pbpaste on macOS,
+xclip or xsel on Linux.
+"""
+
+from contextlib import contextmanager
+import csv
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+import pyautogui
+
+from fixture import LINK, WORKSPACE, environment, slack_fixture
+
+
+OUT = Path(os.environ["E2E_OUT"])
+T0 = float(os.environ["E2E_T0"])
+PLATFORM = sys.argv[1]
+# The row whose message carries the huddle's address.
+OTHER_ROW = "town-square"
+# What the clipboard holds before the copy, so a copy that did nothing cannot pass on what an
+# earlier run left.
+SENTINEL = "tinyclient-e2e-before-the-copy"
+
+READERS = {
+    "windows": [["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"]],
+    "macos": [["pbpaste"]],
+    "linux": [["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"]],
+}
+WRITERS = {
+    "windows": [["powershell", "-NoProfile", "-Command", f"Set-Clipboard -Value '{SENTINEL}'"]],
+    "macos": [["pbcopy"]],
+    "linux": [["xclip", "-selection", "clipboard", "-i"], ["xsel", "--clipboard", "--input"]],
+}
+
+
+def words_at_screen(shot):
+    image = pyautogui.screenshot()
+    image.save(shot)
+    width, height = pyautogui.size()
+    scale_x, scale_y = width / image.width, height / image.height
+    response = subprocess.run(
+        ["tesseract", str(shot), "stdout", "tsv"], capture_output=True, check=True, text=True, encoding="utf-8",
+    )
+    lines = {}
+    for word in csv.DictReader(io.StringIO(response.stdout), delimiter="\t"):
+        text = word["text"].casefold().strip(".,·•:;#?!")
+        if text:
+            line = tuple(word[key] for key in ("block_num", "par_num", "line_num"))
+            x = int(word["left"]) + int(word["width"]) / 2
+            y = int(word["top"]) + int(word["height"]) / 2
+            lines.setdefault(line, []).append((text, round(x * scale_x), round(y * scale_y)))
+    return list(lines.values())
+
+
+def matches(lines, phrase):
+    wanted = phrase.casefold().split()
+    for line in lines:
+        for start in range(len(line) - len(wanted) + 1):
+            span = line[start:start + len(wanted)]
+            if [word[0] for word in span] == wanted:
+                yield ((span[0][1] + span[-1][1]) // 2, span[0][2])
+
+
+def record(step, ok, shot):
+    with (OUT / "steps.jsonl").open("a", encoding="utf-8") as steps:
+        steps.write(json.dumps({"t": round(time.time() - T0, 2), "step": step, "ok": ok, "shot": shot}) + "\n")
+
+
+def expect(step, *phrases):
+    shot = OUT / f"{step}.png"
+    deadline = time.monotonic() + 15
+    while True:
+        lines = words_at_screen(shot)
+        if all(next(matches(lines, phrase), None) for phrase in phrases):
+            ok = True
+            break
+        if time.monotonic() >= deadline:
+            ok = False
+            break
+        time.sleep(0.3)
+    record(step, ok, shot.name)
+    if not ok:
+        raise RuntimeError(f"{step}: expected {', '.join(phrases)}")
+    return lines
+
+
+def huddle_address_at(lines):
+    """Where the screen shows the huddle address: the one address on it. Read loosely, since
+    OCR can miss a character of an id or break a long address across two lines, and the
+    right-most of them: the sidebar's one-line preview of the message repeats the address, and
+    a click there only picks the row."""
+    found = [(x, y) for line in lines for text, x, y in line if text.startswith("http")]
+    return max(found, key=lambda point: point[0]) if found else None
+
+
+def expect_address(step):
+    shot = OUT / f"{step}.png"
+    deadline = time.monotonic() + 15
+    while True:
+        lines = words_at_screen(shot)
+        point = huddle_address_at(lines)
+        if point or time.monotonic() >= deadline:
+            break
+        time.sleep(0.3)
+    record(step, point is not None, shot.name)
+    if not point:
+        raise RuntimeError(f"{step}: expected the huddle address in a message")
+    return point
+
+
+def run_first(commands, stdin=None, capture=True):
+    """The first of `commands` this host has, run with nothing of it on the screen. `None` when
+    there is none. What is read is captured; what is written is not, because `xclip` and `xsel`
+    stay alive to serve the selection and would hold the captured pipes open."""
+    for command in commands:
+        if shutil.which(command[0]):
+            flags = subprocess.CREATE_NO_WINDOW if PLATFORM == "windows" else 0
+            return subprocess.run(
+                command, input=stdin, capture_output=capture, text=True, encoding="utf-8", errors="replace",
+                timeout=30, creationflags=flags,
+            )
+    return None
+
+
+def seed_clipboard():
+    # Only a guard: a host that cannot write it still has to read it below.
+    run_first(WRITERS[PLATFORM], stdin=SENTINEL, capture=False)
+
+
+def clipboard():
+    done = run_first(READERS[PLATFORM])
+    if done is None:
+        raise RuntimeError(f"nothing on this host reads the clipboard (tried {READERS[PLATFORM]})")
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def copied_address(step):
+    """The address on the clipboard, compared as text: exact, where the screen can only be read."""
+    shot = OUT / f"{step}.png"
+    deadline = time.monotonic() + 15
+    while True:
+        held = clipboard()
+        ok = held == LINK
+        if ok or time.monotonic() >= deadline:
+            break
+        time.sleep(0.3)
+    print(f"{step}: the clipboard holds {held!r}", flush=True)
+    words_at_screen(shot)
+    record(step, ok, shot.name)
+    if not ok:
+        raise RuntimeError(f"{step}: expected the clipboard to hold {LINK!r}")
+
+
+@contextmanager
+def launch(path, env, log, hidden=False):
+    flags = subprocess.CREATE_NO_WINDOW if hidden and PLATFORM == "windows" else 0
+    with (OUT / log).open("w", encoding="utf-8") as stream:
+        process = subprocess.Popen([str(path)], env=env, stdout=stream, stderr=subprocess.STDOUT, creationflags=flags)
+        try:
+            yield process
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+
+def drive():
+    lines = expect("01-slack-workspace", WORKSPACE)
+    if not next(matches(lines, "huddle-fixture"), None):
+        pyautogui.click(*next(matches(lines, WORKSPACE)))
+    lines = expect("02-the-huddle-row-is-listed", "huddle-fixture", OTHER_ROW)
+
+    # What a right-click on the row offers.
+    pyautogui.moveTo(*next(matches(lines, "huddle-fixture")))
+    pyautogui.click(button="right")
+    lines = expect("03-row-menu-offers-copy-huddle-link", "Copy huddle link")
+
+    seed_clipboard()
+    pyautogui.click(*next(matches(lines, "Copy huddle link")))
+    copied_address("04-clipboard-holds-the-huddle-address")
+
+    # Another channel carries the address in a message, as someone pasted it.
+    lines = words_at_screen(OUT / "05-other-channel.png")
+    pyautogui.click(*next(matches(lines, OTHER_ROW)))
+    address = expect_address("05-a-message-in-another-channel-carries-the-address")
+    pyautogui.click(*address)
+    expect("06-the-address-opens-the-huddles-conversation", "Huddle in progress", "Join")
+
+
+def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "steps.jsonl").write_text("", encoding="utf-8")
+    app = Path(os.environ["E2E_APP_DIR"]).resolve()
+    if PLATFORM == "macos":
+        app = app / "Contents" / "MacOS"
+    suffix = ".exe" if PLATFORM == "windows" else ""
+    scratch = "/tmp" if PLATFORM == "macos" else None
+    with slack_fixture() as port, tempfile.TemporaryDirectory(prefix="huddle-link-", dir=scratch) as data:
+        env = dict(os.environ, TINYCLIENT_DIR=data, **environment(port))
+        with launch(app / ("chatd" + suffix), env, "chatd.log", hidden=True):
+            with launch(app / ("tinyclient" + suffix), env, "app.log") as process:
+                (OUT / "app.pid").write_text(str(process.pid), encoding="utf-8")
+                drive()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, StopIteration, subprocess.SubprocessError) as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)
