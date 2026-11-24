@@ -1,6 +1,7 @@
 //! One Slack message, from the socket or from a page of history, as the one message model.
 
 use super::emoji;
+use super::huddle::field;
 use super::text::{emoji_end, Custom, Names, Rich};
 use super::{fnv, seconds, thread_id, Slack};
 use protocol::{
@@ -693,23 +694,24 @@ pub(super) fn prove_custom_emoji() -> Result<(), String> {
 /// Slack's old calls (`sh_room_created`) have a room too, and are not huddles. The card and the
 /// conversation's row agree on this one rule.
 pub(super) fn is_huddle(subtype: Option<&str>, room: &Value) -> bool {
-    room.is_object() && subtype != Some("sh_room_created") && (subtype == Some("huddle_thread") || room[super::huddle::field::FAMILY] == "huddle")
+    room.is_object() && subtype != Some("sh_room_created") && (subtype == Some("huddle_thread") || room[field::FAMILY] == "huddle")
 }
 
 /// Slack updates the same room message when the huddle ends. The active list may then
-/// be empty, so the history is what tells us who joined.
+/// be empty, so the history is what tells us who joined. The room's fields are read by the
+/// names kept in one place with the live row's (`huddle::field`).
 fn huddle_note(room: &Value) -> CallNote {
-    let start = room["date_start"].as_i64().filter(|&at| at > 0);
-    let end = room["date_end"].as_i64().filter(|&at| at > 0);
-    let outcome = if room["is_dm_call"] == true && room["was_missed"] == true {
+    let start = room[field::STARTED].as_i64().filter(|&at| at > 0);
+    let end = room[field::ENDED].as_i64().filter(|&at| at > 0);
+    let outcome = if room[field::DIRECT] == true && room[field::MISSED] == true {
         CallOutcome::Missed
-    } else if room["has_ended"] == true || end.is_some() {
+    } else if super::huddle::over(room) {
         CallOutcome::Ended
     } else {
         CallOutcome::Live
     };
-    let active = room["participants"].as_array();
-    let history = room["participant_history"].as_array();
+    let active = room[field::PEOPLE].as_array();
+    let history = room[field::EVER].as_array();
     let (primary, rest) = match outcome {
         CallOutcome::Live => (active.or(history), None),
         _ => (history, active),
@@ -723,7 +725,7 @@ fn huddle_note(room: &Value) -> CallNote {
     let seconds = end.zip(start).and_then(|(end, start)| u32::try_from(end - start).ok()).filter(|&span| span > 0);
     CallNote {
         outcome,
-        caller_id: huddle_user_id(&room["created_by"]).unwrap_or_default().to_owned(),
+        caller_id: huddle_user_id(&room[field::CREATOR]).unwrap_or_default().to_owned(),
         seconds,
         participants,
         video: false,
@@ -732,7 +734,7 @@ fn huddle_note(room: &Value) -> CallNote {
 }
 
 fn huddle_user_id(person: &Value) -> Option<&str> {
-    person.as_str().or_else(|| first(&[&person["user_id"], &person["id"]])).filter(|id| !id.is_empty())
+    super::huddle::person(person)
 }
 
 /// The fallback for inbox previews and clients that only read a message's text.
@@ -749,8 +751,8 @@ fn huddle_line(note: &CallNote) -> String {
 
 /// An old Slack call (`sh_room_created`) uses the same room clock as a huddle.
 fn legacy_call(room: &Value) -> String {
-    let (start, end) = (room["date_start"].as_i64().unwrap_or(0), room["date_end"].as_i64().unwrap_or(0));
-    if room["has_ended"] == true || end > 0 {
+    let (start, end) = (room[field::STARTED].as_i64().unwrap_or(0), room[field::ENDED].as_i64().unwrap_or(0));
+    if super::huddle::over(room) {
         match (end - start) / 60 {
             minutes if start > 0 && minutes > 0 => format!("A call happened · {minutes} min"),
             _ => "A call happened".to_owned(),
@@ -1650,7 +1652,7 @@ impl Slack {
     /// A huddle can carry a Canvas file or just name it. `canvas_thread_ts` is a timestamp,
     /// so it is never used as a file id. The workspace's document URL works for a bare id.
     fn huddle_notes(&self, event: &Value, files: &[Value]) -> (Option<usize>, Option<Card>) {
-        let room = &event["room"];
+        let room = &event[field::ROOM];
         let references = [&room["canvas"], &room["notes_canvas"], &event["canvas"], &event["notes_canvas"]];
         let valid_id = |id: &str| id.starts_with('F') && id.len() > 1 && id.bytes().all(|byte| byte.is_ascii_alphanumeric());
         let reference = references.into_iter().find(|entry| {
@@ -2051,7 +2053,7 @@ impl Slack {
 
         let mut rich = Rich::new(self);
         let system = subtype.is_some_and(|subtype| SYSTEM.contains(&subtype));
-        let room = &event["room"];
+        let room = &event[field::ROOM];
         // Slack's old calls have a room object too. Only huddles get its summary card.
         let huddle = is_huddle(subtype, room).then(|| huddle_note(room));
         if let Some(note) = &huddle {
@@ -2248,7 +2250,7 @@ impl Slack {
             let what = if rich.undrawn { "An interactive message" } else { "A message tinyclient cannot show yet" };
             rich.text = format!("{what} from {}", sender.name);
             MessageKind::Unsupported { link: link.clone() }
-        } else if system || event["room"].is_object() {
+        } else if system || event[field::ROOM].is_object() {
             MessageKind::System
         } else {
             MessageKind::Normal

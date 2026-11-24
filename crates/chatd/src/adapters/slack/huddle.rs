@@ -41,6 +41,12 @@ pub(super) mod field {
     pub const ENDED: &str = "date_end";
     pub const OVER: &str = "has_ended";
     pub const FAMILY: &str = "call_family";
+    /// Who was ever in it: the card's faces once the active list is empty.
+    pub const EVER: &str = "participant_history";
+    pub const CREATOR: &str = "created_by";
+    /// Of a huddle rung in a direct conversation, and missed there.
+    pub const DIRECT: &str = "is_dm_call";
+    pub const MISSED: &str = "was_missed";
     /// The huddle's message, by which huddles of one conversation are told apart.
     pub const MESSAGE: &str = "ts";
     pub const ROOT: &str = "thread_root_ts";
