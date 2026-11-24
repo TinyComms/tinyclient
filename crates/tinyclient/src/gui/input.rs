@@ -415,6 +415,7 @@ pub struct TextInput {
     edit_menu: Option<EditMenu>,
     /// Discord drafts paint markdown in place. Other fields keep the plain marker dimming.
     format_discord: bool,
+    format_slack: bool,
 }
 
 #[derive(Clone)]
@@ -463,6 +464,15 @@ impl TextInput {
             checking: false,
             edit_menu: None,
             format_discord: false,
+            format_slack: false,
+        }
+    }
+
+    /// Paint Slack markup while this draft is open. Off for every other field.
+    pub fn set_format_slack(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.format_slack != on {
+            self.format_slack = on;
+            cx.notify();
         }
     }
 
@@ -851,10 +861,11 @@ impl TextInput {
     }
 
     fn apply_format(&mut self, kind: super::composer::format::Kind, cx: &mut Context<Self>) {
-        if !self.format_discord || self.secret {
+        if !(self.format_discord || self.format_slack) || self.secret {
             return;
         }
-        let (text, range) = super::composer::format::apply(self.editor.text(), self.editor.selection(), kind);
+        let apply = if self.format_slack { super::composer::format::slack::apply } else { super::composer::format::apply };
+        let (text, range) = apply(self.editor.text(), self.editor.selection(), kind);
         if text == self.editor.text() {
             return;
         }
@@ -1345,8 +1356,9 @@ impl Shaping {
         let code_wash: Hsla = theme::field().into_color();
         let spoiler_wash: Hsla = theme::segment().into_color();
         let quote_wash: Hsla = theme::accent_wash().into_color();
-        let formatting = input.format_discord && !input.secret;
-        let styled = if formatting && !content.is_empty() { super::composer::format::paint(content) } else { Vec::new() };
+        let formatting = (input.format_discord || input.format_slack) && !input.secret;
+        let paint = if input.format_slack { super::composer::format::slack::paint } else { super::composer::format::paint };
+        let styled = if formatting && !content.is_empty() { paint(content) } else { Vec::new() };
         let mut lines = Vec::new();
         let mut rows = Vec::new();
         let mut line_start = 0;
@@ -1659,7 +1671,7 @@ impl Element for TextElement {
                 )
             })
             .collect();
-        let quotes = if input.format_discord {
+        let quotes = if input.format_discord || input.format_slack {
             let source = input.editor.text();
             laid.rows
                 .iter()

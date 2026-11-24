@@ -112,11 +112,21 @@ pub(in crate::gui) fn apply(
     selection: Range<usize>,
     kind: Kind,
 ) -> (String, Range<usize>) {
+    apply_with(text, selection, kind, scan_inline, wrap_marker)
+}
+
+fn apply_with(
+    text: &str,
+    selection: Range<usize>,
+    kind: Kind,
+    inline: Inline,
+    mark: fn(Kind) -> &'static str,
+) -> (String, Range<usize>) {
     let sel = snap(text, selection);
     if kind == Kind::Quote {
         return apply_quote(text, sel);
     }
-    let pairs = pairs_in(text);
+    let pairs = analyze(text, inline).1;
     if let Some(pair) = covering(&pairs, kind, &sel) {
         return unwrap(text, &pair, &sel);
     }
@@ -131,7 +141,7 @@ pub(in crate::gui) fn apply(
     {
         return (text.to_owned(), sel);
     }
-    wrap(text, &sel, kind)
+    wrap(text, &sel, kind, mark)
 }
 
 /// `[label](url)` when `url` is an http(s) address and the selection is not empty.
@@ -165,7 +175,7 @@ pub(in crate::gui) fn mask_link(
 
 /// Non-overlapping styled slices of `text`. Plain words are left out.
 pub(in crate::gui) fn paint(text: &str) -> Vec<Look> {
-    let (hits, _) = analyze(text);
+    let (hits, _) = analyze(text, scan_inline);
     flatten(&hits, text.len())
 }
 
@@ -282,11 +292,16 @@ fn wrap_marker(kind: Kind) -> &'static str {
     }
 }
 
-fn wrap(text: &str, sel: &Range<usize>, kind: Kind) -> (String, Range<usize>) {
+fn wrap(
+    text: &str,
+    sel: &Range<usize>,
+    kind: Kind,
+    mark: fn(Kind) -> &'static str,
+) -> (String, Range<usize>) {
     let (open, close) = if kind == Kind::Code && text[sel.clone()].contains('\n') {
         ("```\n", "\n```")
     } else {
-        let mark = wrap_marker(kind);
+        let mark = mark(kind);
         (mark, mark)
     };
     let inner = &text[sel.clone()];
@@ -351,10 +366,6 @@ fn inside_fence(pairs: &[Pair], sel: &Range<usize>) -> bool {
     pairs
         .iter()
         .any(|pair| pair.fence && sel.start >= pair.open.start && sel.end <= pair.close.end)
-}
-
-fn pairs_in(text: &str) -> Vec<Pair> {
-    analyze(text).1
 }
 
 fn apply_quote(text: &str, sel: Range<usize>) -> (String, Range<usize>) {
@@ -450,7 +461,10 @@ fn apply_quote(text: &str, sel: Range<usize>) -> (String, Range<usize>) {
     (next, start..end)
 }
 
-fn analyze(text: &str) -> (Vec<Hit>, Vec<Pair>) {
+/// Reads the markers inside one stretch of a line. Discord and Slack spell them differently.
+type Inline = fn(&str, usize, usize, &mut Vec<Hit>, &mut Vec<Pair>);
+
+fn analyze(text: &str, inline: Inline) -> (Vec<Hit>, Vec<Pair>) {
     let mut hits = Vec::new();
     let mut pairs = Vec::new();
     let fences = fence_pairs(text);
@@ -502,12 +516,12 @@ fn analyze(text: &str) -> (Vec<Hit>, Vec<Pair>) {
         let whole =
             newline == Some(end) || (fence_at.is_none() && end == text.len()) || newline.is_none();
         if whole {
-            scan_line(text, at, end, quoting, &mut hits, &mut pairs);
+            scan_line(text, at, end, quoting, inline, &mut hits, &mut pairs);
             if !quoting && line.trim_start().starts_with(">>> ") {
                 quoting = true;
             }
         } else {
-            scan_inline(text, at, end, &mut hits, &mut pairs);
+            inline(text, at, end, &mut hits, &mut pairs);
         }
         at = if newline == Some(end) { end + 1 } else { end };
     }
@@ -519,6 +533,7 @@ fn scan_line(
     start: usize,
     end: usize,
     quoting: bool,
+    inline: Inline,
     hits: &mut Vec<Hit>,
     pairs: &mut Vec<Pair>,
 ) {
@@ -548,7 +563,7 @@ fn scan_line(
     } else if quoting && body == end {
         // A blank line under `>>> ` is still part of the quote. Nothing to paint.
     }
-    scan_inline(text, body, end, hits, pairs);
+    inline(text, body, end, hits, pairs);
 }
 
 fn scan_inline(text: &str, from: usize, to: usize, hits: &mut Vec<Hit>, pairs: &mut Vec<Pair>) {
@@ -860,6 +875,266 @@ fn flatten(hits: &[Hit], len: usize) -> Vec<Look> {
         }
     }
     looks
+}
+
+/// Slack draft formatting. Slack writes `*bold*`, `_italic_`, `~strike~`, `` `code` `` and `> `
+/// quotes. The markers stay in the field like Discord's, then [`fold`] turns them into style
+/// spans on send, so a message with a mention keeps its formatting too.
+pub(in crate::gui) mod slack {
+    use super::*;
+
+    fn mark(kind: Kind) -> &'static str {
+        match kind {
+            Kind::Bold => "*",
+            Kind::Italic => "_",
+            Kind::Strike => "~",
+            Kind::Code => "`",
+            Kind::Quote => "> ",
+            Kind::Underline | Kind::Spoiler => "",
+        }
+    }
+
+    pub(in crate::gui) fn apply(
+        text: &str,
+        selection: Range<usize>,
+        kind: Kind,
+    ) -> (String, Range<usize>) {
+        if matches!(kind, Kind::Underline | Kind::Spoiler) {
+            return (text.to_owned(), snap(text, selection));
+        }
+        let sel = snap(text, selection);
+        // `*|*` is not a pair Slack reads, so the empty case is undone by hand.
+        if sel.is_empty() && kind != Kind::Quote {
+            let m = mark(kind);
+            if text[..sel.start].ends_with(m) && text[sel.start..].starts_with(m) {
+                let pair = Pair {
+                    kind,
+                    fence: false,
+                    open: sel.start - m.len()..sel.start,
+                    close: sel.start..sel.start + m.len(),
+                    inner: sel.start..sel.start,
+                };
+                return unwrap(text, &pair, &sel);
+            }
+        }
+        apply_with(text, sel, kind, scan_inline, mark)
+    }
+
+    pub(in crate::gui) fn paint(text: &str) -> Vec<Look> {
+        flatten(&analyze(text, scan_inline).0, text.len())
+    }
+
+    /// Takes the markers out of `text` and returns the styles they asked for, with `spans`
+    /// (mentions, emoji) moved to the shorter text.
+    pub(in crate::gui) fn fold(
+        text: String,
+        spans: Vec<protocol::Span>,
+    ) -> (String, Vec<protocol::Span>) {
+        let (hits, pairs) = analyze(&text, scan_inline);
+        let mut cut: Vec<Range<usize>> = hits
+            .iter()
+            .filter(|hit| matches!(hit.style, Style::Marker) && hit.range.start < hit.range.end)
+            .map(|hit| hit.range.clone())
+            .collect();
+        if cut.is_empty() {
+            return (text, spans);
+        }
+        cut.sort_by_key(|range| range.start);
+        let mut merged: Vec<Range<usize>> = Vec::new();
+        for range in cut {
+            match merged.last_mut() {
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => merged.push(range),
+            }
+        }
+        let map = |point: usize| -> u32 {
+            let mut gone = 0;
+            for range in &merged {
+                if point >= range.end {
+                    gone += range.end - range.start;
+                } else if point > range.start {
+                    gone += point - range.start;
+                }
+            }
+            (point - gone) as u32
+        };
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        for range in &merged {
+            out.push_str(&text[at..range.start]);
+            at = range.end;
+        }
+        out.push_str(&text[at..]);
+        let mut folded: Vec<protocol::Span> = spans
+            .into_iter()
+            .map(|span| protocol::Span {
+                start: map(span.start as usize),
+                end: map(span.end as usize),
+                style: span.style,
+            })
+            .collect();
+        for hit in &hits {
+            let style = match hit.style {
+                Style::Bold => protocol::Style::Bold,
+                Style::Italic => protocol::Style::Italic,
+                Style::Strike => protocol::Style::Strike,
+                Style::Quote => protocol::Style::Quote,
+                Style::Code if pairs.iter().any(|pair| pair.fence && pair.inner == hit.range) => {
+                    protocol::Style::CodeBlock { language: String::new() }
+                }
+                Style::Code => protocol::Style::Code,
+                _ => continue,
+            };
+            let (start, end) = (map(hit.range.start), map(hit.range.end));
+            if start < end {
+                folded.push(protocol::Span { start, end, style });
+            }
+        }
+        (out, folded)
+    }
+
+    fn scan_inline(text: &str, from: usize, to: usize, hits: &mut Vec<Hit>, pairs: &mut Vec<Pair>) {
+        let mut at = from;
+        while at < to {
+            let Some(first) = text[at..to].chars().next() else {
+                break;
+            };
+            let kind = match first {
+                '*' => Some(Kind::Bold),
+                '_' => Some(Kind::Italic),
+                '~' => Some(Kind::Strike),
+                '`' => Some(Kind::Code),
+                _ => None,
+            };
+            let opens = text[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|before| !before.is_alphanumeric());
+            if let (Some(kind), true) = (kind, opens) {
+                if let Some(close) = closer(text, at, to, first) {
+                    push(text, at, close, kind, hits, pairs);
+                    at = close + 1;
+                    continue;
+                }
+            }
+            at += first.len_utf8();
+        }
+    }
+
+    /// The matching mark on the same line. Words must touch it, and a letter right after it
+    /// means it was not a closer. Code takes anything.
+    fn closer(text: &str, at: usize, to: usize, mark: char) -> Option<usize> {
+        let rel = text[at + 1..to].find(mark)?;
+        let inner = &text[at + 1..at + 1 + rel];
+        if inner.is_empty() {
+            return None;
+        }
+        if mark == '`' {
+            return Some(at + 1 + rel);
+        }
+        let close = at + 1 + rel;
+        let follows = text[close + 1..to].chars().next().is_some_and(char::is_alphanumeric);
+        let spaced = inner.starts_with(char::is_whitespace) || inner.ends_with(char::is_whitespace);
+        (!spaced && !follows).then_some(close)
+    }
+
+    fn push(
+        text: &str,
+        open_at: usize,
+        close_at: usize,
+        kind: Kind,
+        hits: &mut Vec<Hit>,
+        pairs: &mut Vec<Pair>,
+    ) {
+        let open = open_at..open_at + 1;
+        let close = close_at..close_at + 1;
+        let inner = open.end..close.start;
+        pairs.push(Pair {
+            kind,
+            fence: false,
+            open: open.clone(),
+            close: close.clone(),
+            inner: inner.clone(),
+        });
+        hits.push(Hit { range: open, style: Style::Marker });
+        hits.push(Hit { range: close, style: Style::Marker });
+        hits.push(Hit { range: inner.clone(), style: style_for(kind) });
+        if kind != Kind::Code {
+            scan_inline(text, inner.start, inner.end, hits, pairs);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn marks_toggle_and_the_empty_caret_round_trips() {
+            for (kind, m) in [(Kind::Bold, "*"), (Kind::Italic, "_"), (Kind::Strike, "~"), (Kind::Code, "`")] {
+                let (text, sel) = apply("hi", 0..2, kind);
+                assert_eq!(text, format!("{m}hi{m}"));
+                assert_eq!(apply(&text, sel, kind).0, "hi");
+                let (text, sel) = apply("hi", 2..2, kind);
+                assert_eq!((text.as_str(), sel.clone()), (format!("hi{m}{m}").as_str(), 3..3));
+                assert_eq!(apply(&text, sel, kind), ("hi".to_owned(), 2..2));
+            }
+        }
+
+        #[test]
+        fn underline_and_spoiler_do_nothing() {
+            assert_eq!(apply("hi", 0..2, Kind::Underline).0, "hi");
+            assert_eq!(apply("hi", 0..2, Kind::Spoiler).0, "hi");
+        }
+
+        #[test]
+        fn a_newline_becomes_a_fence() {
+            let (text, _) = apply("a\nb", 0..3, Kind::Code);
+            assert_eq!(text, "```\na\nb\n```");
+        }
+
+        #[test]
+        fn paint_dims_markers_and_leaves_mid_word_marks_alone() {
+            let looks = paint("*hi* a_b_c ~x~");
+            assert!(looks.iter().any(|look| look.bold && !look.marker && look.range == (1..3)));
+            assert!(looks.iter().any(|look| look.strike && !look.marker));
+            assert!(!looks.iter().any(|look| look.italic));
+            assert!(paint("2 * 3 * 4").is_empty());
+        }
+
+        #[test]
+        fn fold_strips_markers_and_moves_other_spans() {
+            let mention = protocol::Span {
+                start: 10,
+                end: 14,
+                style: protocol::Style::Mention {
+                    kind: protocol::MentionKind::User,
+                    id: "U1".into(),
+                },
+            };
+            let (text, spans) = fold("*hi* _yo_ @Bob".to_owned(), vec![mention]);
+            assert_eq!(text, "hi yo @Bob");
+            let find = |style: protocol::Style| spans.iter().find(|s| s.style == style).cloned();
+            let bold = find(protocol::Style::Bold).unwrap();
+            assert_eq!((bold.start, bold.end), (0, 2));
+            let italic = find(protocol::Style::Italic).unwrap();
+            assert_eq!((italic.start, italic.end), (3, 5));
+            let moved = spans.iter().find(|s| matches!(s.style, protocol::Style::Mention { .. })).unwrap();
+            assert_eq!(&text[moved.start as usize..moved.end as usize], "@Bob");
+        }
+
+        #[test]
+        fn fold_reads_quotes_and_fences() {
+            let (text, spans) = fold("> quoted\n```\ncode\n```".to_owned(), Vec::new());
+            assert_eq!(text, "quoted\ncode");
+            assert!(spans.iter().any(|s| s.style == protocol::Style::Quote && (s.start, s.end) == (0, 6)));
+            assert!(spans.iter().any(|s| matches!(s.style, protocol::Style::CodeBlock { .. })));
+        }
+
+        #[test]
+        fn fold_leaves_plain_text_alone() {
+            assert_eq!(fold("a * b".to_owned(), Vec::new()), ("a * b".to_owned(), Vec::new()));
+        }
+    }
 }
 
 #[cfg(test)]
