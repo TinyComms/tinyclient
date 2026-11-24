@@ -159,7 +159,7 @@ impl Shell {
                 }
                 if launch.share {
                     say!("tinyclient: debug launch: sharing the screen");
-                    self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: None }), cx);
+                    self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: None, resolution: None, fps: None }), cx);
                 }
             }
             Stage::Watching(asked) => {

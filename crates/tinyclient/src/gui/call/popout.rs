@@ -450,6 +450,8 @@ impl Render for CallPopout {
                                     show_cursor: None,
                                     sound,
                                     preview,
+                                    resolution: None,
+                                    fps: None,
                                 }),
                                 cx,
                             );

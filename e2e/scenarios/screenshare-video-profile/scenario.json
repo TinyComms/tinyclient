@@ -1,0 +1,12 @@
+{
+  "id": "screenshare-video-profile",
+  "title": "Windows MFT + E2EE screenshare reliability, FPS/resolution/bitrate controls, and Tiny account self-service",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "Mobile shares use the OS broadcast picker; desktop picker and Windows MFT fixes are verified on desktop.",
+    "ios": "Mobile shares use the OS broadcast picker; desktop picker and Windows MFT fixes are verified on desktop."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

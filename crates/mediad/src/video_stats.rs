@@ -14,6 +14,9 @@ pub struct Meter {
     last: Option<Instant>,
     size: (u32, u32),
     watching: Option<Instant>,
+    send_size: (u32, u32),
+    send_target_fps: u32,
+    encoder: String,
 }
 
 impl Meter {
@@ -30,6 +33,14 @@ impl Meter {
             self.watching.get_or_insert(now);
         } else {
             self.watching = None;
+        }
+    }
+
+    pub fn sending(&mut self, width: u32, height: u32, target_fps: u32, encoder: &str) {
+        self.send_size = (width, height);
+        self.send_target_fps = target_fps;
+        if self.encoder != encoder {
+            self.encoder = encoder.to_owned();
         }
     }
     /// One video packet accepted by UDP or the TCP transport after the WebRTC pacer.
@@ -91,6 +102,10 @@ impl Meter {
             width: self.size.0,
             height: self.size.1,
             frame_age_ms: self.last.map(|at| now.saturating_duration_since(at).as_millis().min(u32::MAX as u128) as u32),
+            send_width: self.send_size.0,
+            send_height: self.send_size.1,
+            send_target_fps: self.send_target_fps,
+            encoder: self.encoder.clone(),
         };
         self.sent = (0, 0);
         self.received = (0, 0);

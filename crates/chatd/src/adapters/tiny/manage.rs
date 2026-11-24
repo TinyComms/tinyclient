@@ -461,8 +461,37 @@ pub(crate) fn server_update(account: AccountKey, edit: TinyServerEdit) -> Respon
     change(&account, Some(TINY_FEATURE_SERVER), "community.server.edit", "PATCH", "/v1/server", Some(Value::Object(body)), Missing::Plain)
 }
 
-/// The picture at `path` as the icon, or with `None` no icon. The file is read here, checked,
-/// and sent as it is; the server keeps it.
+/// Reads an image at `real` for an avatar or server icon. Files already within `TINY_ICON_MAX`
+/// are kept as-is; larger PNG/JPEG/WebP/GIF images (up to 16 MiB) are automatically downscaled
+/// and JPEG-compressed so normal photos upload cleanly.
+fn prepare_icon_bytes(real: &std::path::Path) -> Result<(&'static str, Vec<u8>), &'static str> {
+    const MAX_READ: u64 = 16 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(real).and_then(|file| file.take(MAX_READ + 1).read_to_end(&mut bytes));
+    if read.is_err() {
+        return Err("That picture couldn't be read.");
+    }
+    if bytes.len() as u64 > MAX_READ {
+        return Err(ICON_SIZE);
+    }
+    if bytes.len() <= TINY_ICON_MAX {
+        if let Some(kind) = image_kind(&bytes) {
+            return Ok((kind, bytes));
+        }
+    }
+    let decoded = image::load_from_memory(&bytes).map_err(|_| ICON_KIND)?;
+    for (dim, quality) in [(512u32, 85u8), (512, 72), (384, 72), (256, 65)] {
+        let resized = decoded.resize(dim, dim, image::imageops::FilterType::Lanczos3).to_rgb8();
+        let mut out = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+        if encoder.encode(resized.as_raw(), resized.width(), resized.height(), image::ExtendedColorType::Rgb8).is_ok() && out.len() <= TINY_ICON_MAX {
+            return Ok(("image/jpeg", out));
+        }
+    }
+    Err(ICON_SIZE)
+}
+
+/// The picture at `path` as the icon, or with `None` no icon.
 pub(crate) fn server_icon(account: AccountKey, path: Option<String>) -> Response {
     let saved = match allowed(&account, Some(TINY_FEATURE_SERVER), "community.server.edit") {
         Ok(saved) => saved,
@@ -475,16 +504,9 @@ pub(crate) fn server_icon(account: AccountKey, path: Option<String>) -> Response
         Ok((real, _)) => real,
         Err(why) => return refused(&format!("That picture {why}")),
     };
-    let mut bytes = Vec::new();
-    let read = std::fs::File::open(&real).and_then(|file| file.take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes));
-    if read.is_err() {
-        return refused("That picture couldn't be read.");
-    }
-    if bytes.len() > TINY_ICON_MAX {
-        return refused(ICON_SIZE);
-    }
-    let Some(kind) = image_kind(&bytes) else {
-        return refused(ICON_KIND);
+    let (kind, bytes) = match prepare_icon_bytes(&real) {
+        Ok(ready) => ready,
+        Err(why) => return refused(why),
     };
     match put_bytes(&saved, "/v1/server/icon", kind, &bytes) {
         Err(detail) => refused(detail),
@@ -512,16 +534,9 @@ pub(crate) fn user_avatar(account: AccountKey, path: Option<String>) -> Response
         Ok((real, _)) => real,
         Err(why) => return refused(&format!("That picture {why}")),
     };
-    let mut bytes = Vec::new();
-    let read = std::fs::File::open(&real).and_then(|file| file.take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes));
-    if read.is_err() {
-        return refused("That picture couldn't be read.");
-    }
-    if bytes.len() > TINY_ICON_MAX {
-        return refused(ICON_SIZE);
-    }
-    let Some(kind) = image_kind(&bytes) else {
-        return refused(ICON_KIND);
+    let (kind, bytes) = match prepare_icon_bytes(&real) {
+        Ok(ready) => ready,
+        Err(why) => return refused(why),
     };
     match put_bytes(&saved, "/v1/me/avatar", kind, &bytes) {
         Err(detail) => refused(detail),

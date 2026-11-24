@@ -14,6 +14,11 @@ use std::sync::Mutex;
 pub(super) const THUMB: (u32, u32) = (320, 180);
 const THUMB_QUALITY: u8 = 70;
 
+/// Sentinel error returned when a shared window is minimized so the capture loop pauses cleanly
+/// without tearing down the share or spamming notices.
+#[cfg(windows)]
+pub(super) const WINDOW_MINIMIZED: &str = "The window you shared is minimized. Restore it to keep sharing.";
+
 /// The screen or window the share captures, by id. `None` is the primary screen. One call per
 /// process, so one choice per process.
 static CHOSEN: Mutex<Option<String>> = Mutex::new(None);
@@ -21,6 +26,7 @@ static CHOSEN: Mutex<Option<String>> = Mutex::new(None);
 /// What the share captures from its next frame on.
 pub fn choose_screen(id: Option<String>) {
     *CHOSEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = id;
+    super::bump_share_config_version();
 }
 
 pub(super) fn chosen() -> Option<String> {
@@ -156,12 +162,22 @@ pub(super) fn capture(id: Option<&str>) -> Result<Rgba, String> {
     }
 }
 
+#[cfg(windows)]
+static OPEN: Mutex<Option<(String, super::duplicate::Duplicator)>> = Mutex::new(None);
+
+/// Releases any open Desktop Duplication session so the GPU surface isn't held while idle.
+pub(super) fn close_capture() {
+    #[cfg(windows)]
+    {
+        *OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
 /// The screen `device` through Desktop Duplication, kept open from frame to frame; opened
 /// again after it was lost. One at a time: the share captures one screen.
 #[cfg(windows)]
 fn duplicated(device: &str) -> Result<Rgba, String> {
     use super::duplicate::Duplicator;
-    static OPEN: Mutex<Option<(String, Duplicator)>> = Mutex::new(None);
     let mut open = OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if open.as_ref().is_none_or(|(name, _)| name != device) {
         *open = Some((device.to_owned(), Duplicator::open(device)?));
@@ -175,11 +191,18 @@ fn duplicated(device: &str) -> Result<Rgba, String> {
     frame
 }
 
-/// How many times a second the shared screen refreshes, when Windows says. A window is on
-/// the primary screen as far as this knows.
+/// How many times a second the shared screen (or the monitor hosting a shared window) refreshes.
 #[cfg(windows)]
 pub(super) fn refresh_rate(id: Option<&str>) -> Option<u32> {
-    let device = id.and_then(|id| id.strip_prefix("display:")).map(str::to_owned).or_else(|| win::displays().into_iter().find(|display| display.primary).map(|display| display.device))?;
+    let device = id
+        .and_then(|id| id.strip_prefix("display:"))
+        .map(str::to_owned)
+        .or_else(|| {
+            id.and_then(|id| id.strip_prefix("window:"))
+                .and_then(|handle| handle.parse::<isize>().ok())
+                .and_then(win::window_monitor_device)
+        })
+        .or_else(|| win::displays().into_iter().find(|display| display.primary).map(|display| display.device))?;
     win::refresh_rate(&device)
 }
 
@@ -191,8 +214,8 @@ mod win {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows_sys::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors, EnumDisplaySettingsW, GetDC, GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFOHEADER, BI_RGB, DEVMODEW, ENUM_CURRENT_SETTINGS,
-        DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, SRCCOPY,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors, EnumDisplaySettingsW, GetDC, GetDIBits, GetMonitorInfoW, MonitorFromWindow, ReleaseDC, SelectObject, BITMAPINFOHEADER, BI_RGB, DEVMODEW, ENUM_CURRENT_SETTINGS,
+        DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, SRCCOPY,
     };
     use windows_sys::Win32::Storage::Xps::PrintWindow;
     use windows_sys::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
@@ -289,6 +312,28 @@ mod win {
         found
     }
 
+    /// The display device name (`\\.\DISPLAY2`) of the monitor hosting `handle`.
+    pub fn window_monitor_device(handle: isize) -> Option<String> {
+        let hwnd = handle as HWND;
+        // SAFETY: MonitorFromWindow returns null or a valid HMONITOR; GetMonitorInfoW fills a zeroed MONITORINFOEXW.
+        unsafe {
+            if IsWindow(hwnd) == 0 {
+                return None;
+            }
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if monitor.is_null() {
+                return None;
+            }
+            let mut info: MONITORINFOEXW = std::mem::zeroed();
+            info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+            if GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) == 0 {
+                return None;
+            }
+            let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            Some(String::from_utf16_lossy(&info.szDevice[..len]))
+        }
+    }
+
     /// The refresh rate of the screen `device` names (`\\.\DISPLAY2`), as its current mode has
     /// it. `None` when Windows does not say, or says 0 or 1, which mean "the default".
     pub fn refresh_rate(device: &str) -> Option<u32> {
@@ -340,7 +385,7 @@ mod win {
                 return Err(GONE.to_owned());
             }
             if IsIconic(hwnd) != 0 {
-                return Err("The window you shared is minimized. Restore it to keep sharing.".to_owned());
+                return Err(super::WINDOW_MINIMIZED.to_owned());
             }
             let mut rect: RECT = std::mem::zeroed();
             if GetWindowRect(hwnd, &mut rect) == 0 {

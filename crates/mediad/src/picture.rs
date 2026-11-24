@@ -13,10 +13,11 @@
 //! is said in words and the voice call stays. A phone captures and codes through its `platform`
 //! (`phone`). All of it is slow, and none of it runs on the call's tick: `video` holds the threads.
 
-use protocol::{CameraQuality, CameraSettings, PictureKind, ShareQuality};
+use protocol::{CameraQuality, CameraSettings, PictureKind, ShareQuality, ShareResolution};
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -344,9 +345,56 @@ impl Quality {
     }
 }
 
-/// The quality the next share goes at. One call per process, so one choice per process. A
-/// phone has no choice: its hardware codec gets `Low`.
+/// The quality the next share goes at. One call per process, so one choice per process.
 static QUALITY: AtomicU8 = AtomicU8::new(ShareQuality::Best as u8);
+/// Optional explicit resolution override (`0` = use quality default, `1`..=`4` = 720p/1080p/1440p/Source).
+static RESOLUTION: AtomicU8 = AtomicU8::new(0);
+/// Optional explicit FPS override (`0` = use quality default, else 1..=60).
+static FPS_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+/// Set once `choose_share_config` or `choose_quality` has been called explicitly.
+static SHARE_CONFIGURED: AtomicBool = AtomicBool::new(false);
+/// Monotonic counter incremented whenever screen, quality, resolution, FPS, or cursor changes.
+static SHARE_CONFIG_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of what the outbound video encoder is actively sending, for Call Health stats.
+#[derive(Debug, Clone, Default)]
+pub struct OutboundInfo {
+    pub width: u32,
+    pub height: u32,
+    pub target_fps: u32,
+    pub encoder: &'static str,
+}
+
+static OUTBOUND_INFO: Mutex<OutboundInfo> = Mutex::new(OutboundInfo {
+    width: 0,
+    height: 0,
+    target_fps: 0,
+    encoder: "",
+});
+
+pub(crate) fn set_outbound_info(width: u32, height: u32, target_fps: u32, encoder: &'static str) {
+    let mut info = OUTBOUND_INFO.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    info.width = width;
+    info.height = height;
+    info.target_fps = target_fps;
+    info.encoder = encoder;
+}
+
+pub(crate) fn clear_outbound_info() {
+    set_outbound_info(0, 0, 0, "");
+}
+
+pub(crate) fn outbound_info() -> OutboundInfo {
+    OUTBOUND_INFO.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+}
+
+pub(crate) fn bump_share_config_version() {
+    SHARE_CONFIG_VERSION.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn share_config_version() -> u64 {
+    SHARE_CONFIG_VERSION.load(Ordering::Relaxed)
+}
 
 /// Whether the next share draws the sharer's pointer. On by default: viewers follow what is
 /// pointed at, which is what the Wayland portal already embedded. One call per process, so
@@ -357,6 +405,7 @@ static CURSOR: AtomicBool = AtomicBool::new(true);
 /// shell that says nothing is an older one.
 pub fn choose_cursor(show: Option<bool>) {
     CURSOR.store(show != Some(false), Ordering::Relaxed);
+    bump_share_config_version();
 }
 
 /// Whether the capture draws the pointer into the share's frames now.
@@ -364,9 +413,25 @@ pub fn cursor_shown() -> bool {
     CURSOR.load(Ordering::Relaxed)
 }
 
-/// What a share spends from its next frame on. On a desktop only: see [`share_quality`].
-pub fn choose_quality(quality: Option<ShareQuality>) {
+/// What a share spends from its next frame on: quality preset plus optional resolution and FPS overrides.
+pub fn choose_share_config(quality: Option<ShareQuality>, resolution: Option<ShareResolution>, fps: Option<u32>) {
     QUALITY.store(quality.unwrap_or_default() as u8, Ordering::Relaxed);
+    let res_code = match resolution {
+        None => 0,
+        Some(ShareResolution::P720) => 1,
+        Some(ShareResolution::P1080) => 2,
+        Some(ShareResolution::P1440) => 3,
+        Some(ShareResolution::Source) => 4,
+    };
+    RESOLUTION.store(res_code, Ordering::Relaxed);
+    FPS_OVERRIDE.store(fps.map_or(0, |f| f.clamp(1, SHARE_FPS_MOST)), Ordering::Relaxed);
+    SHARE_CONFIGURED.store(quality.is_some() || resolution.is_some() || fps.is_some(), Ordering::Relaxed);
+    bump_share_config_version();
+}
+
+/// What a share spends from its next frame on.
+pub fn choose_quality(quality: Option<ShareQuality>) {
+    choose_share_config(quality, None, None);
 }
 
 /// Frames a second for the share now: what was chosen, held to the shared screen's own refresh
@@ -385,17 +450,39 @@ pub fn share_fps() -> u32 {
 
 /// What the share spends now.
 pub fn share_quality() -> Quality {
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    {
-        Quality::of(ShareQuality::Low)
-    }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        Quality::of(match QUALITY.load(Ordering::Relaxed) {
+    let preset = if cfg!(any(target_os = "android", target_os = "ios")) && !SHARE_CONFIGURED.load(Ordering::Relaxed) {
+        ShareQuality::Low
+    } else {
+        match QUALITY.load(Ordering::Relaxed) {
             1 => ShareQuality::Balanced,
             2 => ShareQuality::Low,
             _ => ShareQuality::Best,
-        })
+        }
+    };
+    let mut q = Quality::of(preset);
+    let max = match RESOLUTION.load(Ordering::Relaxed) {
+        1 => Some(ShareResolution::P720.max_size()),
+        2 => Some(ShareResolution::P1080.max_size()),
+        3 => Some(ShareResolution::P1440.max_size()),
+        4 => Some(ShareResolution::Source.max_size()),
+        _ => None,
+    };
+    if let Some(max) = max {
+        q.max = max;
+    }
+    let fps = FPS_OVERRIDE.load(Ordering::Relaxed);
+    if fps > 0 {
+        q.fps = fps.clamp(1, SHARE_FPS_MOST);
+    }
+    q
+}
+
+/// Phone-specific share quality: defaults to `Low` (`1280×720 @ 15 fps`) until explicitly configured.
+pub fn phone_share_quality() -> Quality {
+    if SHARE_CONFIGURED.load(Ordering::Relaxed) {
+        share_quality()
+    } else {
+        Quality::of(ShareQuality::Low)
     }
 }
 
@@ -662,11 +749,14 @@ pub struct Tag {
     pub small: bool,
 }
 
-/// The picture a painter last painted, which is one file at a time.
+/// How many recent JPEG files each painter keeps on disk before evicting the oldest, so the
+/// GUI thread reading the previous frame never races a 60 fps deletion.
+const CANVAS_RING: usize = 3;
+
+/// The recent pictures a painter painted, cleaned up in ring order and all removed on `forget`.
 #[derive(Default)]
 struct Canvas {
-    /// The file on disk now, removed when the next is written or the picture stops.
-    last: Option<PathBuf>,
+    recent: VecDeque<PathBuf>,
 }
 
 impl Canvas {
@@ -674,15 +764,19 @@ impl Canvas {
     /// pictures apart by it, and so do the files.
     fn paint(&mut self, colors: &[u8], width: u32, height: u32, generation: u64) -> Option<Painted> {
         let path = write_jpeg(colors, width, height, generation).ok()?;
-        self.forget();
-        self.last = Some(path.clone());
+        self.recent.push_back(path.clone());
+        while self.recent.len() > CANVAS_RING {
+            if let Some(old) = self.recent.pop_front() {
+                let _ = std::fs::remove_file(old);
+            }
+        }
         Some(Painted { path, width, height, generation })
     }
 
-    /// The file on disk goes.
+    /// All files on disk go.
     fn forget(&mut self) {
-        if let Some(last) = self.last.take() {
-            let _ = std::fs::remove_file(last);
+        while let Some(old) = self.recent.pop_front() {
+            let _ = std::fs::remove_file(old);
         }
     }
 }
@@ -756,11 +850,14 @@ mod tests {
         let first = canvas.paint(&colors, 2, 2, generation + 1).unwrap();
         assert!(first.path.exists());
         // A frame in between decoded to nothing, so its generation never reached the disk.
-        let second = canvas.paint(&colors, 2, 2, generation + 3).unwrap();
-        assert!(!first.path.exists(), "the file before the gap went too");
-        assert!(second.path.exists());
+        let mut last = first.clone();
+        for step in 1..=CANVAS_RING as u64 {
+            last = canvas.paint(&colors, 2, 2, generation + 1 + step * 2).unwrap();
+        }
+        assert!(!first.path.exists(), "the oldest file beyond the ring went too");
+        assert!(last.path.exists());
         canvas.forget();
-        assert!(!second.path.exists());
+        assert!(!last.path.exists());
     }
 
     #[test]

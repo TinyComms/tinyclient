@@ -1815,7 +1815,7 @@ impl Discord {
                 self.ctx.set_viewers(&conversation, Vec::new());
                 self.ctx.tell_media(
                     &conversation,
-                    MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None, preview: None },
+                    MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None, preview: None, resolution: None, fps: None },
                 );
             }
         }

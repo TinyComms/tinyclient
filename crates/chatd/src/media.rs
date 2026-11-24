@@ -2547,6 +2547,11 @@ impl Calls {
         require_end_to_end(required, &mut offer)?;
         let (call, running) = self.describe();
         let here = call.as_ref().is_some_and(|call| call.conversation == *conversation) && running;
+        let preserved_audio = if direct {
+            call.as_ref().filter(|call| call.conversation == *conversation).map(|call| (call.muted, call.deafened))
+        } else {
+            None
+        };
         if !here {
             if direct && call.as_ref().is_none_or(|call| call.conversation != *conversation || matches!(call.state, CallState::Failed { .. })) {
                 return Err("That call is gone.".to_owned());
@@ -2564,6 +2569,10 @@ impl Calls {
         }
         self.update(hub, conversation, |live| {
             if intent.is_some() && intent != Some(live.intent) { return; }
+            if let Some((muted, deafened)) = preserved_audio {
+                live.call.muted = muted;
+                live.call.deafened = deafened;
+            }
             offer.muted = live.call.muted;
             offer.deafened = live.call.deafened;
             live.me = offer.user_id.clone();

@@ -10,7 +10,7 @@
 
 use crate::dave::Dave;
 use crate::media::{FromMedia, Stream};
-use crate::picture::{camera_high_bps, camera_profile};
+use crate::picture::{self, camera_high_bps, camera_profile};
 use crate::rtp::{self, Cipher, Sender as AudioSender, VideoSender, H264, RTX};
 use crate::session::Controls;
 use crate::video::{Rates, Received, Track, Video, VideoCodec, Wants, Word};
@@ -187,6 +187,8 @@ pub struct Drive {
     /// Remote sources dropped because this leg hit its concurrent decode ceiling.
     refused: Vec<(String, PictureKind)>,
     last_prune: Instant,
+    /// Last share config version announced to the gateway.
+    announced_version: u64,
     user_id: String,
 }
 
@@ -230,6 +232,7 @@ impl Drive {
             next_slot: 0,
             refused: Vec::new(),
             last_prune: Instant::now(),
+            announced_version: picture::share_config_version(),
             user_id,
         }
     }
@@ -241,7 +244,8 @@ impl Drive {
                 camera: false,
                 preview_camera: false,
                 keep_camera: false,
-                rates: Rates { share: crate::picture::share_quality().bps, high: 0, low: 0 },
+                rates: Rates { share: picture::share_quality().bps, high: 0, low: 0 },
+                share_version: picture::share_config_version(),
             }
         } else {
             let low = if self.low_pipe.is_some() { camera_profile().low_layer().bps } else { 0 };
@@ -251,6 +255,7 @@ impl Drive {
                 preview_camera: false,
                 keep_camera: true,
                 rates: Rates { share: 0, high: camera_high_bps(), low },
+                share_version: 0,
             }
         }
     }
@@ -285,7 +290,7 @@ impl Drive {
             return false;
         }
         if (200..=206).contains(&datagram[1]) {
-            self.nack(datagram, opener, socket);
+            self.rtcp(datagram, opener, socket);
             return true;
         }
         let ssrc = u32::from_be_bytes([datagram[8], datagram[9], datagram[10], datagram[11]]);
@@ -437,6 +442,7 @@ impl Drive {
         let on = if self.screen { self.controls.share() } else { self.controls.camera() };
         if on != self.wanted {
             self.wanted = on;
+            self.announced_version = picture::share_config_version();
             if !on {
                 self.announced.store(false, Ordering::Relaxed);
             }
@@ -446,6 +452,13 @@ impl Drive {
         }
         if !on || !self.announced.load(Ordering::Relaxed) {
             return;
+        }
+        if self.screen {
+            let version = picture::share_config_version();
+            if version != self.announced_version {
+                self.announced_version = version;
+                let _ = report.send(FromMedia::Picture { share: true, on: true });
+            }
         }
         self.video.want(self.wants());
         while let Some(word) = self.video.next() {
@@ -481,10 +494,24 @@ impl Drive {
         pipe.send_sealed(self.screen, socket, timestamp, &sealed);
     }
 
-    /// A generic NACK (RTCP PT 205, FMT 1). The first 8 bytes are the clear header; if they are
-    /// not the authenticated prefix, the packet is dropped and the call carries on.
-    fn nack(&mut self, datagram: &[u8], opener: &Cipher, socket: &UdpSocket) {
-        if datagram.len() < 8 + 16 + 4 || datagram[1] != 205 || datagram[0] & 0x1f != 1 {
+    /// Handles RTCP feedback: Generic NACK (PT 205, FMT 1) and PLI/FIR keyframe requests (PT 206, FMT 1 or 4).
+    fn rtcp(&mut self, datagram: &[u8], opener: &Cipher, socket: &UdpSocket) {
+        let pt = datagram[1];
+        let fmt = datagram[0] & 0x1f;
+        if pt == 206 && (fmt == 1 || fmt == 4) {
+            if datagram.len() < 8 + 16 + 4 {
+                return;
+            }
+            let end = datagram.len() - 4;
+            let Ok(counter) = datagram[end..].try_into() else {
+                return;
+            };
+            if opener.open_aad(counter, &datagram[..8], &datagram[8..end]).is_some() {
+                self.video.ask_key(if self.screen { Track::Share } else { Track::High });
+            }
+            return;
+        }
+        if datagram.len() < 8 + 16 + 4 || pt != 205 || fmt != 1 {
             return;
         }
         let end = datagram.len() - 4;

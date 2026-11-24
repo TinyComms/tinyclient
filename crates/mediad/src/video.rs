@@ -284,6 +284,8 @@ pub struct Wants {
     /// The camera stays open: it is only waiting for a renegotiation. Off, it is closed.
     pub keep_camera: bool,
     pub rates: Rates,
+    /// Bumped whenever the share source, resolution, FPS, quality, or cursor changes mid-share.
+    pub share_version: u64,
 }
 
 impl Wants {
@@ -710,7 +712,9 @@ fn capture<S: Source>(mut work: Capture<S>, orders: &Orders) {
             let starts = |was: bool, rate_was: u32, is: bool, rate: u32| {
                 is && rate > 0 && !(was && rate_was > 0)
             };
-            if starts(seen.share, seen.rates.share, wants.share, wants.rates.share) {
+            if starts(seen.share, seen.rates.share, wants.share, wants.rates.share)
+                || (wants.share && wants.rates.share > 0 && wants.share_version != seen.share_version)
+            {
                 work.gate(Track::Share).force();
             }
             if starts(seen.camera, seen.rates.high, wants.camera, wants.rates.high) {
@@ -733,6 +737,7 @@ fn capture<S: Source>(mut work: Capture<S>, orders: &Orders) {
             seen = wants;
             continue;
         }
+        schedule.rate(&wants);
         let began = Instant::now();
         if !work.round(&wants, began, schedule.fps()) {
             return;
@@ -1234,6 +1239,7 @@ impl Video {
     pub fn ask_key(&self, track: Track) {
         if let Some(sender) = &self.sender {
             sender.orders.order.lock().unwrap().keys[track as usize] = true;
+            sender.orders.changed.notify_all();
         }
     }
 
@@ -1699,6 +1705,7 @@ mod tests {
             preview_camera: false,
             keep_camera: camera,
             rates: Rates::default(),
+            share_version: 0,
         }
     }
 

@@ -8,7 +8,7 @@
 //! whether it runs: it stops or starts as on a desktop, and spends its full rate while it does.
 
 use super::convert::{nv12, planes};
-use super::{fit, rgb, scale_rgb, Ask, Canvas, Encoded, Painted, Planes, Tag, CAMERA_HIGH, CAMERA_HIGH_BPS, CAMERA_LOW, CAMERA_LOW_BPS, CODEC_LATER, SHARE_BPS, SHARE_MAX, SMALL_TILE};
+use super::{fit, rgb, scale_rgb, Ask, Canvas, Encoded, Painted, Planes, Tag, CAMERA_HIGH, CAMERA_HIGH_BPS, CAMERA_LOW, CAMERA_LOW_BPS, CODEC_LATER, SMALL_TILE};
 use crate::platform::{self, CameraRequest, EncoderConfig, Facing, FrameSink, H264Decoder, H264Encoder, Permission, Platform, VideoFrame};
 use std::sync::{Arc, Mutex};
 
@@ -61,18 +61,20 @@ impl Drop for Capture {
     }
 }
 
-/// One encoder at the size it was made for.
+/// One encoder at the size, bitrate, and frame rate it was made for.
 struct Coded {
     encoder: Box<dyn H264Encoder>,
     width: u32,
     height: u32,
+    bps: u32,
+    fps: u32,
 }
 
-/// The size and bitrate a layer is coded at, an encoder kept while the size stays.
-fn coded<'a>(slot: &'a mut Option<Coded>, platform: &dyn Platform, width: u32, height: u32, bps: u32, screen: bool) -> Result<&'a mut Coded, String> {
-    if !slot.as_ref().is_some_and(|coded| coded.width == width && coded.height == height) {
-        let config = EncoderConfig { width, height, bitrate_bps: bps, fps: FPS, screen };
-        *slot = Some(Coded { encoder: platform.h264_encoder(config)?, width, height });
+/// The size, bitrate, and frame rate a layer is coded at, an encoder kept while they stay.
+fn coded<'a>(slot: &'a mut Option<Coded>, platform: &dyn Platform, width: u32, height: u32, bps: u32, fps: u32, screen: bool) -> Result<&'a mut Coded, String> {
+    if !slot.as_ref().is_some_and(|coded| coded.width == width && coded.height == height && coded.bps == bps && coded.fps == fps) {
+        let config = EncoderConfig { width, height, bitrate_bps: bps, fps, screen };
+        *slot = Some(Coded { encoder: platform.h264_encoder(config)?, width, height, bps, fps });
     }
     Ok(slot.as_mut().expect("just made"))
 }
@@ -104,9 +106,10 @@ impl Outgoing {
             self.screen = Some(Capture::screen(platform.clone())?);
         }
         let grabbed = self.screen.as_ref().expect("just started").frame()?;
-        let (width, height) = fit(grabbed.width, grabbed.height, SHARE_MAX.0, SHARE_MAX.1);
+        let quality = super::phone_share_quality();
+        let (width, height) = fit(grabbed.width, grabbed.height, quality.max.0, quality.max.1);
         let picture = planes(&grabbed, width, height);
-        encode(coded(&mut self.share, &*platform, width, height, SHARE_BPS, true)?, &picture, ask.key)
+        encode(coded(&mut self.share, &*platform, width, height, quality.bps, quality.fps, true)?, &picture, ask.key)
     }
 
     /// The camera's two layers, high then low, or why the camera could not be read. A layer with
@@ -120,11 +123,11 @@ impl Outgoing {
         let (hw, hh) = fit(grabbed.width, grabbed.height, CAMERA_HIGH.0, CAMERA_HIGH.1);
         let (lw, lh) = fit(grabbed.width, grabbed.height, CAMERA_LOW.0, CAMERA_LOW.1);
         let high = match high {
-            Some(ask) => encode(coded(&mut self.high, &*platform, hw, hh, CAMERA_HIGH_BPS, false)?, &planes(&grabbed, hw, hh), ask.key)?,
+            Some(ask) => encode(coded(&mut self.high, &*platform, hw, hh, CAMERA_HIGH_BPS, FPS, false)?, &planes(&grabbed, hw, hh), ask.key)?,
             None => Encoded::default(),
         };
         let low = match low {
-            Some(ask) => encode(coded(&mut self.low, &*platform, lw, lh, CAMERA_LOW_BPS, false)?, &planes(&grabbed, lw, lh), ask.key)?,
+            Some(ask) => encode(coded(&mut self.low, &*platform, lw, lh, CAMERA_LOW_BPS, FPS, false)?, &planes(&grabbed, lw, lh), ask.key)?,
             None => Encoded::default(),
         };
         Ok((high, low))
@@ -280,6 +283,7 @@ pub fn retry_codec() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::picture::SHARE_BPS;
     use crate::platform::fake::FakePlatform;
     use std::time::{Duration, Instant};
 

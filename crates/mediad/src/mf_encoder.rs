@@ -34,6 +34,7 @@
 //! its frame rate, and whether it has an input slot to fill; a change of frame size is not
 //! a tune but a new encoder (`coded` in `desktop`), as with OpenH264.
 
+use std::collections::VecDeque;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -41,11 +42,13 @@ use windows::core::Interface;
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, VARIANT_BOOL};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
-    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
+    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
+    CODECAPI_AVLowLatencyMode,
     IMFActivate, ICodecAPI, IMFMediaEventGenerator, IMFMediaType, IMFTransform, MFVideoInterlace_Progressive,
     MF_E_NO_EVENTS_AVAILABLE, MF_EVENT_FLAG_NO_WAIT, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE,
     MF_MT_DEFAULT_STRIDE, MF_MT_FIXED_SIZE_SAMPLES, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE,
+    MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE,
     MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFShutdown, METransformHaveOutput,
     METransformNeedInput, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
@@ -209,14 +212,16 @@ pub(crate) struct Platform {
 pub(crate) fn platform() -> Result<Platform, String> {
     // SAFETY: the apartment call is the documented per-thread init; its result is checked.
     let started = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    if started.is_err() {
-        return Err(if started == RPC_E_CHANGED_MODE {
-            "This thread already holds a COM apartment the encoder cannot share.".to_owned()
-        } else {
-            format!("COM would not start for the encoder: {started}")
-        });
-    }
-    let mut guard = Platform { com: true, mf: false };
+    let com = if started.is_ok() {
+        true
+    } else if started == RPC_E_CHANGED_MODE {
+        // Another capture backend on this thread (such as nokhwa camera capture) already
+        // initialized STA on this thread. Media Foundation can still start without owning COM.
+        false
+    } else {
+        return Err(format!("COM would not start for the encoder: {started}"));
+    };
+    let mut guard = Platform { com, mf: false };
     // The init is undone by the guard when this open ends, on the thread that took it.
     // SAFETY: the version and the no-sockets flag are the constants Media Foundation reads.
     if let Err(err) = unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) } {
@@ -285,8 +290,12 @@ trait Mft: Send {
     /// The input ask: NV12 at the promised stride, whole frames, at the size and rate.
     fn set_input_type(&mut self, width: usize, height: usize, stride: usize, frame: usize, fps: f32) -> Result<(), String>;
     /// The codec properties settled for the stream: CBR at `bps`, low latency, no B
-    /// pictures. A refusal is said in the log and lived with, never a failure.
-    fn configure(&mut self, bps: u32);
+    /// pictures, periodic GOP. A refusal is said in the log and lived with, never a failure.
+    fn configure(&mut self, bps: u32, fps: f32);
+    /// Sequence header (SPS/PPS Annex B) advertised by the output media type, if any.
+    fn sequence_header(&self) -> Option<Vec<u8>> {
+        None
+    }
     /// Streaming begun.
     fn begin(&mut self) -> Result<(), String>;
     /// The next event that asks something of the encoder, skipping the kinds a share needs
@@ -328,7 +337,7 @@ impl Source for Hardware {
         let transform: IMFTransform = unsafe { activate.ActivateObject() }
             .map_err(|err| format!("the hardware encoder could not be started: {err}"))?;
         // The event queue belongs to the active transform. ShutdownObject closes it,
-        // so keep the activation reference until RealMft drops.
+        // so keep the activation reference until RealMft ends or drops.
         let events: IMFMediaEventGenerator = match transform.cast() {
             Ok(events) => events,
             Err(err) => {
@@ -340,20 +349,24 @@ impl Source for Hardware {
         // `codec` is `None` when the MFT exposes no codec properties, which leaves a
         // keyframe ask and a bitrate move without their handle; the picture still encodes.
         let codec: Option<ICodecAPI> = transform.cast().ok();
-        Ok(Box::new(RealMft { activate, transform, events, codec, tune_said: false }))
+        // Keep `activate` alive until `end()` / `Drop` — `ShutdownObject()` shuts down the activated MFT itself!
+        Ok(Box::new(RealMft { transform, events, codec, activate: Some(activate), tune_said: false, seq_header: None }))
     }
 }
 
 /// The machine's encoder as COM hands it over: the async MFT, its event queue, and the
 /// codec properties that survive a frame.
 struct RealMft {
-    activate: IMFActivate,
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     codec: Option<ICodecAPI>,
+    /// Held until `end()` / `Drop` so `ShutdownObject()` only runs when the encoder closes.
+    activate: Option<IMFActivate>,
     /// Whether a refused bitrate has been said, once: the ask comes back every frame
     /// while the encoder holds the rate it has, and the log does not follow it there.
     tune_said: bool,
+    /// Optional SPS/PPS exposed on the negotiated output media type.
+    seq_header: Option<Vec<u8>>,
 }
 
 /// SAFETY: the MFT is opened, driven, and dropped on one thread (the share's or the
@@ -364,8 +377,10 @@ unsafe impl Send for RealMft {}
 
 impl Drop for RealMft {
     fn drop(&mut self) {
-        // SAFETY: the worker owns the activation and no longer drives the transform.
-        unsafe { let _ = self.activate.ShutdownObject(); }
+        if let Some(activate) = self.activate.take() {
+            // SAFETY: the worker owns the activation and no longer drives the transform.
+            unsafe { let _ = activate.ShutdownObject(); }
+        }
     }
 }
 
@@ -389,6 +404,14 @@ impl Mft for RealMft {
                 .map_err(|err| format!("the hardware encoder would not take an H.264 output: {err}"))?;
             let kept = self.transform.GetOutputCurrentType(0)
                 .map_err(|err| format!("the hardware encoder would not say what it kept of the H.264 output: {err}"))?;
+            if let Ok(len) = kept.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) {
+                if len > 0 && len <= 4096 {
+                    let mut buf = vec![0u8; len as usize];
+                    if kept.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, None).is_ok() {
+                        self.seq_header = Some(annex_b(&buf));
+                    }
+                }
+            }
             Ok(kept.GetUINT32(&MF_MT_MPEG2_PROFILE).ok())
         }
     }
@@ -402,10 +425,11 @@ impl Mft for RealMft {
         }
     }
 
-    fn configure(&mut self, bps: u32) {
+    fn configure(&mut self, bps: u32, fps: f32) {
         let Some(codec) = &self.codec else {
             return;
         };
+        let gop = (fps.round() as u32).saturating_mul(2).clamp(30, 120);
         // Both rates are said twice on purpose: once on the output type, which the
         // MFT reads as it opens, and once through the codec properties, which the
         // rate control holds for the frames after. A refusal is logged and lived
@@ -428,7 +452,14 @@ impl Mft for RealMft {
             if let Err(err) = codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &counted(0)) {
                 tracing::debug!("mediad: the hardware encoder took no B picture count: {err}");
             }
+            if let Err(err) = codec.SetValue(&CODECAPI_AVEncMPVGOPSize, &counted(gop)) {
+                tracing::debug!("mediad: the hardware encoder took no GOP size: {err}");
+            }
         }
+    }
+
+    fn sequence_header(&self) -> Option<Vec<u8>> {
+        self.seq_header.clone()
     }
 
     fn begin(&mut self) -> Result<(), String> {
@@ -552,10 +583,13 @@ impl Mft for RealMft {
     }
 
     fn end(&mut self) {
-        // SAFETY: the transform is still owned here; both messages are its own.
+        // SAFETY: the transform and its activate are owned here; flush and end streaming before shutting down.
         unsafe {
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            if let Some(activate) = self.activate.take() {
+                let _ = activate.ShutdownObject();
+            }
         }
     }
 }
@@ -578,6 +612,14 @@ pub struct Encoder {
     /// Whether the encoder has an input slot open: a `METransformNeedInput` seen and not
     /// yet fed.
     wants_input: bool,
+    /// Queued encoded access units ready to emit one per `encode()` call so two separate frames
+    /// are never concatenated into a single RTP access unit.
+    pending: VecDeque<Taken>,
+    /// Deferred keyframe request applied immediately before the next `give()`.
+    pending_key: bool,
+    /// Cached SPS and PPS parameter sets so forced keyframes always carry them for late viewers.
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
     /// Whether a frame has gone in yet: the first may wait the encoder's warmup for its
     /// bits, every later one waits at most [`OUTPUT_WAIT`].
     fed: bool,
@@ -619,16 +661,35 @@ impl Encoder {
         if kept != BASELINE && kept != CONSTRAINED_BASELINE {
             return Err(format!("the hardware encoder encodes H.264 profile {kept}, not the baseline the SFU takes."));
         }
+        let (sps, pps) = mft
+            .sequence_header()
+            .map(|header| crate::h264::extract_param_sets(&header))
+            .unwrap_or((None, None));
         mft.set_input_type(width, height, stride, frame, fps)?;
-        mft.configure(bps);
+        mft.configure(bps, fps);
         mft.begin()?;
-        let mut encoder = Encoder { mft, width, height, stride, frame, fps, bps, wants_input: false, fed: false, answered: Instant::now(), _platform: platform };
+        let mut encoder = Encoder {
+            mft,
+            width,
+            height,
+            stride,
+            frame,
+            fps,
+            bps,
+            wants_input: false,
+            pending: VecDeque::new(),
+            pending_key: false,
+            sps,
+            pps,
+            fed: false,
+            answered: Instant::now(),
+            _platform: platform,
+        };
         // The first input slot is usually open before the first frame; wait a moment
         // for it, so the first frame of a share is fed at once and not dropped.
-        let mut nothing = Vec::new();
         let until = Instant::now() + ANSWER_WAIT;
         while !encoder.wants_input && Instant::now() < until {
-            encoder.drain(&mut nothing)?;
+            encoder.drain()?;
             if !encoder.wants_input {
                 std::thread::sleep(POLL);
             }
@@ -636,12 +697,9 @@ impl Encoder {
         Ok(encoder)
     }
 
-    /// One frame in, whatever is out. A frame whose bits are still on their way comes back
-    /// empty, like a skip; an encoded frame comes back marked when it is a keyframe, so
-    /// the share sends it as one. After the first frame is in, the wait for a frame's own
-    /// bits is bounded well under a frame's time, so the capture thread is never held
-    /// long. A driver that sends no bits at all for [`STALLED`] while frames keep being
-    /// offered is called hung, as an Err: the share's failover takes OpenH264 on it.
+    /// One frame in, at most one access unit out. A frame whose bits are still on their way
+    /// comes back empty, like a skip; an encoded frame comes back marked when it is a keyframe,
+    /// with SPS/PPS ensured so late-joining viewers can always decode it.
     pub fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
         if planes.width != self.width || planes.height != self.height {
             return Err(format!("The encoder was opened for {}×{} and handed {}×{}.", self.width, self.height, planes.width, planes.height));
@@ -650,12 +708,13 @@ impl Encoder {
             self.bps = ask.bps;
         }
         if ask.key {
-            self.mft.force_key();
+            self.pending_key = true;
         }
-        // What is already out, before this frame goes in: the machine may be a frame ahead.
-        let mut bytes = Vec::new();
-        let mut key = self.drain(&mut bytes)?;
+        self.drain()?;
         if self.wants_input {
+            if std::mem::take(&mut self.pending_key) {
+                self.mft.force_key();
+            }
             // The ask's clock is milliseconds; Media Foundation's is 100 nanoseconds.
             let at = (ask.at.as_millis() as i64).saturating_mul(10_000);
             let lasting = (10_000_000.0 / self.fps.max(1.0)) as i64;
@@ -663,54 +722,61 @@ impl Encoder {
             self.wants_input = false;
             let first = !self.fed;
             self.fed = true;
-            // A bounded moment for this frame's own bits. The first frame may wait the
-            // encoder's warmup; every later one waits no longer than [`OUTPUT_WAIT`], so a
-            // driver holding frames back never stalls the capture thread. When the bits
-            // are not out in time, the empty frame goes and the pump catches them next
-            // time.
+            // A bounded moment for this frame's own bits when nothing is queued yet.
             let until = Instant::now() + if first { ANSWER_WAIT } else { OUTPUT_WAIT };
-            while bytes.is_empty() && Instant::now() < until {
-                key |= self.drain(&mut bytes)?;
-                if bytes.is_empty() {
+            while self.pending.is_empty() && Instant::now() < until {
+                self.drain()?;
+                if self.pending.is_empty() {
                     std::thread::sleep(POLL);
                 }
             }
         }
-        if bytes.is_empty() {
-            key = false;
-            // The frames are still being offered, and for [`STALLED`] not one of their
-            // bits has come out: a driver that stopped answering its queue would say
-            // every frame a skip forever, and the share would freeze looking skipped.
-            // Said as an Err, this is the swap to OpenH264's cue, the way every other
-            // failure of the hardware runs.
+        let Some(taken) = self.pending.pop_front() else {
             if self.answered.elapsed() >= STALLED {
                 return Err("the hardware encoder has sent no bits for two seconds, with frames going in.".to_owned());
             }
-        } else {
-            self.answered = Instant::now();
+            return Ok(Encoded::default());
+        };
+        let bytes = crate::h264::sanitize_annex_b(&taken.bytes);
+        let (sps, pps) = crate::h264::extract_param_sets(&bytes);
+        if sps.is_some() {
+            self.sps = sps;
         }
+        if pps.is_some() {
+            self.pps = pps;
+        }
+        let key = clean_point_is_key(taken.clean) || crate::h264::has_idr(&bytes);
+        let bytes = if key {
+            crate::h264::ensure_param_sets(&bytes, self.sps.as_deref(), self.pps.as_deref())
+        } else {
+            bytes
+        };
+        if bytes.is_empty() {
+            if self.answered.elapsed() >= STALLED {
+                return Err("the hardware encoder has sent no bits for two seconds, with frames going in.".to_owned());
+            }
+            return Ok(Encoded::default());
+        }
+        self.answered = Instant::now();
         Ok(Encoded { bytes, key })
     }
 
-    /// Everything the event queue holds now, without waiting: frames out, their bytes
-    /// appended, and whether what came out holds a keyframe; the open input slot is
-    /// remembered for the next frame in.
-    fn drain(&mut self, bytes: &mut Vec<u8>) -> Result<bool, String> {
-        let mut key = false;
+    /// Everything the event queue holds now, without waiting: each output sample is queued
+    /// individually so separate access units are never merged together.
+    fn drain(&mut self) -> Result<(), String> {
         while let Some(event) = self.mft.event()? {
             match event {
                 Event::HaveOutput => {
                     if let Some(taken) = self.mft.take()? {
-                        if clean_point_is_key(taken.clean) {
-                            key = true;
+                        if !taken.bytes.is_empty() {
+                            self.pending.push_back(taken);
                         }
-                        bytes.extend_from_slice(&taken.bytes);
                     }
                 }
                 Event::NeedInput => self.wants_input = true,
             }
         }
-        Ok(key)
+        Ok(())
     }
 }
 
@@ -986,7 +1052,7 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn configure(&mut self, bps: u32) {
+        fn configure(&mut self, bps: u32, _fps: f32) {
             self.configured = Some(bps);
         }
 
@@ -1057,8 +1123,8 @@ pub(crate) mod tests {
             self.0.borrow_mut().set_input_type(width, height, stride, frame, fps)
         }
 
-        fn configure(&mut self, bps: u32) {
-            self.0.borrow_mut().configure(bps)
+        fn configure(&mut self, bps: u32, fps: f32) {
+            self.0.borrow_mut().configure(bps, fps)
         }
 
         fn begin(&mut self) -> Result<(), String> {
@@ -1178,20 +1244,20 @@ pub(crate) mod tests {
         }
     }
 
-    /// `MFSampleExtension_CleanPoint` says keyframe only by its value: a delta frame that
-    /// carries the extension as zero, and a sample that does not carry it at all, are not
-    /// keyframes, whatever a mere "the attribute is there" would have said.
+    /// `MFSampleExtension_CleanPoint` says keyframe only by its value: a non-IDR delta frame
+    /// with `clean: Some(0)` or `None` is not a keyframe, while an IDR NAL (`0x65`) or
+    /// `clean: Some(1)` is.
     #[test]
     fn a_frame_is_a_keyframe_only_when_the_sample_says_it_is_a_clean_point() {
         assert!(!clean_point_is_key(None));
         assert!(!clean_point_is_key(Some(0)));
         assert!(clean_point_is_key(Some(1)));
-        for (clean, key) in [(Some(1u32), true), (Some(0u32), false), (None, false)] {
+        for (clean, nal, key) in [(Some(1u32), 0x65u8, true), (Some(0u32), 0x41u8, false), (None, 0x41u8, false), (None, 0x65u8, true)] {
             let mut fake = baseline_fake();
-            fake.after_give = Some(Taken { bytes: vec![0, 0, 0, 1, 0x65], clean });
+            fake.after_give = Some(Taken { bytes: vec![0, 0, 0, 1, nal, 0x88], clean });
             let mut encoder = opened(SharedFake::new(fake));
             let encoded = encoder.encode(&planes(), &Ask::default()).expect("the fake encoder answers");
-            assert_eq!(encoded.key, key, "clean point {clean:?}");
+            assert_eq!(encoded.key, key, "clean point {clean:?}, nal {nal:#x}");
             assert!(!encoded.bytes.is_empty(), "the frame's bits came out");
         }
     }
@@ -1265,5 +1331,107 @@ pub(crate) mod tests {
         };
         assert!(why.contains("no bits"), "{why}");
         assert_eq!(choose(&Err(why)), Choice::OpenH264, "the words are the swap's cue");
+    }
+
+    #[test]
+    fn multiple_ready_outputs_are_returned_one_access_unit_per_call() {
+        let mut fake = baseline_fake();
+        fake.events.push_back(Event::HaveOutput);
+        fake.events.push_back(Event::HaveOutput);
+        fake.outputs.push_back(Taken { bytes: vec![0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0x88], clean: Some(1) });
+        fake.outputs.push_back(Taken { bytes: vec![0, 0, 0, 1, 0x41, 0x9a, 0x11], clean: Some(0) });
+        let mut encoder = opened(SharedFake::new(fake));
+        let first = encoder.encode(&planes(), &Ask::default()).unwrap();
+        assert!(first.key);
+        assert!(!first.bytes.windows(5).any(|w| w == [0, 0, 0, 1, 0x41]), "second AU must not be concatenated onto first");
+        let second = encoder.encode(&planes(), &Ask::default()).unwrap();
+        assert!(!second.key);
+        assert_eq!(second.bytes, vec![0, 0, 0, 1, 0x41, 0x9a, 0x11]);
+    }
+
+    #[test]
+    fn forced_keyframe_repeats_cached_sps_and_pps_and_strips_aud_and_filler() {
+        let mut fake = baseline_fake();
+        // First frame carries AUD (9), SPS (7), PPS (8), Filler (12), IDR (5).
+        fake.after_give = Some(Taken {
+            bytes: vec![
+                0, 0, 0, 1, 0x09, 0x10,
+                0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f,
+                0, 0, 0, 1, 0x68, 0xce, 0x38, 0x80,
+                0, 0, 0, 1, 0x0c, 0xff, 0xff,
+                0, 0, 0, 1, 0x65, 0x88, 0x84,
+            ],
+            clean: Some(1),
+        });
+        let shared = SharedFake::new(fake);
+        let mut encoder = opened(shared.clone());
+        let first = encoder.encode(&planes(), &Ask::default()).unwrap();
+        assert!(first.key);
+        assert!(!first.bytes.windows(5).any(|w| w == [0, 0, 0, 1, 0x09]), "AUD stripped");
+        assert!(!first.bytes.windows(5).any(|w| w == [0, 0, 0, 1, 0x0c]), "Filler stripped");
+
+        // Second keyframe is a bare IDR (as hardware MFTs often emit on PLI).
+        shared.0.borrow_mut().after_give = Some(Taken { bytes: vec![0, 0, 0, 1, 0x65, 0xaa, 0xbb], clean: Some(1) });
+        let second = encoder.encode(&planes(), &Ask { key: true, ..Ask::default() }).unwrap();
+        assert!(second.key);
+        assert!(second.bytes.windows(5).any(|w| w == [0, 0, 0, 1, 0x67]), "cached SPS prepended");
+        assert!(second.bytes.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]), "cached PPS prepended");
+        assert!(second.bytes.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]), "IDR kept");
+    }
+
+    #[test]
+    fn force_key_while_input_is_busy_is_held_until_the_next_give() {
+        let mut fake = FakeMft::default();
+        fake.negotiated_profile = Some(BASELINE);
+        // No initial NeedInput yet — encoder input slot is busy.
+        let shared = SharedFake::new(fake);
+        let mut encoder = opened(shared.clone());
+        let _ = encoder.encode(&planes(), &Ask { key: true, ..Ask::default() }).unwrap();
+        assert_eq!(shared.with(|f| f.keys_forced), 0, "not forced while input is busy");
+        // Now NeedInput arrives on the next call (without ask.key set).
+        shared.0.borrow_mut().events.push_back(Event::NeedInput);
+        let _ = encoder.encode(&planes(), &Ask::default()).unwrap();
+        assert_eq!(shared.with(|f| f.keys_forced), 1, "deferred keyframe fired on next give");
+    }
+
+    /// Real Windows hardware MFT proof: if this machine has a hardware H.264 MFT, encode real
+    /// frames (including a forced PLI keyframe), seal with DAVE E2EE, send over a real str0m
+    /// WebRTC connection (H264Packetizer + SRTP + H264Depacketizer), and verify the receiver
+    /// decrypts every frame cleanly.
+    #[test]
+    fn real_hardware_mft_survives_e2ee_and_str0m_rtp_packetization() {
+        if available().is_err() {
+            return;
+        }
+        let mut enc = Encoder::open(640, 360, 2_000_000, 30., true).expect("hardware MF encoder opens");
+        let (mut ada, mut bea) = crate::e2ee::tests::pair_for_video_proof();
+        let mut pipe = crate::e2ee::tests::Str0mVideoPipe::new();
+        let mut produced = 0usize;
+        let mut keys = 0usize;
+        for n in 0..20usize {
+            let mut rgba = vec![0u8; 640 * 360 * 4];
+            for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+                let v = ((i + n * 37) % 256) as u8;
+                px.copy_from_slice(&[v, v.wrapping_mul(3), 255 - v, 255]);
+            }
+            let p = crate::picture::i420(&rgba, 640, 360, 640, 360, false);
+            let ask = Ask { key: n == 0 || n == 10, bps: 2_000_000, at: Duration::from_millis(n as u64 * 33), fps: 30. };
+            let encoded = enc.encode(&p, &ask).expect("hardware encode succeeds");
+            if encoded.bytes.is_empty() {
+                continue;
+            }
+            produced += 1;
+            if encoded.key {
+                keys += 1;
+                let (sps, pps) = crate::h264::extract_param_sets(&encoded.bytes);
+                assert!(sps.is_some() && pps.is_some(), "keyframe #{keys} (frame {n}) must include SPS & PPS");
+            }
+            let sealed = ada.seal_video(&encoded.bytes).expect("e2ee seals hardware frame");
+            let reassembled = pipe.send_and_receive(sealed, (n as u64 + 1) * 3000);
+            let opened = bea.open_video(crate::e2ee::tests::ADA, &reassembled).expect("receiver decrypts hardware frame after real str0m WebRTC round-trip");
+            assert_eq!(opened, encoded.bytes, "decrypted frame matches sanitized hardware output on frame {n}");
+        }
+        assert!(produced >= 5, "hardware encoder produced {produced} frames");
+        assert!(keys >= 2, "hardware encoder produced {keys} keyframes (initial + forced PLI)");
     }
 }

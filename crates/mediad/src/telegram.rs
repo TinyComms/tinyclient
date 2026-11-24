@@ -775,6 +775,7 @@ pub fn run_direct(join: TelegramCallJoin, controls: Arc<Controls>) {
             preview_camera,
             keep_camera,
             rates,
+            share_version: crate::picture::share_config_version(),
         });
         while let Some(word) = video.next() {
             match word {

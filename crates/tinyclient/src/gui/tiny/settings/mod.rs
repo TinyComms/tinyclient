@@ -113,7 +113,7 @@ impl Page {
             Page::Audit => "Audit log",
             Page::Reports => "Reports",
             Page::Privacy => "Privacy",
-            Page::SignIn => "Sign-in",
+            Page::SignIn => "Sign-in & account",
             Page::Encryption => "Encryption",
             Page::Danger => "Danger zone",
         }
@@ -169,9 +169,9 @@ impl Page {
             Page::Reports => community.has(protocol::TINY_FEATURE_ABUSE_REPORTS) && can("community.reports.manage"),
             // What the server keeps about everyone in it: every member may read it, an owner changes it.
             Page::Privacy => crate::tiny_setup::offered(community),
-            // A member's own sign-in and passkeys, on a server new enough to have them (it has
-            // setup); before that, for those who run the server.
-            Page::SignIn => may.edit_server || may.owner || crate::tiny_setup::offered(community),
+            // Every member can manage their own profile, avatar, display name, passkeys, sessions,
+            // and account deletion on this server.
+            Page::SignIn => true,
             // Everyone's own devices and the people they talk to: not a power over the server.
             Page::Encryption => community.has(protocol::TINY_FEATURE_E2EE_TEXT),
             Page::Danger => may.owner,
@@ -261,6 +261,8 @@ pub(in crate::gui) struct Fields {
     pub backup_open: Entity<TextInput>,
     /// Moderator note input on the Reports page.
     pub report_note: Entity<TextInput>,
+    /// This member's display name on the Sign-in & account page.
+    pub my_name: Entity<TextInput>,
 }
 
 impl Fields {
@@ -287,7 +289,8 @@ impl Fields {
         let backup_again = cx.new(|cx| TextInput::secret("Confirm passphrase", cx));
         let backup_open = cx.new(|cx| TextInput::secret("Backup passphrase", cx));
         let report_note = cx.new(|cx| TextInput::new("Add a moderator note…", cx));
-        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &emoji_name, &confirm, &link_code, &link_check, &recovery_check, &backup_passphrase, &backup_again, &backup_open, &report_note] {
+        let my_name = cx.new(|cx| TextInput::new("Your display name", cx));
+        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &emoji_name, &confirm, &link_code, &link_check, &recovery_check, &backup_passphrase, &backup_again, &backup_open, &report_note, &my_name] {
             cx.subscribe(input, |_, _, _: &crate::gui::input::InputEvent, cx| cx.notify()).detach();
             // Escape in a field leaves Server Settings, as it does anywhere else in it.
             cx.subscribe(input, |this, _, key: &crate::gui::input::InputKey, cx| {
@@ -297,7 +300,7 @@ impl Fields {
             })
             .detach();
         }
-        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, bot_name, emoji_name, confirm, link_code, link_check, recovery_check, backup_passphrase, backup_again, backup_open, report_note }
+        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, bot_name, emoji_name, confirm, link_code, link_check, recovery_check, backup_passphrase, backup_again, backup_open, report_note, my_name }
     }
 }
 
@@ -740,17 +743,17 @@ mod tests {
     #[test]
     fn a_page_is_listed_only_where_the_account_may_use_it_and_the_server_has_it() {
         let legacy = |role: &str| -> TinyCommunity { serde_json::from_value(serde_json::json!({"role": role, "members": [], "invites": [], "audit": [], "me": "me"})).unwrap() };
-        assert_eq!(shown(&legacy("member")), ["Overview"]);
+        assert_eq!(shown(&legacy("member")), ["Overview", "Sign-in & account"]);
         let admin = shown(&legacy("admin"));
         assert!(admin.contains(&"Members") && admin.contains(&"Invites") && admin.contains(&"Audit log"), "{admin:?}");
         assert!(!admin.contains(&"Roles") && !admin.contains(&"Bans") && !admin.contains(&"Danger zone"), "an older server has no roles or bans: {admin:?}");
         let mut modern = legacy("member");
         modern.capabilities.features = ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_text"].map(String::from).to_vec();
         modern.access = Some(TinyAccess { permissions: TINY_KICK_MEMBERS | TINY_VIEW_AUDIT_LOG, ..TinyAccess::default() });
-        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Encryption"], "a moderator sees what they moderate, and everyone sees Encryption where the server has it");
-        // Privacy, and Sign-in with your own passkeys, are for everyone on a server that has setup.
+        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Sign-in & account", "Encryption"], "a moderator sees what they moderate, and everyone sees Sign-in & account and Encryption where the server has it");
+        // Privacy is also for everyone on a server that has setup.
         modern.capabilities.features.push("first_run_setup".to_owned());
-        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Privacy", "Sign-in", "Encryption"]);
+        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Privacy", "Sign-in & account", "Encryption"]);
         modern.access = Some(TinyAccess { permissions: TINY_ALL, rank: 3, ..TinyAccess::default() });
         assert!(!shown(&modern).contains(&"Reports"), "reports needs the abuse_reports server feature");
         modern.capabilities.features.push("abuse_reports".to_owned());

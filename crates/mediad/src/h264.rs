@@ -24,6 +24,85 @@ pub fn is_key(annex_b: &[u8]) -> bool {
     split(annex_b).into_iter().any(|nal| matches!(nal_type(nal), 5 | 7 | 8))
 }
 
+/// True when the access unit contains an actual IDR slice (NAL type 5).
+pub fn has_idr(annex_b: &[u8]) -> bool {
+    split(annex_b).into_iter().any(|nal| nal_type(nal) == 5)
+}
+
+/// Strips Access Unit Delimiter (NAL type 9) and Filler Data (NAL type 12) units and normalizes
+/// start codes to 4-byte Annex B (`00 00 00 01`).
+///
+/// `str0m`'s H.264 RTP packetizer drops NAL types 9 and 12 when building RTP payloads; if those
+/// units were still present when DAVE/E2EE sealed the access unit, their bytes were authenticated
+/// in AAD and recorded in unencrypted ranges, so dropping them during packetization causes every
+/// frame to fail AES-GCM decryption on the receiver.
+pub fn sanitize_annex_b(frame: &[u8]) -> Vec<u8> {
+    let has_start_code = frame.windows(3).any(|w| w == [0, 0, 1]);
+    if !has_start_code {
+        return frame.to_vec();
+    }
+    let nals = split(frame);
+    let mut out = Vec::with_capacity(frame.len());
+    for nal in nals {
+        if nal.is_empty() {
+            continue;
+        }
+        let kind = nal_type(nal);
+        if kind == 9 || kind == 12 {
+            continue;
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+    }
+    out
+}
+
+/// Extracts the latest SPS (NAL type 7) and PPS (NAL type 8) bodies (without start codes)
+/// present in an Annex B access unit.
+pub fn extract_param_sets(frame: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut sps = None;
+    let mut pps = None;
+    for nal in split(frame) {
+        match nal_type(nal) {
+            7 => sps = Some(nal.to_vec()),
+            8 => pps = Some(nal.to_vec()),
+            _ => {}
+        }
+    }
+    (sps, pps)
+}
+
+/// Ensures an Annex B keyframe starts with SPS and PPS when cached copies are available and the
+/// frame itself omitted either parameter set (common on Windows hardware MFTs on forced IDRs).
+pub fn ensure_param_sets(frame: &[u8], sps: Option<&[u8]>, pps: Option<&[u8]>) -> Vec<u8> {
+    let mut has_sps = false;
+    let mut has_pps = false;
+    for nal in split(frame) {
+        match nal_type(nal) {
+            7 => has_sps = true,
+            8 => has_pps = true,
+            _ => {}
+        }
+    }
+    let add_sps = (!has_sps).then_some(sps).flatten();
+    let add_pps = (!has_pps).then_some(pps).flatten();
+    if add_sps.is_none() && add_pps.is_none() {
+        return frame.to_vec();
+    }
+    let extra = add_sps.map_or(0, |s| 4 + s.len()) + add_pps.map_or(0, |p| 4 + p.len());
+    let mut out = Vec::with_capacity(extra + frame.len());
+    if let Some(sps) = add_sps {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(sps);
+    }
+    if let Some(pps) = add_pps {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(pps);
+    }
+    out.extend_from_slice(frame);
+    out
+}
+
 fn nal_type(nal: &[u8]) -> u8 {
     nal.first().map(|byte| byte & 0x1f).unwrap_or(0)
 }

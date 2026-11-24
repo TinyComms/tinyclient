@@ -3005,7 +3005,16 @@ fn start_direct_intent(ctx: &Context, saved: &Saved, person_id: &str, call: bool
             }
             refresh(ctx, saved);
             if ctx.known(id).ok().flatten().is_none() {
-                let mut row = ConversationRow::new(id, ConversationKind::Direct, "Someone");
+                let title = ctx
+                    .hub
+                    .store()
+                    .person(&ctx.key(person_id))
+                    .ok()
+                    .flatten()
+                    .map(|p| p.name)
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "Someone".to_owned());
+                let mut row = ConversationRow::new(id, ConversationKind::Direct, title);
                 row.space = Some(SPACE.to_owned());
                 row.group = Some("directs".to_owned());
                 row.peer = Some(person_id.to_owned());
