@@ -4,7 +4,7 @@
 use super::{https_host, within, Fault, Slack, SEARCHED, SEARCH_EVERY, UNKNOWN};
 use crate::adapters::{Failure, Members};
 use crate::store::{ConversationRow, PersonDetails, PersonRow};
-use protocol::{Activity, ActivityKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation, SEARCH_MIN_CHARS};
+use protocol::{Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation, SEARCH_MIN_CHARS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -127,13 +127,10 @@ fn mark_of(user: &Value, workspace: &str) -> Option<Mark> {
 }
 
 /// In a huddle now, as the profile says. Unverified: `huddle_state` and its value are the
-/// community's; Slack documents neither.
+/// community's; Slack documents neither. Whether they are shown as in one, and which huddle, is
+/// [`Slack::huddling`], which also reads the huddles known to be running.
 fn huddling(profile: &Value) -> bool {
     profile["huddle_state"] == "in_a_huddle"
-}
-
-fn huddle(on: bool) -> Option<Activity> {
-    on.then(|| Activity::new(ActivityKind::Huddle, ""))
 }
 
 /// A person as kept in a note, so a restart asks Slack nothing: what is remembered in memory,
@@ -345,7 +342,7 @@ impl Slack {
             let title = profile["title"].as_str().unwrap_or("").to_owned();
             let utc_offset = user["tz_offset"].as_i64().map(|offset| offset as i32);
             details.push((id.to_owned(), PersonDetails { title, utc_offset, mark }));
-            doing.push((id.to_owned(), status_emoji.to_owned(), huddle(huddling(profile))));
+            doing.push((id.to_owned(), status_emoji.to_owned(), self.huddling(&id, &known)));
             let kept = Kept {
                 user: known.clone(),
                 form: NOTE,
@@ -810,7 +807,7 @@ impl Slack {
         let partners: Vec<String> = self.state().partners.keys().cloned().collect();
         for id in partners {
             if let Some(user) = self.cached(&id) {
-                self.ctx.activity(&id, &user.emoji, huddle(user.huddle), true);
+                self.ctx.activity(&id, &user.emoji, self.huddling(&id, &user), true);
             }
         }
     }

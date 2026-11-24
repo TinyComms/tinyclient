@@ -1975,6 +1975,39 @@ fn who(inside: &protocol::Occupants) -> Vec<&str> {
     inside.people.iter().map(|person| person.name.as_str()).collect()
 }
 
+/// What the People list says someone is doing, as the shell asks for them by name.
+fn doing(world: &World, name: &str, id: &str) -> Option<protocol::Activity> {
+    let asked = Request::People { network: Some(Network::Slack), relation: None, query: Some(name.into()), offset: 0, limit: 10 };
+    match world.ask(asked) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key == alpha(id)).and_then(|person| person.activity).map(|activity| *activity),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A huddle started by Ana in `#general` `started` seconds after the epoch, as the socket says it.
+fn huddle_started_in_general(who: &[&str], started: i64) -> Value {
+    let huddle = "1760000800.000800";
+    json!({
+        "type": "message", "subtype": "huddle_thread", "user": "USLACKBOT", "channel": "C0GEN", "team": "T01ALPHA",
+        "ts": huddle, "event_ts": huddle,
+        "room": {"id": "R0HUD", "call_family": "huddle", "created_by": "U0ANA", "channels": ["C0GEN"], "date_start": started,
+                 "participants": who, "has_ended": false, "thread_root_ts": huddle},
+    })
+}
+
+/// The same huddle, over: Slack changes its message.
+fn huddle_ended_in_general() -> Value {
+    json!({
+        "type": "message", "subtype": "message_changed", "hidden": true, "channel": "C0GEN",
+        "ts": "1760001100.000000", "event_ts": "1760001100.000000",
+        "message": {
+            "type": "message", "subtype": "huddle_thread", "user": "USLACKBOT", "channel": "C0GEN", "ts": "1760000800.000800",
+            "room": {"id": "R0HUD", "call_family": "huddle", "created_by": "U0ANA", "channels": ["C0GEN"], "date_start": 1760000800,
+                     "date_end": 1760001100, "participants": [], "has_ended": true, "thread_root_ts": "1760000800.000800"},
+        },
+    })
+}
+
 #[test]
 fn one_sign_in_is_two_workspaces_each_with_its_sidebar_and_unread_state() {
     let world = World::start();
@@ -2695,6 +2728,56 @@ fn a_row_on_screen_whose_newest_message_is_a_running_huddle_lists_it_without_bei
         world.fake.calls(ALPHA, "conversations.history").iter().all(|call| call.params["limit"] == "1"),
         "one message for the row, never the page an opening reads"
     );
+}
+
+#[test]
+fn in_a_huddle_on_a_person_names_the_conversation_it_is_in() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    // Ana's profile says she is in a huddle. Which conversation it is in, nothing has said.
+    assert_eq!(doing(&world, "Ana", "U0ANA").and_then(|activity| activity.conversation), None);
+
+    // She starts one in #general ten minutes ago: "In a huddle" now opens that channel, and
+    // says how long it has run.
+    let started = now() - 600;
+    world.fake.push(ALPHA, huddle_started_in_general(&["U0ANA"], started));
+    let hers = world.until("Ana's huddle to name its conversation", || {
+        doing(&world, "Ana", "U0ANA").filter(|activity| activity.conversation.is_some())
+    });
+    assert_eq!(
+        (hers.kind, hers.conversation.clone(), hers.name.as_str(), hers.started),
+        (protocol::ActivityKind::Huddle, Some(general.clone()), "#general", Some(started))
+    );
+
+    // It ends: she is in no huddle that is known, wherever her profile says she is.
+    world.fake.push(ALPHA, huddle_ended_in_general());
+    let hers = world.until("Ana's huddle to name no conversation", || {
+        doing(&world, "Ana", "U0ANA").filter(|activity| activity.conversation.is_none())
+    });
+    assert_eq!(hers.kind, protocol::ActivityKind::Huddle, "her profile still says she is in one");
+}
+
+#[test]
+fn someone_a_huddle_lists_is_in_a_huddle_though_their_profile_says_nothing() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    // The shell has Ben on screen, so chatd keeps what he is doing for him.
+    world.ask(Request::Watch(Watching { people: vec![alpha("U0BEN")], ..Watching::default() }));
+    assert!(doing(&world, "Ben", "U0BEN").is_none(), "his profile says nothing, and no huddle lists him");
+
+    world.fake.push(ALPHA, huddle_started_in_general(&["U0ANA"], now() - 600));
+    assert!(doing(&world, "Ben", "U0BEN").is_none(), "a huddle he is not in says nothing of him");
+    world.fake.push(ALPHA, json!({"type": "sh_room_join", "user": "U0BEN", "channel": "C0GEN", "event_ts": "1760000850.000000"}));
+    let his = world.until("Ben to be in a huddle", || doing(&world, "Ben", "U0BEN"));
+    assert_eq!(
+        (his.kind, his.conversation.clone(), his.name.as_str()),
+        (protocol::ActivityKind::Huddle, Some(general.clone()), "#general")
+    );
+
+    world.fake.push(ALPHA, json!({"type": "sh_room_leave", "user": "U0BEN", "channel": "C0GEN", "event_ts": "1760000900.000000"}));
+    world.until("Ben to be in no huddle", || doing(&world, "Ben", "U0BEN").is_none().then_some(()));
 }
 
 #[test]

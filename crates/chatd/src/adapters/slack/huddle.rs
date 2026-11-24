@@ -18,9 +18,9 @@
 
 use super::people::User;
 use super::{message, Slack, State};
-use protocol::Occupant;
+use protocol::{Activity, ActivityKind, Occupant};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The events, by `type`: someone joins a huddle, leaves it, or it changes.
 pub(super) const JOIN: &str = "sh_room_join";
@@ -98,6 +98,9 @@ pub(super) const PEOPLE: usize = protocol::OCCUPANTS_LIMIT;
 /// The longest id taken for a conversation, a person or a message. Slack's are 9 to 12
 /// characters; a thread's adds its message's timestamp.
 const ID: usize = 32;
+
+/// How far back a huddle is believed to have started, for saying how long it has run.
+const DAY: i64 = 86_400;
 
 /// Whether something that calls itself an id may be one. Slack's are letters and digits, and a
 /// thread's has a colon and a dot. Nothing else is handed on as a key.
@@ -183,9 +186,46 @@ impl Slack {
     /// says what is running.
     pub(super) fn rooms_forgotten(&self) {
         let mut state = self.state();
-        let forgotten: Vec<String> = state.rooms.drain().map(|(channel, _)| channel).collect();
-        for channel in forgotten {
-            self.room_told(&channel, &state);
+        let (mut forgotten, mut moved): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        for (channel, room) in state.rooms.drain() {
+            moved.extend(room.people);
+            forgotten.push(channel);
+        }
+        for channel in &forgotten {
+            self.room_told(channel, &state);
+        }
+        self.huddles_told(&moved, &state);
+    }
+
+    /// "In a huddle" for someone: as their profile says, or because a huddle lists them. With the
+    /// conversation it is in, and when it started, where a huddle does, so that "In a huddle" on
+    /// them opens that conversation.
+    pub(super) fn huddling(&self, id: &str, user: &User) -> Option<Activity> {
+        let state = self.state();
+        self.huddling_in(id, user, &state.rooms)
+    }
+
+    fn huddling_in(&self, id: &str, user: &User, rooms: &HashMap<String, Room>) -> Option<Activity> {
+        let sat_in = rooms.iter().find_map(|(channel, room)| room.people.iter().any(|who| who == id).then_some((channel.as_str(), room.started)));
+        let Some((channel, started)) = sat_in else {
+            return user.huddle.then(|| Activity::new(ActivityKind::Huddle, ""));
+        };
+        let mut activity = Activity::new(ActivityKind::Huddle, self.ctx.known(channel).ok().flatten().map_or_else(String::new, |row| row.title));
+        activity.conversation = Some(self.ctx.key(channel));
+        // A start further back than a day is not believed: a huddle is not run that long.
+        activity.started = (started > 0 && crate::hub::now().saturating_sub(started) <= DAY).then_some(started);
+        Some(activity)
+    }
+
+    /// "In a huddle" said again for those who may have moved between a huddle and none.
+    fn huddles_told(&self, moved: &[String], state: &State) {
+        let mine = self.me.get().map(String::as_str);
+        for id in moved {
+            let Some(user) = state.users.get(id) else {
+                continue;
+            };
+            let owned = mine == Some(id.as_str()) || state.partners.contains_key(id);
+            self.ctx.activity(id, &user.emoji, self.huddling_in(id, user, &state.rooms), owned);
         }
     }
 
@@ -233,10 +273,13 @@ impl Slack {
             return;
         }
         let mut state = self.state();
-        let before = state.rooms.get(channel);
-        if before == room.as_ref() || (before.is_none() && room.is_some() && state.rooms.len() >= ROOMS) {
+        let before = state.rooms.get(channel).cloned();
+        if before == room || (before.is_none() && room.is_some() && state.rooms.len() >= ROOMS) {
             return;
         }
+        let mut moved: Vec<String> = before.iter().chain(room.iter()).flat_map(|room| room.people.iter()).cloned().collect();
+        moved.sort();
+        moved.dedup();
         let people: Vec<String> = room.iter().flat_map(|room| room.people.iter()).cloned().collect();
         match &room {
             Some(room) => {
@@ -251,6 +294,7 @@ impl Slack {
         self.users(&people);
         let state = self.state();
         self.room_told(channel, &state);
+        self.huddles_told(&moved, &state);
     }
 
     /// Who is in the huddle in `channel`, for its row, as remembered now. Someone not yet named
