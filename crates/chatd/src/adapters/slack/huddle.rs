@@ -84,6 +84,44 @@ fn earlier(ts: &str, than: &str) -> bool {
     (super::seconds(ts), ts) < (super::seconds(than), than)
 }
 
+/// Conversations remembered as running a huddle, and people in each. Past either, what arrives
+/// later is not kept.
+pub(super) const ROOMS: usize = 64;
+pub(super) const PEOPLE: usize = protocol::OCCUPANTS_LIMIT;
+
+/// The longest id taken for a conversation, a person or a message. Slack's are 9 to 12
+/// characters; a thread's adds its message's timestamp.
+const ID: usize = 32;
+
+/// Whether something that calls itself an id may be one. Slack's are letters and digits, and a
+/// thread's has a colon and a dot. Nothing else is handed on as a key.
+fn id_like(id: &str) -> bool {
+    !id.is_empty() && id.len() <= ID && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-:".contains(&byte))
+}
+
+/// The ids a list of the room names, be they its people or its conversations: at most `cap`,
+/// once each, in Slack's order.
+fn listed(value: &Value, cap: usize) -> Vec<String> {
+    let (mut ids, mut seen) = (Vec::new(), HashSet::new());
+    for entry in value.as_array().into_iter().flatten() {
+        if ids.len() >= cap {
+            break;
+        }
+        let Some(id) = person(entry).filter(|id| id_like(id)) else {
+            continue;
+        };
+        if seen.insert(id) {
+            ids.push(id.to_owned());
+        }
+    }
+    ids
+}
+
+/// The huddle's message a room names, for telling huddles of one conversation apart.
+fn message_of(room: &Value) -> Option<&str> {
+    room[field::ROOT].as_str().filter(|root| id_like(root))
+}
+
 /// What the room says. A room that names neither who is in it nor an end (Slack leaves both out
 /// of some answers) says nothing, and is left alone.
 pub(super) fn standing(room: &Value) -> Option<Standing> {
@@ -93,10 +131,10 @@ pub(super) fn standing(room: &Value) -> Option<Standing> {
     if over(room) {
         return Some(Standing::Over);
     }
-    let people = room[field::PEOPLE].as_array()?;
-    let mut seen = HashSet::new();
-    let people = people.iter().filter_map(person).filter(|id| seen.insert(*id)).map(str::to_owned).collect();
-    Some(Standing::Running(Room { people, started: room[field::STARTED].as_i64().unwrap_or(0), message: String::new() }))
+    if !room[field::PEOPLE].is_array() {
+        return None;
+    }
+    Some(Standing::Running(Room { people: listed(&room[field::PEOPLE], PEOPLE), started: room[field::STARTED].as_i64().unwrap_or(0), message: String::new() }))
 }
 
 impl Slack {
@@ -150,12 +188,12 @@ impl Slack {
     pub(super) fn room_event(&self, event: &Value) {
         let room = &event[field::ROOM];
         if room.is_object() {
-            let mut channels: Vec<String> = room[field::CHANNELS].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+            let mut channels = listed(&room[field::CHANNELS], ROOMS);
             if channels.is_empty() {
-                channels.extend(event[field::CHANNEL].as_str().map(str::to_owned));
+                channels.extend(event[field::CHANNEL].as_str().filter(|channel| id_like(channel)).map(str::to_owned));
             }
             for channel in channels {
-                self.room_heard(&channel, room[field::ROOT].as_str().filter(|root| !root.is_empty()), standing(room));
+                self.room_heard(&channel, message_of(room), standing(room));
             }
             return;
         }
@@ -185,11 +223,12 @@ impl Slack {
     fn room_set(&self, channel: &str, room: Option<Room>) {
         let room = room.filter(|room| !room.people.is_empty());
         // A conversation the store has no row for has nothing that could show it.
-        if self.ctx.known(channel).ok().flatten().is_none() {
+        if !id_like(channel) || self.ctx.known(channel).ok().flatten().is_none() {
             return;
         }
         let mut state = self.state();
-        if state.rooms.get(channel) == room.as_ref() {
+        let before = state.rooms.get(channel);
+        if before == room.as_ref() || (before.is_none() && room.is_some() && state.rooms.len() >= ROOMS) {
             return;
         }
         let people: Vec<String> = room.iter().flat_map(|room| room.people.iter()).cloned().collect();
@@ -237,5 +276,42 @@ impl Slack {
             .collect();
         let total = people.len() as u32;
         self.ctx.occupants(channel, people, total);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn running(room: serde_json::Value) -> Room {
+        let Standing::Running(room) = standing(&room).expect("a huddle running") else { unreachable!() };
+        room
+    }
+
+    /// A room object is whatever the network sent. What is kept of it is bounded, and only
+    /// shaped like Slack's ids.
+    #[test]
+    fn a_room_from_the_network_is_capped_and_holds_only_what_looks_like_slacks_ids() {
+        let crowd = (0..500).map(|at| format!("U{at:08}")).collect::<Vec<_>>();
+        let room = running(json!({"participants": crowd, "date_start": 5}));
+        assert_eq!(room.people.len(), PEOPLE, "a crowd is cut to what a row can list");
+        assert_eq!(room.people.first().map(String::as_str), Some("U00000000"), "the first heard, in Slack's order");
+        assert_eq!(room.people.last(), Some(&format!("U{:08}", PEOPLE - 1)));
+        assert_eq!(room.started, 5);
+
+        let odd = json!({"participants": [
+            "U0ANA", "U0ANA", {"user_id": "U0BEN"}, {"id": "U0BEN"}, 7, null, [], "", "U 0BEN", "U0BEN\n",
+            "<script>", "x".repeat(200), "../..", "U0BOT",
+        ]});
+        assert_eq!(running(odd).people, ["U0ANA", "U0BEN", "U0BOT"], "once each, by id, and nothing that is not an id");
+
+        let channels = (0..5_000).map(|at| format!("C{at:08}")).collect::<Vec<_>>();
+        let room = json!({"participants": ["U0ANA"], "channels": channels, "thread_root_ts": "x".repeat(200)});
+        assert_eq!(listed(&room[field::CHANNELS], ROOMS).len(), ROOMS, "a room names a bounded number of conversations");
+        assert_eq!(listed(&json!(["C0GEN", "C0GEN", 3, "", "C 0 X", "C0GEN:1760000800.000800"]), ROOMS), ["C0GEN", "C0GEN:1760000800.000800"]);
+        // A timestamp as long as that is not one: the huddle is taken as one that named none.
+        assert_eq!(message_of(&room), None);
+        assert_eq!(message_of(&json!({"thread_root_ts": "1760000800.000800"})), Some("1760000800.000800"));
     }
 }
