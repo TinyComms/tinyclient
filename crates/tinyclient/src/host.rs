@@ -169,7 +169,7 @@ pub const APPEARANCE_CAPTION: &str = if cfg!(target_os = "macos") {
 };
 
 /// Settings › Shortcuts, above the list. Click a row, then press the new keys.
-pub const SHORTCUTS_CAPTION: &str = "Click a row, then press the new keys. Reset restores the defaults. A key another command uses is refused. Backspace on a row restores that one.";
+pub const SHORTCUTS_CAPTION: &str = "Click a row, then press the new keys. Reset restores the defaults. A key another command uses is refused. Backspace on a row restores that one. Delete leaves it with no key.";
 
 /// Settings › Notifications, N10: what draws attention to something new in the background.
 pub const FLASH_LABEL: &str = if cfg!(target_os = "macos") {

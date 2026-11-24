@@ -996,6 +996,9 @@ fn listed() -> Vec<Command> {
     out
 }
 
+/// How the saved file spells a command with no key.
+const NONE: &str = "none";
+
 #[derive(Clone, Debug)]
 pub struct Keymap {
     overrides: BTreeMap<String, String>,
@@ -1059,6 +1062,23 @@ impl Keymap {
         None
     }
 
+    /// Leaves `id` with no key at all. A command that never had one has nothing to remove.
+    pub fn unbind(&mut self, id: &str) -> Result<(), BindError> {
+        let spec = find(id)
+            .filter(|spec| on_this_os(spec))
+            .ok_or(BindError::Unknown)?;
+        if default_keys(spec).is_empty() {
+            self.overrides.remove(id);
+        } else {
+            self.overrides.insert(id.to_owned(), String::new());
+        }
+        Ok(())
+    }
+
+    pub fn is_unbound(&self, id: &str) -> bool {
+        self.overrides.get(id).is_some_and(String::is_empty)
+    }
+
     pub fn reset(&mut self) {
         self.overrides.clear();
     }
@@ -1078,14 +1098,14 @@ impl Keymap {
 
     pub fn keys(&self, id: &str) -> Vec<String> {
         if let Some(key) = self.overrides.get(id) {
-            return vec![key.clone()];
+            return if key.is_empty() { Vec::new() } else { vec![key.clone()] };
         }
         find(id).map(default_keys).unwrap_or_default()
     }
 
     pub fn glyph(&self, id: &str) -> String {
         if let Some(key) = self.overrides.get(id) {
-            return glyph_from_gpui(key);
+            return if key.is_empty() { String::new() } else { glyph_from_gpui(key) };
         }
         find(id)
             .map(|spec| spec.glyph.to_owned())
@@ -1153,14 +1173,35 @@ impl Keymap {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let _ = std::fs::write(path, self.render());
+    }
+
+    /// One `id<TAB>key` line per override. No key is written `none`: a bare trailing tab
+    /// would be trimmed away when the file is read back.
+    fn render(&self) -> String {
         let mut body = String::new();
         for (id, key) in &self.overrides {
             body.push_str(id);
             body.push('\t');
-            body.push_str(key);
+            body.push_str(if key.is_empty() { NONE } else { key });
             body.push('\n');
         }
-        let _ = std::fs::write(path, body);
+        body
+    }
+
+    fn parse(text: &str) -> Keymap {
+        let mut map = Keymap::stock();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((id, key)) = line.split_once('\t') else {
+                continue;
+            };
+            let _ = if key == NONE { map.unbind(id) } else { map.rebind(id, key) };
+        }
+        map
     }
 }
 
@@ -1194,18 +1235,7 @@ pub(crate) fn load() {
     let Ok(text) = std::fs::read_to_string(Keymap::path()) else {
         return;
     };
-    let mut map = Keymap::stock();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((id, key)) = line.split_once('\t') else {
-            continue;
-        };
-        let _ = map.rebind(id, key);
-    }
-    *lock() = map;
+    *lock() = Keymap::parse(&text);
 }
 
 pub(crate) fn dirty() -> bool {
@@ -1219,6 +1249,19 @@ pub(crate) fn live_rebind(id: &str, key: &str) -> Result<(), BindError> {
         map.save();
     }
     result
+}
+
+pub(crate) fn live_unbind(id: &str) -> Result<(), BindError> {
+    let mut map = lock();
+    let result = map.unbind(id);
+    if result.is_ok() {
+        map.save();
+    }
+    result
+}
+
+pub(crate) fn is_unbound(id: &str) -> bool {
+    with_live(|map| map.is_unbound(id))
 }
 
 pub(crate) fn live_reset() {
@@ -1328,6 +1371,39 @@ mod tests {
     #[test]
     fn rebinding_quick_switcher_moves_the_binding_and_the_menu_label() {
         prove().unwrap();
+    }
+
+    #[test]
+    fn an_unbound_command_has_no_key_frees_its_default_and_resets_back() {
+        let mut map = Keymap::stock();
+        let stock = map.chord("quick-switcher");
+        assert!(!stock.is_empty());
+        map.unbind("quick-switcher").unwrap();
+        assert!(map.is_unbound("quick-switcher"));
+        assert!(map.keys("quick-switcher").is_empty());
+        assert_eq!(map.glyph("quick-switcher"), "");
+        // Its old key is free for another command.
+        assert!(map.rebind("msg-edit", &stock).is_ok());
+        map.reset_one("quick-switcher");
+        assert_eq!(map.chord("quick-switcher"), stock);
+        // Binding it to its own default key puts it back too.
+        map.unbind("quick-switcher").unwrap();
+        assert!(map.rebind("quick-switcher", &stock).is_ok());
+        assert!(!map.is_unbound("quick-switcher"));
+        assert!(map.unbind("no-such-command").is_err());
+    }
+
+    #[test]
+    fn no_key_survives_the_saved_file() {
+        let mut map = Keymap::stock();
+        map.unbind("quick-switcher").unwrap();
+        map.rebind("msg-edit", "x").unwrap();
+        let text = map.render();
+        assert!(text.contains("quick-switcher\tnone\n"), "{text}");
+        let back = Keymap::parse(&text);
+        assert!(back.is_unbound("quick-switcher"));
+        assert_eq!(back.keys("msg-edit"), ["x"]);
+        assert_eq!(Keymap::parse("quick-switcher\t\n").overrides.len(), 0);
     }
 
     #[test]

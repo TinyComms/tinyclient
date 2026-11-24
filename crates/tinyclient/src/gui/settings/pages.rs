@@ -2479,6 +2479,15 @@ impl SettingsWindow {
         });
     }
 
+    /// Leaves a shortcut with no key.
+    fn clear_chord(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        let _ = crate::gui::keymap::live_unbind(id);
+        self.chord = None;
+        self.chord_clash = None;
+        crate::gui::rebind_keys(cx);
+        cx.notify();
+    }
+
     fn take_chord(&mut self, id: &'static str, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
         if event.keystroke.is_ime_in_progress() {
             return;
@@ -2497,6 +2506,10 @@ impl SettingsWindow {
             cx.notify();
             return;
         }
+        if event.keystroke.key == "delete" && bare {
+            self.clear_chord(id, cx);
+            return;
+        }
         match crate::gui::keymap::live_rebind(id, &event.keystroke.unparse()) {
             Ok(()) => {
                 self.chord = None;
@@ -2511,10 +2524,13 @@ impl SettingsWindow {
     /// One shortcut line. A command with an id takes a click, then the next key.
     fn shortcut_row(&mut self, command: &str, fallback: &str, id: Option<&'static str>, cx: &mut Context<Self>) -> AnyElement {
         let capturing = id.is_some_and(|id| self.chord == Some(id));
+        let unbound = id.is_some_and(crate::gui::keymap::is_unbound);
         let glyph = id.map(crate::gui::keymap::glyph_for).filter(|glyph| !glyph.is_empty()).unwrap_or_else(|| fallback.to_owned());
         let keys = |capturing: bool, glyph: String| -> AnyElement {
             if capturing {
                 div().type_small().text_color(theme::accent_text()).child("Press a key…").into_any_element()
+            } else if unbound {
+                div().type_small().text_color(theme::text_faint()).child("None").into_any_element()
             } else {
                 div().flex().gap(px(2.)).child(keycap(glyph)).into_any_element()
             }
@@ -2539,6 +2555,22 @@ impl SettingsWindow {
             .child(label(command))
             .child(keys(capturing, glyph));
         if capturing {
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("shortcut-{id}-none")))
+                    .ml(px(8.))
+                    .px(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .child("None")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.clear_chord(id, cx);
+                    })),
+            );
             row = row.track_focus(&self.chord_focus).on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
                 if this.chord != Some(id) {
                     return;
