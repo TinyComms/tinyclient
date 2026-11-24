@@ -2349,7 +2349,6 @@ impl Shell {
                 Menu::Person { account, user_id, name } => {
                     Some((260., self.call_person_menu(account.clone(), user_id, name, cx).p(px(6.))))
                 }
-                Menu::TelegramCall => Some((260., self.telegram_call_menu(call, cx).p(px(6.)))),
                 _ => None,
             }
         });

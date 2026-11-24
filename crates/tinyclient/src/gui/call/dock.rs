@@ -1088,8 +1088,9 @@ impl Shell {
     }
 
     /// Compact sidebar dock card shown while the main-pane call stage is open: keeps the call's
-    /// identity, lock/signal/duration, and quick chat/leave actions without duplicating the stage
-    /// bar's mute, deafen, share, camera, and options buttons.
+    /// identity, lock/signal/duration, any dock-only actions with no twin on the stage bar
+    /// (Ring again, Copy call link, Telegram video-chat options), and Show chat / Leave without
+    /// duplicating mute, deafen, share, camera, or call options.
     fn call_compact_stage(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
         let place = subject
             .space
@@ -1117,6 +1118,18 @@ impl Shell {
             }
             _ => place.to_owned(),
         };
+        let joined = call.state == CallState::Joined;
+        let enabled = call.state != CallState::Reconnecting;
+        let menu = self.call_menu().filter(|_| enabled);
+        let ring_again = self
+            .call_ring_again_button(call, subject, joined, enabled, alone.is_some(), cx)
+            .map(|btn| btn.w(px(34.)).h(px(30.)));
+        let copy_link = self
+            .call_copy_link_button(call, joined, enabled, cx)
+            .map(|btn| btn.w(px(34.)).h(px(30.)));
+        let tg_actions = self
+            .call_tg_actions_button(call, subject, joined, enabled, menu.as_ref(), cx)
+            .map(|btn| btn.w(px(34.)).h(px(30.)));
         let in_live_call = in_call(call);
         let show_chat = worded(
             "call-dock-show-chat",
@@ -1126,6 +1139,7 @@ impl Shell {
             theme::text(),
         )
         .flex_1()
+        .min_w_0()
         .h(px(30.))
         .hover(|style| style.bg(theme::selected()))
         .tooltip(tip("Return to chat while staying in the call", None))
@@ -1168,11 +1182,90 @@ impl Shell {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(4.))
                     .child(show_chat)
+                    .children(ring_again)
+                    .children(copy_link)
+                    .children(tg_actions)
                     .child(end),
             )
-            .children(self.call_popover(call, subject, Place::TinyBar, cx))
+            .children(self.call_popover(call, subject, Place::Dock, cx))
+    }
+
+    fn call_ring_again_button(
+        &self,
+        call: &Call,
+        subject: &Subject,
+        joined: bool,
+        enabled: bool,
+        alone: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        (joined
+            && enabled
+            && ((matches!(call.conversation.network, Network::Discord | Network::Signal)
+                && subject.kind.is_direct()
+                && alone)
+                || (call.conversation.network == Network::Signal && subject.kind == ConversationKind::Group)))
+        .then(|| {
+            control("call-ring-again", "icons/phone-outgoing.svg", Look::Rest, true)
+                .aria_label("Ring again")
+                .tooltip(tip("Ring again", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_ask(Request::CallRing { people: None }, cx);
+                }))
+        })
+    }
+
+    fn call_copy_link_button(
+        &self,
+        call: &Call,
+        joined: bool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        call.invite_link
+            .clone()
+            .filter(|link| !link.is_empty() && joined && enabled)
+            .map(|link| {
+                control("call-copy-link", "icons/link.svg", Look::Rest, true)
+                    .aria_label("Copy call link")
+                    .tooltip(tip("Copy call link", None))
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(link.clone()));
+                    }))
+            })
+    }
+
+    fn call_tg_actions_button(
+        &self,
+        call: &Call,
+        subject: &Subject,
+        joined: bool,
+        enabled: bool,
+        menu: Option<&Menu>,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        (call.conversation.network == Network::Telegram
+            && matches!(subject.kind, ConversationKind::Group | ConversationKind::Channel)
+            && joined
+            && enabled)
+            .then(|| {
+                control(
+                    "call-tg-actions",
+                    "icons/ellipsis.svg",
+                    if menu == Some(&Menu::TelegramCall) { Look::Open } else { Look::Rest },
+                    true,
+                )
+                .aria_label("Video chat options")
+                .tooltip(tip("Video chat options", None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::TelegramCall, cx);
+                }))
+            })
     }
 
     /// The popover hung above the call dock card or the compact voice bar.
@@ -1208,7 +1301,7 @@ impl Shell {
             (Place::Dock, Menu::AddPeople) if joined && !stage_visible => {
                 (280., self.call_add_people_menu(call, cx).p(px(6.)))
             }
-            (Place::Dock | Place::TinyBar, Menu::Security) if self.call_security_open(place) => {
+            (Place::Dock, Menu::Security) if self.call_security_open(Place::Dock) => {
                 (320., div().child(self.call_security_panel(call, cx)))
             }
             (Place::Dock, Menu::Soundboard)
@@ -1219,7 +1312,7 @@ impl Shell {
             (_, Menu::Person { account, user_id, name }) if joined && !stage_visible => {
                 (260., self.call_person_menu(account.clone(), user_id, name, cx).p(px(6.)))
             }
-            (_, Menu::TelegramCall) if joined && !stage_visible => {
+            (_, Menu::TelegramCall) if joined => {
                 (260., self.telegram_call_menu(call, cx).p(px(6.)))
             }
             _ => return None,
@@ -1646,21 +1739,7 @@ impl Shell {
                     }))
             })
         });
-        let ring_again = (joined
-            && enabled
-            && ((matches!(call.conversation.network, Network::Discord | Network::Signal)
-                && subject.kind.is_direct()
-                && alone.is_some())
-                || (call.conversation.network == Network::Signal && subject.kind == ConversationKind::Group)))
-        .then(|| {
-            control("call-ring-again", "icons/phone-outgoing.svg", Look::Rest, true)
-                .aria_label("Ring again")
-                .tooltip(tip("Ring again", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.call_ask(Request::CallRing { people: None }, cx);
-                }))
-        });
+        let ring_again = self.call_ring_again_button(call, subject, joined, enabled, alone.is_some(), cx);
         let hand_raised = call.hand_raised;
         let raise_hand = (call.conversation.network == Network::Signal
             && subject.kind == ConversationKind::Group
@@ -1713,15 +1792,7 @@ impl Shell {
                 }
             }))
         });
-        let copy_link = call.invite_link.clone().filter(|link| !link.is_empty() && joined && enabled).map(|link| {
-            control("call-copy-link", "icons/link.svg", Look::Rest, true)
-                .aria_label("Copy call link")
-                .tooltip(tip("Copy call link", None))
-                .on_click(cx.listener(move |_this, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(link.clone()));
-                }))
-        });
+        let copy_link = self.call_copy_link_button(call, joined, enabled, cx);
         let soundboard = (in_call(call) && call.conversation.network == Network::Discord).then(|| {
             let sound_key = call.conversation.clone();
             control(
@@ -1759,24 +1830,7 @@ impl Shell {
                     this.call_menu_toggle(Menu::Devices, cx);
                 }))
         });
-        let tg_actions = (call.conversation.network == Network::Telegram
-            && matches!(subject.kind, ConversationKind::Group | ConversationKind::Channel)
-            && joined
-            && enabled)
-            .then(|| {
-                control(
-                    "call-tg-actions",
-                    "icons/ellipsis.svg",
-                    if menu == Some(Menu::TelegramCall) { Look::Open } else { Look::Rest },
-                    true,
-                )
-                .aria_label("Video chat options")
-                .tooltip(tip("Video chat options", None))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.call_menu_toggle(Menu::TelegramCall, cx);
-                }))
-            });
+        let tg_actions = self.call_tg_actions_button(call, subject, joined, enabled, menu.as_ref(), cx);
         let end = if in_call(call) {
             leave()
         } else {
