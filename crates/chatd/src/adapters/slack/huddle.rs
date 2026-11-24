@@ -41,17 +41,24 @@ pub(super) mod field {
     pub const ENDED: &str = "date_end";
     pub const OVER: &str = "has_ended";
     pub const FAMILY: &str = "call_family";
+    /// The huddle's message, by which huddles of one conversation are told apart.
+    pub const MESSAGE: &str = "ts";
+    pub const ROOT: &str = "thread_root_ts";
     /// Of one entry of `participants`: the person's id, when the entry is not the id itself.
     pub const ID: &str = "id";
     pub const USER_ID: &str = "user_id";
 }
 
-/// A huddle running in a conversation: who is in it, in Slack's order, and when it started.
+/// A huddle running in a conversation: who is in it, in Slack's order, when it started, and the
+/// message that carries it. A conversation has one huddle at a time and one message per huddle,
+/// so the message says which huddle is meant: an older message is about one that is over.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Room {
     pub people: Vec<String>,
     /// Unix seconds; 0 when Slack does not say.
     pub started: i64,
+    /// The huddle's message (`ts`); empty when what said so named none.
+    pub message: String,
 }
 
 /// What a room object says of the huddle in it.
@@ -71,6 +78,12 @@ pub(super) fn over(room: &Value) -> bool {
     room[field::OVER] == true || room[field::ENDED].as_i64().is_some_and(|end| end > 0)
 }
 
+/// Whether the huddle's message `ts` is older than `than`: by Slack's timestamp, seconds first
+/// and then the rest, which is fine for two messages of one second.
+fn earlier(ts: &str, than: &str) -> bool {
+    (super::seconds(ts), ts) < (super::seconds(than), than)
+}
+
 /// What the room says. A room that names neither who is in it nor an end (Slack leaves both out
 /// of some answers) says nothing, and is left alone.
 pub(super) fn standing(room: &Value) -> Option<Standing> {
@@ -83,7 +96,7 @@ pub(super) fn standing(room: &Value) -> Option<Standing> {
     let people = room[field::PEOPLE].as_array()?;
     let mut seen = HashSet::new();
     let people = people.iter().filter_map(person).filter(|id| seen.insert(*id)).map(str::to_owned).collect();
-    Some(Standing::Running(Room { people, started: room[field::STARTED].as_i64().unwrap_or(0) }))
+    Some(Standing::Running(Room { people, started: room[field::STARTED].as_i64().unwrap_or(0), message: String::new() }))
 }
 
 impl Slack {
@@ -95,11 +108,40 @@ impl Slack {
             if !message::is_huddle(entry["subtype"].as_str(), room) {
                 continue;
             }
-            match standing(room) {
-                Some(Standing::Running(room)) => self.room_set(channel, Some(room)),
-                Some(Standing::Over) => self.room_set(channel, None),
-                None => {}
+            self.room_heard(channel, entry[field::MESSAGE].as_str(), standing(room));
+        }
+    }
+
+    /// What was said of the huddle in `channel`, with the huddle's message named when it is
+    /// known. A conversation keeps one message per huddle, so a message older than the one the
+    /// huddle known here was heard from is about a huddle that ran before it, and is left alone:
+    /// a page of history holds those of every huddle that is over.
+    fn room_heard(&self, channel: &str, message: Option<&str>, said: Option<Standing>) {
+        let before = self.state().rooms.get(channel).cloned();
+        if let (Some(known), Some(message)) = (&before, message) {
+            if !known.message.is_empty() && earlier(message, &known.message) {
+                return;
             }
+        }
+        let after = match said {
+            Some(Standing::Running(mut room)) => {
+                room.message = message.unwrap_or_default().to_owned();
+                Some(room)
+            }
+            Some(Standing::Over) => None,
+            None => return,
+        };
+        self.room_set(channel, after);
+    }
+
+    /// A new connection: nothing heard before the socket dropped says a huddle is running
+    /// now. Every row that listed one is emptied; Slack's next word, or the next page read,
+    /// says what is running.
+    pub(super) fn rooms_forgotten(&self) {
+        let mut state = self.state();
+        let forgotten: Vec<String> = state.rooms.drain().map(|(channel, _)| channel).collect();
+        for channel in forgotten {
+            self.room_told(&channel, &state);
         }
     }
 
@@ -112,18 +154,8 @@ impl Slack {
             if channels.is_empty() {
                 channels.extend(event[field::CHANNEL].as_str().map(str::to_owned));
             }
-            match standing(room) {
-                Some(Standing::Running(room)) => {
-                    for channel in channels {
-                        self.room_set(&channel, Some(room.clone()));
-                    }
-                }
-                Some(Standing::Over) => {
-                    for channel in channels {
-                        self.room_set(&channel, None);
-                    }
-                }
-                None => {}
+            for channel in channels {
+                self.room_heard(&channel, room[field::ROOT].as_str().filter(|root| !root.is_empty()), standing(room));
             }
             return;
         }

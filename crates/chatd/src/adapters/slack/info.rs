@@ -834,6 +834,8 @@ impl Slack {
         let entries = history["messages"].as_array().map_or(&[][..], Vec::as_slice);
         self.authors(entries);
         let messages: Vec<Message> = entries.iter().filter_map(|entry| self.message(channel, entry)).collect();
+        // The newest message may be a huddle's, running now: the row then says so, unopened.
+        self.rooms_read(channel, entries);
         self.ctx.history(channel, &messages)?;
         Ok(())
     }

@@ -1273,6 +1273,8 @@ impl Slack {
             // What was whole may have a hole now: the socket was down.
             state.covered.clear();
         }
+        // A huddle heard of before the socket dropped is not known to be running now.
+        self.rooms_forgotten();
         // The unread state is the command thread's to fetch, paced, so the socket is never kept
         // waiting on it.
         let _ = self.ctx.commands.send(Command::OpenSpace(self.ctx.account.account.clone()));
@@ -1723,6 +1725,9 @@ impl Slack {
                 summary.unread = unread;
             }
         }
+        // A huddle that was running before this connection says so on the page, read anyway.
+        // Before the page is stored, so the row already lists it when the shell reads it again.
+        self.rooms_read(channel, entries);
         self.ctx.history(channel, &messages)?;
 
         let listed: Vec<&str> = entries.iter().filter_map(|entry| entry["ts"].as_str()).collect();
