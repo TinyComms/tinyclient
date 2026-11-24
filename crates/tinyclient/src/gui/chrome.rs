@@ -178,12 +178,37 @@ fn windows_button(face: Stateful<Div>, button: Button, icon: &'static str) -> St
         Button::Close => (rgb(CLOSE_RED), Rgba { alpha: 0.8, ..rgb(CLOSE_RED) }),
         _ => (theme::hover(), theme::pressed()),
     };
+    let mark: AnyElement = if button == Button::Close {
+        div()
+            .relative()
+            .size(px(14.))
+            .flex_none()
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .group_hover("win-close", |style| style.opacity(0.))
+                    .child(glyph(icon, 14., theme::text_soft())),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(0.)
+                    .group_hover("win-close", |style| style.opacity(1.))
+                    .child(glyph(icon, 14., theme::on_accent())),
+            )
+            .into_any_element()
+    } else {
+        glyph(icon, 14., theme::text_soft()).into_any_element()
+    };
     face.w(px(CAPTION))
         .h_full()
         .window_control_area(area)
+        .when(button == Button::Close, |face| face.group("win-close"))
         .hover(|style| style.bg(hover))
         .active(|style| style.bg(pressed))
-        .child(glyph(icon, 14., theme::text_soft()))
+        .child(mark)
 }
 
 /// GNOME's round buttons. The compositor knows nothing of them, so a click does the work;

@@ -3434,10 +3434,10 @@ impl Pane {
             let key_sub = key.clone();
             let remind_label = if subscribed { "Reminder set" } else { "Notify me" };
             let mut bar = div()
-                .absolute()
-                .left(px(self.metrics.inset))
-                .right(px(self.metrics.inset))
-                .bottom(px(10.))
+                .flex_none()
+                .mx(px(self.metrics.inset))
+                .mt(px(6.))
+                .mb(px(6.))
                 .h(px(40.))
                 .px(px(12.))
                 .rounded(px(theme::R_CARD))
@@ -3455,7 +3455,7 @@ impl Pane {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(crate::gui::components::glyph("icons/clock.svg", 13., theme::accent())),
+                        .child(crate::gui::components::glyph("icons/clock.svg", 13., theme::accent_text())),
                 )
                 .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text()).child(summary))
                 .child(
@@ -3466,7 +3466,7 @@ impl Pane {
                         .px(px(10.))
                         .rounded_full()
                         .bg(if subscribed { theme::selected() } else { theme::accent_soft() })
-                        .text_color(if subscribed { theme::text() } else { theme::accent() })
+                        .text_color(if subscribed { theme::text() } else { theme::accent_text() })
                         .flex()
                         .items_center()
                         .cursor_pointer()
@@ -3521,10 +3521,10 @@ impl Pane {
         };
         Some(
             div()
-                .absolute()
-                .left(px(self.metrics.inset))
-                .right(px(self.metrics.inset))
-                .bottom(px(10.))
+                .flex_none()
+                .mx(px(self.metrics.inset))
+                .mt(px(6.))
+                .mb(px(6.))
                 .h(px(40.))
                 .px(px(12.))
                 .rounded(px(theme::R_CARD))
@@ -3545,7 +3545,7 @@ impl Pane {
                         .child(crate::gui::components::glyph(
                             if occupants.rtmp_stream { "icons/radio.svg" } else { "icons/phone.svg" },
                             13.,
-                            theme::accent(),
+                            theme::accent_text(),
                         )),
                 )
                 .children(occupants.record_start_date.map(|since| {
@@ -4042,13 +4042,13 @@ impl Render for Pane {
                     .when(self.metrics != Metrics::PHONE, |body| body.pb(px(12.)))
                     .child(crate::gui::components::scroll_frame("message-scroll-frame", self.list.clone(), rows).keyboard(false))
                     .child(after)
-                    .children(self.live_call_row(cx))
                     .children(self.history_banner(cx))
                     .children(self.unread_jump_buttons(cx))
                     .children(self.away.then(|| self.jump_button(cx)))
                     .children(self.selection_bar(cx))
                     .into_any_element()
             })
+            .children((!showing_app_tab).then(|| self.live_call_row(cx)).flatten())
             .children(self.tag_popover_layer(cx))
             .children(self.action_layers(window, cx))
             .children(ephemeral_strip)

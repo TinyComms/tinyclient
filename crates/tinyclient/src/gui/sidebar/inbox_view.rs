@@ -140,7 +140,19 @@ impl Shell {
             faces = faces.child(div().absolute().top_0().left_0().child(face(back)));
         }
         if let Some(front) = apps.members.first() {
-            faces = faces.child(div().absolute().right(px(-2.)).bottom(px(-2.)).rounded(px(7.)).border_2().border_color(theme::sidebar()).child(face(front)));
+            let hovered = theme::over(theme::hover(), theme::sidebar());
+            faces = faces.child(
+                div()
+                    .absolute()
+                    .right(px(-2.))
+                    .bottom(px(-2.))
+                    .rounded(px(7.))
+                    .bg(theme::sidebar())
+                    .border_2()
+                    .border_color(theme::sidebar())
+                    .group_hover("list-row", move |el| el.bg(hovered).border_color(hovered))
+                    .child(face(front)),
+            );
         }
         let badge = match (apps.mentions(), unread) {
             (0, false) => None,

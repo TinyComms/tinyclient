@@ -133,12 +133,14 @@ pub struct ScrollPage {
     id: ElementId,
     content: Stateful<Div>,
     natural_height: bool,
+    keyboard: bool,
 }
 pub fn scroll_page(id: impl Into<ElementId>, content: Stateful<Div>) -> ScrollPage {
     ScrollPage {
         id: id.into(),
         content,
         natural_height: false,
+        keyboard: true,
     }
 }
 /// A horizontally scrolling block whose height follows its content.
@@ -147,6 +149,13 @@ pub fn scroll_content(id: impl Into<ElementId>, content: Stateful<Div>) -> Scrol
         id: id.into(),
         content,
         natural_height: true,
+        keyboard: true,
+    }
+}
+impl ScrollPage {
+    pub fn keyboard(mut self, enabled: bool) -> Self {
+        self.keyboard = enabled;
+        self
     }
 }
 impl RenderOnce for ScrollPage {
@@ -162,6 +171,7 @@ impl RenderOnce for ScrollPage {
             .when(!self.natural_height, |content| content.size_full());
         let mut frame = scroll_frame(self.id, handle.clone(), content.track_scroll(&handle));
         frame.natural_height = self.natural_height;
+        frame.keyboard = self.keyboard;
         frame
     }
 }

@@ -9,7 +9,7 @@ use crate::gui::components::{button, ButtonKind};
 use crate::gui::input::TextInput;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, img, prelude::*, px, AnyElement, ClickEvent, Context, Entity, IntoElement, ObjectFit, SharedString, WeakEntity, Window};
+use gpui::{div, img, prelude::*, px, AnyElement, ClickEvent, Context, Entity, Focusable, IntoElement, ObjectFit, SharedString, WeakEntity, Window};
 use protocol::{Change, Conversation, ForumInfo, Key, MediaFile, Request, Response, TopicSort};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -312,8 +312,8 @@ impl Board {
                 .bg(if post.thumbnail.is_some() { theme::accent_soft() } else { theme::hover() })
                 .children(picture)
         });
-        let mut body = div().min_w_0().flex().flex_col().gap(px(4.));
-        body = body.child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(post.title.clone()));
+        let mut body = div().flex_1().min_w_0().flex().flex_col().gap(px(4.));
+        body = body.child(div().min_w_0().truncate().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(post.title.clone()));
         if !tags.is_empty() {
             let chips = tags.into_iter().enumerate().map(|(ix, label)| {
                 div()
@@ -323,7 +323,7 @@ impl Board {
                     .flex()
                     .items_center()
                     .bg(theme::hover())
-                    .type_ui()
+                    .type_small()
                     .text_color(theme::text())
                     .child(label)
                     .id(SharedString::from(format!("forum-card-tag-{}-{ix}", post.key.id)))
@@ -331,9 +331,14 @@ impl Board {
             body = body.child(div().flex().flex_wrap().gap(px(4.)).children(chips));
         }
         if !post.preview.is_empty() {
-            body = body.child(div().type_ui().text_color(theme::text_faint()).child(post.preview.clone()));
+            body = body.child(div().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(post.preview.clone()));
         }
-        let counts = format!("{} messages · {} sent", post.message_count, post.total_message_sent);
+        let replies = post.message_count.max(post.total_message_sent);
+        let counts = if replies == 1 {
+            "1 reply".to_owned()
+        } else {
+            format!("{replies} replies")
+        };
         let mut meta = counts;
         if !post.reaction.is_empty() {
             meta.push_str(" · ");
@@ -343,13 +348,16 @@ impl Board {
             meta.push_str(" · ");
             meta.push_str(&post.owner);
         }
-        body = body.child(div().type_ui().text_color(theme::text_faint()).child(meta));
+        body = body.child(div().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(meta));
         let card = div()
             .id(SharedString::from(format!("forum-post-{}", post.key.id)))
             .cursor_pointer()
             .p(px(10.))
             .rounded(px(theme::R_CARD))
             .bg(theme::raised())
+            .border_1()
+            .border_color(theme::hairline())
+            .hover(|style| style.bg(theme::over(theme::hover(), theme::raised())).border_color(theme::border()))
             .gap(px(8.))
             .flex();
         let card = if gallery { card.w(px(200.)).flex_col() } else { card.w_full() };
@@ -360,7 +368,7 @@ impl Board {
 }
 
 impl Render for Board {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let gallery = self.info.as_ref().is_some_and(|info| info.media);
         let activity = self.chip("forum-sort-activity".into(), "Activity".to_owned(), self.sort == TopicSort::Activity, cx, |this, cx| {
             this.set_sort(TopicSort::Activity, cx);
@@ -432,7 +440,12 @@ impl Render for Board {
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(div().flex_1().min_w_0().child(self.search.clone()))
+                            .child(
+                                crate::gui::components::field(self.search.focus_handle(cx).is_focused(window))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().flex_1().min_w_0().child(self.search.clone())),
+                            )
                             .child(
                                 button("forum-search", ButtonKind::Secondary, "Search")
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.run_search(cx))),

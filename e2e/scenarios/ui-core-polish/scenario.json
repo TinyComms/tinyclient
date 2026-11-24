@@ -1,0 +1,12 @@
+{
+  "id": "ui-core-polish",
+  "title": "UI audit wave 1: core primitives, inputs, focus rings, light-mode contrast, composer, conversation, and sidebar/people/profile/picker/chrome polish",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window; mobile uses its own phone views and bottom sheets.",
+    "ios": "The phone proof build does not run the desktop window; mobile uses its own phone views and bottom sheets."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

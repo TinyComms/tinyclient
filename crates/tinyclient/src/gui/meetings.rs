@@ -1,14 +1,17 @@
 //! Create or schedule a Teams meeting in the current chat or channel.
 
 use super::components::{
-    accessible_modal, button, button_disabled, icon_button, modal_body, modal_buttons, scrim, tip,
-    ButtonKind,
+    accessible_modal, button, button_disabled, field_on, icon_button, modal_body, modal_buttons,
+    scrim, tip, ButtonKind,
 };
 use super::input::TextInput;
 use super::state::Shell;
 use super::theme::{self, Type};
 use crate::{client::ask, view::now};
-use gpui::{div, prelude::*, px, ClipboardItem, Context, Div, Entity, Focusable, Stateful, Window};
+use gpui::{
+    div, prelude::*, px, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, Stateful,
+    Subscription, Window,
+};
 use protocol::{
     Conversation, ConversationKind, Key, Link, MeetingDraft, MeetingEvent, MeetingSchedule,
     Network, Request, Response,
@@ -30,6 +33,8 @@ pub(super) struct Form {
     error: String,
     attendee_note: String,
     created: Option<(MeetingEvent, bool)>,
+    focused: Option<usize>,
+    _focus_subs: Vec<Subscription>,
 }
 
 impl Shell {
@@ -79,6 +84,27 @@ impl Shell {
         };
         let start = (now() / 900 + 2) * 900;
         let title = input("Meeting title", &format!("Meeting in {}", row.title), cx);
+        let start_input = input("YYYY-MM-DD HH:MM", &local_input(start), cx);
+        let end_input = input("YYYY-MM-DD HH:MM", &local_input(start + 1800), cx);
+        let attendees = input("Email addresses separated by commas", "", cx);
+        let mut focus_subs = Vec::with_capacity(8);
+        for (idx, entity) in [(0, &title), (1, &start_input), (2, &end_input), (3, &attendees)] {
+            let handle = entity.focus_handle(cx);
+            focus_subs.push(cx.on_focus_in(&handle, window, move |this, _, cx| {
+                if let Some(form) = &mut this.meeting_form {
+                    form.focused = Some(idx);
+                    cx.notify();
+                }
+            }));
+            focus_subs.push(cx.on_focus_out(&handle, window, move |this, _, _, cx| {
+                if let Some(form) = &mut this.meeting_form {
+                    if form.focused == Some(idx) {
+                        form.focused = None;
+                        cx.notify();
+                    }
+                }
+            }));
+        }
         window.focus(&title.read(cx).focus_handle(cx), cx);
         self.meeting_form = Some(Form {
             conversation: row.key.clone(),
@@ -86,9 +112,9 @@ impl Shell {
             channel: row.kind == ConversationKind::Channel,
             id: super::composer::client_id(),
             title,
-            start: input("YYYY-MM-DD HH:MM", &local_input(start), cx),
-            end: input("YYYY-MM-DD HH:MM", &local_input(start + 1800), cx),
-            attendees: input("Email addresses separated by commas", "", cx),
+            start: start_input,
+            end: end_input,
+            attendees,
             scheduled: false,
             weekly: false,
             loading_attendees: false,
@@ -96,6 +122,8 @@ impl Shell {
             error: String::new(),
             attendee_note: String::new(),
             created: None,
+            focused: Some(0),
+            _focus_subs: focus_subs,
         });
         cx.notify();
     }
@@ -251,12 +279,12 @@ impl Shell {
                 .flex_col()
                 .gap(px(8.))
                 .mt(px(12.))
-                .child(field("Title", &form.title));
+                .child(field("Title", &form.title, form.focused == Some(0)));
             if form.scheduled {
                 fields = fields
-                    .child(field("Start · local time", &form.start))
-                    .child(field("End · local time", &form.end))
-                    .child(field("Attendee emails", &form.attendees))
+                    .child(field("Start · local time", &form.start, form.focused == Some(1)))
+                    .child(field("End · local time", &form.end, form.focused == Some(2)))
+                    .child(field("Attendee emails", &form.attendees, form.focused == Some(3)))
                     .children(
                         form.loading_attendees
                             .then(|| modal_body("Loading chat members…")),
@@ -324,19 +352,25 @@ impl Shell {
         Some(
             div().absolute().inset_0().child(scrim()).child(
                 div()
+                    .id("meeting-scrim")
                     .absolute()
                     .inset_0()
                     .flex()
                     .items_center()
                     .justify_center()
                     .p(px(12.))
-                    .child(panel),
+                    .on_click(cx.listener(|this, _, window, cx| this.close_meeting(window, cx)))
+                    .child(
+                        panel
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(|_, _, cx| cx.stop_propagation()),
+                    ),
             ),
         )
     }
 }
 
-fn field(label: &'static str, input: &Entity<TextInput>) -> Div {
+fn field(label: &'static str, input: &Entity<TextInput>, focused: bool) -> Div {
     div()
         .flex()
         .flex_col()
@@ -347,15 +381,7 @@ fn field(label: &'static str, input: &Entity<TextInput>) -> Div {
                 .text_color(theme::text_soft())
                 .child(label),
         )
-        .child(
-            div()
-                .px(px(8.))
-                .py(px(4.))
-                .border_1()
-                .border_color(theme::hairline())
-                .rounded(px(theme::R_CONTROL))
-                .child(input.clone()),
-        )
+        .child(field_on(focused, theme::overlay()).child(div().flex_1().min_w_0().child(input.clone())))
 }
 
 fn local_input(unix: i64) -> String {

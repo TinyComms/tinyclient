@@ -821,25 +821,37 @@ impl Shell {
         let stamp = crate::gui::time::stamp(now(), entry.time);
         let status = if entry.read { stamp } else { format!("Unread · {stamp}") };
         let transcript = entry.transcript.clone();
-        let mut controls = div().flex().items_center().gap(px(2.));
+        let mut controls = div().flex_none().flex().items_center().gap(px(2.));
         if entry.audio.is_some() {
             let account = account.clone();
             let entry = entry.clone();
-            controls = controls.child(icon_button(("voicemail-play", ix), "icons/play.svg", false).tooltip(tip("Play voicemail", None))
-                .on_click(cx.listener(move |this, _, _, cx| this.play_voicemail(account.clone(), entry.clone(), cx))));
+            controls = controls.child(
+                icon_button(("voicemail-play", ix), "icons/play.svg", false)
+                    .tooltip(tip("Play voicemail", None))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| this.play_voicemail(account.clone(), entry.clone(), cx))),
+            );
         }
         if !entry.read {
             let account = account.clone();
             let id = entry.id.clone();
-            controls = controls.child(icon_button(("voicemail-read", ix), "icons/check.svg", false).tooltip(tip("Mark voicemail as read", None))
-                .on_click(cx.listener(move |this, _, _, cx| this.update_voicemail(account.clone(), id.clone(), protocol::VoicemailAction::MarkRead, cx))));
+            controls = controls.child(
+                icon_button(("voicemail-read", ix), "icons/check.svg", false)
+                    .tooltip(tip("Mark voicemail as read", None))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| this.update_voicemail(account.clone(), id.clone(), protocol::VoicemailAction::MarkRead, cx))),
+            );
         }
         let id = entry.id.clone();
-        controls = controls.child(icon_button(("voicemail-delete", ix), "icons/trash-2.svg", false).tooltip(tip("Delete voicemail", None))
-            .on_click(cx.listener(move |this, _, _, cx| this.update_voicemail(account.clone(), id.clone(), protocol::VoicemailAction::Delete, cx))));
+        controls = controls.child(
+            icon_button(("voicemail-delete", ix), "icons/trash-2.svg", false)
+                .tooltip(tip("Delete voicemail", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.update_voicemail(account.clone(), id.clone(), protocol::VoicemailAction::Delete, cx))),
+        );
         let body = div().min_w_0().flex_1().flex().flex_col()
             .child(div().type_ui().text_color(theme::text()).truncate().child(entry.caller))
-            .child(div().type_small().text_color(theme::text_faint()).child(status))
+            .child(div().type_small().text_color(theme::text_faint()).truncate().child(status))
             .child(div().type_small().text_color(theme::text_soft()).whitespace_normal().line_clamp(2).child(transcript.clone()));
         list_row(("home-voicemail", ix), theme::row_height(78.), false, focused, div().gap(px(4.)).child(body).child(controls))
             .when(!transcript.is_empty(), |row| row.tooltip(tip(transcript, None)))
@@ -924,7 +936,10 @@ impl Shell {
                 let call_btn = (!conv_key.id.is_empty() && !matches!(call_support, protocol::CallSupport::None | protocol::CallSupport::Restricted)).then(|| {
                     let key = conv_key.clone();
                     let handoff = call_support == protocol::CallSupport::Handoff;
-                    icon_button(("call-log-dial", ix), "icons/phone.svg", false).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).on_click(
+                    icon_button(("call-log-dial", ix), "icons/phone.svg", false)
+                        .tooltip(tip(if handoff { "Open call" } else { "Call back" }, None))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(
                         cx.listener(move |this, _, _, cx| {
                             if handoff {
                                 this.call_handoff(key.clone(), cx);
@@ -937,6 +952,7 @@ impl Shell {
                 let del_ids = group.message_ids.clone();
                 let del_account = conv_key.account();
                 let del_btn = (conv_key.network == Network::Telegram).then(|| icon_button(("call-log-del", ix), "icons/trash-2.svg", false)
+                    .tooltip(tip("Delete call log entry", None))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let ids = del_ids.clone();
@@ -1342,8 +1358,11 @@ impl Shell {
 
         let arrow = |icon: &'static str, enabled: bool, direction: i32, cx: &mut Context<Shell>| {
             let id = if direction < 0 { "folder-tabs-scroll-left" } else { "folder-tabs-scroll-right" };
+            let label = if direction < 0 { "Scroll folders left" } else { "Scroll folders right" };
             icon_button(id, icon, false)
                 .size(px(24.))
+                .aria_label(label)
+                .tooltip(tip(label, None))
                 .when(!enabled, |b| b.opacity(0.35).cursor_default())
                 .when(enabled, |b| {
                     b.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {

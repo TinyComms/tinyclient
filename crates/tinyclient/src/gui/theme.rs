@@ -254,6 +254,7 @@ struct Palette {
     danger: u32,
     danger_fill: u32,
     danger_soft: u32,
+    slider_knob: u32,
 }
 
 const DARK: Palette = Palette {
@@ -297,6 +298,7 @@ const DARK: Palette = Palette {
     danger: 0xf0655d,
     danger_fill: 0xd13f3f,
     danger_soft: 0xf0655d26,
+    slider_knob: 0xf4f4f6,
 };
 
 const LIGHT: Palette = Palette {
@@ -340,6 +342,7 @@ const LIGHT: Palette = Palette {
     danger: 0xc92a2a,
     danger_fill: 0xc92a2a,
     danger_soft: 0xc92a2a1f,
+    slider_knob: 0x2b2e36,
 };
 
 const DARK_HC: Palette = Palette {
@@ -383,6 +386,7 @@ const DARK_HC: Palette = Palette {
     danger: 0xff8078,
     danger_fill: 0xd13f3f,
     danger_soft: 0xff807833,
+    slider_knob: 0xffffff,
 };
 
 const LIGHT_HC: Palette = Palette {
@@ -426,6 +430,7 @@ const LIGHT_HC: Palette = Palette {
     danger: 0xa61b1b,
     danger_fill: 0xa61b1b,
     danger_soft: 0xa61b1b26,
+    slider_knob: 0x141518,
 };
 
 fn palette_for(m: Mode) -> &'static Palette {
@@ -504,6 +509,14 @@ pub fn accent_halo() -> Rgba { rgba(pal().accent_halo) }
 /// Selected text in a field.
 pub fn selection() -> Rgba { rgba(pal().selection) }
 pub fn on_accent() -> Rgba { rgb(pal().on_accent) }
+
+// Light-on-dark media overlays (viewer chrome, dark duration chips, starred scrim controls).
+pub fn on_media() -> Rgba { rgb(0xffffff) }
+pub fn on_media_soft() -> Rgba { rgba(0xffffffb8) }
+pub fn media_chip() -> Rgba { rgba(0x0000008c) }
+
+/// Slider thumb fill, visible on both dark and light surfaces.
+pub fn slider_knob() -> Rgba { rgb(pal().slider_knob) }
 
 // Semantic.
 pub fn positive() -> Rgba { rgb(pal().positive) }
@@ -969,5 +982,33 @@ mod tests {
         assert_eq!(mode(), Mode::Dark);
         assert!(!set_override(Some("invalid")));
         assert!(set_override(None));
+    }
+
+    #[test]
+    fn media_overlay_and_slider_knob_tokens_hold_contrast_in_light_and_dark() {
+        let dark_scrim = rgb(0x000000);
+        assert!(contrast_ratio(on_media(), dark_scrim) >= 15.0);
+        let soft_on_dark = over(on_media_soft(), dark_scrim);
+        assert!(contrast_ratio(soft_on_dark, dark_scrim) >= 7.0);
+        let chip_on_white = over(media_chip(), rgb(0xffffff));
+        assert!(contrast_ratio(on_media(), chip_on_white) >= 4.5);
+
+        for (name, m) in [
+            ("Dark", Mode::Dark),
+            ("Light", Mode::Light),
+            ("DarkHC", Mode::DarkHighContrast),
+            ("LightHC", Mode::LightHighContrast),
+        ] {
+            let p = palette_for(m);
+            let knob = rgb(p.slider_knob);
+            for (bg_name, bg) in [
+                ("canvas", rgb(p.canvas)),
+                ("raised", rgb(p.raised)),
+                ("overlay", rgb(p.overlay)),
+            ] {
+                let ratio = contrast_ratio(knob, bg);
+                assert!(ratio >= 4.5, "{name} slider_knob on {bg_name}: {ratio:.2} < 4.5");
+            }
+        }
     }
 }

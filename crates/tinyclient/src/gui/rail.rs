@@ -252,7 +252,7 @@ impl Shell {
             .child(drags_window(div().h(px(if phone { tokens::safe_top() + 4. } else { TOP_BAR })).w_full().flex_none()))
             .child(div().flex().flex_col().items_center().gap(px(8.)).child(inbox).child(people))
             // The networks and pins scroll together; what is above and below never moves.
-            .child(div().mt(px(8.)).flex_1().min_h_0().w_full().child(crate::gui::components::scroll::scroll_page("rail-scroll-frame", div().id("rail-places").size_full().overflow_y_scroll().child(places))))
+            .child(div().mt(px(8.)).flex_1().min_h_0().w_full().child(crate::gui::components::scroll::scroll_page("rail-scroll-frame", div().id("rail-places").size_full().overflow_y_scroll().child(places)).keyboard(false)))
             .child(
                 div()
                     .flex_none()
@@ -276,10 +276,12 @@ impl Shell {
                                 row.child(
                                     div()
                                         .absolute()
-                                        .top(px(4.))
-                                        .right(px(4.))
-                                        .size(px(6.))
-                                        .rounded(px(3.))
+                                        .top(px(2.))
+                                        .right(px(2.))
+                                        .size(px(10.))
+                                        .rounded(px(5.))
+                                        .border_2()
+                                        .border_color(theme::rail())
                                         .bg(theme::accent()),
                                 )
                             })
@@ -295,7 +297,7 @@ impl Shell {
             .role(gpui::Role::Button)
             .aria_label("Settings")
             .tab_index(0)
-            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
             .absolute()
             .bottom(px(1.))
             .left(px(1.))
@@ -309,7 +311,7 @@ impl Shell {
             .bg(theme::overlay())
             .border_2()
             .border_color(theme::rail())
-            .hover(|style| style.bg(theme::hover()))
+            .hover(|style| style.bg(theme::over(theme::hover(), theme::overlay())))
             .tooltip(tip("Settings", Some("⌘,")))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| {

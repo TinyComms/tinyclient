@@ -8,7 +8,7 @@ use crate::gui::people::card::Float;
 use crate::gui::people::info::{InfoPane, ManageKind, PendingMod};
 use crate::gui::people::presence::{self, Ring, Shape};
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
+use gpui::{div, prelude::*, px, Context, Div, Focusable, MouseButton, Window};
 use protocol::{CallSupport, Conversation, ConversationKind, Key, MeetingResponse, Network, Notify, Presence, Request};
 
 /// A Telegram channel's boost level, and a confirmed Boost for a Premium account.
@@ -90,12 +90,18 @@ fn sound_row(row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
                 });
             }))
     };
-    let mut chips = div().flex().flex_wrap().gap(px(4.)).child(segmented().child(choice(0, format!("Default ({inherited_name})"), None, cx)));
-    let mut set = segmented();
+    let mut chips = div()
+        .p(px(2.))
+        .rounded(px(theme::R_CONTROL))
+        .bg(theme::hover())
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(2.))
+        .child(choice(0, format!("Default ({inherited_name})"), None, cx));
     for (ix, (word, name)) in names.iter().enumerate() {
-        set = set.child(choice(ix + 1, (*name).to_owned(), Some(*word), cx));
+        chips = chips.child(choice(ix + 1, (*name).to_owned(), Some(*word), cx));
     }
-    chips = chips.child(set);
     let muted = (row.muted).then(|| div().type_small().text_color(theme::text_faint()).child("Muted conversations make no sound."));
     div().flex().flex_col().gap(px(6.)).child(div().type_ui().child("Sound")).child(chips).children(muted)
 }
@@ -119,7 +125,14 @@ pub(in crate::gui) fn disappearing_row(
         return None;
     }
     let presets = protocol::disappearing_presets(row.key.network);
-    let mut choices = segmented();
+    let mut choices = div()
+        .p(px(2.))
+        .rounded(px(theme::R_CONTROL))
+        .bg(theme::hover())
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(2.));
     for (ix, &secs) in presets.iter().enumerate() {
         let key = row.key.clone();
         let label = protocol::format_disappearing(secs);
@@ -145,7 +158,7 @@ pub(in crate::gui) fn disappearing_row(
             .flex_col()
             .gap(px(6.))
             .child(div().type_ui().child(heading))
-            .child(div().flex().flex_wrap().gap(px(4.)).child(choices))
+            .child(choices)
             .child(div().type_small().text_color(theme::text_faint()).child("Auto-deletes on the network (separate from local retention).")),
     )
 }
@@ -613,7 +626,10 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                                 .child("Only Discord friends can be added (up to 10 people including you)."),
                         )
                     })
-                    .child(input.clone())
+                    .child(
+                        crate::gui::components::field_on(input.focus_handle(cx).is_focused(window), theme::raised())
+                            .child(div().flex_1().min_w_0().child(input.clone())),
+                    )
                     .when(show_history, |box_| {
                         box_.child(
                             div().flex().items_center().justify_between().child(
@@ -699,7 +715,10 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .flex_col()
                 .gap(px(6.))
                 .child(div().type_small().child(prompt))
-                .children(field)
+                .children(field.map(|input| {
+                    crate::gui::components::field_on(input.focus_handle(cx).is_focused(window), theme::raised())
+                        .child(div().flex_1().min_w_0().child(input))
+                }))
                 .child(
                     div()
                         .flex()
@@ -1177,7 +1196,7 @@ fn actions(
 }
 
 /// A Space's Details: icon, name, counts, about, our nickname and roles there, Open in.
-pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
+pub fn space(pane: &InfoPane, key: &Key, window: &Window, cx: &mut Context<InfoPane>) -> Div {
     let (hub, _, _, info, known, _) = pane.parts();
     let info = info.filter(|info| info.space.key == *key).cloned();
     let name = known.map(|space| space.name.clone()).or_else(|| info.as_ref().map(|info| info.space.name.clone())).unwrap_or_default();
@@ -1520,16 +1539,8 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
                             .flex_col()
                             .gap(px(6.))
                             .child(
-                                div()
-                                    .h(px(28.))
-                                    .px(px(8.))
-                                    .rounded(px(theme::R_CONTROL))
-                                    .bg(theme::field())
-                                    .border_1()
-                                    .border_color(theme::border())
-                                    .flex()
-                                    .items_center()
-                                    .child(input),
+                                crate::gui::components::field(input.focus_handle(cx).is_focused(window))
+                                    .child(div().flex_1().min_w_0().child(input)),
                             )
                             .child(
                                 div()

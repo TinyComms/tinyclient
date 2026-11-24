@@ -255,7 +255,7 @@ pub fn slider(at: f32, width: f32, mark: Option<f32>) -> Div {
                 .left(px(at - 8.))
                 .size(px(16.))
                 .rounded_full()
-                .bg(gpui::rgb(0xf4f4f6))
+                .bg(theme::slider_knob())
                 .border_1()
                 .border_color(theme::border_strong())
                 .shadow(theme::shadow_tooltip()),

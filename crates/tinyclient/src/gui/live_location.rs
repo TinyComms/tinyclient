@@ -264,16 +264,22 @@ impl Shell {
                 .bg(theme::canvas())
                 .border_1()
                 .border_color(theme::hairline())
-                .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(title))
-                .child(div().type_small().text_color(theme::text_faint()).child(remain))
+                .child(div().max_w(px(160.)).min_w_0().truncate().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(title))
+                .child(div().flex_none().type_small().text_color(theme::text_faint()).child(remain))
                 .child(
                     div()
                         .id(SharedString::from(format!("live-loc-stop-{ix}")))
+                        .role(gpui::Role::Button)
+                        .aria_label("Stop sharing live location")
+                        .tab_index(0)
+                        .flex_none()
                         .cursor_pointer()
                         .px(px(6.))
                         .py(px(1.))
                         .rounded(px(theme::R_CONTROL))
                         .bg(theme::danger_soft())
+                        .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
+                        .focus_visible(|style| style.shadow(theme::focus_ring()))
                         .type_small()
                         .font_weight(theme::MEDIUM)
                         .text_color(theme::danger())
@@ -296,22 +302,31 @@ impl Shell {
                 .border_b_1()
                 .border_color(theme::hairline())
                 .flex()
-                .flex_wrap()
                 .items_center()
                 .gap(px(8.))
-                .child(glyph("icons/pin.svg", 14., theme::accent_text()))
                 .child(
                     div()
-                        .type_small()
-                        .font_weight(theme::SEMIBOLD)
-                        .text_color(theme::accent_text())
-                        .child(heading),
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(glyph("icons/pin.svg", 14., theme::accent_text()))
+                        .child(
+                            div()
+                                .type_small()
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(theme::accent_text())
+                                .child(heading),
+                        )
+                        .children(items),
                 )
-                .children(items)
-                .child(div().flex_1())
                 .child(
-                    button("live-loc-stop-all", ButtonKind::Secondary, "Stop all")
-                        .on_click(cx.listener(|this, _, _, cx| this.stop_all_live_locations(cx))),
+                    div().flex_none().child(
+                        button("live-loc-stop-all", ButtonKind::Secondary, "Stop all")
+                            .on_click(cx.listener(|this, _, _, cx| this.stop_all_live_locations(cx))),
+                    ),
                 )
                 .into_any_element(),
         )

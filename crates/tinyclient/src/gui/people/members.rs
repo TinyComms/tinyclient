@@ -22,7 +22,11 @@ use std::time::{Duration, Instant};
 pub const SOURCE: &str = "members";
 /// A member row: compact 36 on desktop to fit name + activity/status, and 48 on a phone.
 fn row() -> f32 {
-    if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE).max(48.) } else { 36. }
+    if crate::gui::phone::active() {
+        theme::row_height(theme::ROW_ONE).max(48.)
+    } else {
+        theme::row_height(36.)
+    }
 }
 /// A member's face: the desktop's 24, and 32 on a phone, beside its name and activity line.
 fn face() -> f32 {
@@ -706,7 +710,12 @@ impl Render for MemberList {
                     .child("Waiting for Discord to send these members…")),
             );
         if let Some(refused) = &self.refused {
-            return body.child(empty_state("icons/users.svg", "Couldn’t load members", refused).px(px(16.))).child(button("retry-members", ButtonKind::Ghost, "Try again").on_click(cx.listener(|this, _, _, cx| this.retry(cx))));
+            let retry = button("retry-members", ButtonKind::Ghost, "Try again")
+                .on_click(cx.listener(|this, _, _, cx| this.retry(cx)));
+            return body.child(
+                crate::gui::components::empty_state_with("icons/users.svg", "Couldn’t load members", refused, retry)
+                    .px(px(16.)),
+            );
         }
         if !self.loaded {
             return body.children((0..WAITING_ROWS).map(|_| waiting_row()));

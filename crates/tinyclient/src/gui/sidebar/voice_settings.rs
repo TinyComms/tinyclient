@@ -9,6 +9,7 @@ pub(in crate::gui) struct Editor {
     settings: Option<DiscordVoiceSettings>,
     bitrate: Entity<TextInput>,
     limit: Entity<TextInput>,
+    region_scroll: gpui::ScrollHandle,
     region: Option<String>,
     quality: u8,
     error: Option<String>,
@@ -32,6 +33,7 @@ impl Shell {
         let limit = cx.new(|cx| TextInput::new("User limit", cx));
         self.sidebar_state.voice_settings = Some(Editor {
             target: target.clone(), direct, settings: None, bitrate: bitrate.clone(), limit,
+            region_scroll: gpui::ScrollHandle::new(),
             region: None, quality: 1, error: None, saving: false,
         });
         cx.notify();
@@ -106,8 +108,22 @@ impl Shell {
 
     pub(in crate::gui) fn voice_settings_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let editor = self.sidebar_state.voice_settings.as_ref()?;
-        let mut card = div().p(px(16.)).w(px(410.)).max_w_full().bg(theme::overlay()).rounded(px(theme::R_FLOAT))
-            .flex().flex_col().gap(px(8.))
+        let mut card = div()
+            .id("voice-settings-card")
+            .p(px(16.))
+            .w(px(410.))
+            .max_w_full()
+            .bg(theme::overlay())
+            .rounded(px(theme::R_MODAL))
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .flex()
+            .flex_col()
+            .gap(px(8.))
             .child(div().type_title().child(if editor.direct { "Change region" } else { "Voice settings" }));
         let mut editable = false;
         if let Some(settings) = &editor.settings {
@@ -117,9 +133,12 @@ impl Shell {
             }
             editable = settings.channel.is_some() || (editor.direct && !settings.regions.is_empty());
             if settings.channel.is_some() {
-                let field = |label: String, input| div().flex().flex_col().gap(px(4.))
+                let field = |label: String, input: Entity<TextInput>| div().flex().flex_col().gap(px(4.))
                     .child(div().type_small().text_color(theme::text_soft()).child(label))
-                    .child(div().p(px(8.)).bg(theme::canvas()).child(input));
+                    .child(
+                        crate::gui::components::field_on(false, theme::overlay())
+                            .child(div().flex_1().min_w_0().child(input)),
+                    );
                 card = card
                     .child(field(format!("Bitrate (8–{} kb/s)", settings.max_bitrate / 1000), editor.bitrate.clone()))
                     .child(field("User limit (0 = unlimited)".into(), editor.limit.clone()))
@@ -152,8 +171,18 @@ impl Shell {
                             }
                         }))
                 }).collect();
-                card = card.child(div().type_small().child("Region"))
-                    .child(div().id("discord-region-list").max_h(px(160.)).overflow_y_scroll().flex().flex_col().gap(px(4.)).children(choices));
+                let list = div()
+                    .id("discord-region-list")
+                    .max_h(px(160.))
+                    .overflow_y_scroll()
+                    .track_scroll(&editor.region_scroll)
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .children(choices);
+                card = card
+                    .child(div().type_small().child("Region"))
+                    .child(crate::gui::components::scroll_frame("discord-region-scroll-frame", editor.region_scroll.clone(), list).fit_content().keyboard(false));
             } else if settings.current_region.is_none() {
                 card = card.child(div().type_small().text_color(theme::text_soft()).child("Waiting for the voice connection."));
             }
@@ -170,7 +199,26 @@ impl Shell {
                     })))
                 .children(editable.then(|| button("voice-settings-save", if enabled { ButtonKind::Primary } else { ButtonKind::Ghost }, if editor.saving { "Saving…" } else { "Save" })
                     .when(enabled, |button| button.on_click(cx.listener(|this, _, _, cx| this.save_discord_voice_settings(cx)))))));
-        Some(div().id("voice-settings-backdrop").absolute().inset_0().bg(theme::scrim()).flex().items_center().justify_center().child(card))
+        let saving = editor.saving;
+        Some(
+            div()
+                .id("voice-settings-backdrop")
+                .absolute()
+                .inset_0()
+                .p(px(16.))
+                .bg(theme::scrim())
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(!saving, |backdrop| {
+                    backdrop.on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.voice_settings = None;
+                        cx.notify();
+                    }))
+                })
+                .child(card),
+        )
     }
 }
 

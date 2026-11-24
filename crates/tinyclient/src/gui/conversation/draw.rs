@@ -1580,7 +1580,7 @@ impl Pane {
             .when(owns && !editing, |row| row.bg(theme::selected()))
             .when(!mentioned && !editing && !owns && !failed && row_hovered, |row| row.bg(tokens::row_hover()))
             .when(!mentioned && !editing && !owns && !failed, |row| row.hover(|style| style.bg(tokens::row_hover())))
-            .when(message.ephemeral && !editing, |row| row.bg(theme::warning_soft()))
+            .when(message.ephemeral && !editing && !failed && !owns, |row| row.bg(theme::warning_soft()))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -1637,7 +1637,7 @@ impl Pane {
                     this.toggle_selected_row(&sel_id, event.modifiers().shift, cx);
                 }))
             })
-            .children(at_edge.map(|receipt| {
+            .children((!row_hovered && !owns).then_some(at_edge).flatten().map(|receipt| {
                 div().absolute().top(px(1.)).right(px(metrics.inset)).h(px(20.)).flex().items_center().child(receipt_mark(&message.id, receipt))
             }))
             // On a phone the actions come up on a long press that holds still (`press_message`),
@@ -1857,6 +1857,9 @@ impl Pane {
             .children((!message.crosspost_source.is_empty()).then(|| {
                 div()
                     .flex_none()
+                    .max_w(px(180.))
+                    .min_w_0()
+                    .truncate()
                     .type_micro()
                     .text_color(theme::text_faint())
                     .child(format!("from {}", message.crosspost_source))
@@ -2375,7 +2378,11 @@ impl Pane {
                     ),
                 );
         }
-        Some(deferred(anchored().position(pop.at).child(card)).into_any_element())
+        let card = card.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.tag_popover = None;
+            cx.notify();
+        }));
+        Some(deferred(anchored().position(pop.at).snap_to_window_with_margin(px(8.)).child(card)).into_any_element())
     }
 
     /// The decoded picture of a file on disk, `edge` pixels on its longer side. Asking queues
@@ -3644,7 +3651,7 @@ impl Pane {
                 div()
                     .type_small()
                     .font_weight(theme::MEDIUM)
-                    .text_color(theme::accent())
+                    .text_color(theme::accent_text())
                     .child("Open story")
             }))
             .into_any_element()
@@ -4682,7 +4689,7 @@ impl Pane {
                         .min_w_0()
                         .flex_1()
                         .when(picked, |el| {
-                            el.child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::accent()).child("✓"))
+                            el.child(glyph("icons/check.svg", 13., theme::accent_text()))
                         })
                         .children(emoji)
                         .child(div().type_ui().truncate().text_color(theme::text()).child(choice.text.clone())),
@@ -4693,7 +4700,7 @@ impl Pane {
                             .relative()
                             .flex_none()
                             .type_small()
-                            .text_color(if picked { theme::accent() } else { theme::text_faint() })
+                            .text_color(if picked { theme::accent_text() } else { theme::text_faint() })
                             .child(format!("{} ({pct}%)", choice.count)),
                     )
                 });
@@ -4741,7 +4748,7 @@ impl Pane {
                 div()
                     .id(name_id("poll-results", &message.id))
                     .type_small()
-                    .text_color(theme::accent())
+                    .text_color(theme::accent_text())
                     .cursor_pointer()
                     .hover(|s| s.underline())
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_poll_results(msg_id.clone(), cx)))
@@ -4878,12 +4885,16 @@ impl Pane {
         });
         // A phone's card is exactly the column's width: wrapped words then measure against it,
         // not against the desktop's 440, and never run past its edge.
+        let card_w = if phone { self.media_width() } else { self.media_width().min(440.) };
+        let right_pad = if can_suppress { 30. } else { 12. };
+        let inner_w = (card_w - 12. - right_pad - 2.).max(1.);
         let card = div()
             .id(("card", index))
             .group("link-card")
             .relative()
-            .w(px(if phone { self.media_width() } else { self.media_width().min(440.) }))
+            .w(px(card_w))
             .max_w_full()
+            .overflow_hidden()
             .px(px(12.))
             .when(can_suppress, |c| c.pr(px(30.)))
             .py(px(10.))
@@ -4909,14 +4920,11 @@ impl Pane {
             if !preview.opens_in_browser {
                 return card.child(words).into_any_element();
             }
-            let wide = if phone { self.media_width() - 26. } else { self.media_width().min(416.) };
-            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(holder("preview", wide, 180., 8.))).into_any_element();
+            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(holder("preview", inner_w, 180., 8.))).into_any_element();
         };
         let shown = |image, radius: f32| anim::picture(image, ObjectFit::Cover, radius, Play::Inline);
         if large {
-            // On a phone the card is the column's width, so the picture is what its 12 pt
-            // padding and 1 pt edges leave inside it.
-            let wide = if self.metrics == Metrics::PHONE { self.media_width() - 26. } else { self.media_width().min(416.) };
+            let wide = inner_w;
             let tall = (wide * image.height as f32 / image.width.max(1) as f32).round().min(210.);
             let edge = media::decode_edge((image.width, image.height), wide, tall, Fit::Cover, scale);
             if self.held_back(&image) {
@@ -5230,7 +5238,7 @@ impl Pane {
             let chip = div()
                 .id(id)
                 .flex_none()
-                .h(px(if phone { 32. } else { 25. }))
+                .h(px(if phone { 32. } else { 26. }))
                 .min_w(px(if phone { 48. } else { 0. }))
                 .px(px(if phone { 10. } else { 7. }))
                 .justify_center()
@@ -5257,9 +5265,9 @@ impl Pane {
                 .filter(|s| s.len() == 6)
                 .and_then(|hex| u32::from_str_radix(hex, 16).ok());
             let base = parsed.unwrap_or(0x8b5cf6);
-            let accent = gpui::rgb(base);
+            let accent = theme::role_color(base);
             let fill = gpui::rgba((base << 8) | if mine { if theme::is_light() { 0x33 } else { 0x42 } } else if theme::is_light() { 0x1a } else { 0x24 });
-            let edge_color = if mine { accent } else { gpui::rgba((base << 8) | 0x80) };
+            let edge_color = if mine { accent } else { gpui::Rgba { alpha: 0.5, ..accent } };
             (
                 div()
                     .id(id)

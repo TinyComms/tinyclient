@@ -605,7 +605,7 @@ impl StatusMenu {
         let mut box_div = div().mt(px(4.)).flex().flex_col().gap(px(4.)).child(
             div()
                 .id(("own-ooo-toggle", ix))
-                .h(px(theme::ROW_ONE))
+                .h(px(theme::row_height(theme::ROW_ONE)))
                 .px(px(8.))
                 .rounded(px(theme::R_CONTROL))
                 .flex()
@@ -793,7 +793,7 @@ impl StatusMenu {
         let account = own.key.clone();
         div()
             .id(("own-account", ix))
-            .h(px(if crate::gui::phone::active() { phone_row() } else { theme::ROW_ONE }))
+            .h(px(if crate::gui::phone::active() { phone_row() } else { theme::row_height(theme::ROW_ONE) }))
             .px(px(if crate::gui::phone::active() { 12. } else { 8. }))
             .rounded(px(if crate::gui::phone::active() { theme::R_CARD } else { theme::R_CONTROL }))
             .flex()
@@ -821,7 +821,7 @@ impl StatusMenu {
             choices = choices.child(
                 div()
                     .id(("own-state", ix * 8 + at))
-                    .h(px(if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
+                    .h(px(theme::row_height(theme::ROW_ONE)))
                     .px(px(8.))
                     .rounded(px(theme::R_CONTROL))
                     .flex()
@@ -846,7 +846,7 @@ impl StatusMenu {
                 .child(
                     div()
                         .id(("own-reset-status", ix))
-                        .h(px(if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
+                        .h(px(theme::row_height(theme::ROW_ONE)))
                         .px(px(8.))
                         .rounded(px(theme::R_CONTROL))
                         .flex()
@@ -902,7 +902,7 @@ impl StatusMenu {
                 choices = choices.child(
                     div()
                         .id(("own-dnd-resume", ix))
-                        .h(px(if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
+                        .h(px(theme::row_height(theme::ROW_ONE)))
                         .px(px(8.))
                         .rounded(px(theme::R_CONTROL))
                         .flex()
@@ -1124,7 +1124,7 @@ impl StatusMenu {
         let ring = presence::Ring::on(theme::overlay());
         let best = most_available(connected(&self.scene).map(|own| own.presence));
         div()
-            .h(px(if crate::gui::phone::active() { 60. } else { theme::ROW_TWO }))
+            .h(px(if crate::gui::phone::active() { 60. } else { theme::row_height(theme::ROW_TWO) }))
             .pl(px(if crate::gui::phone::active() { 12. } else { 8. }))
             .pr(px(4.))
             .flex()
