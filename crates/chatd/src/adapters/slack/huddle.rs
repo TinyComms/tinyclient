@@ -13,8 +13,9 @@
 //! Every field name read in a room or an event is a constant of this module, so a capture that
 //! corrects one corrects it in one edit.
 //!
-//! Nothing is ever asked of Slack for a huddle. A page that is read anyway says what is running,
-//! and the socket says what changes.
+//! Nothing is asked of Slack to find a huddle. A page that is read anyway says what is running,
+//! and the socket says what changes. The people a huddle lists are looked up when their names are
+//! not known yet, as any message's authors are.
 
 use super::people::User;
 use super::{message, Slack, State};

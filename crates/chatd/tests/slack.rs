@@ -2668,8 +2668,8 @@ fn a_huddle_running_before_the_connection_is_listed_once_its_history_is_read_and
     let channel = alpha("C0HUD");
     let running = |world: &World| world.conversation(&channel).and_then(|row| row.occupants).filter(|inside| inside.total == 1);
     let listed = |world: &World, what: &str| world.until(what, || running(world));
-    // Nothing is asked of Slack for a huddle: the row lists nobody until a page that is read
-    // anyway says so.
+    // Nothing is asked of Slack to find a huddle: the row lists nobody until a page that is
+    // read anyway says so.
     assert!(running(&world).is_none());
 
     // The conversation is opened, which reads its history: the huddle's message there says it
@@ -2688,7 +2688,7 @@ fn a_huddle_running_before_the_connection_is_listed_once_its_history_is_read_and
     world.until("the huddle to be forgotten", || world.conversation(&channel)?.occupants.is_none().then_some(()));
     assert!(
         world.fake.calls.lock().unwrap().iter().all(|call| !call.method.contains("room") && !call.method.contains("huddle")),
-        "nothing is asked of Slack for a huddle"
+        "nothing is asked of Slack to find a huddle"
     );
 
     // Slack says again that it is running, and it is listed again.

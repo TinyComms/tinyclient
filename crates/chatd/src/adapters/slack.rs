@@ -7,8 +7,8 @@
 //! first against a real workspace.
 //!
 //! What stays in memory is small and bounded: the people recently seen, the muted channels, who
-//! the user has direct conversations with, and frames waiting for the socket. The sidebar, people
-//! and messages go to the store as they are parsed.
+//! the user has direct conversations with, the huddles running and who is in them, and frames
+//! waiting for the socket. The sidebar, people and messages go to the store as they are parsed.
 
 mod emoji;
 mod huddle;
@@ -349,7 +349,7 @@ struct State {
     /// `conversations.replies`, `FollowThread`, and live `thread_subscribed` / `thread_unsubscribed` events.
     followed_threads: HashSet<String>,
     /// Conversations with a huddle running, and who is in it (`huddle`). Only what the socket
-    /// sends and what a page read anyway says; nothing is asked of Slack for them.
+    /// sends and what a page read anyway says; nothing is asked of Slack to find them.
     rooms: HashMap<String, huddle::Room>,
 }
 
@@ -1351,6 +1351,7 @@ impl Slack {
             // Unverified: `user_huddle_changed` and `user_status_changed` carry it as
             // `user_change` does (the community's reading).
             "user_change" | "user_huddle_changed" | "user_status_changed" => self.user_changed(&event["user"]),
+            // A huddle joined, left or changed. The names are unverified and kept in `huddle`.
             huddle::JOIN | huddle::LEAVE | huddle::UPDATE => {
                 self.room_event(event);
                 Ok(())
