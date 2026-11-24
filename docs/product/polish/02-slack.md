@@ -107,7 +107,7 @@ Rules:
 
 | Row | Fields | Missing-field rule |
 |---|---|---|
-| Channel (28) | glyph `#`/lock/Connect (A) · name (A) · huddle-live glyph (A) [U: `huddle_state` on events] · mention pill or unread dot (A) · draft pencil (A, local draft only) · bell-slash (H) · topic (—, header only) | No glyph is known → `#`. |
+| Channel (28) | glyph `#`/lock/Connect (A) · name (A) · huddle-live glyph (A) [U: the huddle's message and history say who is in it; `sh_room_*` events say what changes] · mention pill or unread dot (A) · draft pencil (A, local draft only) · bell-slash (H) · topic (—, header only) | No glyph is known → `#`. |
 | DM (28) | avatar 16 with presence (A) · display name (A) · status emoji (A, F7) · "you" for self-DM (A) · count (A) · status text, local time "3:40 PM, 9 h ahead" (H tooltip) | No emoji → nothing. Deactivated → greyed name, no presence. |
 | Group DM (28) | two stacked avatars (A) · first names "Mara, Dev, +2" (A) · count (A) · full list (H) | Over 3 people → "+n". |
 | App DM (28) | app icon (A) · app name (A) · dot only (A) · "App" tag (H) | No icon → initial in a square, not a circle. |
@@ -155,7 +155,7 @@ the networks differ, not one menu with greyed rows.
 | Workspace roll-up | Free: per-workspace `client.counts` on connect, plus socket events |
 | Threads list | One `subscriptions.thread.getView` call per open, paged **[U]**; never at connect |
 | DND per person | `dnd.teamInfo` for **visible** DM partners only, batched, on view [U tier]; `dnd_updated_user` events after that |
-| Huddle-live glyph | Only if socket events carry it [U]; never polled |
+| Huddle-live glyph | Free: the huddle's message and pages of history read anyway say who is in it, and `sh_room_*` events [U] say what changes; never polled |
 | Directory | Search only; `users.list` is forbidden (07 §5.4) |
 
 ## 11. Stories
