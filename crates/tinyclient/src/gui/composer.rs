@@ -5111,11 +5111,11 @@ impl Composer {
             }))
     }
 
-    /// Bold, italic, and the rest, while a Discord draft has a selection. A click does not
+    /// Bold, italic, and the rest, always shown on a Discord draft. A click does not
     /// steal focus from the field: the card's own press would, so the button stops it.
     fn format_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
         let discord = self.target.as_ref().is_some_and(|target| target.key.network == Network::Discord);
-        if !discord || self.input.read(cx).selection().is_empty() {
+        if !discord {
             return None;
         }
         let phone = crate::gui::phone::active();
