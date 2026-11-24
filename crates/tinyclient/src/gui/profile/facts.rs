@@ -669,6 +669,8 @@ pub enum Item {
     Mute { muted: bool },
     CopyHandle,
     CopyLink,
+    /// Slack's own "Copy huddle link": where the official app opens the conversation's huddle.
+    CopyHuddleLink,
     CopyId,
     OpenIn,
     CloseDirect,
@@ -934,6 +936,10 @@ pub fn conversation_menu(conversation: &Conversation, link: Option<&str>, alt: b
             items.push(Item::OpenIn);
         }
     }
+    // A Slack conversation's huddle has an address of its own, which Slack's app opens.
+    if huddle_link(conversation).is_some() {
+        items.push(Item::CopyHuddleLink);
+    }
     if alt {
         items.push(Item::CopyId);
     }
@@ -947,6 +953,21 @@ pub fn conversation_menu(conversation: &Conversation, link: Option<&str>, alt: b
 /// Details' foot carries "Open in" for this network's conversations.
 pub fn foot_opens(network: Network) -> bool {
     network != Network::Telegram
+}
+
+/// Where Slack's own app opens this conversation's huddle, for "Copy huddle link": a Slack
+/// conversation the official app carries the huddle of, in a workspace that is known. Made from
+/// the row's ids, so nothing is asked. `None` for every other row.
+// CONTRACT: a Slack row's `space` is its workspace's team id, the same one `conversation_link`
+// and chatd's hand-off put in the address.
+pub fn huddle_link(conversation: &Conversation) -> Option<String> {
+    if conversation.key.network != Network::Slack || conversation.call != CallSupport::Handoff {
+        return None;
+    }
+    let team = conversation.space.as_deref()?;
+    // A thread's huddle is its channel's.
+    let channel = conversation.key.id.split(':').next().unwrap_or_default();
+    Some(protocol::link::slack_huddle_link(team, channel))
 }
 
 /// Where the network's own app opens this conversation, where that can be said without asking.
@@ -1584,6 +1605,39 @@ mod tests {
         assert!(can_transfer_ownership(&owner));
         let owner_acts = member_mod_actions(&owner);
         assert!(owner_acts.remove && owner_acts.ban && owner_acts.promote && owner_acts.transfer);
+    }
+
+    #[test]
+    fn a_slack_row_that_hands_its_huddle_off_can_copy_the_huddle_link() {
+        let mut channel = row(Network::Slack, ConversationKind::Channel);
+        channel.key.id = "C0GENERIC".into();
+        channel.space = Some("T01ALPHA".into());
+        channel.call = CallSupport::Handoff;
+        // The address Slack's own "Copy huddle link" gives, made from the row's ids: no request.
+        assert_eq!(huddle_link(&channel).as_deref(), Some("https://app.slack.com/huddle/T01ALPHA/C0GENERIC"));
+        assert_eq!(
+            conversation_menu(&channel, Some("slack://channel?team=T01ALPHA&id=C0GENERIC"), false),
+            vec![Item::CopyLink, Item::CopyHuddleLink, Item::Separator, Item::Leave]
+        );
+        assert_eq!(conversation_menu(&channel, None, true), vec![Item::CopyHuddleLink, Item::CopyId, Item::Separator, Item::Leave]);
+        // A thread's huddle is its channel's.
+        channel.key.id = "C0GENERIC:1760000200.000200".into();
+        assert_eq!(huddle_link(&channel).as_deref(), Some("https://app.slack.com/huddle/T01ALPHA/C0GENERIC"));
+        // No other row has one: a huddle tinyclient carries, one nobody can join, none at all,
+        // and a Slack row whose workspace is not known.
+        channel.key.id = "C0GENERIC".into();
+        for call in [CallSupport::Native, CallSupport::Restricted, CallSupport::None] {
+            channel.call = call;
+            assert_eq!(huddle_link(&channel), None, "{call:?}");
+        }
+        assert!(!conversation_menu(&channel, Some("slack://channel?team=T01ALPHA&id=C0GENERIC"), false).contains(&Item::CopyHuddleLink));
+        channel.call = CallSupport::Handoff;
+        channel.space = None;
+        assert_eq!(huddle_link(&channel), None);
+        let mut elsewhere = row(Network::Teams, ConversationKind::Direct);
+        elsewhere.space = Some("T01ALPHA".into());
+        elsewhere.call = CallSupport::Handoff;
+        assert_eq!(huddle_link(&elsewhere), None, "another network's hand-off is not a huddle");
     }
 
     #[test]

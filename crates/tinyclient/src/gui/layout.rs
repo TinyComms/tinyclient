@@ -1376,6 +1376,18 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
+                // A Slack row's huddle has an address of its own, to paste elsewhere.
+                if super::people::huddle_link(conversation).is_some() {
+                    let huddle = conversation.clone();
+                    items.push(
+                        menu_item("copy-huddle-link", Some("icons/link.svg"), "Copy huddle link", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.copy_huddle_link(&huddle, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 items.push(menu_separator().into_any_element());
                 if conversation.unread > 0 || conversation.mentions > 0 {
                     let read = conversation.key.clone();
@@ -1835,6 +1847,10 @@ impl Shell {
                 "Huddle in Slack".into(),
                 Box::new(move |this, cx| this.call_handoff(handoff_key.clone(), cx)),
             ));
+        }
+        if super::people::huddle_link(&row).is_some() {
+            let huddle = row.clone();
+            items.push(act("row-huddle-link", "icons/link.svg", "Copy huddle link".into(), Box::new(move |this, cx| this.copy_huddle_link(&huddle, cx))));
         }
         let can = self
             .snapshot
