@@ -1438,7 +1438,7 @@ fn download(path: &Path) -> Result<(), &'static str> {
     let url = library_url(name);
     // The 20 seconds are the whole try's deadline, body read included (`into_reader` keeps
     // it), so a VPN that takes the connection but not the bytes cannot hold this thread.
-    let response = ureq::get(&url).timeout(Duration::from_secs(20)).call().map_err(|err| {
+    let response = fetch_url(&url).map_err(|err| {
         tracing::warn!("mediad: OpenH264 could not be fetched from Cisco: {err}");
         DOWNLOAD_FAILED
     })?;
@@ -1468,6 +1468,12 @@ fn download(path: &Path) -> Result<(), &'static str> {
         SAVE_FAILED
     })?;
     Ok(())
+}
+
+/// Cisco's answer to one GET of `url`, or why there is none. The 20 seconds are on the whole
+/// of the request.
+fn fetch_url(url: &str) -> Result<ureq::Response, ureq::Error> {
+    ureq::get(url).timeout(Duration::from_secs(20)).call()
 }
 
 /// Whether a camera can be opened, said before the button claims it is on.
