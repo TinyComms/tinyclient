@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-22.04","shard":1,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":2,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":3,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":4,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":5,"shards":5,"features":"--features tinyclient/gui"}]' || '[{"os":"ubuntu-22.04","shard":1,"shards":3,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":2,"shards":3,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":3,"shards":3,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":1,"shards":3,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":2,"shards":3,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":3,"shards":3,"features":"--features tinyclient/gui"},{"os":"windows-latest","shard":1,"shards":2},{"os":"windows-latest","shard":2,"shards":2}]') }}
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-22.04","shard":1,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":2,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":3,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":4,"shards":5,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":5,"shards":5,"features":"--features tinyclient/gui"}]' || '[{"os":"ubuntu-22.04","shard":1,"shards":3,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":2,"shards":3,"features":"--features tinyclient/gui"},{"os":"ubuntu-22.04","shard":3,"shards":3,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":1,"shards":3,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":2,"shards":3,"features":"--features tinyclient/gui"},{"os":"macos-latest","shard":3,"shards":3,"features":"--features tinyclient/gui"},{"os":"windows-latest","shard":1,"shards":2,"features":"--features tinyclient/gui"},{"os":"windows-latest","shard":2,"shards":2,"features":"--features tinyclient/gui"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -60,7 +60,8 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # nextest runs the test binaries side by side, where `cargo test` ran them one at a time.
       # The window's own tests (prefs, search, shortcuts against the menus, the controls) build
-      # only with the gui feature, so macOS turns it on for the one pass over the workspace.
+      # only with the gui feature, so macOS and Windows turn it on for the one pass over the
+      # workspace.
       # Tests use the real media engine. Building it inside each nextest process repeats
       # Cargo resolution and serializes tests on its build lock (five minutes on a cold Mac).
       # Use the whole workspace graph so tests and the engine share dependency features.
