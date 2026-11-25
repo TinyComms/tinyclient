@@ -1,13 +1,19 @@
 use std::path::Path;
 
+// What cargo is told to watch is a file of its own, so that a unit test can include it too.
+#[path = "build_support/telegram_env.rs"]
+mod telegram_env;
+
 fn main() {
-    println!("cargo:rerun-if-env-changed=TINYCLIENT_TELEGRAM_API_ID");
-    println!("cargo:rerun-if-env-changed=TINYCLIENT_TELEGRAM_API_HASH");
+    let local = telegram_env::local_file(Path::new(env!("CARGO_MANIFEST_DIR")));
+    let is_there = local.exists();
+    for line in telegram_env::rerun_instructions(is_there.then_some(&local)) {
+        println!("{line}");
+    }
     // Telegram's app id is read at build time and shipped in the binary. The calling shell
     // does not always carry it (and nothing else may stand in the repo), so a local
     // `telegram.env` next to the workspace holds it instead: `KEY = VALUE`, one a line. The
     // env keeps its say; CI sets it there and never looks at a file.
-    println!("cargo:rerun-if-changed=telegram.env");
     let mut id = std::env::var("TINYCLIENT_TELEGRAM_API_ID").unwrap_or_default();
     let mut hash = std::env::var("TINYCLIENT_TELEGRAM_API_HASH").unwrap_or_default();
     if id.is_empty() && hash.is_empty() {
@@ -40,7 +46,7 @@ fn main() {
 /// next to the workspace, or the error that says why there is nothing: the file is absent, or
 /// it does not hold both keys complete.
 fn read_local() -> Result<(String, String), String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("telegram.env");
+    let path = telegram_env::local_file(Path::new(env!("CARGO_MANIFEST_DIR")));
     let file = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
     let mut id = String::new();
     let mut hash = String::new();
