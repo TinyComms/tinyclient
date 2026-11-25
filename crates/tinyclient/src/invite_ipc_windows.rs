@@ -130,7 +130,12 @@ fn receive(file: &mut File, sender: &SyncSender<String>) -> io::Result<()> {
 }
 
 pub fn start(invite: Option<&str>) -> Handoff {
-    let name = pipe_name();
+    start_on(pipe_name(), invite)
+}
+
+/// The handoff on the pipe the caller names: the app's own from `start`, or one a test makes
+/// for itself, so it never meets the app that is running.
+fn start_on(name: Vec<u16>, invite: Option<&str>) -> Handoff {
     match listen(&name, true) {
         Ok(pipe) => {
             let (sender, receiver) = mpsc::sync_channel(8);
@@ -169,19 +174,22 @@ mod tests {
     use super::*;
     #[test]
     fn second_launch_delivers_to_the_primary() {
-        let Handoff::Primary(receiver) = start(None) else { panic!("primary pipe unavailable"); };
+        // A pipe of this test's own, named for its process: the app's real name is taken
+        // whenever the app is running, and nothing here may talk to that app.
+        let name = wide(&format!(r"\\.\pipe\tinyclient-invite-test-{}", std::process::id()));
+        let Handoff::Primary(receiver) = start_on(name.clone(), None) else { panic!("primary pipe unavailable"); };
         let url = protocol::invite_url("https://example.org", "token").unwrap();
         let link = url.replacen("https://tinyclient.io/invite#", "tinyclient://join#", 1);
-        assert!(matches!(start(Some(&link)), Handoff::Delivered));
+        assert!(matches!(start_on(name.clone(), Some(&link)), Handoff::Delivered));
         assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), link);
-        assert!(matches!(start(Some(&link)), Handoff::Delivered));
+        assert!(matches!(start_on(name.clone(), Some(&link)), Handoff::Delivered));
         assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), link);
         // A quick action rides the same pipe; an unknown one is refused.
         let action = crate::quick::QuickAction::Quit.link();
-        assert!(send(&pipe_name(), &action).is_ok());
+        assert!(send(&name, &action).is_ok());
         assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), action);
-        assert!(send(&pipe_name(), "tinyclient://action/nope").is_err());
-        assert!(send(&pipe_name(), "tinyclient://join#invalid").is_err());
+        assert!(send(&name, "tinyclient://action/nope").is_err());
+        assert!(send(&name, "tinyclient://join#invalid").is_err());
         assert!(receiver.try_recv().is_err());
     }
 }
