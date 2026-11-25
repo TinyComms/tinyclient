@@ -2991,6 +2991,55 @@ fn a_login_email_a_new_account_and_password_recovery_does_not_sign_in_and_a_pass
 }
 
 #[test]
+fn a_wrong_password_proof_is_refused_and_the_right_one_signs_in_against_the_fakes_server_check() {
+    // The fake checks a proof the way Telegram's server does: against the account's verifier,
+    // with the secret of the attempt. So the sign-in above is watched once more, by the phone
+    // number, to stay true through that.
+    let world = World::start(None, "30");
+    world.sign_in(None);
+    world.sign_in(Some(SignInInput::UsePhone));
+    world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0199".into() }));
+    let asked = world.sign_in(Some(SignInInput::Code { code: "24680".into() }));
+    assert!(matches!(asked, SignInStep::Password { problem: None, .. }), "{asked:?}");
+    let refused = world.sign_in(Some(SignInInput::Password { password: "hunter2".into() }));
+    assert!(matches!(refused, SignInStep::Password { problem: Some(SignInProblem::PasswordInvalid), .. }), "{refused:?}");
+    // Right or wrong, each try proves against numbers asked for afresh.
+    assert_eq!((world.called("GetPassword"), world.called("CheckPassword")), (2, 1));
+    assert!(world.status().0.is_empty(), "a wrong proof signed nobody in");
+    let done = world.sign_in(Some(SignInInput::Password { password: "correct horse".into() }));
+    assert_eq!(done, SignInStep::Done { account: Some(account()) });
+    world.connected();
+    assert_eq!((world.called("GetPassword"), world.called("CheckPassword")), (2, 2));
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("correct horse") && !said.contains("hunter2"), "{said}");
+}
+
+#[test]
+fn a_password_taken_off_the_signed_in_account_is_not_asked_of_a_later_sign_in() {
+    // A password is the account's, not one wire's. The sign-in opens a wire of its own, and it
+    // meets what the signed-in account has.
+    let world = World::signed_in();
+    world.connected();
+    world.steer("two-step off");
+    let (_, seq) = world.status();
+    assert!(matches!(world.sign_in(None), SignInStep::Qr { .. }));
+    world.code_shown();
+    world.steer_sign_in("scan-password");
+    let done = world.changed(seq, "the scan to sign in with no password to ask for", |change| match change {
+        Change::SignIn { step: SignInStep::Done { account }, .. } => Some(account.clone()),
+        _ => None,
+    });
+    assert_eq!(done, Some(account()));
+    world.until("the account to stay connected", || {
+        world.status().0.iter().any(|row| row.key == account() && row.link == Link::Connected).then_some(())
+    });
+    // The user was asked for no proof, and Telegram was given none.
+    assert!(!world.calls().iter().any(|call| call.starts_with("CheckPassword") || call.starts_with("GetPassword")), "{:#?}", world.calls());
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("correct horse"), "{said}");
+}
+
+#[test]
 fn conversation_search_asks_telegram_with_the_query_and_maps_its_hits() {
     let world = World::signed_in();
     world.connected();

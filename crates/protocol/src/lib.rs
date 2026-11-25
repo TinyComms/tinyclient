@@ -6222,6 +6222,78 @@ mod tests {
         assert!(!wire.contains("spans"), "{wire}");
         assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), Response::TranslatedMessages { items: vec![said] });
     }
+
+    #[test]
+    fn a_two_step_frame_round_trips_and_one_from_before_its_fields_still_reads() {
+        let account = AccountKey { network: Network::Telegram, account: "7001".into() };
+        let read = Request::TelegramTwoStepRead { account: account.clone() };
+        let wire = serde_json::to_string(&read).unwrap();
+        assert_eq!(wire, r#"{"op":"telegram_two_step_read","account":{"network":"telegram","account":"7001"}}"#);
+        assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), read);
+        // Nothing is typed to read it, so the request may be printed whole.
+        assert_eq!(format!("{read:?}"), r#"TelegramTwoStepRead { account: AccountKey { network: Telegram, account: "7001" } }"#);
+
+        let set = TelegramTwoStep {
+            has_password: true,
+            hint: "the old street".to_owned(),
+            has_recovery: true,
+            email_unconfirmed_pattern: "m***@example.com".to_owned(),
+            pending_reset_date: 1_791_892_800,
+            login_email_pattern: "k***@example.org".to_owned(),
+            problem: None,
+        };
+        let wire = serde_json::to_string(&Response::TelegramTwoStep { state: set.clone() }).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"op":"telegram_two_step","state":{"has_password":true,"hint":"the old street","has_recovery":true,"email_unconfirmed_pattern":"m***@example.com","pending_reset_date":1791892800,"login_email_pattern":"k***@example.org"}}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), Response::TelegramTwoStep { state: set });
+        // Empty fields stay off the wire, and a frame written without them still reads.
+        let bare: Response = serde_json::from_str(r#"{"op":"telegram_two_step"}"#).unwrap();
+        assert_eq!(bare, Response::TelegramTwoStep { state: TelegramTwoStep::default() });
+        let state: TelegramTwoStep = serde_json::from_str(r#"{"has_recovery":true,"pending_reset_date":12}"#).unwrap();
+        assert_eq!(state, TelegramTwoStep { has_recovery: true, pending_reset_date: 12, ..TelegramTwoStep::default() });
+        // A refusal is named.
+        for (problem, wire) in [
+            (TelegramTwoStepProblem::Unreachable, r#"{"problem":{"problem":"unreachable"}}"#),
+            (TelegramTwoStepProblem::TooMany { until: 1_791_892_831 }, r#"{"problem":{"problem":"too_many","until":1791892831}}"#),
+            (TelegramTwoStepProblem::Other { reason: "This needs Telegram Premium.".to_owned() }, r#"{"problem":{"problem":"other","reason":"This needs Telegram Premium."}}"#),
+        ] {
+            let state: TelegramTwoStep = serde_json::from_str(wire).unwrap();
+            assert_eq!(state, TelegramTwoStep { problem: Some(problem), ..TelegramTwoStep::default() });
+            assert_eq!(serde_json::to_string(&state).unwrap(), wire);
+        }
+        // What came off the network is cut to its caps before it reaches the window.
+        let mut long = TelegramTwoStep {
+            hint: "h".repeat(300),
+            email_unconfirmed_pattern: "e".repeat(300),
+            login_email_pattern: "l".repeat(300),
+            problem: Some(TelegramTwoStepProblem::Other { reason: "r".repeat(500) }),
+            ..set
+        };
+        long.bound();
+        assert_eq!((long.hint.len(), long.email_unconfirmed_pattern.len(), long.login_email_pattern.len()), (64, 64, 64));
+        assert!(matches!(long.problem, Some(TelegramTwoStepProblem::Other { ref reason }) if reason.len() == 200), "{long:?}");
+    }
+
+    #[test]
+    fn a_secret_never_prints_what_was_typed() {
+        let typed = Secret::new("hunter2");
+        assert_eq!(format!("{typed:?}"), "Secret { .. }");
+        assert_eq!((typed.reveal(), typed.is_empty()), ("hunter2", false));
+        assert!(Secret::new("").is_empty());
+        // On the wire it is what was typed and nothing more, so an older chatd reads the field.
+        assert_eq!(serde_json::to_string(&typed).unwrap(), r#""hunter2""#);
+        assert_eq!(serde_json::from_str::<Secret>(r#""correct horse""#).unwrap(), Secret::new("correct horse"));
+        assert_ne!(typed, Secret::new("hunter3"));
+        // Whatever holds one prints nothing of it: a request may be logged whole.
+        #[derive(Debug, Serialize, Deserialize)]
+        struct Held {
+            password: Secret,
+        }
+        let held: Held = serde_json::from_str(r#"{"password":"hunter2"}"#).unwrap();
+        assert_eq!(format!("{held:?}"), r#"Held { password: Secret { .. } }"#);
+    }
 }
 
 #[cfg(test)]

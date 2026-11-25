@@ -73,6 +73,7 @@ mod real;
 mod secret;
 mod send;
 pub mod signin;
+mod srp;
 mod stories;
 mod sync;
 

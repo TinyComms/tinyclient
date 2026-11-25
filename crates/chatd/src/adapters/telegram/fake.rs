@@ -95,9 +95,9 @@ fn t0() -> i32 {
     *T0.get_or_init(|| std::env::var("TINYCLIENT_TELEGRAM_T0").ok().and_then(|seconds| seconds.parse().ok()).unwrap_or(FIXED_T0))
 }
 /// The prime Telegram itself uses for the password proof, with generator 3.
-const PRIME: &str = "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c3720fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f642477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a4a4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754fd17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae4e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b";
+pub(super) const PRIME: &str = "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c3720fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f642477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a4a4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754fd17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae4e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b";
 
-fn unhex(text: &str) -> Vec<u8> {
+pub(super) fn unhex(text: &str) -> Vec<u8> {
     (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap_or(0)).collect()
 }
 
@@ -9693,6 +9693,323 @@ impl Wire for Fake {
 
     fn close(&self) {
         let _ = self.events.send(Event::Closed("closed".to_owned()));
+    }
+}
+
+/// Telegram's server side of the cloud password, for the scripted wire (#542). A password is the
+/// account's, not one wire's: a sign-in opens a `Fake` of its own, so what an account has is kept
+/// here for the whole process, keyed by the account's user id, the way the fake keys accounts.
+/// Telegram keeps a verifier and never the password. The fake makes one from the typed password
+/// of the account it starts with, as the client that set it would have sent, and keeps only that.
+pub(super) mod cloud {
+    use super::super::srp;
+    use super::{rpc, unhex, Fault, ME, PASSWORD, PRIME};
+    use grammers_tl_types as tl;
+    use num_bigint::BigUint;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    /// The generator every password is proved with.
+    pub(super) const G: i32 = 3;
+    /// How many attempts not yet proved Telegram keeps at once. Each `account.getPassword` issues one.
+    const ATTEMPTS: usize = 16;
+
+    /// The salt the fake's accounts are stretched with, until a password set through the wire
+    /// brings a salt of its own.
+    pub(super) fn salt1() -> Vec<u8> {
+        vec![7; 8]
+    }
+
+    pub(super) fn salt2() -> Vec<u8> {
+        vec![9; 16]
+    }
+
+    /// What the server keeps of one account's cloud password.
+    #[derive(Clone)]
+    pub(super) struct Cloud {
+        /// `g^x mod p`, 256 bytes: enough to check a proof, not to know the password.
+        pub(super) verifier: Vec<u8>,
+        pub(super) salt1: Vec<u8>,
+        pub(super) salt2: Vec<u8>,
+        pub(super) hint: String,
+        pub(super) has_recovery: bool,
+        pub(super) email_unconfirmed_pattern: Option<String>,
+        pub(super) pending_reset_date: Option<i32>,
+        pub(super) login_email_pattern: Option<String>,
+    }
+
+    impl Cloud {
+        /// What setting `typed` with `hint` leaves on the server.
+        pub(super) fn password(typed: &str, hint: &str) -> Cloud {
+            let x = srp::password_x(typed.as_bytes(), &salt1(), &salt2());
+            Cloud {
+                verifier: srp::verifier(&x, &unhex(PRIME), G),
+                salt1: salt1(),
+                salt2: salt2(),
+                hint: hint.to_owned(),
+                has_recovery: false,
+                email_unconfirmed_pattern: None,
+                pending_reset_date: None,
+                login_email_pattern: None,
+            }
+        }
+    }
+
+    /// The numbers of one attempt: `b`, the server's secret, and `B` as the client was given it.
+    #[derive(Clone)]
+    pub(in crate::adapters::telegram) struct Issued {
+        pub secret: Vec<u8>,
+        pub srp_b: Vec<u8>,
+    }
+
+    /// Issues the numbers of one attempt for an account with this verifier: a random `b`, and
+    /// `B = (k·v + g^b) mod p` with `k = H(p | g)`.
+    pub(in crate::adapters::telegram) fn issued(verifier: &[u8]) -> Issued {
+        let mut secret = [5u8; 32];
+        let _ = getrandom::fill(&mut secret);
+        let p = unhex(PRIME);
+        let k = srp::h(&[&p, &srp::pad256(&[G as u8])]);
+        let modulus = BigUint::from_bytes_be(&p);
+        let (b, v) = (BigUint::from_bytes_be(&secret), BigUint::from_bytes_be(verifier));
+        let srp_b = srp::with_stack("fake srp", || {
+            let big_b = (&BigUint::from_bytes_be(&k) * &v + BigUint::from(G as u32).modpow(&b, &modulus)) % &modulus;
+            srp::pad256(&big_b.to_bytes_be()).to_vec()
+        })
+        .unwrap_or_default();
+        Issued { secret: secret.to_vec(), srp_b }
+    }
+
+    /// Telegram's side of the proof, for the verifier the account has and the secret of the
+    /// attempt: `u = H(A | B)`, `S = (A · v^u)^b mod p`, and the `M1` a client makes from `S`.
+    pub(in crate::adapters::telegram) fn proves(verifier: &[u8], salt1: &[u8], salt2: &[u8], secret: &[u8], srp_b: &[u8], a: &[u8], m1: &[u8]) -> bool {
+        if a.len() > 256 {
+            return false;
+        }
+        let (p, g) = (unhex(PRIME), srp::pad256(&[G as u8]));
+        let a = srp::pad256(a);
+        let number = |bytes: &[u8]| BigUint::from_bytes_be(bytes);
+        let modulus = number(&p);
+        let u = number(&srp::h(&[&a, srp_b]));
+        let s = (&number(&a) * number(verifier).modpow(&u, &modulus)).modpow(&number(secret), &modulus);
+        let k_a = srp::h(&[&srp::pad256(&s.to_bytes_be())]);
+        let (h_p, h_g) = (srp::h(&[&p]), srp::h(&[&g]));
+        let expected = srp::h(&[&xor(&h_p, &h_g), &srp::h(&[salt1]), &srp::h(&[salt2]), &a, srp_b, &k_a]);
+        expected.as_slice() == m1
+    }
+
+    fn xor(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.iter_mut().enumerate().for_each(|(at, byte)| *byte = left[at] ^ right[at]);
+        out
+    }
+
+    /// One attempt waiting for its proof, with the account it was issued for.
+    struct Attempt {
+        account: i64,
+        issued: Issued,
+    }
+
+    /// Every account's password, and the attempts not yet proved.
+    struct Kept {
+        accounts: HashMap<i64, Option<Cloud>>,
+        attempts: VecDeque<(i64, Attempt)>,
+        next_id: i64,
+    }
+
+    static KEPT: LazyLock<Mutex<Kept>> =
+        LazyLock::new(|| Mutex::new(Kept { accounts: HashMap::new(), attempts: VecDeque::new(), next_id: 77 }));
+
+    fn kept() -> MutexGuard<'static, Kept> {
+        KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// What the account has: `None` when no password is set. An account nothing was said of
+    /// starts the way the scripts need it: Mira with the password the sign-in scripts use, every
+    /// other one with none.
+    pub(super) fn held(account: i64) -> Option<Cloud> {
+        if let Some(held) = kept().accounts.get(&account) {
+            return held.clone();
+        }
+        let start = (account == ME).then(|| Cloud::password(PASSWORD, "the old street"));
+        // Two wires may ask at once: whichever gets here second keeps what the first wrote.
+        kept().accounts.entry(account).or_insert(start).clone()
+    }
+
+    /// Sets what the account has. `None` takes the password off.
+    pub(super) fn set(account: i64, cloud: Option<Cloud>) {
+        let gone = cloud.is_none();
+        let mut kept = kept();
+        kept.accounts.insert(account, cloud);
+        // With no password, the attempts issued for it are moot.
+        if gone {
+            kept.attempts.retain(|(_, attempt)| attempt.account != account);
+        }
+    }
+
+    /// Says a recovery email is confirmed on the account's password.
+    pub(super) fn recover(account: i64, confirmed: bool) {
+        touch(account, |cloud| cloud.has_recovery = confirmed);
+    }
+
+    /// Says when a pending reset of the password finishes (unix seconds).
+    pub(super) fn pending(account: i64, when: Option<i32>) {
+        touch(account, |cloud| cloud.pending_reset_date = when);
+    }
+
+    /// Says a recovery email is waiting to be confirmed, masked (`m***@example.com`).
+    pub(super) fn unconfirmed(account: i64, pattern: Option<String>) {
+        touch(account, |cloud| cloud.email_unconfirmed_pattern = pattern);
+    }
+
+    /// Says which login email is set on the account, masked.
+    pub(super) fn login_email(account: i64, pattern: Option<String>) {
+        touch(account, |cloud| cloud.login_email_pattern = pattern);
+    }
+
+    /// Changes what the account's password says of itself. With no password there is nothing to say.
+    fn touch(account: i64, change: impl FnOnce(&mut Cloud)) {
+        if held(account).is_none() {
+            return;
+        }
+        if let Some(cloud) = kept().accounts.get_mut(&account).and_then(Option::as_mut) {
+            change(cloud);
+        }
+    }
+
+    /// Issues the numbers of one attempt for the account: the id it goes by, and `B`. With no
+    /// password there is nothing to prove, and `(0, empty)` is said.
+    pub(super) fn begin(account: i64) -> (i64, Vec<u8>) {
+        let Some(cloud) = held(account) else {
+            return (0, Vec::new());
+        };
+        let issued = issued(&cloud.verifier);
+        let mut kept = kept();
+        let srp_id = kept.next_id;
+        kept.next_id += 1;
+        kept.attempts.push_back((srp_id, Attempt { account, issued }));
+        while kept.attempts.len() > ATTEMPTS {
+            kept.attempts.pop_front();
+        }
+        let srp_b = kept.attempts.back().map(|(_, attempt)| attempt.issued.srp_b.clone()).unwrap_or_default();
+        (srp_id, srp_b)
+    }
+
+    /// Telegram's side of `auth.checkPassword`: whether the proof matches the verifier the
+    /// account has, made with the secret of the attempt the client names. Nothing of the password
+    /// is known here.
+    pub(super) fn check(account: i64, proof: &tl::types::InputCheckPasswordSrp) -> Result<(), Fault> {
+        let kept = kept();
+        let found = kept.attempts.iter().find(|(id, attempt)| *id == proof.srp_id && attempt.account == account);
+        let Some((_, attempt)) = found else {
+            return Err(rpc(400, "SRP_ID_INVALID", None));
+        };
+        let Some(cloud) = kept.accounts.get(&account).cloned().flatten() else {
+            return Err(rpc(400, "PASSWORD_HASH_INVALID", None));
+        };
+        let issued = attempt.issued.clone();
+        let (a, m1) = (proof.a.clone(), proof.m1.clone());
+        drop(kept);
+        let proved = srp::with_stack("fake srp", move || {
+            proves(&cloud.verifier, &cloud.salt1, &cloud.salt2, &issued.secret, &issued.srp_b, &a, &m1)
+        })
+        .unwrap_or(false);
+        if proved {
+            Ok(())
+        } else {
+            Err(rpc(400, "PASSWORD_HASH_INVALID", None))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use grammers_crypto::two_factor_auth::calculate_2fa;
+
+        /// A proof the way a client makes it: grammers', for the numbers `begin` issued.
+        fn proof_of(srp_id: i64, srp_b: &[u8], typed: &str) -> tl::types::InputCheckPasswordSrp {
+            let (m1, a) = srp::with_stack("a client's proof in a test", || {
+                calculate_2fa(&salt1(), &salt2(), &unhex(PRIME), &G, srp_b.to_vec(), vec![3; 256], typed.as_bytes())
+            })
+            .expect("the SRP thread");
+            tl::types::InputCheckPasswordSrp { srp_id, a: a.to_vec(), m1: m1.to_vec() }
+        }
+
+        #[test]
+        fn a_password_set_on_an_account_is_the_one_a_later_sign_in_meets() {
+            // A sign-in opens a wire of its own. What it meets is the account's, kept here.
+            let account = 9_900_001;
+            assert!(held(account).is_none(), "an account nobody gave a password has none");
+            set(account, Some(Cloud::password("a fresh passphrase", "three words")));
+            assert_eq!(held(account).map(|kept| kept.hint), Some("three words".to_owned()));
+            let (srp_id, srp_b) = begin(account);
+            assert_ne!((srp_id, srp_b.len()), (0, 0), "numbers were issued for the attempt");
+            assert_eq!(check(account, &proof_of(srp_id, &srp_b, "a fresh passphrase")), Ok(()));
+            assert_eq!(check(account, &proof_of(srp_id, &srp_b, "correct horse")), Err(rpc(400, "PASSWORD_HASH_INVALID", None)));
+            // Another account is not signed in by it.
+            assert_eq!(check(9_900_004, &proof_of(srp_id, &srp_b, "a fresh passphrase")), Err(rpc(400, "SRP_ID_INVALID", None)));
+        }
+
+        #[test]
+        fn accounts_keep_their_own_passwords_and_the_fake_starts_with_miras() {
+            // The account the fake starts with has the password its sign-in scripts use.
+            let (srp_id, srp_b) = begin(ME);
+            assert_eq!(check(ME, &proof_of(srp_id, &srp_b, PASSWORD)), Ok(()));
+            assert_eq!(check(ME, &proof_of(srp_id, &srp_b, "hunter2")), Err(rpc(400, "PASSWORD_HASH_INVALID", None)));
+            let mira = held(ME).expect("Mira has a password");
+            assert_eq!((mira.hint.as_str(), mira.has_recovery), ("the old street", false));
+            // Another account has none: nothing is issued for it, and Mira's proof is not theirs.
+            let other = 9_900_002;
+            assert!(held(other).is_none());
+            assert_eq!(begin(other), (0, Vec::new()));
+            assert_eq!(check(other, &proof_of(srp_id, &srp_b, PASSWORD)), Err(rpc(400, "SRP_ID_INVALID", None)));
+            // Taken off (`two-step off`): the next sign-in is not asked for it.
+            set(ME, None);
+            assert!(held(ME).is_none());
+            assert_eq!(begin(ME), (0, Vec::new()));
+            assert_eq!(check(ME, &proof_of(srp_id, &srp_b, PASSWORD)), Err(rpc(400, "SRP_ID_INVALID", None)));
+        }
+
+        #[test]
+        fn a_proof_of_numbers_from_an_attempt_telegram_no_longer_keeps_is_refused() {
+            let account = 9_900_003;
+            set(account, Some(Cloud::password("first", "")));
+            let (earlier, b_earlier) = begin(account);
+            let stale = proof_of(earlier, &b_earlier, "first");
+            assert_eq!(check(account, &stale), Ok(()));
+            // Numbers Telegram no longer keeps: a proof of them names an attempt it cannot find.
+            for _ in 0..ATTEMPTS {
+                begin(account);
+            }
+            assert_eq!(check(account, &stale), Err(rpc(400, "SRP_ID_INVALID", None)));
+            let (later, b_later) = begin(account);
+            assert_ne!(later, earlier);
+            assert_eq!(check(account, &proof_of(later, &b_later, "first")), Ok(()));
+            // An id Telegram never issued.
+            assert_eq!(check(account, &proof_of(4_242, &b_later, "first")), Err(rpc(400, "SRP_ID_INVALID", None)));
+        }
+
+        #[test]
+        fn what_the_scripts_say_of_a_password_stays_with_the_account() {
+            // An account with a password of its own, so this touches nobody else's.
+            let account = 9_900_005;
+            set(account, Some(Cloud::password("second", "a hint")));
+            recover(account, true);
+            pending(account, Some(1_791_892_800));
+            unconfirmed(account, Some("m***@example.com".to_owned()));
+            login_email(account, Some("k***@example.org".to_owned()));
+            let kept = held(account).expect("the password is still set");
+            assert_eq!(
+                (kept.has_recovery, kept.pending_reset_date, kept.email_unconfirmed_pattern.as_deref(), kept.login_email_pattern.as_deref()),
+                (true, Some(1_791_892_800), Some("m***@example.com"), Some("k***@example.org"))
+            );
+            // A recovery email belongs to a password: with none there is nothing to say.
+            set(account, None);
+            recover(account, true);
+            pending(account, Some(1));
+            unconfirmed(account, Some("m***@example.com".to_owned()));
+            login_email(account, Some("k***@example.org".to_owned()));
+            assert!(held(account).is_none(), "nothing is said of a password that is not there");
+        }
     }
 }
 

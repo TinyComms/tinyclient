@@ -48,6 +48,12 @@ tokio = { version = "1", default-features = false, features = ["rt", "time", "sy
 # grammers-crypto 0.10.0 asks for "2.0.0-rc0" and does not build against 2.0.0 (released
 # 2026-10-13, changed API). Pinned until grammers follows.
 glass_pumpkin = "=2.0.0-rc0"
+# Telegram's cloud password (`adapters/telegram/srp.rs`): grammers computes a proof but keeps the
+# password's x and the verifier inside that call, and setting a password needs both. Same crates
+# grammers' tree has. pbkdf2 0.12 is the one built on chatd's `hmac` 0.12 and `sha2` 0.10;
+# pbkdf2 0.13 wants hmac 0.13.
+num-bigint = "0.4"
+pbkdf2 = "0.12"
 
 # Signal: presage, on libsignal-service-rs and Signal's libsignal (the decision is at the top of
 # `adapters/signal.rs`). On in every build. The libraries are AGPL-3.0 git dependencies at fixed
