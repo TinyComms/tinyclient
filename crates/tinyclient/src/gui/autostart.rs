@@ -407,11 +407,14 @@ mod tests {
 
     #[test]
     fn the_autostart_folder_follows_xdg() {
-        let home = Path::new("/home/user");
-        assert_eq!(autostart_dir(Some(std::ffi::OsStr::new("/tmp/config")), Some(home)), Some(PathBuf::from("/tmp/config/autostart")));
+        // A root that is absolute here too: `/tmp` and `/home` are not absolute on Windows.
+        let root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+        let xdg = root.join("tmp").join("config");
+        let home = root.join("home").join("user");
+        assert_eq!(autostart_dir(Some(xdg.as_os_str()), Some(&home)), Some(xdg.join("autostart")));
         // A relative XDG_CONFIG_HOME is ignored, as the spec says.
-        assert_eq!(autostart_dir(Some(std::ffi::OsStr::new("config")), Some(home)), Some(PathBuf::from("/home/user/.config/autostart")));
-        assert_eq!(autostart_dir(None, Some(home)), Some(PathBuf::from("/home/user/.config/autostart")));
+        assert_eq!(autostart_dir(Some(std::ffi::OsStr::new("config")), Some(&home)), Some(home.join(".config").join("autostart")));
+        assert_eq!(autostart_dir(None, Some(&home)), Some(home.join(".config").join("autostart")));
         assert_eq!(autostart_dir(None, None), None);
     }
 }
