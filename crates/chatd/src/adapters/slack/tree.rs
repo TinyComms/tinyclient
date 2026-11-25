@@ -1388,6 +1388,8 @@ impl Slack {
         let channel = &event["channel"];
         if let Some(id) = channel.as_str().or(channel["id"].as_str()) {
             self.forget_partner(id);
+            // Before the row goes, so a huddle running there is emptied from it on the way.
+            self.room_forgotten(id);
             self.ctx.conversation_gone(id)?;
         }
         Ok(())

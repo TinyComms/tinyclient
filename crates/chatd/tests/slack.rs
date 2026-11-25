@@ -2780,6 +2780,42 @@ fn someone_a_huddle_lists_is_in_a_huddle_though_their_profile_says_nothing() {
     world.until("Ben to be in no huddle", || doing(&world, "Ben", "U0BEN").is_none().then_some(()));
 }
 
+/// An event that names no room names a person and the conversation. What is kept of the person is
+/// only what looks like one of Slack's ids: nothing else reaches a row.
+#[test]
+fn a_room_event_that_names_no_room_keeps_only_what_looks_like_a_person() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    world.fake.push(ALPHA, huddle_started_in_general(&["U0ANA"], now() - 600));
+    world.until("Ana's huddle to be listed", || world.conversation(&general)?.occupants.filter(|inside| inside.total == 1));
+
+    // Not an id Slack would send: nothing is kept of it. Ben joining after it shows it was read.
+    world.fake.push(ALPHA, json!({"type": "sh_room_join", "user": "x".repeat(200), "channel": "C0GEN", "event_ts": "1760000850.000000"}));
+    world.fake.push(ALPHA, json!({"type": "sh_room_join", "user": "U0BEN", "channel": "C0GEN", "event_ts": "1760000851.000000"}));
+    let two = world.until("the huddle to list the two people it was told of", || {
+        world.conversation(&general)?.occupants.filter(|inside| inside.total == 2)
+    });
+    assert_eq!(who(&two), ["Ana", "Ben Ito"]);
+}
+
+/// A conversation left or closed while its huddle runs: the huddle is not shown after it, so
+/// nobody stays in a huddle of a conversation that is gone.
+#[test]
+fn a_huddle_is_forgotten_with_the_conversation_we_have_left() {
+    let world = World::start();
+    world.ready();
+    // The shell has Ben on screen, so chatd keeps what he is doing for him.
+    world.ask(Request::Watch(Watching { people: vec![alpha("U0BEN")], ..Watching::default() }));
+    world.fake.push(ALPHA, huddle_started_in_general(&["U0ANA", "U0BEN"], now() - 600));
+    world.until("Ben to be in the huddle", || doing(&world, "Ben", "U0BEN"));
+
+    // We leave #general: its row goes, though the huddle runs on there.
+    world.fake.push(ALPHA, json!({"type": "channel_left", "channel": "C0GEN"}));
+    world.until("#general's row to be gone", || world.conversation(&alpha("C0GEN")).is_none().then_some(()));
+    world.until("Ben to be in no huddle of a conversation that is gone", || doing(&world, "Ben", "U0BEN").is_none().then_some(()));
+}
+
 #[test]
 fn a_message_with_no_replies_can_start_its_thread() {
     let world = World::start();

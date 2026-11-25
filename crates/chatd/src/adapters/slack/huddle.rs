@@ -132,6 +132,26 @@ fn message_of(room: &Value) -> Option<&str> {
     room[field::ROOT].as_str().filter(|root| id_like(root))
 }
 
+/// The message a huddle's own message entry says it is, when it looks like one of Slack's. What
+/// is kept of it is bounded like any other id the network names.
+fn message_named(entry: &Value) -> Option<&str> {
+    entry[field::MESSAGE].as_str().filter(|ts| id_like(ts))
+}
+
+/// `id` joins the huddle known in a conversation, as an event that names no room says. What is
+/// kept of it is bounded the way a room's list is: only an id Slack might have sent, and no more
+/// than a huddle holds. Something that is not an id leaves the huddle as it was.
+fn joined(before: Option<&Room>, id: &str) -> Option<Room> {
+    if !id_like(id) {
+        return before.cloned();
+    }
+    let mut room = before.cloned().unwrap_or_default();
+    if room.people.len() < PEOPLE && !room.people.iter().any(|who| who == id) {
+        room.people.push(id.to_owned());
+    }
+    Some(room)
+}
+
 /// What the room says. A room that names neither who is in it nor an end (Slack leaves both out
 /// of some answers) says nothing, and is left alone.
 pub(super) fn standing(room: &Value) -> Option<Standing> {
@@ -156,7 +176,7 @@ impl Slack {
             if !message::is_huddle(entry["subtype"].as_str(), room) {
                 continue;
             }
-            self.room_heard(channel, entry[field::MESSAGE].as_str(), standing(room));
+            self.room_heard(channel, message_named(entry), standing(room));
         }
     }
 
@@ -250,11 +270,7 @@ impl Slack {
         let joining = event["type"] != LEAVE;
         let before = self.state().rooms.get(channel).cloned();
         let after = if joining {
-            let mut room = before.unwrap_or_default();
-            if !room.people.iter().any(|who| who == id) {
-                room.people.push(id.to_owned());
-            }
-            Some(room)
+            joined(before.as_ref(), id)
         } else {
             before.map(|mut room| {
                 room.people.retain(|who| who != id);
@@ -269,8 +285,9 @@ impl Slack {
     /// is none. The row is told, and the channel remembered until the huddle is over.
     fn room_set(&self, channel: &str, room: Option<Room>) {
         let room = room.filter(|room| !room.people.is_empty());
-        // A conversation the store has no row for has nothing that could show it.
-        if !id_like(channel) || self.ctx.known(channel).ok().flatten().is_none() {
+        // A huddle starting needs a row to show it. One ending does not: it is forgotten even
+        // when the row is gone.
+        if !id_like(channel) || (room.is_some() && self.ctx.known(channel).ok().flatten().is_none()) {
             return;
         }
         let mut state = self.state();
@@ -296,6 +313,18 @@ impl Slack {
         let state = self.state();
         self.room_told(channel, &state);
         self.huddles_told(&moved, &state);
+    }
+
+    /// A conversation the user is no longer in: the huddle that ran there is not known here any
+    /// more, and nobody is said to be in it. Said while its row still stands, so the row is
+    /// emptied before it goes.
+    pub(super) fn room_forgotten(&self, channel: &str) {
+        let mut state = self.state();
+        let Some(room) = state.rooms.remove(channel) else { return };
+        drop(state);
+        let state = self.state();
+        self.room_told(channel, &state);
+        self.huddles_told(&room.people, &state);
     }
 
     /// Who is in the huddle in `channel`, for its row, as remembered now. Someone not yet named
@@ -364,5 +393,32 @@ mod tests {
         // A timestamp as long as that is not one: the huddle is taken as one that named none.
         assert_eq!(message_of(&room), None);
         assert_eq!(message_of(&json!({"thread_root_ts": "1760000800.000800"})), Some("1760000800.000800"));
+    }
+
+    /// An event that names no room names a person. What is kept of that is bounded the way a
+    /// room's list is: only an id Slack might have sent, and no more than a huddle holds.
+    #[test]
+    fn a_person_joining_by_an_event_that_names_no_room_is_kept_only_when_slack_shaped_and_under_the_cap() {
+        let ana = Some(vec!["U0ANA".to_owned()]);
+        assert_eq!(joined(None, "U0ANA").map(|room| room.people), ana, "a join makes the huddle when none was known");
+        let one = joined(None, "U0ANA");
+        assert_eq!(joined(one.as_ref(), "U0ANA").map(|room| room.people), ana, "once each");
+        assert_eq!(joined(one.as_ref(), "U0BEN").map(|room| room.people), Some(vec!["U0ANA".to_owned(), "U0BEN".to_owned()]));
+        for odd in ["x".repeat(200), "U 0BEN".to_owned(), "U0BEN\n".to_owned(), "<script>".to_owned(), String::new()] {
+            assert_eq!(joined(one.as_ref(), &odd).map(|room| room.people), ana, "not an id: {odd:?}");
+        }
+
+        let full = Room { people: (0..PEOPLE).map(|at| format!("U{at:08}")).collect(), ..Room::default() };
+        assert_eq!(joined(Some(&full), "U0LATE"), Some(full), "a huddle lists no more than a row can");
+    }
+
+    /// A huddle's message says which huddle is meant. What is kept of it is bounded like any
+    /// other id the network names.
+    #[test]
+    fn a_huddles_message_is_kept_only_when_it_looks_like_a_slack_timestamp() {
+        assert_eq!(message_named(&json!({"ts": "1760000800.000800"})), Some("1760000800.000800"));
+        for odd in [json!({"ts": "x".repeat(200)}), json!({"ts": "in a huddle\n"}), json!({"ts": ""}), json!({"ts": 1760000800}), json!({})] {
+            assert_eq!(message_named(&odd), None, "not a timestamp: {odd}");
+        }
     }
 }
