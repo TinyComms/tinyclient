@@ -129,6 +129,20 @@ fn main() -> ExitCode {
         eprintln!("isolation-bounded: proved");
         return ExitCode::SUCCESS;
     }
+    // The lab's OpenH264 download driver: the real download from Cisco, into an isolated
+    // folder. The download says precisely what went wrong only in its log, so the log goes
+    // where a call's goes. A build without this is asked for no call, exits 0 at once and
+    // says nothing, which the driver counts as a failure.
+    if env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("openh264-download") {
+        let _log = protocol::log_policy::install("mediad", protocol::log_policy::LogPolicy::from_env());
+        if let Err(err) = mediad::picture::prove_openh264_download() {
+            eprintln!("openh264-download: {err}");
+            return ExitCode::from(1);
+        }
+        // What the driver looks for: the exit code alone proves nothing.
+        eprintln!("openh264-download: proved");
+        return ExitCode::SUCCESS;
+    }
     let _log = protocol::log_policy::install("mediad", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("mediad");
     let code = mediad::serve::run(&args);
