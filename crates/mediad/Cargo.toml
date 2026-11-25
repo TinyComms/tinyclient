@@ -78,7 +78,9 @@ nokhwa = { version = "0.10.10", default-features = false, features = ["input-nat
 openh264-sys2 = { version = "=0.9.9", default-features = false, features = ["libloading"] }
 # The Cisco binary is bz2. Pure Rust, so the release image needs no libbz2.
 bzip2-rs = "0.1.2"
-# The download of that binary. native-tls is already linked.
+# The download of that binary. Its `native-tls` feature is only the adapter for the system's
+# TLS, which is already linked: ureq never picks that as a default, so the agent a download
+# builds names the connector (`picture/desktop.rs`, `fetch_url`).
 ureq = { version = "2.12.1", default-features = false, features = ["native-tls"] }
 
 # The voice gateway's TLS, the system's, as chatd's everywhere but Android (`chatd::tls`).

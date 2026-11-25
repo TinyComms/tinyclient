@@ -1472,8 +1472,20 @@ fn download(path: &Path) -> Result<(), &'static str> {
 
 /// Cisco's answer to one GET of `url`, or why there is none. The 20 seconds are on the whole
 /// of the request.
+///
+/// The agent is built by hand around the system's TLS, which this crate already links for its
+/// voice gateway: ureq's `tls` feature is off here, and ureq never takes `native-tls` as a
+/// default, so its shortcut (`ureq::get`) refused every `https` URL with "no TLS backend is
+/// configured" (#967). Everything else is what the shortcut's own agent has: five redirects,
+/// 30 seconds to connect, the same headers.
 fn fetch_url(url: &str) -> Result<ureq::Response, ureq::Error> {
-    ureq::get(url).timeout(Duration::from_secs(20)).call()
+    let tls = native_tls::TlsConnector::new().map_err(std::io::Error::other)?;
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(20))
+        .tls_connector(Arc::new(tls))
+        .build()
+        .get(url)
+        .call()
 }
 
 /// Whether a camera can be opened, said before the button claims it is on.
@@ -1711,6 +1723,29 @@ mod tests {
         std::fs::write(&path, b"not a codec").unwrap();
         assert!(open_cached(&path).is_none());
         assert!(!path.exists(), "the broken file is gone");
+    }
+
+    /// The request to Cisco speaks TLS. ureq does not take `native-tls` by itself: with only
+    /// that feature the shortcut call refused every `https` URL ("no TLS backend is
+    /// configured", #967) and the codec folder stayed empty. A listener that takes the
+    /// connection and hangs up at once makes a real handshake fail, so the error must be
+    /// that failure and not the missing backend.
+    #[test]
+    fn the_download_request_has_a_tls_backend() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener on this machine");
+        let port = listener.local_addr().expect("the listener is bound").port();
+        let (taken, arrived) = channel::<std::io::Result<()>>();
+        std::thread::spawn(move || {
+            // Nothing there speaks TLS: the one connection is taken and hung up at once.
+            let _ = taken.send(listener.accept().map(|(stream, _)| drop(stream)));
+        });
+        let Err(err) = fetch_url(&format!("https://127.0.0.1:{port}/")) else {
+            panic!("nothing there speaks TLS, so the request cannot succeed");
+        };
+        // The connection was taken, so the failure came after the socket: at the handshake.
+        assert!(matches!(arrived.recv_timeout(Duration::from_secs(10)), Ok(Ok(()))), "the request never reached the listener: {err}");
+        let said = err.to_string();
+        assert!(!said.contains("no TLS backend is configured"), "{said}");
     }
 
     /// A camera, or a screen, through real OpenH264: `cargo test -p mediad --lib -- --ignored`
