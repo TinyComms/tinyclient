@@ -166,9 +166,9 @@ never bent: nothing is done that the user did not ask for, and nothing is enumer
   issue if there is one.
 - `cargo test --workspace` passes, and `cargo check -p tinyclient --features gui` if you touched
   the window. New behaviour comes with a test; a bug fix with a test that failed before it.
-- Commit messages are one plain sentence in the imperative, ending with a period, saying what the
-  change does for the user or the code: "Find mediad and OpenSSL on Windows so the call tests can
-  run there."
+- Commit messages are one plain sentence in the imperative, with no trailing period, saying
+  what the change does for the user or the code: "Find mediad and OpenSSL on Windows so the call
+  tests can run there".
 - A visible change to the window: attach a screenshot (`--features gui-shot` and `--shot out.png`
   make one from the demo without screen recording permission).
 - New dependencies: say what they cost in size, and why nothing already in the tree will do.
