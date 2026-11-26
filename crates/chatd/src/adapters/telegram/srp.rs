@@ -58,7 +58,7 @@ pub(super) fn pad256(bytes: &[u8]) -> [u8; 256] {
 /// v := g^x mod p
 fn v(x: &[u8; 32], p: &[u8], g: i32) -> [u8; 256] {
     let modulus = BigUint::from_bytes_be(p);
-    pad256(&BigUint::from_bytes_be(x).modpow(&BigUint::from(g as u32), &modulus).to_bytes_be())
+    pad256(&BigUint::from(g as u32).modpow(&BigUint::from_bytes_be(x), &modulus).to_bytes_be())
 }
 
 /// The verifier of `x`: `g^x mod p`, 256 bytes big-endian, which is what
@@ -181,7 +181,7 @@ mod tests {
             let x = password_x(typed.as_bytes(), &[7; 8], &[9; 16]);
             let set = verifier(&x, &p, 3);
             assert_eq!(set.len(), 256, "2048 bits");
-            let straight = BigUint::from_bytes_be(&x).modpow(&BigUint::from(3u32), &BigUint::from_bytes_be(&p)).to_bytes_be();
+            let straight = BigUint::from(3u32).modpow(&BigUint::from_bytes_be(&x), &BigUint::from_bytes_be(&p)).to_bytes_be();
             assert_eq!(&set[256 - straight.len()..], straight.as_slice(), "big-endian, left-padded to 256 bytes");
             assert!(set[..256 - straight.len()].iter().all(|byte| *byte == 0));
 
