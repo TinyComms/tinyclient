@@ -141,7 +141,13 @@ pub(in crate::gui) fn only_draws() -> bool {
 
 /// In the call we are in, or in a voice channel chatd told us about.
 fn in_call(hub: &Hub, scene: &Scene, person: &Key) -> bool {
-    scene.in_call.contains(person) || hub.in_voice(person)
+    scene.in_call.contains(person) || in_voice(hub, person)
+}
+
+/// In a voice channel chatd told us about. Not on Slack: its occupants are the people in a
+/// huddle, which is said as "In a huddle" and is not a call.
+fn in_voice(hub: &Hub, person: &Key) -> bool {
+    person.network != Network::Slack && hub.in_voice(person)
 }
 
 /// The direct conversation with `person` among rows already read, on the same account.
@@ -489,7 +495,7 @@ impl Shell {
         joined.is_some_and(|call| {
             call.conversation.account() == person.account() && call.participants.iter().any(|who| who.id == person.id)
         }) || calling
-            || self.people_state.hub.in_voice(person)
+            || in_voice(&self.people_state.hub, person)
     }
 
     /// The line under the title of a direct conversation, with the presence word's color.
@@ -908,6 +914,42 @@ mod tests {
         assert_eq!(header_line("", "On holiday", false).as_deref(), Some("On holiday"));
         assert_eq!(header_line("", "", false), None);
         assert_eq!(header_line("Do not disturb", "Presenting", true).as_deref(), Some("In a call"));
+    }
+
+    /// chatd reports the people in a Slack huddle as their conversation's occupants, the way it
+    /// does a voice channel's. A huddle is not a call: "In a huddle" is said of them another way.
+    #[test]
+    fn a_slack_person_in_a_huddle_is_not_in_a_call() {
+        let hub = Hub::default();
+        let seated = |network: Network, id: &str| {
+            protocol::Occupants {
+                people: vec![protocol::Occupant {
+                    person: Key { network, account: "acme".into(), id: id.into() },
+                    name: id.into(),
+                    avatar: None,
+                    muted: false,
+                    deafened: false,
+                    server_muted: false,
+                    server_deafened: false,
+                    suppressed: false,
+                    streaming: false,
+                    camera: false,
+                    speaking: false,
+                    hand_raised: false,
+                    is_channel: false,
+                }],
+                total: 1,
+                ..Default::default()
+            }
+        };
+        let in_slack = Key { network: Network::Slack, account: "acme".into(), id: "U0ANA".into() };
+        hub.set_occupants(&Key { id: "C0GEN".into(), ..in_slack.clone() }, &seated(Network::Slack, "U0ANA"));
+        assert!(hub.in_voice(&in_slack), "the hub files a huddle's people with a voice channel's");
+        assert!(!in_voice(&hub, &in_slack), "which is not a call");
+
+        let in_tiny = Key { network: Network::Tiny, account: "acme".into(), id: "bea".into() };
+        hub.set_occupants(&Key { id: "room".into(), ..in_tiny.clone() }, &seated(Network::Tiny, "bea"));
+        assert!(in_voice(&hub, &in_tiny), "a voice channel's people are in a call, as before");
     }
 
     #[test]

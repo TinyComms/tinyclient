@@ -3512,12 +3512,13 @@ impl Pane {
             .map(|p| crate::gui::components::Avatar::named(&p.name, 20.).build())
             .collect();
         let handoff = call_support == protocol::CallSupport::Handoff;
-        let join_label = if handoff {
-            format!("Open in {}", key.network.label())
+        let join_label = live_bar_words(key.network, call_support, occupants.rtmp_stream);
+        let mark = if key.network == Network::Slack {
+            "icons/headphones.svg"
         } else if occupants.rtmp_stream {
-            "Watch".to_owned()
+            "icons/radio.svg"
         } else {
-            "Join".to_owned()
+            "icons/phone.svg"
         };
         Some(
             div()
@@ -3542,11 +3543,7 @@ impl Pane {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(crate::gui::components::glyph(
-                            if occupants.rtmp_stream { "icons/radio.svg" } else { "icons/phone.svg" },
-                            13.,
-                            theme::accent_text(),
-                        )),
+                        .child(crate::gui::components::glyph(mark, 13., theme::accent_text())),
                 )
                 .children(occupants.record_start_date.map(|since| {
                     super::call::telegram::recording_badge("live-bar-rec", since, occupants.record_video_active)
@@ -4851,6 +4848,47 @@ mod tests {
         assert_eq!(is_away(false, false, false, 600., 600., None), Some(false));
     }
 
+    /// Who is in a huddle, by name.
+    fn seated(names: &[&str]) -> protocol::Occupants {
+        protocol::Occupants {
+            people: names
+                .iter()
+                .map(|name| protocol::Occupant {
+                    person: Key { network: Network::Slack, account: "acme".into(), id: name.to_lowercase() },
+                    name: (*name).to_owned(),
+                    avatar: None,
+                    muted: false,
+                    deafened: false,
+                    server_muted: false,
+                    server_deafened: false,
+                    suppressed: false,
+                    streaming: false,
+                    camera: false,
+                    speaking: false,
+                    hand_raised: false,
+                    is_channel: false,
+                })
+                .collect(),
+            total: names.len() as u32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_live_bar_of_a_slack_huddle_joins_in_slack_and_calls_it_a_huddle() {
+        let two = seated(&["Ana", "Ben Ito"]);
+        assert_eq!(live_bar_words(Network::Slack, protocol::CallSupport::Handoff, false), crate::gui::call::JOIN_HUDDLE);
+        assert_eq!(crate::gui::call::JOIN_HUDDLE, "Join in Slack", "the bar and the header say the same");
+        assert_eq!(live_call_summary(Network::Slack, ConversationKind::Channel, &two, 2_000), "Huddle in progress · Ana, Ben Ito");
+        assert_eq!(live_call_summary(Network::Slack, ConversationKind::Group, &two, 2_000), "2 in this huddle · Ana, Ben Ito");
+        // Any other bar says what it did.
+        assert_eq!(live_bar_words(Network::Teams, protocol::CallSupport::Handoff, false), "Open in Teams");
+        assert_eq!(live_bar_words(Network::Tiny, protocol::CallSupport::Native, false), "Join");
+        assert_eq!(live_bar_words(Network::Telegram, protocol::CallSupport::Native, true), "Watch");
+        assert_eq!(live_call_summary(Network::Tiny, ConversationKind::Channel, &two, 2_000), "Call in progress · Ana, Ben Ito");
+        assert_eq!(live_call_summary(Network::Tiny, ConversationKind::Group, &two, 2_000), "2 in this call · Ana, Ben Ito");
+    }
+
     #[test]
     fn telegram_live_and_scheduled_video_chat_summaries_format_cleanly() {
         let scheduled = protocol::Occupants {
@@ -4944,6 +4982,21 @@ pub(crate) fn format_schedule_countdown(scheduled_at: i64, now_unix: i64) -> Str
     }
 }
 
+/// What the live bar's button says: "Join in Slack" for a huddle, which Slack carries; "Open in
+/// Teams" for any other call the official app carries; "Watch" a live stream; "Join" a call
+/// carried here.
+fn live_bar_words(network: Network, call: protocol::CallSupport, stream: bool) -> String {
+    if network == Network::Slack {
+        super::call::JOIN_HUDDLE.to_owned()
+    } else if call == protocol::CallSupport::Handoff {
+        format!("Open in {}", network.label())
+    } else if stream {
+        "Watch".to_owned()
+    } else {
+        "Join".to_owned()
+    }
+}
+
 /// Summary text for the live or scheduled call banner (`#462`, `#465`).
 pub(crate) fn live_call_summary(
     network: Network,
@@ -4961,6 +5014,21 @@ pub(crate) fn live_call_summary(
         };
     }
     let names: Vec<&str> = occupants.people.iter().take(3).map(|p| p.name.as_str()).collect();
+    // A Slack huddle is a huddle, not a call.
+    if network == Network::Slack {
+        if kind == ConversationKind::Group {
+            return if names.is_empty() {
+                format!("{} in this huddle", occupants.total)
+            } else {
+                format!("{} in this huddle · {}", occupants.total, names.join(", "))
+            };
+        }
+        return if names.is_empty() {
+            format!("Huddle in progress · {}", occupants.total)
+        } else {
+            format!("Huddle in progress · {}", names.join(", "))
+        };
+    }
     if network == Network::Telegram {
         if occupants.rtmp_stream {
             let head = if occupants.title.is_empty() {

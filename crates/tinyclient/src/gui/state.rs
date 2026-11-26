@@ -774,6 +774,7 @@ impl Shell {
     }
 
     /// Who is in a voice channel changed: the row carries it, so the row is changed where it is.
+    /// The open conversation's row too, which the header's pill and the bar under it read.
     fn occupants_changed(&mut self, channel: &Key, occupants: &Occupants, cx: &mut Context<Self>) {
         let inside = (occupants.total > 0).then(|| occupants.clone());
         let mut changed = false;
@@ -782,6 +783,10 @@ impl Shell {
                 Rc::make_mut(row).occupants = inside.clone();
                 changed = true;
             }
+        }
+        if self.snapshot.as_mut().is_some_and(|snapshot| following(&mut snapshot.open, channel, occupants)) {
+            changed = true;
+            self.refresh_conversation_window(channel, cx);
         }
         if changed {
             self.rebuild_rows(cx);
@@ -1258,6 +1263,24 @@ impl Shell {
     }
 }
 
+/// The open conversation's row follows who is in it when that is all that changed: the header's
+/// pill and the bar under it read them from there. As a row read again would say it, so a call
+/// that is only scheduled is not dropped.
+fn following(open: &mut Option<Conversation>, channel: &Key, occupants: &Occupants) -> bool {
+    let Some(row) = open.as_mut().filter(|row| &row.key == channel) else {
+        return false;
+    };
+    // Kept as chatd keeps it: nothing going on is forgotten, a stage with a topic or an
+    // activity is not.
+    let kept = occupants.active() || (occupants.stage && (!occupants.stage_topic.is_empty() || occupants.activity.is_some()));
+    let shown = kept.then(|| occupants.clone());
+    if row.occupants == shown {
+        return false;
+    }
+    row.occupants = shown;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1265,6 +1288,33 @@ mod tests {
 
     fn key(id: &str) -> Key {
         Key { network: Network::Discord, account: "me".into(), id: id.into() }
+    }
+
+    #[test]
+    fn the_open_conversations_row_follows_who_is_in_it() {
+        let channel = Key { network: Network::Slack, account: "acme".into(), id: "C0GEN".into() };
+        let mut open = Some(Conversation::new(channel.clone(), protocol::ConversationKind::Channel, "#general"));
+        let two = Occupants { total: 2, ..Default::default() };
+        fn seated(open: &Option<Conversation>) -> Option<&Occupants> {
+            open.as_ref().and_then(|row| row.occupants.as_ref())
+        }
+        // A huddle starts in the open conversation.
+        assert!(following(&mut open, &channel, &two));
+        assert_eq!(seated(&open).map(|inside| inside.total), Some(2));
+        assert!(!following(&mut open, &channel, &two), "the same again changes nothing");
+        // It ends: nothing is in it.
+        assert!(following(&mut open, &channel, &Occupants::default()));
+        assert!(seated(&open).is_none());
+        // Another conversation's people leave the open row alone.
+        assert!(!following(&mut open, &key("other"), &two));
+        assert!(seated(&open).is_none());
+        // A call that is only scheduled is something, as a row read again would say.
+        let scheduled = Occupants { scheduled_at: Some(2_000), ..Default::default() };
+        assert!(following(&mut open, &channel, &scheduled));
+        assert_eq!(seated(&open).map(|inside| inside.scheduled_at), Some(Some(2_000)));
+        // Nothing open: nothing to follow.
+        let mut none: Option<Conversation> = None;
+        assert!(!following(&mut none, &channel, &two));
     }
 
     #[test]
