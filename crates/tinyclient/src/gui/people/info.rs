@@ -2371,6 +2371,16 @@ impl Shell {
         (facts::conversation_link(row, None), facts::can_leave(row))
     }
 
+    /// "Copy huddle link", from a row's menu: where Slack's own app opens the conversation's
+    /// huddle, on the clipboard. Said as "Copy link" is, since nothing on screen changes.
+    pub(in crate::gui) fn copy_huddle_link(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
+        let Some(link) = facts::huddle_link(conversation) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(link));
+        self.toast(Some(("icons/check.svg", theme::text_soft())), "Huddle link copied".to_owned(), cx);
+    }
+
     /// Asks once, then leaves: the same confirm Details' "…" asks, from a row's sheet.
     pub(in crate::gui) fn confirm_leave(&mut self, conversation: Conversation, cx: &mut Context<Self>) {
         self.open_float(Float::Leave { conversation, silent: false }, gpui::Point::default(), cx);

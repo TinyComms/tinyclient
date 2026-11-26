@@ -4980,6 +4980,23 @@ fn slack_permalinks_and_in_app_link_resolution() {
     assert_eq!(t_conv, Some(thread.clone()));
     assert_eq!(t_mid.as_deref(), Some(reply_ts));
 
+    // A huddle address names a conversation by its workspace and channel: the same jump in-app,
+    // to the conversation and not to a message.
+    let Response::Resolved { conversation: huddle, message_id: huddle_message, .. } = world.ask(Request::Resolve {
+        url: "https://app.slack.com/huddle/T01ALPHA/C0GEN".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(huddle, Some(general.clone()));
+    assert_eq!(huddle_message, None);
+    // One of another workspace names none of ours, as an archive address of one does not.
+    let Response::Resolved { conversation: other_huddle, .. } = world.ask(Request::Resolve {
+        url: "https://app.slack.com/huddle/T02BETA/C0GEN".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(other_huddle, None);
+
     // A link for a different workspace does not hijack our workspace's channel.
     let Response::Resolved { conversation: other_conv, .. } = world.ask(Request::Resolve {
         url: "https://unrelated-workspace.slack.com/archives/C0GEN/p1760000200000200".into(),

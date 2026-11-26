@@ -1098,6 +1098,13 @@ impl Floating {
                     this.close(cx);
                 })))
             }
+            Item::CopyHuddleLink => {
+                let huddle = conversation.and_then(facts::huddle_link).unwrap_or_default();
+                div().child(menu_item("menu-huddle-link", Some("icons/link.svg"), "Copy huddle link", None).on_click(cx.listener(move |this, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(huddle.clone()));
+                    this.close(cx);
+                })))
+            }
             Item::CopyId => {
                 let id = person.map(|person| person.key.id.clone()).or(conversation.map(|row| row.key.id.clone())).unwrap_or_default();
                 div().child(menu_item("menu-id", Some("icons/copy.svg"), "Copy ID", Some("⌥")).on_click(cx.listener(move |this, _, _, cx| {

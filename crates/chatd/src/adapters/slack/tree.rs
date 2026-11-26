@@ -1429,11 +1429,11 @@ impl Slack {
     /// Where the official app opens this conversation's huddle. Of the two forms seen,
     /// `https://app.slack.com/huddle/TEAM/CHANNEL` is used: it is what Slack's own "copy huddle
     /// link" produces, and the system hands it to the Slack app when that is installed. The
-    /// `slack://` form is not used. Unverified that it starts the huddle rather than only
-    /// opening the conversation.
+    /// `slack://` form is not used. The address is made in one place, which also holds what is
+    /// not verified about it ([`protocol::link::slack_huddle_link`]).
     pub(super) fn huddle_link(&self, conversation: &str) -> String {
         let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
-        format!("https://app.slack.com/huddle/{}/{channel}", self.session.team_id)
+        protocol::link::slack_huddle_link(&self.session.team_id, channel)
     }
 }
 

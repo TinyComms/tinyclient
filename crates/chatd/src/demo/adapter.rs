@@ -917,7 +917,7 @@ impl Demo {
             Command::Handoff { conversation_id, reply } => {
                 let account = &demo.ctx.account.account;
                 let link = match demo.ctx.account.network {
-                    Network::Slack => format!("https://app.slack.com/huddle/{account}/{conversation_id}"),
+                    Network::Slack => protocol::link::slack_huddle_link(account, &conversation_id),
                     Network::Messages => "https://messages.google.com/web/".to_owned(),
                     Network::Tiny => String::new(),
                     _ => format!("https://discord.com/channels/@me/{conversation_id}"),

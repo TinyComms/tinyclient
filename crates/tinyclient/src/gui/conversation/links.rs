@@ -145,6 +145,17 @@ pub(super) fn network_link_chip(url: &str, conversations: &[protocol::Conversati
     Some(if parsed.message_id.is_some() { format!("{label} ↗") } else { label })
 }
 
+/// Whether a plain click on `url` opens a conversation inside the app, the way a network's own
+/// message and conversation links do (a Discord channel, a Slack archive or huddle address, a
+/// `t.me` chat): chatd is asked which conversation it names, and opens it when the row is
+/// known. Anything else, and Alt on any link, goes on to the browser's question.
+pub(in crate::gui) fn opens_in_app(url: &str) -> bool {
+    // Only t.me and telegram.me open in the app. telegram.dog, tg://, a traversal, or a pack
+    // is still a Telegram address, so it must not fall through to the wider parser.
+    protocol::link::telegram_app_link(url).is_some()
+        || (!protocol::link::telegram_family(url) && protocol::link::parse_network_link(url).is_some())
+}
+
 /// Opens an external `http://` or `https://` URL from surfaces outside a conversation [`Pane`]
 /// (such as Settings or the right-hand info pane), enforcing the same scheme validation and
 /// tracking-parameter stripping as [`Pane::open_external_link`].
@@ -242,10 +253,7 @@ impl Pane {
                 }
             }
         }
-        // Only t.me and telegram.me open in the app. telegram.dog, tg://, a traversal, or a pack
-        // is still a Telegram address, so it must not fall through to the wider parser.
-        let in_app = protocol::link::telegram_app_link(url).is_some()
-            || (!protocol::link::telegram_family(url) && protocol::link::parse_network_link(url).is_some());
+        let in_app = opens_in_app(url);
         if !external && in_app {
             let owned = url.to_owned();
             let request = protocol::Request::Resolve { url: owned.clone() };
@@ -583,6 +591,31 @@ mod tests {
         assert_eq!(parsed_slack.space.as_deref(), Some("T1"));
         assert_eq!(parsed_slack.channel, "C9");
         assert_eq!(parsed_slack.message_id.as_deref(), Some("67890"));
+    }
+
+    #[test]
+    fn a_huddle_link_opens_its_conversation_in_the_app_and_no_other_address_moved() {
+        // The address Slack's own "Copy huddle link" gives: a conversation of a signed-in
+        // workspace, opened in the app as any network link is, to land on no message.
+        let address = protocol::link::slack_huddle_link("T01ALPHA", "C0GENERIC");
+        assert!(opens_in_app(&address));
+        let parsed = protocol::link::parse_network_link(&address).unwrap();
+        assert_eq!(
+            (parsed.network, parsed.space.as_deref(), parsed.channel.as_str()),
+            (protocol::Network::Slack, Some("T01ALPHA"), "C0GENERIC")
+        );
+        assert_eq!((parsed.message_id, parsed.thread_id), (None, None));
+        // Not Slack's own address, or not that shape: the question and then the browser, as before.
+        for other in [
+            "https://evil.app.slack.com/huddle/T01ALPHA/C0GENERIC",
+            "https://app.slack.com.evil.example/huddle/T01ALPHA/C0GENERIC",
+            "https://app.slack.com@evil.example/huddle/T01ALPHA/C0GENERIC",
+            "https://app.slack.com/huddle/T01ALPHA/C0GENERIC/extra",
+            "https://app.slack.com/client/T01ALPHA/C0GENERIC",
+            "https://example.com/huddle/T01ALPHA/C0GENERIC",
+        ] {
+            assert!(!opens_in_app(other), "{other}");
+        }
     }
 
     #[test]
