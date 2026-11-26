@@ -1438,7 +1438,7 @@ fn download(path: &Path) -> Result<(), &'static str> {
     let url = library_url(name);
     // The 20 seconds are the whole try's deadline, body read included (`into_reader` keeps
     // it), so a VPN that takes the connection but not the bytes cannot hold this thread.
-    let response = ureq::get(&url).timeout(Duration::from_secs(20)).call().map_err(|err| {
+    let response = fetch_url(&url).map_err(|err| {
         tracing::warn!("mediad: OpenH264 could not be fetched from Cisco: {err}");
         DOWNLOAD_FAILED
     })?;
@@ -1468,6 +1468,41 @@ fn download(path: &Path) -> Result<(), &'static str> {
         SAVE_FAILED
     })?;
     Ok(())
+}
+
+/// Cisco's answer to one GET of `url`, or why there is none. The 20 seconds are on the whole
+/// of the request.
+///
+/// The agent is built by hand around the system's TLS, which this crate already links for its
+/// voice gateway: ureq's `tls` feature is off here, and ureq never takes `native-tls` as a
+/// default, so its shortcut (`ureq::get`) refused every `https` URL with "no TLS backend is
+/// configured" (#967). Everything else is what the shortcut's own agent has: five redirects,
+/// 30 seconds to connect, the same headers.
+fn fetch_url(url: &str) -> Result<ureq::Response, ureq::Error> {
+    let tls = native_tls::TlsConnector::new().map_err(std::io::Error::other)?;
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(20))
+        .tls_connector(Arc::new(tls))
+        .build()
+        .get(url)
+        .call()
+}
+
+/// What the lab's run of the download proves (`TINYCLIENT_PROVE=openh264-download`): that
+/// `fetch` brings Cisco's library to `path`, by the download a call's thread runs, and that
+/// the file then opens the way a call opens it. A download that did not arrive says its own
+/// words. A file that does not open is no proof, and is left where it is for the lab to look
+/// at, where a call takes such a file away (`open_cached`).
+fn prove_download(path: &Path, fetch: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
+    fetch(path)?;
+    OpenH264API::from_blob_path(path).map(|_| ()).map_err(|err| format!("OpenH264 was downloaded to {} but does not load: {err}", path.display()))
+}
+
+/// The lab's run of the download: Cisco's library is fetched to where a call keeps it, for
+/// real, from Cisco, and it succeeds only when the library loads. Needs the network.
+pub fn prove_openh264_download() -> Result<(), String> {
+    let path = library_path()?;
+    prove_download(&path, download_with_retries)
 }
 
 /// Whether a camera can be opened, said before the button claims it is on.
@@ -1705,6 +1740,58 @@ mod tests {
         std::fs::write(&path, b"not a codec").unwrap();
         assert!(open_cached(&path).is_none());
         assert!(!path.exists(), "the broken file is gone");
+    }
+
+    /// The request to Cisco speaks TLS. ureq does not take `native-tls` by itself: with only
+    /// that feature the shortcut call refused every `https` URL ("no TLS backend is
+    /// configured", #967) and the codec folder stayed empty. A listener that takes the
+    /// connection and hangs up at once makes a real handshake fail, so the error must be
+    /// that failure and not the missing backend.
+    #[test]
+    fn the_download_request_has_a_tls_backend() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener on this machine");
+        let port = listener.local_addr().expect("the listener is bound").port();
+        let (taken, arrived) = channel::<std::io::Result<()>>();
+        std::thread::spawn(move || {
+            // Nothing there speaks TLS: the one connection is taken and hung up at once.
+            let _ = taken.send(listener.accept().map(|(stream, _)| drop(stream)));
+        });
+        let Err(err) = fetch_url(&format!("https://127.0.0.1:{port}/")) else {
+            panic!("nothing there speaks TLS, so the request cannot succeed");
+        };
+        // The connection was taken, so the failure came after the socket: at the handshake.
+        assert!(matches!(arrived.recv_timeout(Duration::from_secs(10)), Ok(Ok(()))), "the request never reached the listener: {err}");
+        let said = err.to_string();
+        assert!(!said.contains("no TLS backend is configured"), "{said}");
+    }
+
+    /// The lab's run of the download (`TINYCLIENT_PROVE=openh264-download`) is proved by a
+    /// library that opens and by nothing else: a download that did not arrive is its own
+    /// failure, in its own words.
+    #[test]
+    fn a_download_that_did_not_arrive_is_not_proved() {
+        let path = std::env::temp_dir().join("tinyclient-test-prove-nothing-arrived.dll");
+        let _ = std::fs::remove_file(&path);
+        let Err(why) = prove_download(&path, |_| Err(DOWNLOAD_FAILED.to_owned())) else {
+            panic!("nothing was downloaded, so there is nothing to prove");
+        };
+        assert_eq!(why, DOWNLOAD_FAILED);
+    }
+
+    /// ...and a file that does not open is no proof either: the loader takes Cisco's hash
+    /// alone. It stays where it is, for the lab to look at.
+    #[test]
+    fn a_file_that_does_not_open_is_not_a_proved_download() {
+        let path = std::env::temp_dir().join("tinyclient-test-prove-not-a-codec.dll");
+        std::fs::write(&path, b"not a codec").unwrap();
+        let proved = prove_download(&path, |_| Ok(()));
+        let kept = path.exists();
+        let _ = std::fs::remove_file(&path);
+        let Err(why) = proved else {
+            panic!("a file that is not Cisco's library does not open, so it proves nothing");
+        };
+        assert!(why.contains("does not load"), "{why}");
+        assert!(kept, "the file stays, for the lab to look at");
     }
 
     /// A camera, or a screen, through real OpenH264: `cargo test -p mediad --lib -- --ignored`
