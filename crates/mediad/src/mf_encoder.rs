@@ -1394,16 +1394,57 @@ pub(crate) mod tests {
         assert_eq!(shared.with(|f| f.keys_forced), 1, "deferred keyframe fired on next give");
     }
 
+    /// Whether a hardware encoder's refusal to open is one a machine can simply have: the
+    /// encoder it lists will not take the H.264 output or the NV12 input its D3D device is
+    /// asked for. The product then shares through OpenH264. Any other refusal is a defect.
+    fn machine_has_no_encoder(why: &str) -> bool {
+        why.starts_with("the hardware encoder would not take an H.264 output")
+            || why.starts_with("the hardware encoder would not take NV12")
+    }
+
+    /// Only a refused media type excuses the hardware encoder. Anything else is a defect, and
+    /// the hardware test must fail on it, as it did before.
+    #[test]
+    fn only_a_refused_media_type_excuses_the_hardware_encoder() {
+        assert!(
+            machine_has_no_encoder(
+                "the hardware encoder would not take an H.264 output: Der Eingabetyp wird für das D3D-Gerät nicht unterstützt. (0xC00D6D76)"
+            ),
+            "this PC's refusal: the D3D device will not take the output type"
+        );
+        assert!(machine_has_no_encoder("the hardware encoder would not take NV12: (0xC00D36B4)"));
+        for defect in [
+            "the hardware encoder would not take the frame: (0xC00D36B4)",
+            "the hardware encoder would not say which H.264 profile it encodes.",
+            "the hardware encoder could not be unlocked: (0x80004005)",
+            "the hardware encoder would not say what it kept of the H.264 output: (0xC00D36B4)",
+            "",
+        ] {
+            assert!(!machine_has_no_encoder(defect), "a defect must fail the test: {defect}");
+        }
+    }
+
     /// Real Windows hardware MFT proof: if this machine has a hardware H.264 MFT, encode real
     /// frames (including a forced PLI keyframe), seal with DAVE E2EE, send over a real str0m
     /// WebRTC connection (H264Packetizer + SRTP + H264Depacketizer), and verify the receiver
-    /// decrypts every frame cleanly.
+    /// decrypts every frame cleanly. A listed encoder can still refuse the output or input type
+    /// its D3D device will not take; the product then shares through OpenH264 instead, so the
+    /// test skips with that refusal. Any other refusal fails it, as before: that would be a
+    /// machine whose encoder stops working, which somebody must see.
     #[test]
     fn real_hardware_mft_survives_e2ee_and_str0m_rtp_packetization() {
-        if available().is_err() {
+        if let Err(why) = available() {
+            eprintln!("skipping: {why}");
             return;
         }
-        let mut enc = Encoder::open(640, 360, 2_000_000, 30., true).expect("hardware MF encoder opens");
+        let mut enc = match Encoder::open(640, 360, 2_000_000, 30., true) {
+            Ok(enc) => enc,
+            Err(why) if machine_has_no_encoder(&why) => {
+                eprintln!("skipping: {why}");
+                return;
+            }
+            Err(why) => panic!("hardware MF encoder opens: {why}"),
+        };
         let (mut ada, mut bea) = crate::e2ee::tests::pair_for_video_proof();
         let mut pipe = crate::e2ee::tests::Str0mVideoPipe::new();
         let mut produced = 0usize;

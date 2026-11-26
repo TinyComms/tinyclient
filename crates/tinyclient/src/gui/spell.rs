@@ -732,6 +732,14 @@ mod windows_spell {
         }
     }
 
+    /// Whether the user's locale is English. The checker is built for that locale, and only an
+    /// English dictionary knows that "teh" is wrong and "the" is a word.
+    #[cfg(test)]
+    pub(super) fn english_locale() -> bool {
+        let name = String::from_utf16_lossy(&locale());
+        name.trim_end_matches('\0').split(['-', '_']).next().is_some_and(|language| language.eq_ignore_ascii_case("en"))
+    }
+
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -1236,6 +1244,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_system_checker_answers_teh() {
+        // The checker is built for the user's locale, and only an English one knows that "the"
+        // is a word. On any other locale this test says nothing, and says why.
+        if !windows_spell::english_locale() {
+            eprintln!("skipping: the spell checker is built for the user's locale, which is not English");
+            return;
+        }
         let words = windows_spell::probe("teh").expect("the spell checker did not open");
         let correct = windows_spell::probe("the").expect("the spell checker did not open");
         assert!(correct.is_none(), "a correct word was marked: {correct:?}");

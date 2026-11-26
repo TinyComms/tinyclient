@@ -1,3 +1,6 @@
+# Every text file is stored with LF and checked out with LF, on Windows too, so a working tree's
+# CRLF stops reaching other machines. A file already stored with CRLF is left as it is.
+* text=auto eol=lf
 # Shell scripts keep LF on a Windows checkout too: the release workflow runs them under Git Bash.
 *.sh text eol=lf
 packaging/linux/AppRun text eol=lf
