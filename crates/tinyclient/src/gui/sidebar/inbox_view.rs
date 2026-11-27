@@ -579,6 +579,7 @@ impl Shell {
                     .gap(px(2.))
                     .child(
                         div()
+                            .w_full()
                             .flex()
                             .items_center()
                             .gap(px(6.))
@@ -612,6 +613,7 @@ impl Shell {
                     .when(!hide && !snippet.is_empty(), |col| {
                         col.child(
                             div()
+                                .w_full()
                                 .truncate()
                                 .type_small()
                                 .text_color(if item.unread { theme::text() } else { theme::text_soft() })
@@ -624,6 +626,9 @@ impl Shell {
                 } else {
                     list_row(("activity-row", ix), height, false, false, content)
                 };
+                if ix > 0 {
+                    list_box = list_box.child(div().flex_none().h(px(1.)).mx(px(theme::INSET + 8.)).bg(theme::hairline()));
+                }
                 list_box = list_box.child(
                     row.on_click(cx.listener(move |this, _, _, cx| this.open_activity_item(picked.clone(), cx))),
                 );
