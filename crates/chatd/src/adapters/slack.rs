@@ -2068,6 +2068,9 @@ impl Slack {
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
+            Command::Reactors { conversation_id, message_id, emoji, burst: _, after, limit, reply } => {
+                answer(reply, self.reactors(&conversation_id, &message_id, &emoji, after.as_deref(), limit));
+            }
             Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text, &spans));
             }
@@ -2536,16 +2539,7 @@ impl Slack {
     /// Slack's name for a reaction: the shell sends the emoji itself, a custom one as `:name:`,
     /// or the id of a custom emoji's registered file.
     fn reaction_name(&self, emoji: &str) -> Option<String> {
-        if let Some(file) = emoji.strip_prefix("emoji:") {
-            return file.rsplit_once(':').map(|(name, _)| name.to_owned());
-        }
-        let named = emoji.strip_prefix(':').and_then(|rest| rest.strip_suffix(':'));
-        match named.filter(|name| !name.is_empty()) {
-            Some(name) => Some(name.to_owned()),
-            // The table holds the emoji people actually use, not all of Unicode: one outside
-            // it has no name here and is refused in words.
-            None => emoji::name(emoji),
-        }
+        slack_reaction_name(emoji)
     }
 
     /// Stars or unstars a channel or direct conversation. Slack's documented call is `stars.add`
@@ -2714,6 +2708,39 @@ impl Slack {
             Err(Fault::Slack(error)) if error == "not_found" => Ok(()),
             other => other.map(drop),
         }
+    }
+
+    /// Who added this reaction. One documented `reactions.get`, then the names and avatars already
+    /// in the people cache. Someone not cached yet is answered by their id. Nothing is stored.
+    fn reactors(
+        &self,
+        conversation: &str,
+        ts: &str,
+        emoji: &str,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<super::ReactorsPage, Fault> {
+        let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
+        let asked = self.api("reactions.get", &[("channel", channel), ("timestamp", ts), ("full", "true")])?;
+        let (ids, more) = reaction_user_ids(&asked, emoji, after, limit);
+        let reactors = ids
+            .into_iter()
+            .map(|id| {
+                let cached = self.cached(&id);
+                let name = cached
+                    .as_ref()
+                    .map(|user| user.name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                let avatar = cached.as_ref().and_then(User::avatar);
+                protocol::Reactor {
+                    key: self.ctx.key(&id),
+                    name,
+                    avatar,
+                }
+            })
+            .collect();
+        Ok(super::ReactorsPage { reactors, more })
     }
 
     /// Adds or takes back our reaction. The store already shows it; Slack's own event for it
@@ -3598,6 +3625,7 @@ pub(crate) fn capability_ceiling() -> protocol::Capabilities {
         forward: true,
         polls: None,
         reactions: true,
+        reactors: true,
         mention_format: protocol::MentionFormat::Slack,
         mention_spans: false,
         activity_feed: true,
@@ -3767,6 +3795,105 @@ pub(crate) fn prove_channel_star() -> Result<(), String> {
         return Err(format!("the stars section marks {filed:?}"));
     }
     Ok(())
+}
+
+/// Slack's name for a reaction: the shell sends the emoji itself, a custom one as `:name:`,
+/// or the id of a custom emoji's registered file.
+fn slack_reaction_name(emoji: &str) -> Option<String> {
+    if let Some(file) = emoji.strip_prefix("emoji:") {
+        return file.rsplit_once(':').map(|(name, _)| name.to_owned());
+    }
+    let named = emoji.strip_prefix(':').and_then(|rest| rest.strip_suffix(':'));
+    match named.filter(|name| !name.is_empty()) {
+        Some(name) => Some(name.to_owned()),
+        None => emoji::name(emoji),
+    }
+}
+
+/// Extracts one page of user ids for `emoji` from a `reactions.get` response, preserving Slack's
+/// order without duplicates.
+fn reaction_user_ids(asked: &Value, emoji: &str, after: Option<&str>, limit: u32) -> (Vec<String>, bool) {
+    let wanted = slack_reaction_name(emoji);
+    let rows = asked["message"]["reactions"].as_array().or_else(|| asked["reactions"].as_array());
+    let Some(rows) = rows else {
+        return (Vec::new(), false);
+    };
+    let plain = |text: &str| text.replace('\u{fe0f}', "");
+    let glyph = wanted.as_deref().and_then(emoji::standard).unwrap_or_else(|| emoji.to_owned());
+    let mut ids = Vec::new();
+    for reaction in rows {
+        let name = reaction["name"].as_str().unwrap_or("");
+        let by_name = wanted.as_deref() == Some(name);
+        let by_glyph = emoji::standard(name)
+            .is_some_and(|got| plain(&got) == plain(&glyph) || plain(&got) == plain(emoji));
+        if !by_name && !by_glyph {
+            continue;
+        }
+        for user in reaction["users"].as_array().into_iter().flatten() {
+            let Some(id) = user.as_str().filter(|id| !id.is_empty()) else { continue };
+            if !ids.iter().any(|seen| seen == id) {
+                ids.push(id.to_owned());
+            }
+        }
+    }
+    let start = match after.filter(|cursor| !cursor.is_empty()) {
+        Some(cursor) => match ids.iter().position(|id| id == cursor) {
+            Some(pos) => pos + 1,
+            None => return (Vec::new(), false),
+        },
+        None => 0,
+    };
+    let limit = if limit == 0 { 100 } else { limit.clamp(1, 100) } as usize;
+    let remaining = &ids[start..];
+    let more = remaining.len() > limit;
+    (remaining[..remaining.len().min(limit)].to_vec(), more)
+}
+
+/// What the slack-reactors driver checks, with no workspace and no socket.
+pub(crate) fn prove_reactors() -> Result<(), String> {
+    if !capability_ceiling().reactors {
+        return Err("Slack capability_ceiling().reactors must be true".to_owned());
+    }
+    let payload = json!({
+        "ok": true,
+        "type": "message",
+        "channel": "C0GEN",
+        "message": {
+            "type": "message",
+            "ts": "1760000300.000300",
+            "reactions": [
+                {"name": "tada", "users": ["U0BEN", "U0ME"], "count": 2},
+                {"name": "+1::skin-tone-4", "users": ["U0ANA"], "count": 1},
+                {"name": "partyparrot", "users": ["U0BEN", "U0UNCACHED"], "count": 2},
+            ],
+        },
+    });
+    let (ids, more) = reaction_user_ids(&payload, "🎉", None, 100);
+    if ids != ["U0BEN", "U0ME"] || more {
+        return Err(format!("standard emoji reactors were ({ids:?}, {more})"));
+    }
+    let (page1, more1) = reaction_user_ids(&payload, "🎉", None, 1);
+    let (page2, more2) = reaction_user_ids(&payload, "🎉", Some("U0BEN"), 1);
+    if page1 != ["U0BEN"] || !more1 || page2 != ["U0ME"] || more2 {
+        return Err(format!("paged reactors were ({page1:?}, {more1}) / ({page2:?}, {more2})"));
+    }
+    let (toned, _) = reaction_user_ids(&payload, "👍🏽", None, 100);
+    if toned != ["U0ANA"] {
+        return Err(format!("skin-tone reactors were {toned:?}"));
+    }
+    let (custom_colon, _) = reaction_user_ids(&payload, ":partyparrot:", None, 100);
+    let (custom_file, _) = reaction_user_ids(&payload, "emoji:partyparrot:deadbeef", None, 100);
+    if custom_colon != ["U0BEN", "U0UNCACHED"] || custom_file != ["U0BEN", "U0UNCACHED"] {
+        return Err(format!("custom emoji reactors were {custom_colon:?} / {custom_file:?}"));
+    }
+    let (missing, more_missing) = reaction_user_ids(&payload, "👀", None, 100);
+    if !missing.is_empty() || more_missing {
+        return Err(format!("unmatched emoji reactors were ({missing:?}, {more_missing})"));
+    }
+    if thread_of(&thread_id("C0GEN", "1760000100.000100")) != Some(("C0GEN", "1760000100.000100")) {
+        return Err("thread_of did not unwrap Slack thread channel".to_owned());
+    }
+    emoji::prove_picker_names()
 }
 
 /// What the slack-call-cards driver checks, with no workspace and no socket.

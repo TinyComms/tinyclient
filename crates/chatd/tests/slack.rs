@@ -444,6 +444,20 @@ impl Fake {
                     {"command": "/standup", "description": "Start standup check-in", "usage": ""}
                 ]
             })),
+            "reactions.get" => Some(json!({
+                "ok": true,
+                "type": "message",
+                "channel": channel,
+                "message": {
+                    "type": "message",
+                    "ts": param("timestamp"),
+                    "reactions": [
+                        {"name": "tada", "users": ["U0BEN", "U0ME"], "count": 2},
+                        {"name": "+1::skin-tone-4", "users": ["U0ANA"], "count": 1},
+                        {"name": "partyparrot", "users": ["U0BEN", "U0UNCACHED"], "count": 2},
+                    ],
+                },
+            })),
             method @ ("reactions.add" | "reactions.remove") => {
                 if param("name") == "no_entry_sign" {
                     return refused("too_many_reactions");
@@ -3149,6 +3163,113 @@ fn someone_who_uploaded_no_picture_shows_slacks_default_for_them_and_not_initial
     let again = world.until("a message of his after the restart", || world.message(&general, "1760000900.000900"));
     assert!(again.sender.avatar.as_ref().is_some_and(|avatar| avatar.path.is_some()), "{:?}", again.sender.avatar);
     assert_eq!(lookups(&world), before);
+}
+
+#[test]
+fn who_reacted_is_named_from_the_people_cache() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    world.general();
+    let shipping = "1760000300.000300";
+
+    // Slack advertises on-demand reactor lookup in its account capabilities.
+    let acme = world.accounts().into_iter().find(|account| account.key.account == "T01ALPHA").unwrap();
+    assert!(acme.can.reactors, "Slack accounts support Request::Reactors");
+
+    let lookups = world.fake.calls(ALPHA, "users.info").len() + world.fake.calls(ALPHA, "edge:users/info").len();
+    let Response::Reactors { reactors, message_id, emoji, more, .. } = world.ask(Request::Reactors {
+        conversation: general.clone(),
+        message_id: shipping.to_owned(),
+        emoji: "🎉".to_owned(),
+        burst: false,
+        after: None,
+        limit: 100,
+    }) else {
+        panic!("no reactors");
+    };
+    assert_eq!((message_id.as_str(), emoji.as_str(), more), (shipping, "🎉", false));
+    let listed: Vec<(&str, &str)> = reactors.iter().map(|r| (r.key.id.as_str(), r.name.as_str())).collect();
+    assert_eq!(listed, [("U0BEN", "Ben Ito"), ("U0ME", "Justin")]);
+    assert_eq!(reactors[0].avatar.as_ref().map(|avatar| avatar.id.as_str()), Some("avatar:U0BEN:g2c8d4"));
+    let asked = world.fake.calls(ALPHA, "reactions.get").pop().unwrap();
+    assert_eq!(
+        (asked.params["channel"].as_str(), asked.params["timestamp"].as_str(), asked.params["full"].as_str()),
+        ("C0GEN", shipping, "true"),
+    );
+    let again = world.fake.calls(ALPHA, "users.info").len() + world.fake.calls(ALPHA, "edge:users/info").len();
+    assert_eq!(again, lookups, "the names come from the people cache");
+
+    // Paging with `limit` and `after` slices Slack's list cleanly.
+    let Response::Reactors { reactors: page1, more: more1, .. } = world.ask(Request::Reactors {
+        conversation: general.clone(),
+        message_id: shipping.to_owned(),
+        emoji: "🎉".to_owned(),
+        burst: false,
+        after: None,
+        limit: 1,
+    }) else {
+        panic!("no reactors page 1");
+    };
+    assert_eq!(page1.iter().map(|r| r.key.id.as_str()).collect::<Vec<_>>(), ["U0BEN"]);
+    assert!(more1);
+    let Response::Reactors { reactors: page2, more: more2, .. } = world.ask(Request::Reactors {
+        conversation: general.clone(),
+        message_id: shipping.to_owned(),
+        emoji: "🎉".to_owned(),
+        burst: false,
+        after: Some("U0BEN".to_owned()),
+        limit: 1,
+    }) else {
+        panic!("no reactors page 2");
+    };
+    assert_eq!(page2.iter().map(|r| r.key.id.as_str()).collect::<Vec<_>>(), ["U0ME"]);
+    assert!(!more2);
+
+    // Custom emoji (by `:name:` and by registered file id) and skin-tone reactions resolve too,
+    // and someone not in the people cache falls back to their id without looking them up.
+    let Response::Reactors { reactors: custom, .. } = world.ask(Request::Reactors {
+        conversation: general.clone(),
+        message_id: shipping.to_owned(),
+        emoji: "emoji:partyparrot:deadbeef".to_owned(),
+        burst: false,
+        after: None,
+        limit: 100,
+    }) else {
+        panic!("no custom reactors");
+    };
+    let custom_listed: Vec<(&str, &str, bool)> = custom
+        .iter()
+        .map(|r| (r.key.id.as_str(), r.name.as_str(), r.avatar.is_some()))
+        .collect();
+    assert_eq!(custom_listed, [("U0BEN", "Ben Ito", true), ("U0UNCACHED", "U0UNCACHED", false)]);
+
+    let Response::Reactors { reactors: toned, .. } = world.ask(Request::Reactors {
+        conversation: alpha(&format!("C0GEN:{ROOT}")),
+        message_id: shipping.to_owned(),
+        emoji: "👍🏽".to_owned(),
+        burst: false,
+        after: None,
+        limit: 100,
+    }) else {
+        panic!("no skin-tone reactors");
+    };
+    assert_eq!(toned.iter().map(|r| (r.key.id.as_str(), r.name.as_str())).collect::<Vec<_>>(), [("U0ANA", "Ana")]);
+    assert_eq!(world.fake.calls(ALPHA, "reactions.get").pop().unwrap().params["channel"], "C0GEN");
+
+    // A reaction nobody added answers no names, and still does not look anyone up.
+    let Response::Reactors { reactors, more, .. } = world.ask(Request::Reactors {
+        conversation: general,
+        message_id: shipping.to_owned(),
+        emoji: "👀".to_owned(),
+        burst: false,
+        after: None,
+        limit: 100,
+    }) else {
+        panic!("no reactors");
+    };
+    assert!(reactors.is_empty() && !more);
+    assert_eq!(world.fake.calls(ALPHA, "users.info").len() + world.fake.calls(ALPHA, "edge:users/info").len(), lookups);
 }
 
 #[test]

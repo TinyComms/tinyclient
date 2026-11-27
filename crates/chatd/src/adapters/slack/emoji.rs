@@ -188,76 +188,76 @@ pub fn from_code_points(unicode: &str) -> Option<String> {
     emoji.filter(|emoji| !emoji.is_empty())
 }
 
+/// Gemoji gives these the same shortcode as an emoji this table already names, so there is no
+/// second name to send. Slack would treat that name as the other emoji.
+const SHARED_SHORTCODE: &[&str] = &["🤵‍♂️", "🪲", "🚋", "📡"];
+
+fn plain(text: &str) -> String {
+    text.replace('\u{fe0f}', "")
+}
+
+fn quoted<'a>(line: &'a str, mark: &str) -> Option<&'a str> {
+    let start = line.find(mark)? + mark.len();
+    let rest = line.get(start..)?;
+    let end = rest.find('"')?;
+    rest.get(..end)
+}
+
+/// Every emoji the picker offers has a Slack name, including each skin tone. A glyph in
+/// [`SHARED_SHORTCODE`] is the exception: its only shortcode already names a different emoji.
+pub(crate) fn prove_picker_names() -> Result<(), String> {
+    let table = include_str!("../../../../tinyclient/src/gui/picker/table.rs");
+    let mut seen = 0usize;
+    let mut shared = 0usize;
+    for line in table.lines() {
+        let Some(glyph) = quoted(line, "glyph: \"") else { continue };
+        let Some(code) = quoted(line, "code: \"") else { continue };
+        let tones = line.split("tones: ").nth(1).is_some_and(|rest| rest.starts_with("true"));
+        seen += 1;
+        if SHARED_SHORTCODE.contains(&glyph) {
+            if name(glyph).is_some() {
+                return Err(format!("{glyph} ({code}) was a shared shortcode and now has its own name"));
+            }
+            shared += 1;
+            continue;
+        }
+        let Some(named) = name(glyph) else {
+            return Err(format!("no Slack name for {glyph} ({code})"));
+        };
+        let Some(back) = standard(&named) else {
+            return Err(format!("{named} does not read back"));
+        };
+        if plain(&back) != plain(glyph) {
+            return Err(format!("{named} reads back as {back}, not {glyph}"));
+        }
+        if !tones {
+            continue;
+        }
+        for level in 2..=6 {
+            let tone_name = format!("{named}::skin-tone-{level}");
+            let Some(toned) = standard(&tone_name) else {
+                return Err(format!("{tone_name} is not an emoji"));
+            };
+            if name(&toned).as_deref() != Some(tone_name.as_str()) {
+                return Err(format!("{toned} is not named {tone_name}"));
+            }
+        }
+    }
+    if seen < 1800 {
+        return Err(format!("the picker table parsed as {seen} emoji"));
+    }
+    if shared != SHARED_SHORTCODE.len() {
+        return Err(format!("shared shortcodes found {shared}, expected {}", SHARED_SHORTCODE.len()));
+    }
+    if nameable().len() > protocol::REACTIONS_LISTED {
+        return Err("the reaction list is longer than the protocol keeps".to_owned());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Gemoji gives these the same shortcode as an emoji this table already names, so there is no
-    /// second name to send. Slack would treat that name as the other emoji.
-    const SHARED_SHORTCODE: &[&str] = &["🤵‍♂️", "🪲", "🚋", "📡"];
-
-    fn plain(text: &str) -> String {
-        text.replace('\u{fe0f}', "")
-    }
-
-    fn quoted<'a>(line: &'a str, mark: &str) -> Option<&'a str> {
-        let start = line.find(mark)? + mark.len();
-        let rest = line.get(start..)?;
-        let end = rest.find('"')?;
-        rest.get(..end)
-    }
-
-    /// Every emoji the picker offers has a Slack name, including each skin tone. A glyph in
-    /// [`SHARED_SHORTCODE`] is the exception: its only shortcode already names a different emoji.
-    fn prove_picker_names() -> Result<(), String> {
-        let table = include_str!("../../../../tinyclient/src/gui/picker/table.rs");
-        let mut seen = 0usize;
-        let mut shared = 0usize;
-        for line in table.lines() {
-            let Some(glyph) = quoted(line, "glyph: \"") else { continue };
-            let Some(code) = quoted(line, "code: \"") else { continue };
-            let tones = line.split("tones: ").nth(1).is_some_and(|rest| rest.starts_with("true"));
-            seen += 1;
-            if SHARED_SHORTCODE.contains(&glyph) {
-                if name(glyph).is_some() {
-                    return Err(format!("{glyph} ({code}) was a shared shortcode and now has its own name"));
-                }
-                shared += 1;
-                continue;
-            }
-            let Some(named) = name(glyph) else {
-                return Err(format!("no Slack name for {glyph} ({code})"));
-            };
-            let Some(back) = standard(&named) else {
-                return Err(format!("{named} does not read back"));
-            };
-            if plain(&back) != plain(glyph) {
-                return Err(format!("{named} reads back as {back}, not {glyph}"));
-            }
-            if !tones {
-                continue;
-            }
-            for level in 2..=6 {
-                let tone_name = format!("{named}::skin-tone-{level}");
-                let Some(toned) = standard(&tone_name) else {
-                    return Err(format!("{tone_name} is not an emoji"));
-                };
-                if name(&toned).as_deref() != Some(tone_name.as_str()) {
-                    return Err(format!("{toned} is not named {tone_name}"));
-                }
-            }
-        }
-        if seen < 1800 {
-            return Err(format!("the picker table parsed as {seen} emoji"));
-        }
-        if shared != SHARED_SHORTCODE.len() {
-            return Err(format!("shared shortcodes found {shared}, expected {}", SHARED_SHORTCODE.len()));
-        }
-        if nameable().len() > protocol::REACTIONS_LISTED {
-            return Err("the reaction list is longer than the protocol keeps".to_owned());
-        }
-        Ok(())
-    }
 
     #[test]
     fn names_tones_and_code_points_become_the_emoji_itself() {
