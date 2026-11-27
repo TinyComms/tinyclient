@@ -306,7 +306,7 @@ impl ConversationWindow {
 }
 
 impl Render for ConversationWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(shell) = self.shell.upgrade() else {
             return div().into_any_element();
         };
@@ -331,8 +331,10 @@ impl Render for ConversationWindow {
             None
         };
         let thread_note = thread_has_draft.then(|| self.note("The draft stays in the main window."));
+        let thread_replaces = self.thread.is_some() && f32::from(window.viewport_size().width) < 620.;
         let thread = self.thread.clone().map(|pane| {
-            let close = icon_button("popout-thread-close", "icons/x.svg", false)
+            let close_icon = if thread_replaces { "icons/chevron-left.svg" } else { "icons/x.svg" };
+            let close = icon_button("popout-thread-close", close_icon, false)
                 .tooltip(tip("Close thread", None))
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -343,62 +345,70 @@ impl Render for ConversationWindow {
                     let _ = shell.update(cx, |shell, cx| shell.clear_window_thread(&key, cx));
                     cx.notify();
                 }));
-            div()
-                .w(px(RIGHT_WIDTH))
+            let mut panel = div()
                 .h_full()
+                .flex()
+                .flex_col();
+            panel = if thread_replaces {
+                panel.flex_1().min_w_0()
+            } else {
+                panel.w(px(RIGHT_WIDTH)).flex_none().border_l_1().border_color(theme::hairline())
+            };
+            let thread_bar = div()
+                .h(px(TOP_BAR))
+                .px(px(12.))
+                .when(thread_replaces && cfg!(target_os = "macos"), |bar| bar.pl(px(78.)))
                 .flex_none()
                 .flex()
-                .flex_col()
-                .border_l_1()
+                .items_center()
+                .gap(px(8.))
+                .border_b_1()
                 .border_color(theme::hairline())
-                .child(
-                    div()
-                        .h(px(TOP_BAR))
-                        .px(px(12.))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .border_b_1()
-                        .border_color(theme::hairline())
-                        .child(close)
-                        .child(div().flex_1().min_w_0().truncate().type_title().child("Thread")),
-                )
+                .child(close)
+                .child(div().flex_1().min_w_0().truncate().type_title().child("Thread"));
+            let thread_bar = if thread_replaces { drags_window(thread_bar) } else { thread_bar };
+            panel
+                .child(thread_bar)
                 .child(div().flex_1().min_h_0().child(pane))
                 .children(thread_note)
                 .children(self.thread_composer.clone().filter(|_| !thread_has_draft))
         });
         div()
             .size_full()
+            .font_family(theme::FONT)
+            .text_color(theme::text())
             .flex()
             .flex_row()
             .bg(theme::canvas())
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        drags_window(
-                            div()
-                                .h(px(TOP_BAR))
-                                .px(px(theme::PANE_PAD))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .border_b_1()
-                                .border_color(theme::hairline())
-                                .child(glyph("icons/picture-in-picture-2.svg", 14., theme::text_soft()))
-                                .child(div().min_w_0().truncate().type_title().child(title)),
-                        ),
-                    )
-                    .child(div().flex_1().min_h_0().child(self.pane.clone()))
-                    .children(draft)
-                    .children(self.composer.clone().filter(|_| !service)),
-            )
+            .when(!thread_replaces, |root| {
+                root.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            drags_window(
+                                div()
+                                    .h(px(TOP_BAR))
+                                    .px(px(theme::PANE_PAD))
+                                    .when(cfg!(target_os = "macos"), |bar| bar.pl(px(78.)))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .border_b_1()
+                                    .border_color(theme::hairline())
+                                    .child(glyph("icons/picture-in-picture-2.svg", 14., theme::text_soft()))
+                                    .child(div().min_w_0().truncate().type_title().child(title)),
+                            ),
+                        )
+                        .child(div().flex_1().min_h_0().child(self.pane.clone()))
+                        .children(draft)
+                        .children(self.composer.clone().filter(|_| !service)),
+                )
+            })
             .children(thread)
             .into_any_element()
     }
@@ -916,7 +926,7 @@ impl Shell {
         };
         live.thread = None;
         let composer = live.thread_composer.take();
-        drop(live);
+        let _ = live;
         self.drop_one_composer(composer, true, cx);
         cx.notify();
     }
@@ -931,7 +941,7 @@ impl Shell {
             return;
         };
         let composer = if nested { live.thread_composer.take() } else { live.composer.take() };
-        drop(live);
+        let _ = live;
         self.drop_one_composer(composer, to_side, cx);
     }
 

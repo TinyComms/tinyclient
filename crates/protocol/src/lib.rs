@@ -1674,6 +1674,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         folder_remove: Option<String>,
     },
+    /// Reorders pinned conversations in the main list (`folder: None`), archive (`Some("1")` or
+    /// `Some("archive")`), or a network folder (`Some(folder_id)`).
+    ReorderPinned {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+        conversations: Vec<Key>,
+    },
     /// Star or unstar one message on the network (Google Messages).
     StarMessage {
         conversation: Key,
@@ -6000,6 +6008,26 @@ mod tests {
         // Older capabilities JSON without these fields defaults to 0 / false.
         let old: Capabilities = serde_json::from_str("{}").unwrap();
         assert_eq!((old.pin_chats, old.archive, old.folders_edit), (0, false, false));
+
+        let acct = AccountKey { network: Network::Telegram, account: "a".into() };
+        let k1 = Key::new(&acct, "u:1");
+        let k2 = Key::new(&acct, "g:2");
+        let reorder = Request::ReorderPinned {
+            account: acct.clone(),
+            folder: None,
+            conversations: vec![k1.clone(), k2.clone()],
+        };
+        let rjson = serde_json::to_string(&reorder).unwrap();
+        assert!(!rjson.contains("folder"), "{rjson}");
+        assert_eq!(serde_json::from_str::<Request>(&rjson).unwrap(), reorder);
+
+        let folder_reorder = Request::ReorderPinned {
+            account: acct,
+            folder: Some("2".into()),
+            conversations: vec![k2, k1],
+        };
+        let fjson = serde_json::to_string(&folder_reorder).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&fjson).unwrap(), folder_reorder);
     }
 
     #[test]

@@ -20,12 +20,37 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 const MAX_REDIRECTS: usize = 3;
-const TOTAL_DEADLINE: Duration = Duration::from_secs(5);
+const TOTAL_DEADLINE: Duration = Duration::from_millis(1500);
+const PREVIEW_IDLE: Duration = Duration::from_secs(30);
 const MAX_HTML_BYTES: u64 = 512 * 1024;
 const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_IMAGE_EDGE: u32 = 640;
 const JPEG_QUALITY: u8 = 82;
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; LinkPreview/1.0)";
+
+fn preview_agent() -> ureq::Agent {
+    static SHARED: std::sync::Mutex<Option<(protocol::settings::ProxyConfig, ureq::Agent)>> =
+        std::sync::Mutex::new(None);
+    let cfg = crate::adapters::net::proxy_config();
+    let mut guard = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((saved, agent)) = guard.as_ref() {
+        if *saved == cfg {
+            return agent.clone();
+        }
+    }
+    let built: ureq::Agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
+        .tls_config(crate::tls::config())
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .http_status_as_error(false)
+        .max_idle_age(PREVIEW_IDLE)
+        .timeout_global(Some(TOTAL_DEADLINE))
+        .user_agent(USER_AGENT)
+        .build()
+        .into();
+    *guard = Some((cfg, built.clone()));
+    built
+}
 
 const MAX_SITE_LEN: usize = 100;
 const MAX_TITLE_LEN: usize = 200;
@@ -209,8 +234,40 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     true
 }
 
+/// Resolves `(host, port)` on a helper thread bounded by `timeout` so a hung DNS resolver
+/// cannot stall sending beyond the preview budget.
+fn resolve_addrs_bounded(
+    host: String,
+    port: u16,
+    timeout: Duration,
+) -> Result<Vec<std::net::SocketAddr>, &'static str> {
+    if timeout.is_zero() {
+        return Err("timeout");
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("tiny-preview-dns".into())
+        .spawn(move || {
+            let res = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|iter| iter.collect::<Vec<_>>());
+            let _ = tx.send(res);
+        })
+        .map_err(|_| "dns failed")?;
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(_)) => Err("dns failed"),
+        Err(_) => Err("timeout"),
+    }
+}
+
 /// Validates a URL and checks that EVERY resolved IP address is public.
+#[cfg(test)]
 pub(crate) fn check_public_target(url: &str) -> Result<ParsedUrl, &'static str> {
+    check_public_target_within(url, Instant::now() + TOTAL_DEADLINE)
+}
+
+fn check_public_target_within(url: &str, deadline: Instant) -> Result<ParsedUrl, &'static str> {
     let parsed = validate_https_url(url)?;
     if parsed.host == "localhost" || parsed.host.ends_with(".localhost") {
         return Err("local host");
@@ -221,9 +278,8 @@ pub(crate) fn check_public_target(url: &str) -> Result<ParsedUrl, &'static str> 
         }
         return Ok(parsed);
     }
-    let addrs = (parsed.host.as_str(), parsed.port)
-        .to_socket_addrs()
-        .map_err(|_| "dns failed")?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let addrs = resolve_addrs_bounded(parsed.host.clone(), parsed.port, remaining)?;
     let mut count = 0;
     for addr in addrs {
         count += 1;
@@ -244,22 +300,23 @@ fn fetch_checked(
     max_bytes: u64,
     deadline: Instant,
 ) -> Result<(String, String, Vec<u8>), &'static str> {
+    let agent = preview_agent();
     let mut current = start_url.to_owned();
     for hop in 0..=MAX_REDIRECTS {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("timeout");
         }
-        let _ = check_public_target(&current)?;
-        let config = ureq::Agent::config_builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(remaining))
-            .user_agent(USER_AGENT)
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
+        let _ = check_public_target_within(&current, deadline)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("timeout");
+        }
         let response = agent
             .get(&current)
+            .config()
+            .timeout_global(Some(remaining))
+            .build()
             .header("Accept", "text/html,application/xhtml+xml,image/*;q=0.8,*/*;q=0.1")
             .call()
             .map_err(|_| "request failed")?;
@@ -697,5 +754,30 @@ mod tests {
         assert_eq!(out.width, 640);
         assert_eq!(out.height, 320);
         assert!(out.jpeg.starts_with(&[0xFF, 0xD8]), "output must be JPEG");
+    }
+
+    #[test]
+    fn preview_respects_total_deadline() {
+        assert!(
+            TOTAL_DEADLINE <= Duration::from_millis(1500),
+            "preview total budget should stay bounded at <= 1500ms, got {TOTAL_DEADLINE:?}"
+        );
+        let started = Instant::now();
+        assert_eq!(
+            resolve_addrs_bounded("example.com".to_owned(), 443, Duration::ZERO),
+            Err("timeout")
+        );
+        assert_eq!(
+            check_public_target_within("https://example.com/", Instant::now()),
+            Err("timeout")
+        );
+        assert_eq!(
+            fetch_checked("https://1.1.1.1/", MAX_HTML_BYTES, Instant::now()),
+            Err("timeout")
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "expired preview deadline must fail promptly"
+        );
     }
 }

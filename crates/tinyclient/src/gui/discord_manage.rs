@@ -5,14 +5,14 @@
 //! user click. External links (App Directory, per-command permissions in Discord) go through
 //! `Shell::open_external_link` which enforces `http://` / `https://`.
 
-use super::components::{button, glyph, ButtonKind};
+use super::components::{button, glyph, segment, segmented, ButtonKind, Layer};
 use super::input::TextInput;
 use super::state::Shell;
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, ClipboardItem, Context, Div, ElementId, Entity, MouseButton,
-    PathPromptOptions, SharedString, Stateful, Window,
+    deferred, div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, ElementId, Entity, MouseButton,
+    PathPromptOptions, SharedString, Window,
 };
 use protocol::{
     Key, Request, Response, SpaceEmoji, SpaceExpressions, SpaceIntegrations, SpaceRoleChoice,
@@ -849,8 +849,11 @@ impl Shell {
             })
     }
 
-    pub(in crate::gui) fn discord_admin_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn discord_admin_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.discord_admin.modal.as_ref()?;
+        let viewport = window.viewport_size();
+        let max_w = (f32::from(viewport.width) - 32.).max(200.);
+        let max_h = (f32::from(viewport.height) - 32.).max(200.);
         let space = modal.space.clone();
         let channels: Vec<(String, String)> = self
             .trees
@@ -869,11 +872,11 @@ impl Shell {
             })
             .unwrap_or_default();
 
-        let mut tabs = div().flex().items_center().gap(px(6.));
+        let mut tabs = segmented().flex_wrap();
         if modal.can_integrations {
             let active = modal.tab == Tab::Integrations;
             tabs = tabs.child(
-                button("admin-tab-int", if active { ButtonKind::Primary } else { ButtonKind::Secondary }, "Integrations")
+                segment("admin-tab-int", "Integrations", active)
                     .on_click(cx.listener(|this, _, _, cx| this.switch_admin_tab(Tab::Integrations, cx))),
             );
         }
@@ -882,11 +885,11 @@ impl Shell {
             let st_active = modal.tab == Tab::Stickers;
             tabs = tabs
                 .child(
-                    button("admin-tab-emoji", if em_active { ButtonKind::Primary } else { ButtonKind::Secondary }, "Emoji")
+                    segment("admin-tab-emoji", "Emoji", em_active)
                         .on_click(cx.listener(|this, _, _, cx| this.switch_admin_tab(Tab::Emoji, cx))),
                 )
                 .child(
-                    button("admin-tab-stickers", if st_active { ButtonKind::Primary } else { ButtonKind::Secondary }, "Stickers")
+                    segment("admin-tab-stickers", "Stickers", st_active)
                         .on_click(cx.listener(|this, _, _, cx| this.switch_admin_tab(Tab::Stickers, cx))),
                 );
         }
@@ -913,8 +916,8 @@ impl Shell {
         let card = div()
             .id("discord-admin-card")
             .w(px(580.))
-            .max_w_full()
-            .max_h(px(560.))
+            .max_w(px(max_w))
+            .max_h(px(560.0_f32.min(max_h)))
             .p(px(16.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
@@ -941,24 +944,29 @@ impl Shell {
                             })),
                     ),
             )
-            .child(tabs)
+            .child(div().flex().child(tabs))
             .child(div().id("discord-admin-scroll").flex_1().min_h_0().overflow_y_scroll().child(body));
 
         Some(
-            div()
-                .id("discord-admin-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.discord_admin.modal = None;
-                    cx.notify();
-                }))
-                .child(card),
+            deferred(
+                div()
+                    .id("discord-admin-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .bg(theme::scrim())
+                    .occlude()
+                    .p(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.discord_admin.modal = None;
+                        cx.notify();
+                    }))
+                    .child(card),
+            )
+            .priority(Layer::Modal as usize)
+            .into_any_element(),
         )
     }
 

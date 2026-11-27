@@ -137,7 +137,7 @@ impl Rich {
                 };
                 face.weight = FontWeight::MEDIUM;
                 color = if mine {
-                    if theme::is_light() { theme::accent_text().into_color() } else { gpui::white() }
+                    theme::mention_me_text().into_color()
                 } else {
                     tokens::link().into_color()
                 };

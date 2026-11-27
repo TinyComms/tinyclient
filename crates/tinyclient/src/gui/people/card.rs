@@ -9,13 +9,13 @@ use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence,
 use crate::gui::components::place::{placed, Layer, Place};
 use crate::gui::components::{
     button, button_with_icon, fade_in, menu, menu_item, menu_item_danger, menu_item_more, menu_label, menu_separator,
-    modal_body, modal_buttons, network_icon, scrim, sensitive_cover, Avatar, ButtonKind, Shape as Plate,
+    modal_body, modal_buttons, modal_layer, network_icon, sensitive_cover, Avatar, ButtonKind, Shape as Plate,
 };
 use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{
-    anchored, canvas, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, Entity,
+    canvas, div, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, Entity,
     FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Pixels, Point, WeakEntity, Window,
 };
 use protocol::{AccountKey, AppCommand, CommandKind, Conversation, Key, Link, Network, Notify, Person, Profile, RelateAction, Request, Response, SpaceRole};
@@ -165,6 +165,8 @@ pub struct Floating {
     apps_menu: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// The open card's bio was revealed in Streamer mode. A new card hides it again.
     bio_revealed: bool,
+    /// Viewport size when a non-modal float opened, so resizing the window dismisses it.
+    viewport: Option<(f32, f32)>,
 }
 
 impl Floating {
@@ -195,6 +197,7 @@ impl Floating {
             apps_anchor: Rc::default(),
             apps_menu: Rc::default(),
             bio_revealed: false,
+            viewport: None,
         }
     }
 
@@ -236,6 +239,7 @@ impl Floating {
         self.apps_anchor.set(None);
         self.apps_menu.set(None);
         self.bio_revealed = false;
+        self.viewport = None;
         self.open = Some((float, anchor));
         self.opened += 1;
         cx.notify();
@@ -470,6 +474,7 @@ impl Floating {
         self.release_note(next, cx);
         let anchor = self.open.as_ref().map(|(_, anchor)| *anchor).unwrap_or_default();
         self.bio_revealed = false;
+        self.viewport = None;
         self.open = Some((float, anchor));
         self.opened += 1;
         cx.notify();
@@ -869,6 +874,7 @@ impl Floating {
             .child(div().pr(px(8.)).child(network_icon(network, 16.)));
         div()
             .w(px(CARD_WIDTH))
+            .max_w_full()
             .max_h(px(max))
             .rounded(px(theme::R_FLOAT))
             .bg(theme::overlay())
@@ -1369,10 +1375,10 @@ impl Floating {
         let (title, words, verb) = facts::confirm_words(act, name, network);
         let size = window.viewport_size();
         let then = std::rc::Rc::new(then);
-        // A phone keeps 16 pt of screen on each side of it.
-        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
-        let panel = div()
+        let wide = CONFIRM_WIDTH.min((f32::from(size.width) - 32.).max(200.));
+        div()
             .w(px(wide))
+            .max_w_full()
             .p(px(20.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
@@ -1393,24 +1399,19 @@ impl Floating {
                         let then = then.clone();
                         this.shell_do(cx, move |shell, cx| then(shell, cx));
                     }))),
-            );
-        div()
-            .w(size.width)
-            .h(size.height)
-            .relative()
-            .child(scrim().id("confirm-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
-            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+            )
     }
 
     fn confirm_leave(&self, row: &Conversation, silent: bool, window: &Window, cx: &mut Context<Self>) -> Div {
         let (title, words, verb) = facts::confirm_words(Act::Leave, &row.title, row.key.network);
         let size = window.viewport_size();
-        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let wide = CONFIRM_WIDTH.min((f32::from(size.width) - 32.).max(200.));
         let can_silent = row.key.network == protocol::Network::Discord && row.kind == protocol::ConversationKind::Group;
         let toggle_row = row.clone();
         let target = row.clone();
         let mut panel = div()
             .w(px(wide))
+            .max_w_full()
             .p(px(20.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
@@ -1460,20 +1461,14 @@ impl Floating {
                     .child("Leave without telling the group"),
             );
         }
-        panel = panel.child(
+        panel.child(
             modal_buttons()
                 .child(button("confirm-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
                 .child(button("confirm-do", ButtonKind::Danger, verb).on_click(cx.listener(move |this, _, _, cx| {
                     let target = target.clone();
                     this.shell_do(cx, move |shell, cx| shell.leave(&target, silent, cx));
                 }))),
-        );
-        div()
-            .w(size.width)
-            .h(size.height)
-            .relative()
-            .child(scrim().id("confirm-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
-            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+        )
     }
 
     fn confirm_clear_history(&self, row: &Conversation, delete_chat: bool, revoke: bool, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -1485,12 +1480,13 @@ impl Floating {
         };
         let verb = if delete_chat { "Delete chat" } else { "Clear history" };
         let size = window.viewport_size();
-        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let wide = CONFIRM_WIDTH.min((f32::from(size.width) - 32.).max(200.));
         let can_revoke = row.kind == protocol::ConversationKind::Direct;
         let toggle_row = row.clone();
         let target = row.clone();
         let mut panel = div()
             .w(px(wide))
+            .max_w_full()
             .p(px(20.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
@@ -1525,20 +1521,14 @@ impl Floating {
                     .child(format!("Also delete for {} (cannot be undone)", row.title)),
             );
         }
-        panel = panel.child(
+        panel.child(
             modal_buttons()
                 .child(button("confirm-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
                 .child(button("confirm-do", ButtonKind::Danger, verb).on_click(cx.listener(move |this, _, _, cx| {
                     let target = target.clone();
                     this.shell_do(cx, move |shell, cx| shell.clear_history(&target, delete_chat, revoke, cx));
                 }))),
-        );
-        div()
-            .w(size.width)
-            .h(size.height)
-            .relative()
-            .child(scrim().id("confirm-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
-            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+        )
     }
 
     fn confirm_report(
@@ -1553,7 +1543,7 @@ impl Floating {
     ) -> Div {
         let network = target.account().network.label();
         let size = window.viewport_size();
-        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let wide = CONFIRM_WIDTH.min((f32::from(size.width) - 32.).max(200.));
         let mut reasons = div().mt(px(12.)).flex().flex_wrap().gap(px(6.));
         for (ix, candidate) in protocol::ReportReason::ALL.into_iter().enumerate() {
             let active = candidate == reason;
@@ -1616,8 +1606,9 @@ impl Floating {
 
         let send_target = target.clone();
         let fallback_link = link.clone();
-        let panel = div()
+        div()
             .w(px(wide))
+            .max_w_full()
             .p(px(20.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
@@ -1651,13 +1642,7 @@ impl Floating {
                             }
                         });
                     }))),
-            );
-        div()
-            .w(size.width)
-            .h(size.height)
-            .relative()
-            .child(scrim().id("report-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
-            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+            )
     }
 
     fn save_friend_nickname(&mut self, person: Key, clear: bool, cx: &mut Context<Self>) {
@@ -1701,9 +1686,10 @@ impl Floating {
         let key = person.key.clone();
         let key_clear = key.clone();
         let focused = self.nick_input.as_ref().is_some_and(|i| i.focus_handle(cx).is_focused(window));
-        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
-        let panel = div()
+        let wide = CONFIRM_WIDTH.min((f32::from(size.width) - 32.).max(200.));
+        div()
             .w(px(wide))
+            .max_w_full()
             .p(px(20.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
@@ -1744,21 +1730,37 @@ impl Floating {
                     .child(button("nick-save", ButtonKind::Primary, "Save").on_click(cx.listener(move |this, _, _, cx| {
                         this.save_friend_nickname(key.clone(), false, cx);
                     }))),
-            );
-        div()
-            .w(size.width)
-            .h(size.height)
-            .relative()
-            .child(scrim().id("nick-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
-            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+            )
     }
 }
 
 impl Render for Floating {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some((float, anchor)) = self.open.clone() else {
+            self.viewport = None;
             return div();
         };
+        let is_modal = matches!(
+            float,
+            Float::Confirm(..)
+                | Float::FriendNickname(_)
+                | Float::Leave { .. }
+                | Float::ClearHistory { .. }
+                | Float::Report { .. }
+        );
+        let vp = window.viewport_size();
+        let now_vp = (f32::from(vp.width).round(), f32::from(vp.height).round());
+        if !is_modal {
+            match self.viewport {
+                Some(prev) if prev != now_vp => {
+                    self.viewport = None;
+                    self.close(cx);
+                    return div();
+                }
+                None => self.viewport = Some(now_vp),
+                _ => {}
+            }
+        }
         // Someone seen only as a message's sender still floats: the id is all that is known.
         let person = float.person().map(|key| self.hub.person(key).unwrap_or_else(|| Person::new(key.clone(), key.id.clone())));
         let (surface, modal) = match (&float, person.as_ref()) {
@@ -1805,7 +1807,12 @@ impl Render for Floating {
             }
         }));
         if modal {
-            return div().child(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in(("float", self.opened), 160, surface))).priority(3));
+            return div().child(modal_layer(
+                "people-modal-backdrop",
+                window,
+                fade_in(("float", self.opened), 160, surface),
+                cx.listener(|this, _, _, cx| this.close(cx)),
+            ));
         }
         let (row_at, menu_at) = (self.apps_anchor.clone(), self.apps_menu.clone());
         let surface = surface.on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -1815,13 +1822,10 @@ impl Render for Floating {
                 this.close(cx);
             }
         }));
-        let offset = if matches!(float, Float::Card(_)) { point(px(8.), px(0.)) } else { point(px(2.), px(2.)) };
+        let layer = if matches!(float, Float::Card(_)) { Layer::Popover } else { Layer::Menu };
         let flyout = person.as_ref().and_then(|person| self.apps_flyout(person, window, cx));
         div()
-            .child(
-                deferred(anchored().position(anchor + offset).snap_to_window_with_margin(px(8.)).child(fade_in(("float", self.opened), 120, surface)))
-                    .priority(2),
-            )
+            .child(placed(("people-float", self.opened), Place::Pointer(anchor), layer, window, fade_in(("float", self.opened), 120, surface)))
             .children(flyout)
     }
 }

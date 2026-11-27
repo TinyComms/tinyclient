@@ -92,7 +92,7 @@ use protocol::{
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1286,6 +1286,12 @@ pub enum Command {
         folder_remove: Option<String>,
         reply: Reply<()>,
     },
+    /// Reorders pinned conversations in the main list (`None`), archive (`Some("1")`), or a folder.
+    ReorderPinned {
+        folder: Option<String>,
+        conversation_ids: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Star or unstar one message on the network (Google Messages, Slack Later).
     StarMessage {
         conversation_id: String,
@@ -2380,6 +2386,7 @@ impl Command {
             | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. }
             | Command::File { reply, .. }
+            | Command::ReorderPinned { reply, .. }
             | Command::StarMessage { reply, .. }
             | Command::Remind { reply, .. }
             | Command::CancelScheduled { reply, .. }
@@ -3170,10 +3177,7 @@ impl Context {
     /// much is. Messages already stored and unchanged cost nothing.
     pub fn history(&self, conversation_id: &str, messages: &[Message]) -> Stores {
         let conversation = self.key(conversation_id);
-        let mut stored = Vec::with_capacity(messages.len());
-        for message in messages {
-            stored.push(self.hub.store().ingest(&conversation, message, false)?);
-        }
+        let stored = self.hub.store().ingest_batch(&conversation, messages, false)?;
         self.stored(&conversation, &stored, false);
         if let Some(message) = messages.iter().find(|message| message.expires_at.is_some()) {
             self.carries_timer(message);
@@ -4286,47 +4290,161 @@ pub(crate) fn serve_commands(
     mut backfill: impl FnMut(&str),
     mut other: impl FnMut(Command),
 ) {
+    let mut immediate = VecDeque::new();
     let mut urgent = VecDeque::new();
-    let mut warm = VecDeque::new();
+    let mut background_previews = VecDeque::new();
+    let mut background_warm = VecDeque::new();
     let mut fetched: HashMap<String, Instant> = HashMap::new();
+    let mut last_fetch: Option<Instant> = None;
+
+    let enqueue = |command: Command,
+                   immediate: &mut VecDeque<Command>,
+                   urgent: &mut VecDeque<Command>,
+                   background_previews: &mut VecDeque<Command>,
+                   background_warm: &mut VecDeque<Command>|
+     -> bool {
+        match command {
+            Command::Stop => return true,
+            Command::Send { .. } | Command::SendWith { .. } | Command::CancelSend { .. } => {
+                immediate.push_back(command);
+            }
+            Command::Previews(_) => {
+                background_previews.push_back(command);
+            }
+            Command::Warm(_) => {
+                background_warm.push_back(command);
+            }
+            command => urgent.push_back(command),
+        }
+        false
+    };
+
     while !ctx.stopped() {
-        if urgent.is_empty() && warm.is_empty() {
+        if immediate.is_empty()
+            && urgent.is_empty()
+            && background_previews.is_empty()
+            && background_warm.is_empty()
+        {
             match inbox.recv() {
-                Ok(Command::Stop) | Err(_) => return,
-                Ok(Command::Warm(id)) => warm.push_back(id),
-                Ok(command) => urgent.push_back(command),
+                Ok(command) => {
+                    if enqueue(
+                        command,
+                        &mut immediate,
+                        &mut urgent,
+                        &mut background_previews,
+                        &mut background_warm,
+                    ) {
+                        return;
+                    }
+                }
+                Err(_) => return,
             }
         }
         for command in inbox.try_iter() {
-            match command {
-                Command::Stop => return,
-                Command::Warm(id) => warm.push_back(id),
-                command => urgent.push_back(command),
+            if enqueue(
+                command,
+                &mut immediate,
+                &mut urgent,
+                &mut background_previews,
+                &mut background_warm,
+            ) {
+                return;
             }
         }
-        let id = match urgent.pop_front() {
-            Some(Command::Backfill(id)) => id,
+        let next = immediate
+            .pop_front()
+            .or_else(|| urgent.pop_front())
+            .or_else(|| background_previews.pop_front())
+            .or_else(|| background_warm.pop_front());
+        let (id, is_warm) = match next {
+            Some(Command::Backfill(id)) => (id, false),
+            Some(Command::Warm(id)) => (id, true),
             Some(command) => {
-                if catch_unwind(AssertUnwindSafe(|| other(command))).is_err() && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS)) {
+                if catch_unwind(AssertUnwindSafe(|| other(command))).is_err()
+                    && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS))
+                {
                     return;
                 }
                 continue;
             }
-            None => match warm.pop_front() {
-                Some(id) => id,
-                None => continue,
-            },
+            None => continue,
         };
         if fetched.get(&id).is_some_and(|at| at.elapsed() < FRESH) {
             continue;
         }
-        if catch_unwind(AssertUnwindSafe(|| backfill(&id))).is_err() && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS)) {
+        if !pace.is_zero() {
+            if let Some(at) = last_fetch {
+                let deadline = at + pace;
+                let mut preempted = false;
+                while !ctx.stopped() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let slice = remaining.min(Duration::from_millis(100));
+                    match inbox.recv_timeout(slice) {
+                        Ok(command) => {
+                            if enqueue(
+                                command,
+                                &mut immediate,
+                                &mut urgent,
+                                &mut background_previews,
+                                &mut background_warm,
+                            ) {
+                                return;
+                            }
+                            for more in inbox.try_iter() {
+                                if enqueue(
+                                    more,
+                                    &mut immediate,
+                                    &mut urgent,
+                                    &mut background_previews,
+                                    &mut background_warm,
+                                ) {
+                                    return;
+                                }
+                            }
+                            let urgent_non_backfill = urgent
+                                .iter()
+                                .any(|cmd| !matches!(cmd, Command::Backfill(_)));
+                            let urgent_fresh_preempt =
+                                is_warm && !urgent.is_empty() && !urgent.iter().all(|cmd| {
+                                    matches!(cmd, Command::Backfill(cid) if fetched.get(cid).is_some_and(|t| t.elapsed() < FRESH))
+                                });
+                            if !immediate.is_empty()
+                                || urgent_non_backfill
+                                || urgent_fresh_preempt
+                                || (is_warm && !background_previews.is_empty())
+                            {
+                                preempted = true;
+                                break;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                if ctx.stopped() {
+                    return;
+                }
+                if preempted {
+                    if is_warm {
+                        background_warm.push_front(Command::Warm(id));
+                    } else {
+                        urgent.push_front(Command::Backfill(id));
+                    }
+                    continue;
+                }
+            }
+        }
+        if catch_unwind(AssertUnwindSafe(|| backfill(&id))).is_err()
+            && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS))
+        {
             return;
         }
-        fetched.insert(id, Instant::now());
-        if ctx.pause(pace) {
-            return;
-        }
+        let done = Instant::now();
+        fetched.insert(id, done);
+        last_fetch = Some(done);
     }
 }
 
@@ -4591,6 +4709,181 @@ pub fn prove_teams_team_info() -> Result<(), String> {
     teams::prove_team_info()
 }
 
+/// The lab's fast-send-pipeline driver (`TINYCLIENT_PROVE=fast-send-pipeline`).
+/// Verifies end-to-end:
+/// 1. Real Slack adapter completes `Command::Send` in < 1.5s while `Backfill` stalls 4s.
+/// 2. `serve_commands` wakes out of a 2s pace sleep and runs `Command::Send` ahead of `Warm`/`Previews` in < 200ms.
+/// 3. `Store::messages(Page::After { id: pending_client_id })` resolves the replacement settled message after `ctx.sent`.
+/// 4. `Store::fail_pending_excluding` keeps an active upload `Pending` past 60s while failing inactive rows.
+pub fn prove_fast_send_pipeline() -> Result<(), String> {
+    use crate::store::Store;
+
+    // 1. Real Slack adapter non-blocking send while Backfill stalls on conversations.history.
+    slack::prove_fast_send_non_blocking()?;
+
+    // 2. serve_commands wakes out of a 2s pace sleep and prioritizes Send over Warm/Previews in < 200ms.
+    {
+        let hub = Arc::new(Hub::new(
+            Store::open(std::path::Path::new(":memory:")).map_err(|e| format!("open store: {e}"))?,
+        ));
+        let account = AccountKey { network: Network::Slack, account: "prove-pace".into() };
+        let (adapter, ctx, inbox) = local(account, hub);
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let order_bg = order.clone();
+        let order_other = order.clone();
+        let (in_pace, pace_started) = channel();
+        let (sent_done, sent_wait) = channel();
+        let thread_ctx = ctx.clone();
+        let thread = std::thread::spawn(move || {
+            serve_commands(
+                &thread_ctx,
+                inbox,
+                Duration::from_secs(2),
+                move |id| {
+                    lock(&order_bg).push(format!("backfill:{id}"));
+                    if id == "first" {
+                        let _ = in_pace.send(());
+                    }
+                },
+                move |cmd| match cmd {
+                    Command::Send { client_id, .. } => {
+                        lock(&order_other).push(format!("send:{client_id}"));
+                        let _ = sent_done.send(Instant::now());
+                    }
+                    Command::Previews(ids) => {
+                        lock(&order_other).push(format!("previews:{}", ids.join(",")));
+                    }
+                    _ => {}
+                },
+            );
+        });
+
+        adapter.command(Command::Warm("first".into()));
+        adapter.command(Command::Warm("second".into()));
+        pace_started
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "first warm did not execute".to_owned())?;
+        std::thread::sleep(Duration::from_millis(25));
+
+        let sent_at = Instant::now();
+        adapter.command(Command::Previews(vec!["p1".into()]));
+        adapter.command(Command::Warm("third".into()));
+        adapter.command(Command::Send {
+            conversation_id: "c1".into(),
+            client_id: "cid-pace".into(),
+            text: "hi".into(),
+            reply_to: None,
+        });
+
+        let finished_at = sent_wait
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "Command::Send did not wake serve_commands".to_owned())?;
+        let wake = finished_at.duration_since(sent_at);
+
+        drop(adapter);
+        let _ = thread.join();
+
+        if wake >= Duration::from_millis(200) {
+            return Err(format!("serve_commands wake took {wake:?}, expected < 200ms"));
+        }
+        let recorded = lock(&order).clone();
+        if recorded.len() < 2 || recorded[0] != "backfill:first" || recorded[1] != "send:cid-pace" {
+            return Err(format!("Command::Send did not run ahead of Warm/Previews: {recorded:?}"));
+        }
+    }
+
+    // 3. Store::messages(Page::After { id: pending_client_id }) resolves replacement settled row after ctx.sent.
+    {
+        let hub = Arc::new(Hub::new(
+            Store::open(std::path::Path::new(":memory:")).map_err(|e| format!("open store: {e}"))?,
+        ));
+        let account = AccountKey { network: Network::Discord, account: "prove-after".into() };
+        let key = Key::new(&account, "c1");
+        let ts = now();
+        hub.store()
+            .upsert_conversation(&account, &ConversationRow::new("c1", protocol::ConversationKind::Direct, "Ada"))
+            .map_err(|e| format!("upsert c1: {e}"))?;
+        let (_adapter, ctx, _inbox) = local(account, hub.clone());
+
+        let mk = |id: &str, text: &str, sent: i64, outgoing: bool| {
+            Message::plain(id, if outgoing { "Me" } else { "Ada" }, text, sent, outgoing)
+        };
+        hub.store()
+            .ingest(&key, &mk("m1", "earlier", ts - 20, false), false)
+            .map_err(|e| format!("ingest m1: {e}"))?;
+        let mut pending = mk("cid-99", "my reply", ts - 10, true);
+        pending.state = SendState::Pending;
+        pending.client_id = Some("cid-99".into());
+        hub.store()
+            .ingest(&key, &pending, true)
+            .map_err(|e| format!("ingest pending: {e}"))?;
+
+        let mut settled = mk("srv-100", "my reply", ts - 9, true);
+        settled.state = SendState::Sent;
+        ctx.sent("c1", "cid-99", Ok(settled));
+
+        hub.store()
+            .ingest(&key, &mk("srv-101", "afterwards", ts - 5, false), false)
+            .map_err(|e| format!("ingest srv-101: {e}"))?;
+
+        let page = hub
+            .store()
+            .messages(&key, &protocol::Page::After { id: "cid-99".into() }, 20, ts)
+            .map_err(|e| format!("messages Page::After: {e}"))?
+            .ok_or_else(|| "conversation c1 missing".to_owned())?;
+        let ids: Vec<&str> = page.messages.iter().map(|m| m.id.as_str()).collect();
+        if ids != ["srv-100", "srv-101"] {
+            return Err(format!("Page::After returned {ids:?}, expected [\"srv-100\", \"srv-101\"]"));
+        }
+    }
+
+    // 4. Store::fail_pending_excluding preserves an active upload past 60s and fails inactive >60s rows.
+    {
+        let mut store = Store::open(std::path::Path::new(":memory:"))
+            .map_err(|e| format!("open store: {e}"))?;
+        let account = AccountKey { network: Network::Slack, account: "T-upload".into() };
+        let key = Key::new(&account, "c1");
+        let ts = now();
+        store
+            .upsert_conversation(&account, &ConversationRow::new("c1", protocol::ConversationKind::Direct, "Ada"))
+            .map_err(|e| format!("upsert c1: {e}"))?;
+
+        let mut active_upload = Message::plain("up-1", "Me", "big video", ts - 120, true);
+        active_upload.state = SendState::Pending;
+        active_upload.client_id = Some("up-1".into());
+        store.ingest(&key, &active_upload, true).map_err(|e| format!("ingest active: {e}"))?;
+        active_upload.id = "msg-2".into();
+        active_upload.text = "dropped text".into();
+        active_upload.client_id = Some("msg-2".into());
+        store.ingest(&key, &active_upload, true).map_err(|e| format!("ingest stuck: {e}"))?;
+
+        let touched = store
+            .fail_pending_excluding(ts - 60, "The network did not answer.", |acct, cid| {
+                acct == &account && cid == "up-1"
+            })
+            .map_err(|e| format!("fail_pending_excluding: {e}"))?;
+        if touched != [key.clone()] {
+            return Err(format!("unexpected touched keys: {touched:?}"));
+        }
+        let kept = store
+            .message(&key, "up-1")
+            .map_err(|e| format!("read up-1: {e}"))?
+            .ok_or_else(|| "up-1 missing".to_owned())?;
+        if kept.state != SendState::Pending {
+            return Err(format!("active upload should stay Pending, got {:?}", kept.state));
+        }
+        let failed = store
+            .message(&key, "msg-2")
+            .map_err(|e| format!("read msg-2: {e}"))?
+            .ok_or_else(|| "msg-2 missing".to_owned())?;
+        if !matches!(failed.state, SendState::Failed { .. }) {
+            return Err(format!("inactive row should be Failed, got {:?}", failed.state));
+        }
+    }
+
+    Ok(())
+}
+
 /// An adapter with no network behind it, for whatever serves an account inside chatd (the
 /// demo). The caller runs `serve_commands` on the inbox with the context.
 pub(crate) fn local(account: AccountKey, hub: Arc<Hub>) -> (Adapter, Context, Receiver<Command>) {
@@ -4774,5 +5067,70 @@ mod tests {
         assert_eq!(attempts, 2, "restarted once");
         assert_eq!(said, Some((Link::Offline, RECOVERING.to_owned())), "while it recovered the account said why");
         assert_eq!(linked(&hub, &account).0, Link::Expired);
+    }
+
+    #[test]
+    fn serve_commands_runs_send_ahead_of_background_and_wakes_from_pace_quickly() {
+        let hub = hub();
+        let account = AccountKey { network: Network::Slack, account: "priority".into() };
+        let (adapter, ctx, inbox) = local(account, hub);
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let order_bg = order.clone();
+        let order_other = order.clone();
+        let (in_pace, pace_started) = channel();
+        let (sent_done, sent_wait) = channel();
+        let thread_ctx = ctx.clone();
+        let thread = std::thread::spawn(move || {
+            serve_commands(
+                &thread_ctx,
+                inbox,
+                Duration::from_secs(5),
+                move |id| {
+                    lock(&order_bg).push(format!("backfill:{id}"));
+                    if id == "first" {
+                        let _ = in_pace.send(());
+                    }
+                },
+                move |cmd| match cmd {
+                    Command::Send { client_id, .. } => {
+                        lock(&order_other).push(format!("send:{client_id}"));
+                        let _ = sent_done.send(Instant::now());
+                    }
+                    Command::Previews(ids) => {
+                        lock(&order_other).push(format!("previews:{}", ids.join(",")));
+                    }
+                    _ => {}
+                },
+            );
+        });
+
+        // Queue two warms so the thread enters the 5s pace sleep waiting before the second
+        // warm; Send must interrupt that pace wait in <100ms and run ahead of Backfill/Warm/Previews.
+        adapter.command(Command::Warm("first".into()));
+        adapter.command(Command::Warm("second".into()));
+        pace_started.recv_timeout(Duration::from_secs(2)).expect("first backfill ran");
+        std::thread::sleep(Duration::from_millis(20));
+
+        let sent_at = Instant::now();
+        adapter.command(Command::Previews(vec!["p1".into()]));
+        adapter.command(Command::Backfill("b1".into()));
+        adapter.command(Command::Send {
+            conversation_id: "c1".into(),
+            client_id: "cid-1".into(),
+            text: "hi".into(),
+            reply_to: None,
+        });
+
+        let finished_at = sent_wait.recv_timeout(Duration::from_secs(2)).expect("send ran");
+        let wake_ms = finished_at.duration_since(sent_at).as_millis();
+        assert!(wake_ms < 100, "Send must wake from pace wait in <100ms, took {wake_ms}ms");
+
+        drop(adapter);
+        thread.join().unwrap();
+
+        let recorded = lock(&order).clone();
+        assert!(recorded.len() >= 2, "recorded={recorded:?}");
+        assert_eq!(recorded[0], "backfill:first");
+        assert_eq!(recorded[1], "send:cid-1", "Send must run ahead of Backfill/Warm/Previews: {recorded:?}");
     }
 }

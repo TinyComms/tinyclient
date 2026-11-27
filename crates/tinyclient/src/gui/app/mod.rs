@@ -643,8 +643,15 @@ impl Shell {
     }
 
     /// Called each frame: saves when the open conversation or mode changed since the last save.
-    /// A string compare, nothing more, when nothing did.
+    /// Also dismisses transient pointer/anchor overlays when the viewport size changes.
     pub(in crate::gui) fn note_place(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let vp = window.viewport_size();
+        let now_vp = (f32::from(vp.width).round(), f32::from(vp.height).round());
+        if let Some(prev) = self.layout_state.last_viewport.replace(Some(now_vp)) {
+            if prev != now_vp {
+                self.dismiss_transient_overlays(cx);
+            }
+        }
         if self.restore.is_some() {
             return;
         }

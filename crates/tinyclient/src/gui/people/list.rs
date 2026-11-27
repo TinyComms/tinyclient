@@ -7,7 +7,7 @@ use super::hub::Leaves;
 use super::presence::Ring;
 use super::{can_call, in_call, person_avatar, shown_presence, Hub, Scene};
 use crate::gui::components::{
-    badge_count_unread, button, empty_state, glyph, icon_button, search_field, section_header, segment, segmented, tip, ButtonKind,
+    badge_count_unread, button, empty_state, glyph, icon_button, search_field, section_header, tip, ButtonKind,
 };
 use crate::gui::input::{InputEvent, InputKey, TextInput};
 use crate::gui::sidebar::{on_screen, Mode};
@@ -1204,7 +1204,7 @@ impl PeopleList {
     fn scoped_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
         let scope = self.scope?;
         let pending = self.pending();
-        let mut switch = segmented();
+        let mut switch = crate::gui::components::segmented_compact();
         for chip in chips(Some(scope), pending) {
             let label: SharedString = match chip {
                 Chip::Online => "Online".into(),
@@ -1219,8 +1219,8 @@ impl PeopleList {
                 Chip::Blocked => "chip-blocked",
             };
             let incoming = self.owned.iter().filter(|p| p.relation == Relation::Incoming).count() as u32;
-            let count = (chip == Chip::Pending && incoming > 0).then(|| div().ml(px(5.)).child(badge_count_unread(incoming)));
-            switch = switch.child(segment(id, label, self.chip == chip).children(count).on_click(cx.listener(move |this, _, _, cx| this.pick_chip(chip, cx))));
+            let count = (chip == Chip::Pending && incoming > 0).then(|| div().flex_none().ml(px(4.)).child(badge_count_unread(incoming)));
+            switch = switch.child(crate::gui::components::segment_compact(id, label, self.chip == chip).children(count).on_click(cx.listener(move |this, _, _, cx| this.pick_chip(chip, cx))));
         }
         let word = if scope == Network::Discord { "Friends" } else { "Contacts" };
         Some(
@@ -1238,7 +1238,7 @@ impl PeopleList {
                 )
                 .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(word)),
         )
-        .map(|bar| div().flex_none().child(bar).child(div().px(px(theme::PANE_PAD)).pb(px(8.)).flex().child(switch)))
+        .map(|bar| div().flex_none().child(bar).child(div().px(px(theme::INSET)).pb(px(8.)).flex().child(switch)))
     }
 
     /// Types into the search field, for `--people-search`.

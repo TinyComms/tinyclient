@@ -258,8 +258,9 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
             rollup: if collapsed { rollup } else { Rollup::default() },
             depth,
         });
-        // Discord category children stay nested beneath their header.
-        let child_depth = depth + u8::from(!slack && space.network == Network::Discord);
+        // Category children align cleanly at the standard channel inset (matching Discord Desktop
+        // and Tiny Server); voice occupants indent underneath their voice channel at `depth + 1`.
+        let child_depth = depth;
         emit(&mut rows, &members, child_depth, collapsed);
         if !quiet.is_empty() && !collapsed {
             let words = if quiet.len() == 1 { "1 quiet channel".to_owned() } else { format!("{} quiet channels", quiet.len()) };
@@ -365,7 +366,7 @@ mod tests {
             ],
             None,
         );
-        assert_eq!(tree, ["rules", "orphan", "vtext", ".general", ".help", "vvoice", ".lounge"]);
+        assert_eq!(tree, ["rules", "orphan", "vtext", "general", "help", "vvoice", "lounge"]);
     }
 
     #[test]
@@ -401,9 +402,9 @@ mod tests {
         assert_eq!(folded.len(), 2, "the selected thread and all channel children stay folded");
         let opened = HashSet::from(["text".into()]);
         let expanded = flatten(&key("s"), &groups, &conversations, Some(&open), 2, &Rules { opened: Some(&opened), ..Rules::default() });
-        assert!(matches!(&expanded[2], Row::Conversation { depth: 3, .. }));
-        assert!(matches!(&expanded[3], Row::Conversation { depth: 4, .. }));
-        assert!(matches!(&expanded[4], Row::Conversation { depth: 3, .. }));
+        assert!(matches!(&expanded[2], Row::Conversation { depth: 2, .. }));
+        assert!(matches!(&expanded[3], Row::Conversation { depth: 3, .. }));
+        assert!(matches!(&expanded[4], Row::Conversation { depth: 2, .. }));
     }
 
     #[test]
@@ -412,10 +413,10 @@ mod tests {
         let mut muted = group("muted", 0, false);
         muted.muted = true;
         let tree = vec![channel("a", Some("muted"), Channel), channel("b", Some("text"), Channel)];
-        assert_eq!(rows(&[muted.clone(), group("text", 1, false)], tree.clone(), None), [">muted", "vtext", ".b"]);
+        assert_eq!(rows(&[muted.clone(), group("text", 1, false)], tree.clone(), None), [">muted", "vtext", "b"]);
         let opened = HashSet::from(["muted".to_owned()]);
         let rules = Rules { opened: Some(&opened), ..Rules::default() };
-        assert_eq!(rows_with(&[muted, group("text", 1, false)], tree, None, &rules), ["vmuted", ".a", "vtext", ".b"]);
+        assert_eq!(rows_with(&[muted, group("text", 1, false)], tree, None, &rules), ["vmuted", "a", "vtext", "b"]);
 
         let mut many: Vec<Conversation> = (0..90).map(|n| channel(&format!("c{n}"), Some("big"), Channel)).collect();
         many[3].mentions = 1;

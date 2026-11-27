@@ -10,7 +10,7 @@ use super::super::anim::Autoplay;
 use super::super::layout;
 use super::super::settings::Section;
 use super::super::sidebar::Mode;
-use super::super::theme::Appearance;
+use super::super::theme::{Accent, Appearance, ThemeId};
 use protocol::link::Trusted;
 use protocol::settings::Values;
 use protocol::{Key, Network};
@@ -24,6 +24,12 @@ pub const FILE: &str = "shell.prefs";
 pub struct Choices {
     /// A1: System (default), Light, or Dark.
     pub appearance: Appearance,
+    /// AT: preferred dark theme (used in Dark mode and when System is Dark).
+    pub dark_theme: ThemeId,
+    /// AT: preferred light theme (used in Light mode and when System is Light).
+    pub light_theme: ThemeId,
+    /// AC: curated accent colour (`Auto` follows the active theme's signature accent).
+    pub accent: Accent,
     /// A5: high-contrast palette (in addition to the OS Increase Contrast setting).
     pub high_contrast: bool,
     /// A3: list rows 40 instead of 48.
@@ -67,13 +73,16 @@ pub struct Choices {
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { appearance: Appearance::System, high_contrast: false, compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, text_previews: true, updates: true, open_at_login: false, tray: false, confirm_links: true, strip_tracking: false, spell: true, send_link_previews: true, auto_popout_call: false, section: Section::Accounts }
+        Choices { appearance: Appearance::System, dark_theme: ThemeId::Graphite, light_theme: ThemeId::Paper, accent: Accent::Auto, high_contrast: false, compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, text_previews: true, updates: true, open_at_login: false, tray: false, confirm_links: true, strip_tracking: false, spell: true, send_link_previews: true, auto_popout_call: false, section: Section::Accounts }
     }
 }
 
 // One window, one value each, read while drawing: globals, as the text step is.
 static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     appearance: Appearance::System,
+    dark_theme: ThemeId::Graphite,
+    light_theme: ThemeId::Paper,
+    accent: Accent::Auto,
     high_contrast: false,
     compact: false,
     previews: true,
@@ -139,6 +148,9 @@ pub fn set_choices(choices: Choices) {
     *CHOICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = choices;
     super::super::theme::set_compact(choices.compact);
     super::super::theme::set_appearance(choices.appearance);
+    super::super::theme::set_dark_theme(choices.dark_theme);
+    super::super::theme::set_light_theme(choices.light_theme);
+    super::super::theme::set_accent(choices.accent);
     super::super::theme::set_high_contrast(choices.high_contrast);
 }
 
@@ -312,6 +324,9 @@ pub fn parse(text: &str) -> Prefs {
             }
             // A value that does not parse reads as the default.
             "appearance" => prefs.choices.appearance = fields.next().and_then(Appearance::from_word).unwrap_or_default(),
+            "dark_theme" => prefs.choices.dark_theme = fields.next().and_then(ThemeId::from_dark_word).unwrap_or(ThemeId::Graphite),
+            "light_theme" => prefs.choices.light_theme = fields.next().and_then(ThemeId::from_light_word).unwrap_or(ThemeId::Paper),
+            "accent" => prefs.choices.accent = fields.next().and_then(Accent::from_word).unwrap_or(Accent::Auto),
             "high_contrast" => prefs.choices.high_contrast = fields.next() == Some("on"),
             "density" => prefs.choices.compact = fields.next() == Some("compact"),
             "previews" => prefs.choices.previews = fields.next() != Some("off"),
@@ -386,8 +401,11 @@ pub fn write(prefs: &Prefs) -> String {
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
     let (choices, default) = (prefs.choices, Choices::default());
-    let lines: [(&str, bool, &str); 19] = [
+    let lines: [(&str, bool, &str); 22] = [
         ("appearance", choices.appearance != default.appearance, choices.appearance.word()),
+        ("dark_theme", choices.dark_theme != default.dark_theme, choices.dark_theme.word()),
+        ("light_theme", choices.light_theme != default.light_theme, choices.light_theme.word()),
+        ("accent", choices.accent != default.accent, choices.accent.word()),
         ("high_contrast", choices.high_contrast != default.high_contrast, "on"),
         ("density", choices.compact != default.compact, "compact"),
         ("previews", choices.previews != default.previews, "off"),
@@ -477,7 +495,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { appearance: Appearance::Light, high_contrast: true, compact: true, previews: false, send_link_previews: false, auto_popout_call: true, command_return: true, newest: true, typing: false, emoticons: true, images: false, text_previews: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
+            choices: Choices { appearance: Appearance::Light, dark_theme: ThemeId::Mocha, light_theme: ThemeId::Stone, accent: Accent::Emerald, high_contrast: true, compact: true, previews: false, send_link_previews: false, auto_popout_call: true, command_return: true, newest: true, typing: false, emoticons: true, images: false, text_previews: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,
@@ -525,9 +543,11 @@ mod tests {
     #[test]
     fn only_changed_choices_are_written_and_lines_from_a_newer_build_are_kept() {
         let text = write(&Prefs::default());
-        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "text_previews", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell", "login", "tray"] {
+        for name in ["dark_theme", "light_theme", "accent", "density", "previews", "send", "open_at", "typing", "emoticons", "images", "text_previews", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell", "login", "tray"] {
             assert!(!text.contains(name), "{name} is at its default and not written");
         }
+        assert!(write(&Prefs { choices: Choices { dark_theme: ThemeId::Nord, light_theme: ThemeId::Stone, accent: Accent::Rose, ..Choices::default() }, ..Prefs::default() }).contains("dark_theme\tnord\nlight_theme\tstone\naccent\trose\n"));
+        assert_eq!(parse("dark_theme\tpaper\nlight_theme\tnord\naccent\tneon\n").choices, Choices::default());
         assert!(write(&Prefs { choices: Choices { text_previews: false, ..Choices::default() }, ..Prefs::default() }).contains("text_previews\toff\n"));
         assert!(!parse("text_previews\toff\n").choices.text_previews);
         assert!(parse("text_previews\ton\n").choices.text_previews);

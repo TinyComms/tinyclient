@@ -263,7 +263,7 @@ impl Render for CallPopout {
         let Some(data) = data else {
             // The call ended while the pop-out was still alive; dismiss cleanly.
             window.remove_window();
-            return div().size_full().bg(gpui::rgb(0x0b0b0d)).into_any_element();
+            return div().size_full().bg(theme::media_stage()).into_any_element();
         };
 
         let body: AnyElement = if let Some(frame) = data.main_frame {
@@ -275,7 +275,7 @@ impl Render for CallPopout {
             let ring = if data.speaker_speaking {
                 theme::positive()
             } else {
-                gpui::rgba(0xffffff26)
+                gpui::Rgba { alpha: 0.25, ..theme::on_media() }
             };
             div()
                 .size_full()
@@ -300,7 +300,7 @@ impl Render for CallPopout {
                     div()
                         .type_small()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::on_accent())
+                        .text_color(theme::on_media())
                         .child(data.speaker_name.clone()),
                 )
                 .into_any_element()
@@ -319,7 +319,7 @@ impl Render for CallPopout {
                 .overflow_hidden()
                 .border_1()
                 .border_color(theme::border())
-                .bg(gpui::rgb(0x0b0b0d))
+                .bg(theme::media_stage())
                 .child(img(frame).size_full().object_fit(ObjectFit::Contain))
         });
 
@@ -358,7 +358,7 @@ impl Render for CallPopout {
                                 .rounded(px(4.))
                                 .bg(theme::danger())
                                 .text_color(theme::on_accent())
-                                .text_size(px(9.5))
+                                .type_micro()
                                 .font_weight(FontWeight::BOLD)
                                 .child("LIVE")
                         }))
@@ -500,7 +500,7 @@ impl Render for CallPopout {
             .id("call-popout-root")
             .relative()
             .size_full()
-            .bg(gpui::rgb(0x0b0b0d))
+            .bg(theme::media_stage())
             .border_1()
             .border_color(theme::hairline())
             .overflow_hidden()

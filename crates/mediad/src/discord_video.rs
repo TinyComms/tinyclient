@@ -12,7 +12,7 @@ use crate::dave::Dave;
 use crate::media::{FromMedia, Stream};
 use crate::picture::{self, camera_high_bps, camera_profile};
 use crate::rtp::{self, Cipher, Sender as AudioSender, VideoSender, H264, RTX};
-use crate::session::Controls;
+use crate::session::{lock, Controls};
 use crate::video::{Rates, Received, Track, Video, VideoCodec, Wants, Word};
 use crate::{av1, h264, hear::Ear, opus, out, rt, share_audio, vp8, FRAME, FRAME_SAMPLES};
 use protocol::{MediaResponse, PictureKind, WatchSize};
@@ -294,7 +294,7 @@ impl Drive {
             return true;
         }
         let ssrc = u32::from_be_bytes([datagram[8], datagram[9], datagram[10], datagram[11]]);
-        let remote = self.videos.lock().unwrap().get(&ssrc).cloned();
+        let remote = lock(&self.videos).get(&ssrc).cloned();
         let Some(remote) = remote else {
             return datagram[1] & 0x7f != rtp::PAYLOAD_TYPE;
         };
@@ -341,7 +341,7 @@ impl Drive {
         let Some(id) = user.parse().ok() else {
             return;
         };
-        let Some(clear) = dave.lock().unwrap().decrypt_video(Some(id), &sealed) else {
+        let Some(clear) = lock(&dave).decrypt_video(Some(id), &sealed) else {
             return;
         };
         self.paint(ssrc, user, codec, clear);
@@ -401,7 +401,7 @@ impl Drive {
         }
         self.last_prune = Instant::now();
         let (active_ssrcs, active_users): (HashSet<u32>, HashSet<String>) = {
-            let videos = self.videos.lock().unwrap();
+            let videos = lock(&self.videos);
             let ssrcs = videos.keys().copied().collect();
             let users = videos
                 .values()
@@ -488,7 +488,7 @@ impl Drive {
         let Some(pipe) = pipe else {
             return;
         };
-        let Some(sealed) = dave.lock().unwrap().encrypt_video(frame) else {
+        let Some(sealed) = lock(&dave).encrypt_video(frame) else {
             return;
         };
         pipe.send_sealed(self.screen, socket, timestamp, &sealed);
@@ -616,11 +616,11 @@ fn receive_audio(leg: &Leg, datagram: &[u8], owner: &str, owner_id: u64, gain_ke
     let Ok(packet) = leg.opener.unseal(datagram) else {
         return;
     };
-    if leg.users.lock().unwrap().get(&packet.ssrc).map(String::as_str) != Some(owner) {
+    if lock(&leg.users).get(&packet.ssrc).map(String::as_str) != Some(owner) {
         return;
     }
     let mut again = Vec::new();
-    let frame = leg.dave.lock().unwrap().open(Some(owner_id), &packet.payload, &mut again);
+    let frame = lock(&leg.dave).open(Some(owner_id), &packet.payload, &mut again);
     if !again.is_empty() {
         let _ = leg.report.send(FromMedia::Dave(again));
     }
@@ -628,11 +628,11 @@ fn receive_audio(leg: &Leg, datagram: &[u8], owner: &str, owner_id: u64, gain_ke
         return;
     };
     // Hold the SSRC map through insertion so a disconnect or remap can clear the old audio.
-    let users = leg.users.lock().unwrap();
+    let users = lock(&leg.users);
     if users.get(&packet.ssrc).map(String::as_str) != Some(owner) {
         return;
     }
-    let mut playing = leg.controls.watched_audio.lock().unwrap();
+    let mut playing = lock(&leg.controls.watched_audio);
     // Stop and deafen can clear the buffer while authentication is in progress.
     if leg.controls.leg_done(true, Some(owner)) || leg.controls.deafened.load(Ordering::Relaxed) {
         return;
@@ -707,7 +707,7 @@ impl Sound {
             }
             let mut packet = [0u8; 1500];
             if let Some(len) = self.encoder.as_mut().and_then(|encoder| encoder.encode(&frame, &mut packet)) {
-                let sealed = leg.dave.lock().unwrap().encrypt(&packet[..len]);
+                let sealed = lock(&leg.dave).encrypt(&packet[..len]);
                 if let Some(sealed) = sealed {
                     if let Some(datagram) = self.sender.seal(&sealed) {
                         let _ = leg.socket.send(&datagram);
@@ -773,7 +773,7 @@ pub fn run(mut leg: Leg) {
         }
     }
     if let Some((owner, _, _)) = &owner {
-        leg.controls.watched_audio.lock().unwrap().remove(owner);
+        lock(&leg.controls.watched_audio).remove(owner);
     }
     drive.finish();
 }

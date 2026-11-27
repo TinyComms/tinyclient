@@ -86,7 +86,7 @@ fn chip() -> Div {
         .h(px(26.))
         .px(px(8.))
         .rounded(px(9.))
-        .bg(gpui::rgba(0x0000008c))
+        .bg(theme::media_chip())
         .flex()
         .items_center()
         .gap(px(5.))
@@ -363,15 +363,15 @@ impl Shell {
         let label = chip()
             .max_w(px(wide - 20.))
             .children(tile.muted.then(|| glyph("icons/mic-off.svg", 13., theme::danger())))
-            .child(div().min_w_0().truncate().text_size(px(tokens::scaled(13.))).font_weight(theme::MEDIUM).text_color(gpui::rgb(0xffffff)).child(name));
+            .child(div().min_w_0().truncate().text_size(px(tokens::scaled(13.))).font_weight(theme::MEDIUM).text_color(theme::on_media()).child(name));
         let marks = div()
             .absolute()
             .top(px(8.))
             .right(px(8.))
             .flex()
             .gap(px(4.))
-            .children(tile.deafened.then(|| chip().px(px(6.)).child(glyph("icons/headphone-off.svg", 13., theme::on_accent()))))
-            .children(tile.sharing.then(|| chip().px(px(6.)).child(glyph("icons/monitor-up.svg", 13., theme::accent_text()))));
+            .children(tile.deafened.then(|| chip().px(px(6.)).child(glyph("icons/headphone-off.svg", 13., theme::on_media()))))
+            .children(tile.sharing.then(|| chip().px(px(6.)).child(glyph("icons/monitor-up.svg", 13., theme::on_media()))));
         // Their camera or screen share is on and someone else's picture is the one on screen: Watch theirs.
         let watch = ((tile.camera || tile.sharing) && tile.frame.is_none() && !tile.me).then(|| {
             let source = tile.id.clone();
@@ -446,23 +446,23 @@ impl Shell {
             .h(px(30.))
             .px(px(12.))
             .rounded_full()
-            .bg(gpui::rgba(0x0000008c))
+            .bg(theme::media_chip())
             .flex()
             .items_center()
             .gap(px(6.))
             .cursor_pointer()
-            .active(|style| style.bg(theme::pressed()))
+            .active(|style| style.bg(theme::media_pressed()))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| this.call_stop_watch_user(cx)))
-            .child(glyph("icons/x.svg", 13., theme::on_accent()))
-            .child(div().phone_stamp().text_color(theme::on_accent()).child("Stop watching"));
+            .child(glyph("icons/x.svg", 13., theme::on_media()))
+            .child(div().phone_stamp().text_color(theme::on_media()).child("Stop watching"));
         let screen = div()
             .relative()
             .flex_none()
             .w(px(wide))
             .h(px(stage_h))
             .rounded(px(RADIUS))
-            .bg(gpui::rgb(0x000000))
+            .bg(theme::media_stage())
             .border_1()
             .border_color(theme::hairline())
             .children(frame.map(|frame| picture(frame, RADIUS, true)))
@@ -485,8 +485,8 @@ impl Shell {
                             .min_w_0()
                             .h(px(30.))
                             .px(px(10.))
-                            .child(glyph("icons/monitor-up.svg", 14., theme::accent_text()))
-                            .child(div().min_w_0().truncate().phone_stamp().text_color(theme::on_accent()).child(caption)),
+                            .child(glyph("icons/monitor-up.svg", 14., theme::on_media()))
+                            .child(div().min_w_0().truncate().phone_stamp().text_color(theme::on_media()).child(caption)),
                     )
                     .child(stop),
             );
@@ -546,7 +546,7 @@ impl Shell {
             .bottom(px(6.))
             .size(px(30.))
             .rounded_full()
-            .bg(gpui::rgba(0x0000008c))
+            .bg(theme::media_chip())
             .flex()
             .items_center()
             .justify_center()
@@ -557,7 +557,7 @@ impl Shell {
                 super::hooks::flip_camera(!front);
                 cx.notify();
             }))
-            .child(glyph("icons/switch-camera.svg", 15., theme::on_accent()));
+            .child(glyph("icons/switch-camera.svg", 15., theme::on_media()));
         let size = (wide, tall, controls_h);
         Some(
             div()

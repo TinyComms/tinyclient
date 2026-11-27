@@ -28,8 +28,11 @@ use std::time::Instant;
 use crate::teams;
 
 fn open_here(web: &WKWebView, url: &str) {
-    let url = NSURL::URLWithString(&NSString::from_str(url)).expect("a valid url");
-    unsafe { web.loadRequest(&NSURLRequest::requestWithURL(&url)) };
+    let Some(parsed) = NSURL::URLWithString(&NSString::from_str(url)) else {
+        tracing::warn!("tinyclient-login: ignoring invalid navigation url");
+        return;
+    };
+    unsafe { web.loadRequest(&NSURLRequest::requestWithURL(&parsed)) };
 }
 
 fn page_url(web: &WKWebView) -> Option<String> {
@@ -190,11 +193,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>, fresh: bool,
         let _: () = msg_send![&web, setUIDelegate: &*delegate];
         web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     }
-    let load = |web: &WKWebView, url: &str| unsafe {
-        let url = NSURL::URLWithString(&NSString::from_str(url)).expect("a valid url");
-        web.loadRequest(&NSURLRequest::requestWithURL(&url));
-    };
-    load(&web, start.unwrap_or(site.start));
+    open_here(&web, start.unwrap_or(site.start));
     window.setContentView(Some(&web));
     window.makeKeyAndOrderFront(None);
     #[allow(deprecated)]
@@ -212,7 +211,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>, fresh: bool,
         let at = page_url(&web).unwrap_or_default();
         if let Some((path, instead)) = site.detour {
             if at.contains(path) {
-                load(&web, instead);
+                open_here(&web, instead);
                 return;
             }
         }

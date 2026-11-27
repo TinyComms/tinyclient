@@ -17,7 +17,7 @@
 //! The element is measured first and then placed: preferred side, then flipped, then shifted
 //! along the edge, always 8 from every window edge. A height that cannot fit shrinks (to
 //! `H − 16`, or for a picker to the room on its side when that is at least 240) and the content
-//! scrolls; a width never shrinks. Anchors are in window coordinates; a view that does not know
+//! scrolls; a width wider than the window shrinks to `W − 16`. Anchors are in window coordinates; a view that does not know
 //! its anchor's bounds can capture them with `on_children_prepainted` or pass the pointer.
 //!
 //! The result is `deferred`, painted above the panes in the stacking order of [`Layer`]. One
@@ -98,6 +98,11 @@ fn shift(at: f32, len: f32, limit: f32) -> f32 {
     at.min(limit - MARGIN - len).max(MARGIN)
 }
 
+/// The widest an overlay may be in a window `window` big, keeping [`MARGIN`] on each side.
+pub fn max_width(window: (f32, f32)) -> f32 {
+    (window.0 - 2. * MARGIN).max(0.)
+}
+
 /// The tallest an overlay may be for this place in a window `window` big, before it is measured.
 pub fn max_height(place: Place, window: (f32, f32)) -> f32 {
     let (_, tall) = window;
@@ -115,9 +120,9 @@ pub fn max_height(place: Place, window: (f32, f32)) -> f32 {
     }
 }
 
-/// Where an overlay of `size` (already capped at [`max_height`]) goes in a window `window` big.
+/// Where an overlay of `size` (already capped at [`max_width`] and [`max_height`]) goes in a window `window` big.
 pub fn fit(place: Place, size: (f32, f32), window: (f32, f32)) -> Frame {
-    let (w, h) = (size.0, size.1.min(max_height(place, window)));
+    let (w, h) = (size.0.min(max_width(window)), size.1.min(max_height(place, window)));
     let (wide, tall) = window;
     let fits_x = |x: f32| x >= MARGIN && x + w <= wide - MARGIN;
     let fits_y = |y: f32| y >= MARGIN && y + h <= tall - MARGIN;
@@ -192,7 +197,9 @@ pub fn toast_width(window_width: f32) -> f32 {
 /// it is taller than the room; the id names that scroll.
 pub fn placed(id: impl Into<ElementId>, place: Place, layer: Layer, window: &Window, content: impl IntoElement) -> AnyElement {
     let viewport = window.viewport_size();
-    let limit = max_height(place, (f32::from(viewport.width), f32::from(viewport.height)));
+    let win = (f32::from(viewport.width), f32::from(viewport.height));
+    let max_w = max_width(win);
+    let limit = max_height(place, win);
     let (radius, shadow) = match (layer, place) {
         (Layer::Modal, _) | (_, Place::Center) => (theme::R_MODAL, theme::shadow_modal()),
         _ => (theme::R_FLOAT, theme::shadow_popover()),
@@ -200,6 +207,7 @@ pub fn placed(id: impl Into<ElementId>, place: Place, layer: Layer, window: &Win
     let body = div()
         .id(id)
         .flex_none()
+        .max_w(px(max_w))
         .max_h(px(limit))
         .overflow_hidden()
         .overflow_y_scroll()
@@ -320,12 +328,24 @@ mod tests {
         assert_eq!(popover.x, 540. - 8. - 360.);
         let flipped = fit(Place::Pointer(point(px(400.), px(50.))), (360., 100.), (540., 440.));
         assert_eq!(flipped.x, 400. - 2. - 360.);
-        // Its width is kept even when the window is narrower than it: it starts at the margin.
+        // A menu wider than the window clamps to W − 16 and starts at the margin.
         let wide = fit(Place::Below(anchor(10., 10., 20., 20.)), (600., 100.), (540., 440.));
-        assert_eq!((wide.x, wide.w), (MARGIN, 600.));
+        assert_eq!((wide.x, wide.w), (MARGIN, 540. - 2. * MARGIN));
         // A menu taller than the window shrinks to H − 16 and starts at the margin.
         let tall = fit(Place::Pointer(point(px(100.), px(300.))), (220., 900.), (540., 440.));
         assert_eq!((tall.y, tall.h), (MARGIN, 424.));
+    }
+
+    #[test]
+    fn a_wide_overlay_clamps_inside_a_narrow_window() {
+        let narrow = (360., 640.);
+        assert_eq!(max_width(narrow), 344.);
+        let picker = fit(Place::Above(anchor(310., 580., 36., 36.)), (352., 400.), narrow);
+        assert_eq!((picker.x, picker.w), (MARGIN, 344.));
+        assert!(picker.x + picker.w <= narrow.0 - MARGIN);
+        let popover = fit(Place::Pointer(point(px(300.), px(120.))), (400., 240.), narrow);
+        assert_eq!((popover.x, popover.w), (MARGIN, 344.));
+        assert!(popover.x + popover.w <= narrow.0 - MARGIN);
     }
 
     #[test]

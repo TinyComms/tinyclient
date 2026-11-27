@@ -12,6 +12,7 @@
 use super::super::{Failure, Members, Refusal, Reply};
 use super::model::{Member, PresenceUpdate};
 use super::{answer, gateway, Discord};
+use crate::hub::lock;
 use protocol::{
     ConversationKind, MediaFile, MemberSection, Network, Person, Presence, Relation, Watching, SEARCH_MIN_CHARS,
 };
@@ -233,7 +234,7 @@ impl Discord {
 
     fn subscribe(&self, again: bool) {
         let frame = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             let watched = &mut state.members;
             let want = watched.on_screen.clone().map(|guild| Subscription {
                 guild,
@@ -273,7 +274,7 @@ impl Discord {
 
     pub(super) fn open_space(&self, guild: &str) {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             if !state.guilds.contains_key(guild) {
                 return;
             }
@@ -289,7 +290,7 @@ impl Discord {
     /// ends the subscription.
     pub(super) fn watch(&self, watching: &Arc<Watching>) {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             let watched = &mut state.members;
             if *watched.seen == **watching {
                 // Nothing moved. A Space opened by a shell that then never said what it is
@@ -308,7 +309,7 @@ impl Discord {
     /// and channels are: a Watch that came before READY found none of them, and the same Watch
     /// again is not acted on.
     pub(super) fn rewatch(&self) {
-        let seen = self.state.lock().unwrap().members.seen.clone();
+        let seen = lock(&self.state).members.seen.clone();
         if *seen == Watching::default() {
             // Nothing named; a Space opened without a Watch stays as it is.
             return self.sync_subscription();
@@ -324,7 +325,7 @@ impl Discord {
         let guild = conversation.as_ref().and_then(|conversation| self.guild_of(conversation));
         let listable = conversation.as_ref().is_some_and(|conversation| conversation.kind != ConversationKind::Thread);
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             let state = &mut *state;
             // A newer Watch came meanwhile on the other thread; it places itself.
             if !Arc::ptr_eq(&state.members.seen, watching) {
@@ -374,7 +375,7 @@ impl Discord {
     }
 
     fn sections(&self, guild: &str, roster: &Roster) -> Vec<MemberSection> {
-        let state = self.state.lock().unwrap();
+        let state = lock(&self.state);
         let roles = state.guilds.get(guild).map(|info| &info.roles);
         let named = roster.groups.iter().map(|(id, count)| MemberSection {
             name: match id.as_str() {
@@ -393,7 +394,7 @@ impl Discord {
     /// A group DM's people, from READY. Nothing is asked of Discord. `None` when this is not one.
     fn group_list(&self, channel: &str, offset: u32, limit: u32) -> Option<Members> {
         let (seats, names, relations, presence) = {
-            let state = self.state.lock().unwrap();
+            let state = lock(&self.state);
             let group = state.groups.get(channel)?;
             let seats = super::group_seats(&state.me, &group.owner, &group.recipients);
             let names: HashMap<String, String> = seats.iter().filter_map(|(id, _)| state.users.get(id).map(|name| (id.clone(), name.clone()))).collect();
@@ -414,6 +415,11 @@ impl Discord {
         Some(Members { pending: false, sections: vec![MemberSection { name: "Members".into(), count }], members })
     }
 
+    /// Whether `channel` is a Discord thread whose member list requires a blocking HTTP fetch.
+    pub(super) fn is_thread_channel(&self, channel: &str) -> bool {
+        self.ctx.known(channel).ok().flatten().is_some_and(|conversation| conversation.kind == ConversationKind::Thread)
+    }
+
     /// Fetches the member list of a Discord thread (`GET /channels/{thread}/thread-members?with_member=true`).
     fn thread_members(&self, thread: &str, offset: u32, limit: u32) -> Result<Members, Refusal> {
         #[derive(Deserialize)]
@@ -430,8 +436,10 @@ impl Discord {
             .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
         let mut files = Vec::new();
         let mut all = Vec::with_capacity(entries.len());
-        let known_users = self.state.lock().unwrap().users.clone();
-        let relations = self.state.lock().unwrap().relations.clone();
+        let (known_users, relations) = {
+            let state = lock(&self.state);
+            (state.users.clone(), state.relations.clone())
+        };
         let guild = self.ctx.known(thread).ok().flatten().and_then(|row| self.guild_of(&row)).unwrap_or_default();
         for entry in entries {
             if let Some(member) = entry.member.as_ref() {
@@ -475,7 +483,7 @@ impl Discord {
         let in_tree = conversation.as_ref().is_some_and(|conversation| conversation.space.is_some());
         let (Some(guild), true) = (guild, in_tree) else { return answer(reply, Err(Refusal::Unsupported)); };
         let (groups, members, pending) = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             if !state.guilds.contains_key(&guild) {
                 if !state.guilds.is_empty() { return answer(reply, Err(Refusal::Unsupported)); }
                 // Before READY no server is known yet: the list is still to come, not refused.
@@ -554,7 +562,7 @@ impl Discord {
     /// or removed.
     pub(super) fn member_list(&self, update: ListUpdate) {
         let voice_raw: Vec<(String, String, Option<String>)> = {
-            let state = self.state.lock().unwrap();
+            let state = lock(&self.state);
             let place = state.guilds.get(&update.guild_id).map(|g| g.name.clone());
             state
                 .voice
@@ -603,7 +611,7 @@ impl Discord {
             })
             .collect();
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             let state = &mut *state;
             let watched = &mut state.members;
             let (Some(guild), Some(channel)) = (&watched.on_screen, &watched.list) else {
@@ -704,7 +712,7 @@ impl Discord {
         if query.chars().count() < SEARCH_MIN_CHARS {
             return self.ctx.searched(query);
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock(&self.state);
         let state = &mut *state;
         let Some(guild) = state.members.on_screen.clone() else {
             drop(state.search.waiting.take());
@@ -736,7 +744,7 @@ impl Discord {
     /// answered. True while either is outstanding, so the socket thread looks again soon.
     pub(super) fn search_tick(&self) -> bool {
         let (unanswered, due) = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             let state = &mut *state;
             let late = state.search.sent.as_ref().is_some_and(|(_, _, at)| at.elapsed() > PATIENCE);
             let unanswered = state.search.sent.take_if(|_| late).map(|(query, _, _)| query);
@@ -752,13 +760,13 @@ impl Discord {
         if let Some(query) = due {
             self.search_people(&query);
         }
-        let state = self.state.lock().unwrap();
+        let state = lock(&self.state);
         state.search.sent.is_some() || state.search.waiting.is_some()
     }
 
     pub(super) fn members_chunk(&self, chunk: Chunk) -> Result<(), Failure> {
         let asked = {
-            let state = self.state.lock().unwrap();
+            let state = lock(&self.state);
             state.search.sent.as_ref().map(|(query, nonce, _)| (query.clone(), nonce.clone()))
         };
         let Some((query, _)) = asked.filter(|(_, nonce)| chunk.nonce.as_ref() == Some(nonce)) else {
@@ -769,7 +777,7 @@ impl Discord {
         for user in chunk.members.iter().filter_map(|member| member.user.as_ref()).take(25) {
             // People keeps who someone is everywhere: a nickname we gave a friend, else their
             // own name. A server nickname belongs to that server's messages and member list.
-            let nickname = self.state.lock().unwrap().users.get(&user.id).cloned();
+            let nickname = lock(&self.state).users.get(&user.id).cloned();
             files.push(user.avatar());
             people.push(user.person(nickname.as_deref()));
         }
@@ -779,7 +787,7 @@ impl Discord {
             self.presence(presence);
         }
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             let state = &mut *state;
             state.search.sent = None;
             if state.search.done.len() >= SEARCHED {

@@ -192,14 +192,14 @@ impl Pane {
                     .h(px(20.))
                     .px(px(6.))
                     .rounded(px(4.))
-                    .bg(if captions_active { theme::accent() } else { gpui::rgba(0x000000aa) })
+                    .bg(if captions_active { theme::accent() } else { theme::media_dim() })
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
                     .type_micro()
                     .font_weight(theme::SEMIBOLD)
-                    .text_color(gpui::white())
+                    .text_color(if captions_active { theme::on_accent() } else { theme::on_media() })
                     .tooltip(tip(if captions_active { "Hide captions" } else { "Show captions" }, None))
                     .child("CC")
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -234,9 +234,9 @@ impl Pane {
                                 .px(px(8.))
                                 .py(px(4.))
                                 .rounded(px(4.))
-                                .bg(gpui::rgba(0x000000bf))
+                                .bg(theme::media_dim())
                                 .type_small()
-                                .text_color(gpui::white())
+                                .text_color(theme::on_media())
                                 .child(caption),
                         );
                     }

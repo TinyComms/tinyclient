@@ -146,11 +146,11 @@ pub fn name_mark(c: &Conversation) -> Option<Div> {
                         .bg(theme::accent_soft())
                         .flex()
                         .items_center()
-                        .text_size(px(10.5))
+                        .text_size(px(11.))
                         .line_height(px(14.))
                         .font_weight(theme::SEMIBOLD)
-                        .text_color(theme::accent())
-                        .child("LIVE"),
+                        .text_color(theme::accent_text())
+                        .child("Live"),
                 );
             }
             if occ.is_scheduled() {
@@ -417,14 +417,15 @@ impl Shell {
         let avatar_size = theme::row_avatar();
         let mark_w = if name_mark(c).is_some() { 56. } else { 0. };
         let pin_w = if look.pin && c.pin.is_some() { 18. } else { 0. };
+        let scale = (13. + theme::text_step() as f32) / 13.;
         let room = self.sidebar_state.width.get() - 2. * theme::INSET - 16. - avatar_size - 10. - 12.
             - if look.mark { 20. } else { 0. }
             - pin_w
             - mark_w
-            - stamp.len() as f32 * 6.5
-            - title.chars().count().min(24) as f32 * 7.6;
+            - stamp.len() as f32 * 6.5 * scale
+            - title.chars().count().min(24) as f32 * 7.6 * scale;
         // Six letters and the ellipsis, or nothing.
-        let context = context.filter(|_| room > 6. * 7. + 14.);
+        let context = context.filter(|_| room > (6. * 7. + 14.) * scale);
         let has_context = context.is_some();
         let title_el = div()
             .min_w_0()
@@ -449,7 +450,7 @@ impl Shell {
                 Some(context) => line
                     .child(title_el)
                     .children(name_mark(c))
-                    .child(div().flex_1().min_w_0().truncate().type_ui().text_color(faint).child(one_line(&context).into_owned())),
+                    .child(div().flex_1().min_w_0().truncate().type_small().text_color(faint).child(format!("· {}", one_line(&context)))),
                 None => line.child(
                     div()
                         .flex_1()
@@ -484,6 +485,7 @@ impl Shell {
                     .min_w_0()
                     .flex()
                     .flex_col()
+                    .gap(px(2.))
                     .child(line_one)
                     .child(
                         div().h(theme::line(16.)).flex_none().overflow_hidden().flex().items_center().gap(px(6.))

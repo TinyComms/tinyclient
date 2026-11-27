@@ -108,11 +108,6 @@ set -eu
 src=$1 target=$2 profile=$3
 source "$HOME/.cargo/env"
 cd "$src"
-# chatd's build.rs says rerun-if-changed=telegram.env, a path cargo reads from crates/chatd. While
-# that file is missing cargo reruns the script and relinks chatd (about 3 minutes) on every build,
-# so make it exist. Nothing reads it there (the script's own lookup is at the workspace root), so
-# the binary is the same one the file's absence gives.
-[ -e crates/chatd/telegram.env ] || : > crates/chatd/telegram.env
 export CARGO_TARGET_DIR=$target
 flag=--release; dir=release
 [ "$profile" = dev ] && { flag=; dir=debug; }

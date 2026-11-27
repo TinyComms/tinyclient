@@ -530,68 +530,116 @@ impl Shell {
         let Some(overlay) = self.tiny_state.settings.as_ref() else {
             return div().into_any_element();
         };
+        let wide = f32::from(window.viewport_size().width);
+        let stacked_nav = wide < 680.;
+        let compact = wide < 820.;
+        let nav_w = if compact { 184. } else { 232. };
+        let pad_x = if compact { 16. } else { 40. };
         let shown = if overlay.page.visible(facts) { overlay.page } else { Page::Overview };
-        let mut nav_items = div()
-            .id("tiny-settings-nav-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px(px(12.))
-            .pb(px(16.))
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .child(
-                div()
-                    .px(px(8.))
-                    .pb(px(12.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(crate::gui::components::Avatar::named(&facts.name, 24.).shape(crate::gui::components::Shape::Place).image_at(facts.icon()).build())
-                    .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(facts.name.clone())),
-            );
-        let mut group = "";
-        for page in Page::ALL.into_iter().filter(|page| page.visible(facts)) {
-            if page.group() != group {
-                group = page.group();
-                nav_items = nav_items.child(div().h(px(28.)).px(px(8.)).pb(px(4.)).flex().items_end().type_micro().text_color(theme::text_faint()).child(group.to_uppercase()));
+        let nav_el = if stacked_nav {
+            let mut pills = div()
+                .id("tiny-settings-nav-strip")
+                .w_full()
+                .flex_none()
+                .px(px(pad_x))
+                .py(px(8.))
+                .bg(theme::sidebar())
+                .border_b_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.));
+            for page in Page::ALL.into_iter().filter(|page| page.visible(facts)) {
+                let on = page == shown;
+                let danger = page == Page::Danger;
+                pills = pills.child(
+                    div()
+                        .id(SharedString::from(format!("tiny-settings-nav-{}", page.label())))
+                        .role(gpui::Role::Tab)
+                        .aria_label(page.label())
+                        .aria_selected(on)
+                        .tab_index(0)
+                        .focus_visible(|style| style.shadow(theme::focus_ring()))
+                        .h(px(28.))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .cursor_pointer()
+                        .when(on, |row| row.bg(theme::selected()))
+                        .when(!on, |row| row.hover(|style| style.bg(theme::hover())))
+                        .on_click(cx.listener(move |this, _, _, cx| this.tiny_settings_page(page, cx)))
+                        .child(glyph(page.icon(), 14., if danger { theme::danger() } else if on { theme::text() } else { theme::text_soft() }))
+                        .child(div().type_small().text_color(if danger { theme::danger() } else if on { theme::text() } else { theme::text_soft() }).child(page.label())),
+                );
             }
-            let on = page == shown;
-            let danger = page == Page::Danger;
-            nav_items = nav_items.child(
-                div()
-                    .id(SharedString::from(format!("tiny-settings-nav-{}", page.label())))
-                    .role(gpui::Role::Tab)
-                    .aria_label(page.label())
-                    .aria_selected(on)
-                    .tab_index(0)
-                    .focus_visible(|style| style.shadow(theme::focus_ring()))
-                    .h(px(32.))
-                    .px(px(8.))
-                    .rounded(px(theme::R_CONTROL))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .cursor_pointer()
-                    .when(on, |row| row.bg(theme::selected()))
-                    .when(!on, |row| row.hover(|style| style.bg(theme::hover())))
-                    .on_click(cx.listener(move |this, _, _, cx| this.tiny_settings_page(page, cx)))
-                    .child(glyph(page.icon(), 16., if danger { theme::danger() } else if on { theme::text() } else { theme::text_soft() }))
-                    .child(div().type_ui().text_color(if danger { theme::danger() } else if on { theme::text() } else { theme::text_soft() }).child(page.label())),
-            );
-        }
-        let nav = div()
-            .w(px(232.))
-            .h_full()
-            .flex_none()
-            .bg(theme::sidebar())
-            .border_r_1()
-            .border_color(theme::hairline())
-            .flex()
-            .flex_col()
-            .child(crate::gui::layout::drags_window(div().h(px(48.)).w_full().flex_none()))
-            .child(nav_items);
+            pills.into_any_element()
+        } else {
+            let mut nav_items = div()
+                .id("tiny-settings-nav-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px(px(12.))
+                .pb(px(16.))
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(
+                    div()
+                        .px(px(8.))
+                        .pb(px(12.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(crate::gui::components::Avatar::named(&facts.name, 24.).shape(crate::gui::components::Shape::Place).image_at(facts.icon()).build())
+                        .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(facts.name.clone())),
+                );
+            let mut group = "";
+            for page in Page::ALL.into_iter().filter(|page| page.visible(facts)) {
+                if page.group() != group {
+                    group = page.group();
+                    nav_items = nav_items.child(div().h(px(28.)).px(px(8.)).pb(px(4.)).flex().items_end().type_micro().text_color(theme::text_faint()).child(group.to_uppercase()));
+                }
+                let on = page == shown;
+                let danger = page == Page::Danger;
+                nav_items = nav_items.child(
+                    div()
+                        .id(SharedString::from(format!("tiny-settings-nav-{}", page.label())))
+                        .role(gpui::Role::Tab)
+                        .aria_label(page.label())
+                        .aria_selected(on)
+                        .tab_index(0)
+                        .focus_visible(|style| style.shadow(theme::focus_ring()))
+                        .h(px(32.))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .cursor_pointer()
+                        .when(on, |row| row.bg(theme::selected()))
+                        .when(!on, |row| row.hover(|style| style.bg(theme::hover())))
+                        .on_click(cx.listener(move |this, _, _, cx| this.tiny_settings_page(page, cx)))
+                        .child(glyph(page.icon(), 16., if danger { theme::danger() } else if on { theme::text() } else { theme::text_soft() }))
+                        .child(div().min_w_0().truncate().type_ui().text_color(if danger { theme::danger() } else if on { theme::text() } else { theme::text_soft() }).child(page.label())),
+                );
+            }
+            div()
+                .w(px(nav_w))
+                .h_full()
+                .flex_none()
+                .bg(theme::sidebar())
+                .border_r_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_col()
+                .child(crate::gui::layout::drags_window(div().h(px(48.)).w_full().flex_none()))
+                .child(nav_items)
+                .into_any_element()
+        };
         let body = self.tiny_settings_body(shown, facts, window, cx);
         let dirty = self.tiny_settings_dirty(cx);
         let close = div()
@@ -618,24 +666,28 @@ impl Shell {
             .h(px(48.))
             .w_full()
             .flex_none()
-            .pl(px(40.))
-            .pr(px(chrome::corner_pad(window, 24.)))
+            .overflow_hidden()
+            .pl(px(pad_x))
+            .pr(px(chrome::corner_pad(window, if compact { 16. } else { 24. })))
             .flex()
             .items_center()
             .justify_between()
+            .gap(px(8.))
             .border_b_1()
             .border_color(theme::hairline())
-            .child(div().type_title().text_color(theme::text()).child(shown.label()))
+            .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(shown.label()))
             .child(close);
+        let mut header_opt = Some(header);
         let content = div()
             .flex_1()
             .min_w_0()
+            .min_h_0()
             .h_full()
             .relative()
             .flex()
             .flex_col()
             .bg(theme::canvas())
-            .child(header)
+            .children((!stacked_nav).then(|| header_opt.take()).flatten())
             .child(
                 div().flex_1().min_h_0().child(crate::gui::components::scroll_frame(
                     "tiny-settings-scroll-frame",
@@ -645,11 +697,11 @@ impl Shell {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&overlay.scroll)
-                        .child(div().w_full().max_w(px(740.)).px(px(40.)).pt(px(24.)).pb(px(120.)).child(body)),
+                        .child(div().w_full().max_w(px(740.)).px(px(pad_x)).pt(px(24.)).pb(px(120.)).child(body)),
                 )),
             )
             .when(dirty || overlay.error.is_some(), |content| {
-                content.child(div().absolute().bottom(px(20.)).left(px(40.)).right(px(40.)).flex().child(unsaved_bar(overlay.saving, overlay.error.clone(), self.tiny_settings_save_button(overlay.page), cx)))
+                content.child(div().absolute().bottom(px(20.)).left(px(pad_x)).right(px(pad_x)).flex().child(unsaved_bar(overlay.saving, overlay.error.clone(), self.tiny_settings_save_button(overlay.page), cx)))
             });
         div()
             .id("tiny-settings")
@@ -669,9 +721,11 @@ impl Shell {
             }))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.tiny_channels_slide_end()))
             .flex()
+            .when(stacked_nav, |root| root.flex_col())
             .font_family(theme::FONT)
             .text_color(theme::text())
-            .child(nav)
+            .children(header_opt)
+            .child(nav_el)
             .child(content)
             .into_any_element()
     }

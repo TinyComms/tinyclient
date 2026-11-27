@@ -91,33 +91,83 @@ fn waiting() -> SignInStep {
     SignInStep::Qr { link: String::new(), expires: 0, problem: None }
 }
 
-/// Computes a Telegram 2FA SRP proof (`InputCheckPasswordSRP`) for `password` by fetching
-/// fresh parameters from `account.getPassword`. Used by ownership transfer (`messages.editChatCreator`).
-pub(super) fn srp_proof(wire: &dyn Wire, password: &str) -> Result<tl::enums::InputCheckPasswordSrp, Fault> {
-    let tl::enums::account::Password::Password(asked) = wire::call(wire, &tl::functions::account::GetPassword {})?;
-    let (Some(tl::enums::PasswordKdfAlgo::Sha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow(algo)), Some(g_b), Some(srp_id)) =
-        (&asked.current_algo, asked.srp_b.clone(), asked.srp_id)
-    else {
-        return Err(Fault::Rpc { code: 400, name: "PASSWORD_REQUIRED".to_owned(), value: None });
-    };
-    if !(2..=7).contains(&algo.g) || !check_p_and_g(&algo.p, &algo.g) {
-        return Err(Fault::Net("Telegram sent untrusted SRP parameters for the password check.".to_owned()));
+#[derive(Debug)]
+enum SrpFault {
+    Missing,
+    Untrusted,
+    Local(String),
+}
+
+/// Validates Telegram SRP parameters before calling `grammers_crypto::two_factor_auth::calculate_2fa`:
+/// - `g` in `{2..=7}`
+/// - `p` is a 2048-bit safe prime (`p.len() == 256` AND high bit set `p[0] & 0x80 != 0`)
+/// - `0 < g_b < p` and `g_b.len() <= 256` (preventing both weak subgroups and `pad_to_256` panics)
+fn validate_srp_params(p: &[u8], g: i32, g_b: &[u8]) -> bool {
+    if !(2..=7).contains(&g) || p.len() != 256 || (p[0] & 0x80) == 0 || !check_p_and_g(p, &g) {
+        return false;
     }
-    let (salt1, salt2, p, g, secure_random, pw) = (
+    if g_b.is_empty() || g_b.len() > 256 {
+        return false;
+    }
+    let mut padded = [0u8; 256];
+    padded[256 - g_b.len()..].copy_from_slice(g_b);
+    padded != [0u8; 256] && padded.as_slice() < p
+}
+
+/// Computes a validated Telegram 2FA SRP proof using client CSPRNG entropy for `a`.
+fn compute_srp_proof(
+    asked: &tl::types::account::Password,
+    password: &str,
+) -> Result<tl::enums::InputCheckPasswordSrp, SrpFault> {
+    let (
+        Some(tl::enums::PasswordKdfAlgo::Sha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow(algo)),
+        Some(g_b),
+        Some(srp_id),
+    ) = (&asked.current_algo, asked.srp_b.clone(), asked.srp_id)
+    else {
+        return Err(SrpFault::Missing);
+    };
+    if !validate_srp_params(&algo.p, algo.g, &g_b) {
+        return Err(SrpFault::Untrusted);
+    }
+    // Generate 256 bytes of client CSPRNG secret `a` (failing closed on RNG error) and mix in
+    // Telegram's `secure_random` via XOR so `a` is never server-controlled and always 256 bytes.
+    let mut client_a = [0u8; 256];
+    getrandom::fill(&mut client_a)
+        .map_err(|err| SrpFault::Local(format!("OS random generator failed: {err}")))?;
+    for (dst, &src) in client_a.iter_mut().zip(asked.secure_random.iter()) {
+        *dst ^= src;
+    }
+    let (salt1, salt2, p, g, a, pw) = (
         algo.salt1.clone(),
         algo.salt2.clone(),
         algo.p.clone(),
         algo.g,
-        asked.secure_random.clone(),
+        client_a.to_vec(),
         password.as_bytes().to_vec(),
     );
+    // grammers' SRP bends a debug build's 256 KiB connection stack past its end, so the
+    // computation runs on its own thread with room to spare.
     let srp = std::thread::Builder::new()
-        .name("srp-transfer".into())
+        .name("srp".into())
         .stack_size(4 * 1024 * 1024)
-        .spawn(move || calculate_2fa(&salt1, &salt2, &p, &g, g_b, secure_random, &pw))
-        .map_err(|err| Fault::Net(err.to_string()))?;
-    let (m1, g_a) = srp.join().map_err(|_| Fault::Net("SRP calculation failed.".to_owned()))?;
+        .spawn(move || calculate_2fa(&salt1, &salt2, &p, &g, g_b, a, &pw))
+        .map_err(|err| SrpFault::Local(err.to_string()))?;
+    let (m1, g_a) = srp
+        .join()
+        .map_err(|_| SrpFault::Local("SRP calculation failed.".to_owned()))?;
     Ok(tl::types::InputCheckPasswordSrp { srp_id, a: g_a.to_vec(), m1: m1.to_vec() }.into())
+}
+
+/// Computes a Telegram 2FA SRP proof (`InputCheckPasswordSRP`) for `password` by fetching
+/// fresh parameters from `account.getPassword`. Used by ownership transfer (`messages.editChatCreator`).
+pub(super) fn srp_proof(wire: &dyn Wire, password: &str) -> Result<tl::enums::InputCheckPasswordSrp, Fault> {
+    let tl::enums::account::Password::Password(asked) = wire::call(wire, &tl::functions::account::GetPassword {})?;
+    compute_srp_proof(&asked, password).map_err(|err| match err {
+        SrpFault::Missing => Fault::Rpc { code: 400, name: "PASSWORD_REQUIRED".to_owned(), value: None },
+        SrpFault::Untrusted => Fault::Net("Telegram sent untrusted SRP parameters for the password check.".to_owned()),
+        SrpFault::Local(why) => Fault::Net(why),
+    })
 }
 
 /// Begins a sign-in, or with `input` answers the step on show. Answers the step to draw.
@@ -601,35 +651,23 @@ impl Flow {
             return self.password_step(from_qr, None);
         };
         let hint = asked.hint.clone().unwrap_or_default();
-        let (Some(tl::enums::PasswordKdfAlgo::Sha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow(algo)), Some(g_b), Some(srp_id)) =
-            (&asked.current_algo, asked.srp_b.clone(), asked.srp_id)
-        else {
-            return self.fail("This account's password is kept in a way this version of tinyclient does not know. Update tinyclient.");
-        };
         // Telegram's numbers are checked before anything is proved with them: a bad group
         // would give the password away.
-        if !(2..=7).contains(&algo.g) || !check_p_and_g(&algo.p, &algo.g) {
-            return self.fail("Telegram sent numbers that cannot be trusted for checking the password.");
-        }
-        // grammers' SRP bends a debug build's 256 KiB connection stack past its end, so the
-        // computation runs on its own thread with room to spare.
-        let srp = std::thread::Builder::new().name("srp".into()).stack_size(4 * 1024 * 1024).spawn({
-            let (salt1, salt2, p, g, secure_random, password) = (
-                algo.salt1.clone(),
-                algo.salt2.clone(),
-                algo.p.clone(),
-                algo.g,
-                asked.secure_random.clone(),
-                password.clone(),
-            );
-            move || calculate_2fa(&salt1, &salt2, &p, &g, g_b, secure_random, password.as_bytes())
-        })
-        .expect("the SRP thread");
-        let (m1, g_a) = srp.join().expect("the SRP thread");
+        let proof = compute_srp_proof(&asked, &password);
         drop(password);
-        let request = tl::functions::auth::CheckPassword {
-            password: tl::types::InputCheckPasswordSrp { srp_id, a: g_a.to_vec(), m1: m1.to_vec() }.into(),
+        let password_srp = match proof {
+            Ok(srp) => srp,
+            Err(SrpFault::Missing) => {
+                return self.fail("This account's password is kept in a way this version of tinyclient does not know. Update tinyclient.");
+            }
+            Err(SrpFault::Untrusted) => {
+                return self.fail("Telegram sent numbers that cannot be trusted for checking the password.");
+            }
+            Err(SrpFault::Local(why)) => {
+                return self.fail(&format!("Could not verify the password locally ({why})."));
+            }
         };
+        let request = tl::functions::auth::CheckPassword { password: password_srp };
         match wire::call(self.wire.as_ref(), &request) {
             Ok(authorization) => self.finish(authorization, false),
             Err(fault) => {
@@ -845,4 +883,96 @@ impl Flow {
 #[allow(dead_code)]
 pub(super) fn busy() -> bool {
     current().is_some() && scripted()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TELEGRAM_SRP_PRIME_HEX: &str = "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c3720fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f642477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a4a4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754fd17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae4e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b";
+
+    fn valid_prime() -> Vec<u8> {
+        let bytes = TELEGRAM_SRP_PRIME_HEX.as_bytes();
+        (0..256)
+            .map(|i| {
+                let nibble = |b: u8| match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    _ => 0,
+                };
+                (nibble(bytes[i * 2]) << 4) | nibble(bytes[i * 2 + 1])
+            })
+            .collect()
+    }
+
+    fn sample_password(p: Vec<u8>, g: i32, srp_b: Option<Vec<u8>>, secure_random: Vec<u8>) -> tl::types::account::Password {
+        let algo = tl::types::PasswordKdfAlgoSha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow {
+            salt1: vec![7; 8],
+            salt2: vec![9; 16],
+            g,
+            p,
+        };
+        tl::types::account::Password {
+            has_recovery: false,
+            has_secure_values: false,
+            has_password: true,
+            current_algo: Some(algo.clone().into()),
+            srp_b,
+            srp_id: Some(77),
+            hint: None,
+            email_unconfirmed_pattern: None,
+            new_algo: algo.into(),
+            new_secure_algo: tl::enums::SecurePasswordKdfAlgo::Unknown,
+            secure_random,
+            pending_reset_date: None,
+            login_email_pattern: None,
+        }
+    }
+
+    #[test]
+    fn srp_rejects_tiny_padded_prime_without_high_bit() {
+        let mut tiny_p = vec![0u8; 256];
+        tiny_p[255] = 47;
+        // grammers' check_p_and_g alone accepts this 6-bit prime!
+        assert!(check_p_and_g(&tiny_p, &3));
+        assert!(!validate_srp_params(&tiny_p, 3, &[5]));
+        let asked = sample_password(tiny_p, 3, Some(vec![5]), vec![3; 256]);
+        assert!(matches!(compute_srp_proof(&asked, "pw"), Err(SrpFault::Untrusted)));
+    }
+
+    #[test]
+    fn srp_rejects_out_of_range_or_oversized_g_b() {
+        let p = valid_prime();
+        assert!(!validate_srp_params(&p, 3, &[]));
+        assert!(!validate_srp_params(&p, 3, &[0u8; 256]));
+        assert!(!validate_srp_params(&p, 3, &p));
+        let mut p_plus_1 = p.clone();
+        p_plus_1[255] = p_plus_1[255].wrapping_add(1);
+        assert!(!validate_srp_params(&p, 3, &p_plus_1));
+        assert!(!validate_srp_params(&p, 3, &[1u8; 257]));
+
+        let asked_oversized = sample_password(p, 3, Some(vec![1u8; 257]), vec![3; 256]);
+        assert!(matches!(compute_srp_proof(&asked_oversized, "pw"), Err(SrpFault::Untrusted)));
+    }
+
+    #[test]
+    fn srp_uses_fresh_client_csprng_secret_and_tolerates_oversized_server_random() {
+        let p = valid_prime();
+        assert!(validate_srp_params(&p, 3, &[5u8; 256]));
+        // Oversized server secure_random (> 256 bytes) must not panic in pad_to_256.
+        let asked = sample_password(p, 3, Some(vec![5u8; 256]), vec![3u8; 300]);
+        let tl::enums::InputCheckPasswordSrp::Srp(first) = compute_srp_proof(&asked, "pw").expect("first proof") else {
+            panic!("expected Srp");
+        };
+        let tl::enums::InputCheckPasswordSrp::Srp(second) = compute_srp_proof(&asked, "pw").expect("second proof") else {
+            panic!("expected Srp");
+        };
+        assert_eq!(first.a.len(), 256);
+        assert_eq!(second.a.len(), 256);
+        assert_eq!(first.m1.len(), 32);
+        assert_ne!(
+            first.a, second.a,
+            "client SRP secret `a` must come from client CSPRNG, not server secure_random"
+        );
+    }
 }

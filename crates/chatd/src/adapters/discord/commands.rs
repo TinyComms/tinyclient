@@ -244,8 +244,9 @@ impl Discord {
         if files.is_empty() {
             return Ok(Vec::new());
         }
-        let mut upload = Upload::new(&self.ctx, channel, &snowflake_nonce(), files).map_err(super::super::Refusal::Refused)?;
-        self.upload(channel, &mut upload, None).map_err(super::super::Refusal::Refused)
+        let nonce = snowflake_nonce();
+        let mut upload = Upload::new(&self.ctx, channel, &nonce, files).map_err(super::super::Refusal::Refused)?;
+        self.upload(channel, &nonce, &mut upload, None).map_err(super::super::Refusal::Refused)
     }
 
     fn run_builtin(&self, channel: &str, name: &str, arguments: &[CommandArg]) -> Result<(), super::super::Refusal> {

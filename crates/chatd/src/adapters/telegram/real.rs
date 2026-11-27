@@ -19,12 +19,38 @@ use grammers_mtsender::{ConnectionParams, InvocationError, SenderPool};
 use grammers_session::types::{ChannelState, DcOption, PeerAuth, PeerId, PeerInfo, UpdateState, UpdatesState};
 use grammers_session::updates::UpdatesLike;
 use grammers_session::{BoxFuture, Session, SessionData};
-use grammers_tl_types as tl;
+use grammers_tl_types::{self as tl, Identifiable};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+/// Hard timeout for normal interactive/sync Telegram MTProto RPCs so half-open TCP sockets never hang.
+const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+/// Hard timeout for file transfer (`upload.*` / `messages.UploadMedia`) RPCs.
+const FILE_RPC_TIMEOUT: Duration = Duration::from_secs(45);
+/// Extra slack on the blocking `mpsc::Receiver::recv_timeout` beyond the async `tokio::time::timeout`.
+const RECV_SLACK: Duration = Duration::from_secs(5);
+
+fn rpc_timeout(body: &[u8]) -> Duration {
+    let Some(bytes) = body.get(..4).and_then(|slice| <[u8; 4]>::try_from(slice).ok()) else {
+        return RPC_TIMEOUT;
+    };
+    match u32::from_le_bytes(bytes) {
+        tl::functions::upload::SaveFilePart::CONSTRUCTOR_ID
+        | tl::functions::upload::SaveBigFilePart::CONSTRUCTOR_ID
+        | tl::functions::upload::GetFile::CONSTRUCTOR_ID
+        | tl::functions::upload::GetCdnFile::CONSTRUCTOR_ID
+        | tl::functions::upload::ReuploadCdnFile::CONSTRUCTOR_ID
+        | tl::functions::upload::GetFileHashes::CONSTRUCTOR_ID
+        | tl::functions::upload::GetCdnFileHashes::CONSTRUCTOR_ID
+        | tl::functions::upload::GetWebFile::CONSTRUCTOR_ID
+        | tl::functions::messages::UploadMedia::CONSTRUCTOR_ID => FILE_RPC_TIMEOUT,
+        _ => RPC_TIMEOUT,
+    }
+}
 
 /// Peers the library is told of and may ask back for (to fill a gap in a channel's updates).
 /// Past this the cache starts over; what it then lacks is learned again from the next answer
@@ -219,6 +245,7 @@ impl Session for Vault {
 struct Job {
     dc: Option<i32>,
     body: Vec<u8>,
+    timeout: Duration,
     reply: Sender<Result<Vec<u8>, Fault>>,
 }
 
@@ -343,8 +370,11 @@ async fn run(api_id: i32, vault: Arc<Vault>, mut jobs: UnboundedReceiver<Job>, e
         };
         let thin = handle.thin.clone();
         tokio::spawn(async move {
-            let answer = thin.invoke_in_dc(job.dc.unwrap_or(home), job.body).await;
-            let _ = job.reply.send(answer.map_err(fault));
+            let answer = match tokio::time::timeout(job.timeout, thin.invoke_in_dc(job.dc.unwrap_or(home), job.body)).await {
+                Ok(result) => result.map_err(fault),
+                Err(_) => Err(Fault::Net("Telegram request timed out".to_owned())),
+            };
+            let _ = job.reply.send(answer);
         });
     }
     following.abort();
@@ -356,12 +386,17 @@ impl Wire for Real {
     fn invoke(&self, dc: Option<i32>, body: Vec<u8>) -> Result<Vec<u8>, Fault> {
         let (reply, answer) = channel();
         let closed = || Fault::Net("the connection is closed".to_owned());
+        let timeout = rpc_timeout(&body);
         match self.jobs.lock().map_err(|_| closed())?.as_ref() {
-            Some(jobs) => jobs.send(Job { dc, body, reply }).map_err(|_| closed())?,
+            Some(jobs) => jobs.send(Job { dc, body, timeout, reply }).map_err(|_| closed())?,
             None => return Err(closed()),
         }
-        // The library answers every request, with an error once its connection is gone.
-        answer.recv().unwrap_or_else(|_| Err(Fault::Net("the connection is closed".to_owned())))
+        // Hard upper bound in case the runtime or socket stalls past the async timeout.
+        match answer.recv_timeout(timeout + RECV_SLACK) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(Fault::Net("Telegram request timed out".to_owned())),
+            Err(RecvTimeoutError::Disconnected) => Err(Fault::Net("the connection is closed".to_owned())),
+        }
     }
 
     fn events(&self) -> Option<Receiver<Event>> {

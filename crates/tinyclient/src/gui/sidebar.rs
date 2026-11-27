@@ -8,7 +8,7 @@ pub mod chat;
 pub mod history;
 pub mod hold;
 pub mod home;
-mod home_view;
+pub(super) mod home_view;
 pub mod inbox;
 mod inbox_view;
 pub mod pages;
@@ -22,9 +22,9 @@ mod voice_settings;
 pub(super) use voice_settings::discord_voice_editor;
 
 use super::components::{
-    badge_dot, badge_mention, banner, banner_action, button, empty_state, glyph, icon_button, keycap, list_row,
-    network_icon, pane_title, rollup_badge, row_badge, row_tone, segment, segmented, skeleton, tip, Avatar, ButtonKind,
-    Shape, Tone,
+    badge_dot, badge_mention, banner, banner_action, button, empty_state, fade_in, glyph, icon_button, keycap,
+    list_row, modal_layer, modal_layer_fit, network_icon, pane_title, place, placed, rollup_badge, row_badge,
+    row_tone, segment, segmented, skeleton, tip, Avatar, ButtonKind, Layer, Place, Shape, Tone,
 };
 use super::chrome::{self, End};
 use super::layout::{drags_window, Menu};
@@ -32,8 +32,9 @@ use super::state::{Shell, Snapshot, SpaceTree, TROUBLE_SHOWN};
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, Div, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListState,
-    MouseButton, ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, Window,
+    canvas, div, prelude::*, px, uniform_list, AnyElement, Bounds, Context, Div, Entity, FocusHandle, Focusable,
+    FontWeight, ListAlignment, ListState, MouseButton, Pixels, ScrollStrategy, SharedString, Stateful,
+    UniformListScrollHandle, Window,
 };
 use history::History;
 use pages::Pages;
@@ -173,6 +174,8 @@ pub struct State {
     /// The Slack workspace on show, and whether its menu is open.
     pub slack: Option<Key>,
     slack_menu: bool,
+    /// Captured window bounds of the Slack workspace header trigger for `placed(...)`.
+    slack_header: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     pub spaces_loaded: bool,
     /// Groups the user opened or closed against how they start, and what they revealed.
     opened: HashSet<String>,
@@ -196,7 +199,7 @@ pub struct State {
     /// The Space the unread walk is going into, and its direction, until its tree is read.
     walking: Option<(Key, bool)>,
     /// The sidebar's width as last drawn, for fitting a row's title.
-    width: std::cell::Cell<f32>,
+    pub(in crate::gui) width: std::cell::Cell<f32>,
     /// Drafts typed since their rows were read: chatd announces no change for `SetDraft`.
     drafts: HashMap<Key, String>,
     /// Friend requests waiting, for People's dot on the rail.
@@ -487,6 +490,7 @@ impl State {
             navigation: 0,
             slack: None,
             slack_menu: false,
+            slack_header: Rc::default(),
             spaces_loaded: false,
             opened: HashSet::new(),
             closed: HashSet::new(),
@@ -834,8 +838,10 @@ impl Shell {
                     snapshot.open = None;
                 }
                 self.sync_popout_composers(cx);
+                self.tiny_pick_channel(there.tiny_channel, cx);
+            } else {
+                self.tiny_state.channel = there.tiny_channel;
             }
-            self.tiny_pick_channel(there.tiny_channel, cx);
         }
         match there.open {
             Some((key, title)) if self.open.as_ref() != Some(&key) => self.open_now(key, &title, cx),
@@ -2001,20 +2007,59 @@ impl Shell {
                     .as_ref()
                     .and_then(|file| self.people_state.hub().file(&occupant.person.account(), file, cx).path.map(std::path::PathBuf::from))
                     .or_else(|| self.person_picture(&occupant.person, cx));
+                let speaking = occupant.speaking && !occupant.server_muted;
+                let avatar = super::call::ringed(
+                    Avatar::new(&occupant.person, &occupant.name, 20.).image_at(face).build(),
+                    20.,
+                    speaking,
+                );
+                let mut marks: Vec<(&'static str, gpui::Rgba, &'static str)> = Vec::new();
+                if occupant.streaming {
+                    marks.push(("icons/monitor-up.svg", theme::accent(), "Sharing screen"));
+                }
+                if occupant.camera {
+                    marks.push(("icons/video.svg", theme::accent(), "Camera on"));
+                }
+                if occupant.server_deafened {
+                    marks.push(("icons/headphone-off.svg", theme::danger(), "Server deafened"));
+                } else if occupant.deafened {
+                    marks.push(("icons/headphone-off.svg", theme::text_faint(), "Deafened"));
+                }
+                if occupant.server_muted {
+                    marks.push(("icons/mic-off.svg", theme::danger(), "Server muted"));
+                } else if occupant.suppressed {
+                    marks.push(("icons/mic-off.svg", theme::warning(), "Can't speak in this channel"));
+                } else if occupant.muted && !occupant.deafened && !occupant.server_deafened {
+                    marks.push(("icons/mic-off.svg", theme::text_faint(), "Muted"));
+                }
+                let status_cluster = (!marks.is_empty()).then(|| {
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .children(marks.into_iter().enumerate().map(|(mix, (icon, color, words))| {
+                            div()
+                                .id(("occ-mark", ix * 8 + mix))
+                                .tooltip(tip(words, None))
+                                .child(glyph(icon, 14., color))
+                        }))
+                });
+                let spacer_w = (16. * f32::from(*depth)).max(16.);
                 let content = div()
-                    .children(indent(*depth, 8.))
                     .gap(px(8.))
-                    .child(Avatar::new(&occupant.person, &occupant.name, 20.).image_at(face).build())
-                    .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(occupant.name.clone()))
-                    .when(occupant.streaming, |row| row.child(glyph("icons/monitor-up.svg", 14., theme::text_soft())))
-                    .when(occupant.camera, |row| row.child(glyph("icons/video.svg", 14., theme::text_soft())))
-                    .when(occupant.server_muted, |row| row.child(glyph("icons/mic-off.svg", 14., theme::danger())))
-                    .when(!occupant.server_muted && occupant.suppressed, |row| row.child(glyph("icons/mic-off.svg", 14., theme::warning())))
-                    .when(!occupant.server_muted && !occupant.suppressed && occupant.muted && !occupant.deafened && !occupant.server_deafened, |row| {
-                        row.child(glyph("icons/mic-off.svg", 14., theme::text_faint()))
-                    })
-                    .when(occupant.server_deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::danger())))
-                    .when(!occupant.server_deafened && occupant.deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::text_faint())))
+                    .child(div().w(px(spacer_w)).flex_none())
+                    .child(avatar)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .type_ui()
+                            .text_color(if speaking { theme::text() } else { theme::text_soft() })
+                            .child(occupant.name.clone()),
+                    )
+                    .children(status_cluster)
                     .children((phone && can_moderate).then(|| icon_button(("voice-phone-moderate", ix), "icons/ellipsis.svg", false)
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
@@ -2022,7 +2067,7 @@ impl Shell {
                             this.open_menu(Menu::VoiceOccupant(phone_source.clone(), phone_target.clone(), event.position()), cx);
                         }))));
                 let drag = VoiceMove { channel: channel.key.clone(), person: occupant.person.clone(), name: occupant.name.clone() };
-                list_row(row_id("occupant", &occupant.person), height, false, false, content)
+                list_row(row_id("occupant", &occupant.person), height, false, focused, content)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
                     .when(can_moderate, |row| row.on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                         this.open_menu(Menu::VoiceOccupant(source.clone(), target.clone(), event.position), cx);
@@ -2034,7 +2079,6 @@ impl Shell {
                 let lit = *collapsed && (rollup.attention > 0 || rollup.unread);
                 let dot = rollup_badge(rollup.attention, rollup.unread).filter(|_| *collapsed);
                 let chevron = if *collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" };
-                let group = SharedString::from(format!("group-{id}"));
                 let can_create = self.spaces.iter().any(|s| &s.key == space && s.can_create_channels);
                 let add_space = space.clone();
                 let add_group = id.clone();
@@ -2042,17 +2086,18 @@ impl Shell {
                 let menu_id = id.clone();
                 let menu_name = name.clone();
                 let menu_muted = *muted;
+                let discord = space.network == Network::Discord;
+                let phone = super::phone::active();
                 let add_btn = can_create.then(|| {
                     div()
                         .id((gpui::ElementId::from("group-add"), id.clone()))
-                        .size(px(18.))
+                        .size(px(if phone { 24. } else { 18. }))
                         .rounded(px(theme::R_CONTROL))
                         .flex()
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
-                        .invisible()
-                        .group_hover(group.clone(), |s| s.visible())
+                        .when(!phone, |btn| btn.invisible().group_hover("list-row", |s| s.visible()))
                         .hover(|s| s.bg(theme::hover()))
                         .tooltip(tip("Create channel…", None))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -2061,18 +2106,27 @@ impl Shell {
                         }))
                         .child(glyph("icons/plus.svg", 12., theme::text_faint()))
                 });
+                let label_text = if discord { name.to_uppercase() } else { name.clone() };
                 let content = div()
-                    .group(group.clone())
                     .children(indent(*depth, 4.))
                     .gap(px(4.))
-                    .child(div().min_w_0().truncate().type_micro().text_color(if lit { theme::text() } else { theme::text_faint() }).child(name.clone()))
-                    .child(glyph(chevron, 12., theme::text_faint()).when(!*collapsed, |chevron| chevron.invisible().group_hover(group, |style| style.visible())))
+                    .when(discord, |row| row.items_end().pb(px(3.)))
+                    .child(div().flex_none().when(discord, |el| el.pb(px(1.))).child(glyph(chevron, 12., theme::text_faint())))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .when(discord, |el| el.text_size(theme::sized(11.)).line_height(theme::sized(14.)).font_weight(theme::SEMIBOLD))
+                            .when(!discord, |el| el.type_micro())
+                            .text_color(if lit { theme::text() } else { theme::text_faint() })
+                            .child(label_text),
+                    )
                     .child(div().flex_1())
                     .children(add_btn)
                     .children(dot);
                 list_row((gpui::ElementId::from("group"), id.clone()), height, false, focused, content)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
-                    .when(space.network == Network::Discord, |row| {
+                    .when(discord, |row| {
                         row.on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -2094,25 +2148,25 @@ impl Shell {
         }
     }
 
-    /// The hover Join pill of a voice row: the header pill's look, shrunk to the row (07 §1).
-    /// Invisible until the row is hovered, so a plain view of the list stays quiet.
-    pub(super) fn join_pill(&self, conversation: &Conversation, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// The hover Join pill of a voice row: overlaid at the right edge on desktop hover so it
+    /// never steals horizontal width from voice channel names at rest; always visible on phone touch.
+    pub(super) fn join_pill(&self, conversation: &Conversation, selected: bool, cx: &mut Context<Self>) -> Div {
         let key = conversation.key.clone();
         let title = conversation.title.clone();
         let group_call = conversation.kind == ConversationKind::Group;
-        let hover_group = if group_call { "group-call" } else { "voice" };
         let icon = if group_call { "icons/phone.svg" } else { "icons/volume-2.svg" };
-        div()
+        let phone = super::phone::active();
+        let pill = div()
             .id(row_id("join", &key))
             .flex_none()
-            .h(px(20.))
-            .px(px(8.))
-            .rounded(px(10.))
+            .h(px(if phone { 30. } else { 22. }))
+            .px(px(if phone { 12. } else { 8. }))
+            .rounded(px(theme::R_CONTROL))
             .border_1()
             .flex()
             .items_center()
             .gap(px(5.))
-            .text_size(px(11.))
+            .text_size(px(if phone { 13. } else { 11. }))
             .font_weight(FontWeight::MEDIUM)
             .cursor_pointer()
             .bg(theme::raised())
@@ -2123,19 +2177,28 @@ impl Shell {
                 format!("Join {}. People there will see you arrive.", title),
                 None,
             ))
-            // A phone has no hover: there the pill is always on the row, at a thumb's size.
-            .map(|pill| {
-                if super::phone::active() {
-                    pill.h(px(30.)).px(px(12.)).rounded(px(15.)).text_size(px(13.))
-                } else {
-                    pill.invisible().group_hover(hover_group, |style| style.visible())
-                }
-            })
             // The press belongs to the pill: the row's open must not fire with it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
             .child(glyph(icon, 12., theme::text()))
-            .child("Join")
+            .child("Join");
+        if phone {
+            div().flex_none().child(pill)
+        } else {
+            let row_bg = theme::over(if selected { theme::selected() } else { theme::hover() }, theme::sidebar());
+            div()
+                .absolute()
+                .right(px(6.))
+                .top_0()
+                .bottom_0()
+                .pl(px(8.))
+                .bg(row_bg)
+                .flex()
+                .items_center()
+                .invisible()
+                .group_hover("list-row", |style| style.visible())
+                .child(pill)
+        }
     }
 
     /// A conversation in a tree, 28: glyph or avatar 20, the name, then what is going on.
@@ -2191,18 +2254,18 @@ impl Shell {
         let voice_join = joins_from_list(c) && !ours;
         let group_join = c.kind == ConversationKind::Group && c.call == CallSupport::Native && inside.is_some() && !ours;
         let show_join = voice_join || group_join;
-        let hover_group = if c.kind == ConversationKind::Group { "group-call" } else { "voice" };
         let count_icon = if c.kind == ConversationKind::Group { "icons/phone.svg" } else { "icons/volume-2.svg" };
         let voice_status = discord_voice_status(c);
         let activity = c.occupants.as_ref().and_then(|row| row.activity.as_ref()).map(|activity| super::call::discord_ux::activity_line(&activity.name));
         let stage_topic = c.occupants.as_ref().and_then(|row| (!row.stage_topic.is_empty()).then(|| row.stage_topic.clone()));
         let content = div()
+            .relative()
             // 16 a level less the gap after it (none at the top), as the tree's other rows.
             .children((depth > 0).then(|| div().flex_none().w(px(16. * f32::from(depth) - 8.))))
             .gap(px(8.))
             .child(leading)
             .child(
-                div().min_w_0().flex().flex_col()
+                div().flex_1().min_w_0().flex().flex_col()
                     .child(div().truncate().type_ui().font_weight(tone.weight).text_color(title_color).child(tree_title(c)))
                     .children(voice_status.as_ref().map(|status| self.voice_status_line(&c.key, status, cx)))
                     .children(stage_topic.as_ref().map(|topic| div().truncate().type_micro().text_color(faint).child(topic.clone())))
@@ -2210,14 +2273,12 @@ impl Shell {
             )
             .children(status.map(|emoji| div().flex_none().type_small().child(emoji)))
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
-            .child(div().flex_1())
-            .children(show_join.then(|| self.join_pill(c, cx)))
             .children(huddle.then(|| glyph("icons/headphones.svg", 14., theme::text_soft())))
             .children(draft)
             .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph(count_icon, 12., faint)).child(div().type_micro().text_color(if soft { theme::text_soft() } else { faint }).child(count))))
             .children(live.map(|line| div().flex_none().type_micro().text_color(faint).child(line)))
             .children(row_badge(c))
-            .when(show_join, |row| row.group(hover_group));
+            .children(show_join.then(|| self.join_pill(c, selected, cx)));
         let lines = u8::from(voice_status.is_some()) + u8::from(stage_topic.is_some()) + u8::from(activity.is_some());
         let height = match lines {
             0 => theme::ROW_ONE,
@@ -2388,8 +2449,45 @@ impl Shell {
         out
     }
 
+    /// Full-width compact segmented filter bar for stacked Inbox and narrow Discord/Slack headers.
+    fn segments_compact(
+        &self,
+        choices: &[(&'static str, &'static str, u32, bool)],
+        show_counts: bool,
+        cx: &mut Context<Self>,
+        pick: impl Fn(&mut Shell, usize, &mut Context<Shell>) + Clone + 'static,
+    ) -> Div {
+        let mut out = super::components::segmented_compact();
+        for (ix, (id, label, count, on)) in choices.iter().copied().enumerate() {
+            let pick = pick.clone();
+            let counted = (count > 0 && show_counts).then(|| {
+                let words = if count > 99 { "99+".to_owned() } else { count.to_string() };
+                div()
+                    .flex_none()
+                    .ml(px(4.))
+                    .text_size(px(11.))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(if on { theme::text() } else { theme::text_faint() })
+                    .child(words)
+            });
+            let mention_tip = (label == "Mentions" && count > 0).then(|| {
+                if count == 1 { "1 conversation mentions you".to_owned() } else { format!("{count} conversations mention you") }
+            });
+            out = out.child(
+                super::components::segment_compact(id, label, on)
+                    .children(counted)
+                    .when_some(mention_tip, |segment, words| segment.tooltip(tip(words, None)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| pick(this, ix, cx))),
+            );
+        }
+        out
+    }
+
     fn title_strip(&self, mode: &Mode, window: &Window, cx: &mut Context<Self>) -> Div {
-        let strip = drags_window(div()).h(px(theme::STRIP)).flex_none().pl(px(theme::PANE_PAD)).pr(px(chrome::end_pad(End::List, 12.))).flex().items_center().gap(px(8.));
+        let end_pad = chrome::end_pad(End::List, 12.);
+        let effective_width = (self.sidebar_state.width.get() - end_pad + 12.).max(0.);
+        let strip = drags_window(div()).h(px(theme::STRIP)).flex_none().overflow_hidden().pl(px(theme::PANE_PAD)).pr(px(end_pad)).flex().items_center().gap(px(8.));
         let quiet = |button: Stateful<Div>| button.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         let back = |id: &'static str, words: String, cx: &mut Context<Self>| {
             quiet(icon_button(id, "icons/chevron-left.svg", false))
@@ -2406,6 +2504,20 @@ impl Shell {
                             .on_click(cx.listener(move |this, _, _, cx| this.begin_forum_post(&forum, cx))),
                     )
                 }
+                home::Drill::Unreads(_) if !self.sidebar_state.home.unreads.is_empty() => Some(
+                    quiet(icon_button("unreads-mark-all", "icons/check-check.svg", false))
+                        .tooltip(tip("Mark all as read", None))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let space = match &this.sidebar_state.drill {
+                                Some(home::Drill::Unreads(space)) => space.clone(),
+                                _ => None,
+                            };
+                            let network = space.as_ref().map(|s| s.network).or(this.sidebar_state.home.network);
+                            this.sidebar_state.home.unreads.clear();
+                            this.rebuild_home(cx);
+                            this.off_thread(cx, move || ask(&Request::MarkAllRead { network, space, folder: None }), |_, _, _| {});
+                        })),
+                ),
                 _ => None,
             };
             let title = match drill {
@@ -2457,7 +2569,7 @@ impl Shell {
                 };
                 let has_unread = counts.unread > 0 || counts.mentions > 0;
                 let fit = inbox_strip_fit(
-                    self.sidebar_state.width.get(),
+                    effective_width,
                     super::phone::active(),
                     if super::phone::active() { super::phone::tokens::text_scale() } else { 1. },
                     has_unread,
@@ -2469,19 +2581,20 @@ impl Shell {
                         .tooltip(tip("Mark all as read", None))
                         .on_click(cx.listener(|this, _, _, cx| this.mark_all_read(cx)))
                 });
-                let segments = self.segments(&choices, fit.counts, cx, pick);
                 if fit.stacked {
+                    let segments = self.segments_compact(&choices, fit.counts, cx, pick);
                     return div()
                         .flex_none()
                         .flex()
                         .flex_col()
                         .child(strip.child(title).child(div().flex_1()).children(mark))
-                        .child(div().flex_none().px(px(theme::PANE_PAD)).pb(px(8.)).flex().child(segments));
+                        .child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().child(segments));
                 }
+                let segments = self.segments(&choices, fit.counts, cx, pick);
                 strip.child(title).child(segments).child(div().flex_1()).children(mark)
             }
             Mode::People => strip.child(pane_title("People")),
-            Mode::Network(Network::Slack) => self.slack_title(strip, cx),
+            Mode::Network(Network::Slack) => self.slack_title(strip, effective_width, cx),
             // A Tiny server's strip is its header: its icon and name, which open its menu.
             Mode::Network(Network::Tiny) if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.link(Network::Tiny) == Link::Connected) => {
                 strip.child(self.tiny_header(cx))
@@ -2515,7 +2628,7 @@ impl Shell {
                     Network::Discord => {
                         let unread = self.sidebar_state.home_unread;
                         let choices = [("home-all", "All", 0, !unread), ("home-unread", "Unread", self.sidebar_state.home_news, unread)];
-                        let strip = strip.child(
+                        let top = strip.child(
                             div()
                                 .id("network-name")
                                 .flex_1()
@@ -2530,7 +2643,17 @@ impl Shell {
                                 .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(network.label()))
                                 .child(glyph("icons/chevron-down.svg", 12., theme::text_faint())),
                         );
-                        strip.child(self.segments(&choices, self.sidebar_state.width.get() >= 300., cx, |this, ix, cx| this.set_home_unread(ix == 1, cx)))
+                        if effective_width < 320. {
+                            let tabs = self.segments_compact(&choices, effective_width >= 240., cx, |this, ix, cx| this.set_home_unread(ix == 1, cx));
+                            div()
+                                .flex_none()
+                                .flex()
+                                .flex_col()
+                                .child(top)
+                                .child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().child(tabs))
+                        } else {
+                            top.child(self.segments(&choices, effective_width >= 300., cx, |this, ix, cx| this.set_home_unread(ix == 1, cx)))
+                        }
                     }
                     _ => strip.child(pane_title(network.label())).child(
                         quiet(icon_button("network-menu", "icons/ellipsis.svg", false))
@@ -2568,7 +2691,7 @@ impl Shell {
     }
 
     /// The Slack home's strip: the workspace is the title and its switcher (`02` §5).
-    fn slack_title(&self, strip: Div, cx: &mut Context<Self>) -> Div {
+    fn slack_title(&self, strip: Div, effective_width: f32, cx: &mut Context<Self>) -> Div {
         let Some(key) = self.slack_space() else {
             return strip.child(network_icon(Network::Slack, 20.)).child(pane_title("Slack"));
         };
@@ -2588,28 +2711,49 @@ impl Shell {
         let unread = self.sidebar_state.home_unread;
         let news = self.trees.get(&key).map_or(0, |tree| tree.conversations.iter().filter(|c| c.badge() != Badge::None).count() as u32);
         let choices = [("slack-all", "All", 0, !unread), ("slack-unread", "Unread", news, unread)];
-        strip
-            .child(
-                div()
-                    .id("slack-workspace")
-                    .flex_1()
-                    .min_w_0()
-                    .h(px(28.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar_state.slack_menu = !this.sidebar_state.slack_menu;
-                        cx.notify();
-                    }))
-                    .child(Avatar::new(&key, &name, 20.).shape(Shape::Place).image_at(icon).build())
-                    .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(name))
-                    .child(glyph("icons/chevron-down.svg", 12., theme::text_faint()))
-                    .children(elsewhere),
-            )
-            .child(self.segments(&choices, self.sidebar_state.width.get() >= 300., cx, |this, ix, cx| this.set_home_unread(ix == 1, cx)))
+        let header_bounds = self.sidebar_state.slack_header.clone();
+        let top = strip.child(
+            div()
+                .id("slack-workspace")
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.slack_menu = !this.sidebar_state.slack_menu;
+                    cx.notify();
+                }))
+                .child(Avatar::new(&key, &name, 20.).shape(Shape::Place).image_at(icon).build())
+                .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(name))
+                .child(glyph("icons/chevron-down.svg", 12., theme::text_faint()))
+                .children(elsewhere)
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            header_bounds.set(Some(bounds));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                ),
+        );
+        if effective_width < 320. {
+            let tabs = self.segments_compact(&choices, effective_width >= 240., cx, |this, ix, cx| this.set_home_unread(ix == 1, cx));
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .child(top)
+                .child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().child(tabs))
+        } else {
+            top.child(self.segments(&choices, effective_width >= 300., cx, |this, ix, cx| this.set_home_unread(ix == 1, cx)))
+        }
     }
 
     /// The mentions of me in these workspaces, from the rows the shell holds: their trees where
@@ -2621,17 +2765,17 @@ impl Shell {
         trees.chain(self.sidebar_state.inbox.all().iter()).filter(inside).filter(|c| seen.insert(c.key.clone())).map(|c| c.mentions).sum()
     }
 
-    /// The Slack header's menu: the workspaces, then signing out of this one.
+    /// The Slack header's menu rows (shared between the desktop `placed` menu and the phone sheet).
     // CONTRACT: status, pause notifications, away and "Open in Slack" have no request behind
     // them in the protocol, so the menu holds the workspaces and sign-out only.
-    fn slack_menu(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn slack_menu_body(&self, cx: &mut Context<Self>) -> Option<Div> {
         if !self.sidebar_state.slack_menu {
             return None;
         }
         let current = self.slack_space();
         let snapshot = self.snapshot.as_ref()?;
         let phone = super::phone::active();
-        let mut menu = if phone { div().w_full().flex().flex_col() } else { super::components::menu().w(px(280.)) };
+        let mut menu = div().w_full().flex().flex_col();
         let workspaces: Vec<&protocol::Space> = self.spaces.iter().filter(|s| s.key.network == Network::Slack).collect();
         if workspaces.len() > 1 {
             menu = menu.child(super::components::menu_label("Workspaces"));
@@ -2725,22 +2869,57 @@ impl Shell {
                 this.sign_out(account, false, cx);
             }
         })));
-        if phone {
-            // A phone's menu is a sheet over the whole screen, drawn by `phone_slack_sheet`.
-            return Some(menu);
-        }
-        Some(
-            div()
-                .absolute()
-                .top(px(theme::STRIP - 6.))
-                .left(px(12.))
-                .occlude()
+        Some(menu)
+    }
+
+    /// The Slack header's menu on desktop: placed below the workspace header at `Layer::Menu` so it
+    /// never clips against narrow sidebars or overflows short windows.
+    fn slack_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let body = self.slack_menu_body(cx)?;
+        let anchor = self.sidebar_state.slack_header.get().unwrap_or_else(|| {
+            place::anchor(super::layout::RAIL_WIDTH + 12., 12., 200., 28.)
+        });
+        let panel = fade_in(
+            "slack-menu-fade",
+            120,
+            super::components::menu()
+                .w(px(280.))
+                .max_w_full()
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.sidebar_state.slack_menu = false;
                     cx.notify();
                 }))
-                .child(menu),
-        )
+                .child(body),
+        );
+        Some(placed("slack-menu", Place::Below(anchor), Layer::Menu, window, panel))
+    }
+
+    /// Closes any open sidebar modal (in top-down order). Used by `Shell::close_top` on `Esc`.
+    pub(super) fn close_sidebar_modal(&mut self, cx: &mut Context<Self>) -> bool {
+        let state = &mut self.sidebar_state;
+        if state.create_invite.take().is_some()
+            || state.join_server.take().is_some()
+            || state.conference_link.take().is_some()
+            || state.create_server.take().is_some()
+            || state.events_modal.take().is_some()
+            || state.server_gate.take().is_some()
+            || state.leave_space.take().is_some()
+            || state.delete_channel.take().is_some()
+            || state.move_channels.take().is_some()
+            || state.edit_channel.take().is_some()
+            || state.create_category.take().is_some()
+            || state.create_channel.take().is_some()
+            || state.browse_channels.take().is_some()
+            || state.folder_edit.take().is_some()
+            || state.forum_post.take().is_some()
+            || state.voice_status.take().is_some()
+            || state.voice_move.take().is_some()
+            || state.voice_settings.take().is_some()
+        {
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     /// Closes the Slack header's menu. False when it was not open.
@@ -2780,7 +2959,7 @@ impl Shell {
 
     /// The Slack header's menu on a phone: the same rows as a bottom sheet over the screen.
     pub(in crate::gui) fn phone_slack_sheet(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
-        let body = self.slack_menu(cx)?;
+        let body = self.slack_menu_body(cx)?;
         let tall = f32::from(window.viewport_size().height);
         let close = cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
             this.sidebar_state.slack_menu = false;
@@ -2990,7 +3169,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn browse_channels_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn browse_channels_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.browse_channels.as_ref()?;
         let space_row = self.spaces.iter().find(|s| s.key == modal.space);
         let opt_in_on = space_row.is_some_and(|s| s.opt_in_channels);
@@ -3171,22 +3350,15 @@ impl Shell {
             .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
             .child(list);
 
-        Some(
-            div()
-                .id("browse-channels-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.browse_channels = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "browse-channels-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.browse_channels = None;
+                cx.notify();
+            }),
+        ))
     }
 
     /// Open the "Leave server" confirmation modal for a Space.
@@ -3219,7 +3391,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn leave_space_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn leave_space_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (space, name) = self.sidebar_state.leave_space.as_ref()?;
         let is_teams = space.network == Network::Teams;
         let leave_btn = if is_teams { "Leave team" } else { "Leave server" };
@@ -3263,22 +3435,15 @@ impl Shell {
                         cx.listener(|this, _, _, cx| this.confirm_leave_space(cx)),
                     )),
             );
-        Some(
-            div()
-                .id("leave-space-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.leave_space = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "leave-space-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.leave_space = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(in crate::gui) fn open_create_invite(&mut self, target: CreateInviteTarget, cx: &mut Context<Self>) {
@@ -3401,7 +3566,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn create_invite_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn create_invite_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.create_invite.as_ref()?;
         let (heading, is_friend) = match &modal.target {
             CreateInviteTarget::Space(_, name) => (format!("Invite people to {name}"), false),
@@ -3668,22 +3833,15 @@ impl Shell {
                     ))),
             );
 
-        Some(
-            div()
-                .id("create-invite-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.create_invite = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "create-invite-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.create_invite = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn open_join_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
@@ -3854,7 +4012,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn conference_link_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn conference_link_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.conference_link.as_ref()?;
         let heading = modal
             .info
@@ -3929,22 +4087,15 @@ impl Shell {
                         }),
                     ),
             );
-        Some(
-            div()
-                .id("conference-link-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.conference_link = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "conference-link-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.conference_link = None;
+                cx.notify();
+            }),
+        ))
     }
 
     fn preview_join_server(&mut self, cx: &mut Context<Self>) {
@@ -4057,7 +4208,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn join_server_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn join_server_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.join_server.as_ref()?;
         let is_teams = modal.account.network == Network::Teams;
         let modal_title = if is_teams { "Join a team" } else { "Join a server" };
@@ -4145,22 +4296,15 @@ impl Shell {
                         }),
                     ),
             );
-        Some(
-            div()
-                .id("join-server-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.join_server = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "join-server-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.join_server = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn open_create_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
@@ -4254,7 +4398,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn create_server_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn create_server_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.create_server.as_ref()?;
         let trimmed = modal.name.read(cx).text().trim().chars().count();
         let ready = (2..=100).contains(&trimmed) && !modal.busy;
@@ -4360,22 +4504,15 @@ impl Shell {
                         }),
                     ),
             );
-        Some(
-            div()
-                .id("create-server-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.create_server = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "create-server-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.create_server = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(in crate::gui) fn load_space_events(&mut self, space: Key, cx: &mut Context<Self>) {
@@ -4554,7 +4691,7 @@ impl Shell {
         Some(strip)
     }
 
-    pub(in crate::gui) fn events_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn events_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.events_modal.as_ref()?;
         let space = modal.space.clone();
         let space_name = self
@@ -4735,22 +4872,15 @@ impl Shell {
             )
             .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
             .child(list);
-        Some(
-            div()
-                .id("space-events-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.events_modal = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "space-events-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.events_modal = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn open_server_gate(&mut self, space: Key, cx: &mut Context<Self>) {
@@ -4927,7 +5057,7 @@ impl Shell {
         });
     }
 
-    pub(in crate::gui) fn server_gate_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn server_gate_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.server_gate.as_ref()?;
         let gate = modal.gate.clone();
         let busy = modal.busy;
@@ -5093,22 +5223,15 @@ impl Shell {
                         )
                     }),
             );
-        Some(
-            div()
-                .id("server-gate-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.server_gate = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "server-gate-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.server_gate = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn open_create_channel(&mut self, space: Key, group: Option<String>, cx: &mut Context<Self>) {
@@ -5340,7 +5463,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn create_channel_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn create_channel_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.create_channel.as_ref()?;
         let ready = !modal.name.read(cx).text().trim().is_empty();
         let is_discord = modal.space.network == Network::Discord;
@@ -5469,22 +5592,15 @@ impl Shell {
                         .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_create_channel(cx)))),
                     ),
             );
-        Some(
-            div()
-                .id("create-channel-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.create_channel = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "create-channel-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.create_channel = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn open_create_category(&mut self, space: Key, cx: &mut Context<Self>) {
@@ -5551,7 +5667,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn create_category_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn create_category_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.create_category.as_ref()?;
         let ready = !modal.name.read(cx).text().trim().is_empty() && !modal.busy;
         let name_focused = modal.name.focus_handle(cx).is_focused(window);
@@ -5593,22 +5709,15 @@ impl Shell {
                         .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_create_category(cx)))),
                     ),
             );
-        Some(
-            div()
-                .id("create-category-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.create_category = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "create-category-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.create_category = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn open_voice_status(&mut self, row: &Conversation, cx: &mut Context<Self>) {
@@ -5679,60 +5788,52 @@ impl Shell {
         }).detach();
     }
 
-    pub(super) fn voice_status_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(super) fn voice_status_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.voice_status.as_ref()?;
         let input_focused = modal.input.focus_handle(cx).is_focused(window);
-        Some(
-            div()
-                .id("voice-status-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.voice_status = None;
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .id("voice-status-card")
-                        .p(px(16.))
-                        .w(px(380.))
-                        .max_w_full()
-                        .bg(theme::overlay())
-                        .rounded(px(theme::R_MODAL))
-                        .border_1()
-                        .border_color(theme::overlay_edge())
-                        .shadow(theme::shadow_modal())
-                        .flex()
-                        .flex_col()
-                        .gap(px(10.))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(div().type_title().child("Set channel status"))
-                        .child(
-                            crate::gui::components::field(input_focused)
-                                .child(div().flex_1().min_w_0().child(modal.input.clone())),
-                        )
-                        .children(modal.error.iter().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap(px(8.))
-                                .child(button("voice-status-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
-                                    this.sidebar_state.voice_status = None;
-                                    cx.notify();
-                                })))
-                                .child(
-                                    button("voice-status-save", ButtonKind::Primary, if modal.saving { "Saving…" } else { "Save" })
-                                        .when(!modal.saving, |button| button.on_click(cx.listener(|this, _, _, cx| this.save_voice_status(cx)))),
-                                ),
-                        ),
-                ),
-        )
+        let card = div()
+            .id("voice-status-card")
+            .p(px(16.))
+            .w(px(380.))
+            .max_w_full()
+            .bg(theme::overlay())
+            .rounded(px(theme::R_MODAL))
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().child("Set channel status"))
+            .child(
+                crate::gui::components::field(input_focused)
+                    .child(div().flex_1().min_w_0().child(modal.input.clone())),
+            )
+            .children(modal.error.iter().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("voice-status-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.voice_status = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button("voice-status-save", ButtonKind::Primary, if modal.saving { "Saving…" } else { "Save" })
+                            .when(!modal.saving, |button| button.on_click(cx.listener(|this, _, _, cx| this.save_voice_status(cx)))),
+                    ),
+            );
+        Some(modal_layer(
+            "voice-status-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.voice_status = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn discord_voice_row(&self, key: &Key) -> Option<Conversation> {
@@ -5824,7 +5925,7 @@ impl Shell {
         items
     }
 
-    pub(super) fn voice_move_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(super) fn voice_move_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let target = self.sidebar_state.voice_move.clone()?;
         let rooms = self.voice_move_rooms(&target.channel);
         let choices = rooms.into_iter().enumerate().map(|(ix, room)| {
@@ -5836,42 +5937,33 @@ impl Shell {
                     this.send_voice_move(&target, Some(key.clone()), cx);
                 }))
         }).collect::<Vec<_>>();
-        Some(
-            div()
-                .id("voice-move-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.voice_move = None;
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .p(px(16.))
-                        .w(px(380.))
-                        .max_w_full()
-                        .bg(theme::overlay())
-                        .rounded(px(theme::R_MODAL))
-                        .border_1()
-                        .border_color(theme::overlay_edge())
-                        .shadow(theme::shadow_modal())
-                        .flex()
-                        .flex_col()
-                        .gap(px(10.))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(div().type_title().child(if target.name.is_empty() { "Move to channel".to_owned() } else { format!("Move {}", target.name) }))
-                        .child(div().id("voice-move-rooms").max_h(px(280.)).overflow_y_scroll().children(choices))
-                        .child(div().flex().justify_end().child(button("voice-move-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_state.voice_move = None;
-                            cx.notify();
-                        })))),
-                ),
-        )
+        let card = div()
+            .p(px(16.))
+            .w(px(380.))
+            .max_w_full()
+            .bg(theme::overlay())
+            .rounded(px(theme::R_MODAL))
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().child(if target.name.is_empty() { "Move to channel".to_owned() } else { format!("Move {}", target.name) }))
+            .child(div().id("voice-move-rooms").max_h(px(280.)).overflow_y_scroll().children(choices))
+            .child(div().flex().justify_end().child(button("voice-move-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                this.sidebar_state.voice_move = None;
+                cx.notify();
+            }))));
+        Some(modal_layer_fit(
+            "voice-move-backdrop",
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.voice_move = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn open_edit_channel(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
@@ -6056,7 +6148,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn edit_channel_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn edit_channel_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.edit_channel.as_ref()?;
         let ready = !modal.name.read(cx).text().trim().is_empty() && !modal.busy;
         let is_category = modal.is_category;
@@ -6190,22 +6282,15 @@ impl Shell {
                         .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_edit_channel(cx)))),
                     ),
             );
-        Some(
-            div()
-                .id("edit-channel-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.edit_channel = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "edit-channel-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.edit_channel = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn open_move_channels(&mut self, space: Key, cx: &mut Context<Self>) {
@@ -6318,7 +6403,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn move_channels_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn move_channels_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.move_channels.as_ref()?;
         let categories = modal.categories.clone();
         let len = modal.items.len();
@@ -6462,22 +6547,14 @@ impl Shell {
                         .when(!modal.busy, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_move_channels(cx)))),
                     ),
             );
-        Some(
-            div()
-                .id("move-channels-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.move_channels = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer_fit(
+            "move-channels-backdrop",
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.move_channels = None;
+                cx.notify();
+            }),
+        ))
     }
 
     pub(super) fn open_delete_channel(&mut self, target: Key, name: String, is_category: bool, cx: &mut Context<Self>) {
@@ -6555,7 +6632,7 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn delete_channel_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn delete_channel_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.delete_channel.as_ref()?;
         let matches_name = modal.confirm.read(cx).text().trim() == modal.name && !modal.busy;
         let kind_word = if modal.is_category { "category" } else { "channel" };
@@ -6604,25 +6681,18 @@ impl Shell {
                         .when(matches_name, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_delete_channel(cx)))),
                     ),
             );
-        Some(
-            div()
-                .id("delete-channel-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.delete_channel = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "delete-channel-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.delete_channel = None;
+                cx.notify();
+            }),
+        ))
     }
 
-    pub(in crate::gui) fn folder_edit_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn folder_edit_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.folder_edit.as_ref()?;
         let name_focused = modal.name.focus_handle(cx).is_focused(window);
         let card = div()
@@ -6663,25 +6733,18 @@ impl Shell {
                             .on_click(cx.listener(|this, _, _, cx| this.submit_folder_rename(cx))),
                     ),
             );
-        Some(
-            div()
-                .id("folder-edit-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.folder_edit = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "folder-edit-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.folder_edit = None;
+                cx.notify();
+            }),
+        ))
     }
 
-    pub(in crate::gui) fn forum_post_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn forum_post_modal(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.sidebar_state.forum_post.as_ref()?;
         let title = modal.title.clone();
         let text = modal.text.clone();
@@ -6796,28 +6859,21 @@ impl Shell {
                             .when(ready, |button| button.on_click(cx.listener(|this, _, _, cx| this.submit_forum_post(cx)))),
                     ),
             );
-        Some(
-            div()
-                .id("forum-post-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_state.forum_post = None;
-                    cx.notify();
-                }))
-                .child(card),
-        )
+        Some(modal_layer(
+            "forum-post-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| {
+                this.sidebar_state.forum_post = None;
+                cx.notify();
+            }),
+        ))
     }
 
     /// The persistent Discord parent column, using the same home list and scroll state.
     pub(super) fn discord_overview(&self, snapshot: &Snapshot, width: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
         self.sidebar_state.width.set(width);
-        div().w(px(width)).h_full().flex_none().bg(theme::sidebar()).border_r_1().border_color(theme::hairline()).child(
+        div().w(px(width)).h_full().flex_none().overflow_hidden().bg(theme::sidebar()).border_r_1().border_color(theme::hairline()).child(
             div().id("discord-overview").size_full().flex().flex_col()
                 .child(self.title_strip(&Mode::Network(Network::Discord), window, cx))
                 .child(self.jump_strip(cx))
@@ -6845,9 +6901,7 @@ impl Shell {
     pub(super) fn sidebar(&self, snapshot: &Snapshot, width: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let people = self.sidebar_state.mode == Mode::People;
         let tiny = matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny));
-        if !matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
-            self.sidebar_state.width.set(width);
-        }
+        self.sidebar_state.width.set(width);
         let body = if people {
             let drawn = self.slots.people.and_then(|draw| draw(self, window, cx));
             drawn.unwrap_or_else(|| empty_state("icons/users.svg", "People", "Friends and contacts show up here.").px(px(24.)).into_any_element())
@@ -6862,6 +6916,7 @@ impl Shell {
             .w(px(width))
             .h_full()
             .flex_none()
+            .overflow_hidden()
             .flex()
             .flex_col()
             .bg(theme::sidebar())
@@ -6896,7 +6951,7 @@ impl Shell {
             .children(super::playing::draw(self, window, cx))
             .children(self.slots.call_dock.and_then(|draw| draw(self, window, cx)))
             .children(tiny.then(|| self.tiny_user_panel(cx)).flatten())
-            .when(!phone, |sidebar| sidebar.children(self.slack_menu(cx)))
+            .when(!phone, |sidebar| sidebar.children(self.slack_menu(window, cx)))
     }
 }
 

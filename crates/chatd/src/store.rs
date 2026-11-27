@@ -229,6 +229,8 @@ const TABLES: &str = "
         -- An encrypted message shares its minute and a plaintext message its second, so this
         -- is what keeps a burst in the order it was posted. The id is not that order.
         seq          INTEGER NOT NULL DEFAULT 0,
+        -- 1 when `outgoing` is true and `reactions` is non-empty, for indexed Inbox Activity checks.
+        reacted_mine INTEGER NOT NULL DEFAULT 0,
         -- The rest of the message as the protocol's JSON: sender, ranges, attachments, link
         -- previews, reactions, reply, thread summary, flags.
         body         TEXT NOT NULL,
@@ -237,6 +239,8 @@ const TABLES: &str = "
     CREATE INDEX message_by_time ON message (network, account, conversation, sent);
     CREATE INDEX message_unsent ON message (pending) WHERE pending != 0;
     CREATE INDEX message_expires ON message (expires) WHERE expires IS NOT NULL;
+    CREATE INDEX message_client_id ON message (network, account, conversation, client_id) WHERE client_id IS NOT NULL;
+    CREATE INDEX message_reacted_mine ON message (network, account, conversation) WHERE reacted_mine = 1;
     -- Earlier wordings, only where a network's own history was stored. A live edit does not write here.
     CREATE TABLE revision (
         network      TEXT NOT NULL,
@@ -349,7 +353,7 @@ const IN_INBOX: &str = "(NOT c.hidden AND c.special != 'request'
 const IS_UNREAD: &str = "(((c.unread > 0 AND NOT c.bot AND NOT c.archived) OR c.mentions > 0) AND NOT c.muted)";
 const IS_MENTION: &str = "(c.mentions > 0)";
 const IS_APP: &str = "(c.bot AND c.unread > 0)";
-const IS_ACTIVITY: &str = "(NOT c.muted AND (c.mentions > 0 OR (c.kind = 'thread' AND c.followed AND c.unread > 0) OR EXISTS (SELECT 1 FROM message m WHERE m.network = c.network AND m.account = c.account AND m.conversation = c.id AND json_extract(m.body, '$.outgoing') = 1 AND json_array_length(json_extract(m.body, '$.reactions')) > 0)))";
+const IS_ACTIVITY: &str = "(NOT c.muted AND (c.mentions > 0 OR (c.kind = 'thread' AND c.followed AND c.unread > 0) OR EXISTS (SELECT 1 FROM message m WHERE m.network = c.network AND m.account = c.account AND m.conversation = c.id AND m.reacted_mine = 1)))";
 
 const PERSON: &str = "
     SELECT p.network, p.account, p.id, p.name, p.handle, p.bot, p.relation, p.status, p.link,
@@ -1228,13 +1232,12 @@ impl Store {
             let _ = protocol::private::touch(path);
         }
         let db = Connection::open(path)?;
-        // A 1 MB page cache, half SQLite's default: every list read is one page of rows, the
-        // file is on a local disk the system already caches, and chatd's idle budget is tight.
+        // A 16 MB page cache keeps hot conversation and message B-trees resident across syncs.
         // Under WAL, NORMAL syncs at checkpoints, not at every write: a power cut can undo the
         // last writes to this cache of what the networks hold, and never corrupts it. FULL
         // flushed the disk at every write; on Windows four chatds seeding the demo at once took
         // over a minute that way, and 3 s this way.
-        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -1024;")?;
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -16384;")?;
         for suffix in ["-wal", "-shm"].into_iter().filter(|_| path != Path::new(":memory:")) {
             let mut side = path.as_os_str().to_owned();
             side.push(suffix);
@@ -1325,6 +1328,18 @@ impl Store {
         if !column(&store.db, "section", "sort")? {
             store.db.execute_batch("ALTER TABLE section ADD COLUMN sort TEXT NOT NULL DEFAULT ''")?;
         }
+        if !column(&store.db, "message", "reacted_mine")? {
+            store.db.execute_batch(
+                "ALTER TABLE message ADD COLUMN reacted_mine INTEGER NOT NULL DEFAULT 0;
+                 UPDATE message SET reacted_mine = 1
+                  WHERE json_extract(body, '$.outgoing') = 1
+                    AND json_array_length(json_extract(body, '$.reactions')) > 0;",
+            )?;
+        }
+        store.db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS message_client_id ON message (network, account, conversation, client_id) WHERE client_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS message_reacted_mine ON message (network, account, conversation) WHERE reacted_mine = 1;",
+        )?;
         Ok(store)
     }
 
@@ -3604,6 +3619,36 @@ impl Store {
     /// Tiny lists). A message that carries the `client_id` of one still pending here replaces it.
     pub fn ingest(&mut self, conversation: &Key, message: &Message, unread: bool) -> rusqlite::Result<Stored> {
         let tx = self.db.transaction()?;
+        let outcome = Self::ingest_in_tx(&tx, conversation, message, unread)?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// Records a batch of messages in a single SQLite transaction.
+    pub fn ingest_batch(
+        &mut self,
+        conversation: &Key,
+        messages: &[Message],
+        unread: bool,
+    ) -> rusqlite::Result<Vec<Stored>> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self.db.transaction()?;
+        let mut outcomes = Vec::with_capacity(messages.len());
+        for message in messages {
+            outcomes.push(Self::ingest_in_tx(&tx, conversation, message, unread)?);
+        }
+        tx.commit()?;
+        Ok(outcomes)
+    }
+
+    fn ingest_in_tx(
+        tx: &Transaction,
+        conversation: &Key,
+        message: &Message,
+        unread: bool,
+    ) -> rusqlite::Result<Stored> {
         let (network, account, id) = (word(&conversation.network), &conversation.account, &conversation.id);
         let mut incoming = message.clone();
         // The echo of a send we are still showing replaces that row. If the list was previewing
@@ -3717,10 +3762,11 @@ impl Store {
             }
         }
         if outcome != Stored::Same {
+            let reacted_mine = i64::from(incoming.outgoing && !incoming.reactions.is_empty());
             tx.execute(
                 "INSERT OR REPLACE INTO message
-                     (network, account, conversation, id, sent, text, pending, client_id, expires, body, seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     (network, account, conversation, id, sent, text, pending, client_id, expires, body, seq, reacted_mine)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     network,
                     account,
@@ -3733,6 +3779,7 @@ impl Store {
                     incoming.expires_at,
                     body,
                     incoming.seq,
+                    reacted_mine,
                 ],
             )?;
         }
@@ -3822,7 +3869,6 @@ impl Store {
             }
             Stored::Same => {}
         }
-        tx.commit()?;
         Ok(outcome)
     }
 
@@ -3874,10 +3920,11 @@ impl Store {
             SendState::Pending => 1,
             SendState::Failed { .. } => 2,
         };
+        let reacted_mine = i64::from(message.outgoing && !message.reactions.is_empty());
         tx.execute(
             "INSERT OR REPLACE INTO message
-                 (network, account, conversation, id, sent, text, pending, client_id, expires, body, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (network, account, conversation, id, sent, text, pending, client_id, expires, body, seq, reacted_mine)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 network,
                 account,
@@ -3890,6 +3937,7 @@ impl Store {
                 message.expires_at,
                 body,
                 message.seq,
+                reacted_mine,
             ],
         )?;
         if already.is_none() && bump_unread && !message.outgoing {
@@ -4529,6 +4577,49 @@ impl Store {
         let Some(last_read) = last_read else {
             return Ok(None);
         };
+        // If an anchor was a pending row replaced by its server id, resolve it via `client_id`.
+        let resolve_anchor = |anchor: &str| -> rusqlite::Result<(String, bool)> {
+            let direct: Option<String> = self
+                .db
+                .query_row(
+                    "SELECT id FROM message
+                      WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                    params![key[0], key[1], key[2], anchor],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = direct {
+                return Ok((id, false));
+            }
+            let by_col: Option<String> = self
+                .db
+                .query_row(
+                    "SELECT id FROM message
+                      WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND client_id = ?4
+                      LIMIT 1",
+                    params![key[0], key[1], key[2], anchor],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = by_col {
+                return Ok((id, true));
+            }
+            let by_json: Option<String> = self
+                .db
+                .query_row(
+                    "SELECT id FROM message
+                      WHERE network = ?1 AND account = ?2 AND conversation = ?3
+                        AND json_extract(body, '$.client_id') = ?4
+                      LIMIT 1",
+                    params![key[0], key[1], key[2], anchor],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match by_json {
+                Some(id) => Ok((id, true)),
+                None => Ok((anchor.to_owned(), false)),
+            }
+        };
         // One more than asked for says whether there is more in that direction.
         let run = |side: &str, order: &str, anchor: Option<&str>, limit: u32| -> rusqlite::Result<(Vec<Message>, bool)> {
             let mut values = key.to_vec();
@@ -4567,18 +4658,22 @@ impl Store {
                 (found, older, false)
             }
             Page::Before { id } => {
-                let (mut found, older) = run("<", NEWEST_FIRST, Some(id), limit)?;
+                let (resolved, _) = resolve_anchor(id)?;
+                let (mut found, older) = run("<", NEWEST_FIRST, Some(&resolved), limit)?;
                 found.reverse();
                 (found, older, true)
             }
             Page::After { id } => {
-                let (found, newer) = run(">", OLDEST_FIRST, Some(id), limit)?;
+                let (resolved, via_client_id) = resolve_anchor(id)?;
+                let side = if via_client_id { ">=" } else { ">" };
+                let (found, newer) = run(side, OLDEST_FIRST, Some(&resolved), limit)?;
                 (found, true, newer)
             }
             Page::Around { id } => {
-                let (mut found, older) = run("<=", NEWEST_FIRST, Some(id), limit / 2 + 1)?;
+                let (resolved, _) = resolve_anchor(id)?;
+                let (mut found, older) = run("<=", NEWEST_FIRST, Some(&resolved), limit / 2 + 1)?;
                 found.reverse();
-                let (after, newer) = run(">", OLDEST_FIRST, Some(id), limit / 2)?;
+                let (after, newer) = run(">", OLDEST_FIRST, Some(&resolved), limit / 2)?;
                 found.extend(after);
                 (found, older, newer)
             }
@@ -4613,17 +4708,33 @@ impl Store {
     /// own. A row queued while the account was offline (`waiting`) is left for [`Self::fail_queued`].
     /// Returns the conversations touched.
     pub fn fail_pending(&mut self, before: i64, reason: &str) -> rusqlite::Result<Vec<Key>> {
-        let stuck: Vec<(Key, String)> = self
+        self.fail_pending_excluding(before, reason, |_, _| false)
+    }
+
+    /// Like [`Self::fail_pending`], skipping any row for which `active(account, client_id)` is true
+    /// (for instance, a large file upload still actively streaming past `SEND_SECONDS`).
+    pub fn fail_pending_excluding(
+        &mut self,
+        before: i64,
+        reason: &str,
+        active: impl Fn(&AccountKey, &str) -> bool,
+    ) -> rusqlite::Result<Vec<Key>> {
+        let stuck: Vec<(Key, String, Option<String>)> = self
             .db
             .prepare(
-                "SELECT network, account, conversation, id FROM message
+                "SELECT network, account, conversation, id, client_id FROM message
                   WHERE pending = 1 AND sent < ?1
                     AND coalesce(json_extract(body, '$.waiting'), 0) = 0",
             )?
-            .query_map(params![before], |row| Ok((key_at(row)?, row.get(3)?)))?
+            .query_map(params![before], |row| Ok((key_at(row)?, row.get(3)?, row.get(4)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut touched = Vec::new();
-        for (conversation, id) in stuck {
+        for (conversation, id, client_id) in stuck {
+            let account = conversation.account();
+            let check_id = client_id.as_deref().unwrap_or(id.as_str());
+            if active(&account, check_id) || (check_id != id && active(&account, &id)) {
+                continue;
+            }
             if let Some(mut message) = self.message(&conversation, &id)? {
                 message.state = SendState::Failed {
                     reason: reason.to_owned(),
@@ -6819,5 +6930,70 @@ mod tests {
         assert_eq!(row.draft, "half a thought");
         assert_eq!(store.media_bytes().unwrap(), 0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn page_after_resolves_replaced_pending_client_id_anchor() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let account = AccountKey { network: Network::Discord, account: "me".into() };
+        store.upsert_conversation(&account, &ConversationRow::new("c1", ConversationKind::Direct, "Ada")).unwrap();
+        let key = Key::new(&account, "c1");
+
+        store.ingest(&key, &said("m1", "earlier", NOW - 20), false).unwrap();
+        let mut pending = said("cid-99", "my reply", NOW - 10);
+        pending.outgoing = true;
+        pending.state = SendState::Pending;
+        pending.client_id = Some("cid-99".into());
+        store.ingest(&key, &pending, true).unwrap();
+
+        // Server echoes the message under its real id, replacing the pending row.
+        let mut settled = said("srv-100", "my reply", NOW - 9);
+        settled.outgoing = true;
+        settled.state = SendState::Sent;
+        settled.client_id = Some("cid-99".into());
+        store.ingest(&key, &settled, true).unwrap();
+        store.ingest(&key, &said("srv-101", "afterwards", NOW - 5), false).unwrap();
+
+        // A scrolled-up pane polling Page::After using the old pending id must receive the
+        // replacement row inclusive plus newer messages instead of an empty page.
+        let page = store
+            .messages(&key, &Page::After { id: "cid-99".into() }, 20, NOW)
+            .unwrap()
+            .expect("conversation exists");
+        let ids: Vec<&str> = page.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["srv-100", "srv-101"]);
+    }
+
+    #[test]
+    fn fail_pending_excluding_skips_active_uploads_and_fails_inactive_rows() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let account = AccountKey { network: Network::Slack, account: "T1".into() };
+        store.upsert_conversation(&account, &ConversationRow::new("c1", ConversationKind::Direct, "Ada")).unwrap();
+        let key = Key::new(&account, "c1");
+
+        let mut active_upload = said("up-1", "big video", NOW - 120);
+        active_upload.outgoing = true;
+        active_upload.state = SendState::Pending;
+        active_upload.client_id = Some("up-1".into());
+        store.ingest(&key, &active_upload, true).unwrap();
+
+        let mut stuck_send = said("msg-2", "dropped text", NOW - 120);
+        stuck_send.outgoing = true;
+        stuck_send.state = SendState::Pending;
+        stuck_send.client_id = Some("msg-2".into());
+        store.ingest(&key, &stuck_send, true).unwrap();
+
+        let touched = store
+            .fail_pending_excluding(NOW - 60, "The network did not answer.", |acct, cid| {
+                acct == &account && cid == "up-1"
+            })
+            .unwrap();
+        assert_eq!(touched, vec![key.clone()]);
+
+        let still_pending = store.message(&key, "up-1").unwrap().unwrap();
+        assert_eq!(still_pending.state, SendState::Pending);
+
+        let failed = store.message(&key, "msg-2").unwrap().unwrap();
+        assert!(matches!(failed.state, SendState::Failed { .. }));
     }
 }

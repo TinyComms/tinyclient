@@ -547,17 +547,7 @@ pub(super) fn apply(account: &Account, update: &Update) {
         Update::NewChannelMessage(new) => message(account, &new.message, false),
         Update::EditMessage(edit) => message(account, &edit.message, true),
         Update::EditChannelMessage(edit) => message(account, &edit.message, true),
-        Update::MessageId(named) => {
-            let mut live = account.live();
-            if let Some(at) = live.random.iter().position(|(random, _)| *random == named.random_id) {
-                if let Some((_, client_id)) = live.random.remove(at) {
-                    if live.sent.len() >= 64 {
-                        live.sent.pop_front();
-                    }
-                    live.sent.push_back((named.id, client_id));
-                }
-            }
-        }
+        Update::MessageId(named) => record_message_id(account, named.id, named.random_id),
         // Outside a channel a deletion names the messages and not their chat. The chat is
         // the one this connection saw, or the note written when the message arrived, which
         // outlives a reconnect. A channel that is not a forum names itself.
@@ -818,7 +808,10 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 let id = who.text();
                 if marked.unread {
                     let _ = account.ctx.mark_unread(&id);
-                    filing::facts_changed(account, who, |facts| facts.read = false);
+                    filing::facts_changed(account, who, |facts| {
+                        facts.read = false;
+                        facts.unread_mark = true;
+                    });
                 } else if let Some(fresh) = sync::peer_dialog(account, who) {
                     let unread = sync::unread_of(fresh.unread_count, fresh.unread_mark);
                     let mentions = fresh.unread_mentions_count.max(0) as u32;
@@ -826,7 +819,12 @@ pub(super) fn apply(account: &Account, update: &Update) {
                     let read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
                     let _ = account.ctx.counts(&id, unread, mentions, read.as_deref(), 0);
                     let _ = account.ctx.unread_reactions(&id, unread_reactions);
-                    filing::facts_changed(account, who, |facts| facts.read = unread == 0);
+                    filing::facts_changed(account, who, |facts| {
+                        facts.read = unread == 0;
+                        facts.unread_mark = fresh.unread_mark;
+                    });
+                } else {
+                    filing::facts_changed(account, who, |facts| facts.unread_mark = false);
                 }
             }
         }
@@ -886,6 +884,18 @@ pub(super) fn answered(account: &Account, answer: &tl::enums::Updates) {
     }
 }
 
+fn record_message_id(account: &Account, id: i32, random_id: i64) {
+    let mut live = account.live();
+    if let Some(at) = live.random.iter().position(|(random, _)| *random == random_id) {
+        if let Some((_, client_id)) = live.random.remove(at) {
+            if live.sent.len() >= 64 {
+                live.sent.pop_front();
+            }
+            live.sent.push_back((id, client_id));
+        }
+    }
+}
+
 /// The message Telegram made of a send, from the answer to it.
 pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, reply: Option<i32>, answer: &tl::enums::Updates) -> Option<Message> {
     // The short answer names only the id and the time: the rest is what we sent.
@@ -919,6 +929,13 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
         _ => return None,
     };
     account.learn(users, chats);
+    // Process `Update::MessageId` entries first so `live.sent` maps server ids -> `client_id`
+    // for both single messages and albums before any `UpdateNewMessage` is processed.
+    for update in updates {
+        if let Update::MessageId(named) = update {
+            record_message_id(account, named.id, named.random_id);
+        }
+    }
     let mut outgoing = Vec::new();
     for update in updates {
         let raw = match update {
@@ -957,8 +974,15 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
         return last;
     }
     outgoing.into_iter().find_map(|raw| {
-        let (place, mapped) = placed(account, raw)?;
-        (place == conversation && mapped.message.outgoing).then_some(mapped.message)
+        let (place, mut mapped) = placed(account, raw)?;
+        if place != conversation || !mapped.message.outgoing {
+            return None;
+        }
+        let mut live = account.live();
+        if let Some(at) = live.sent.iter().position(|(id, _)| *id == mapped.id) {
+            mapped.message.client_id = live.sent.remove(at).map(|(_, client_id)| client_id);
+        }
+        Some(mapped.message)
     })
 }
 
@@ -1012,4 +1036,160 @@ pub(super) fn answered_scheduled(account: &Account, conversation: &str, text: &s
     }
     live.scheduled.push_back((conversation.to_owned(), text.to_owned(), id));
     Some(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::telegram::wire::{Event, Fault, Wire};
+    use crate::adapters::telegram::{files, peers::Directory, remember_random, Account};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex};
+
+    struct DummyWire;
+    impl Wire for DummyWire {
+        fn invoke(&self, _dc: Option<i32>, _body: Vec<u8>) -> Result<Vec<u8>, Fault> {
+            Err(Fault::Net("unused".into()))
+        }
+        fn events(&self) -> Option<Receiver<Event>> { None }
+        fn home(&self) -> i32 { 2 }
+        fn set_home(&self, _dc: i32) {}
+        fn signed_in(&self, _user: &tl::types::User) {}
+        fn session(&self, _user: i64, _name: &str) -> String { String::new() }
+        fn unsaved(&self) -> bool { false }
+        fn close(&self) {}
+    }
+
+    fn test_account() -> Account {
+        let db = std::env::temp_dir().join(format!("tinyclient-tg-live-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = crate::store::Store::open(&db).unwrap();
+        let hub = Arc::new(crate::hub::Hub::new(store));
+        let account_key = protocol::AccountKey { network: protocol::Network::Telegram, account: "100".into() };
+        let (_adapter, ctx, _rx) = crate::adapters::local(account_key, hub);
+        let account = Account {
+            files: files::Files::start(&ctx),
+            ctx,
+            wire: Box::new(DummyWire),
+            me: 100,
+            name: "Me".into(),
+            dir: Mutex::new(Directory::new(100)),
+            live: Mutex::default(),
+            pending: Arc::default(),
+            dialog_pages: Mutex::default(),
+        };
+        let row = crate::store::ConversationRow::new("u200", protocol::ConversationKind::Direct, "Alice");
+        account.ctx.conversation(&row).unwrap();
+        account
+    }
+
+    fn raw_msg(id: i32, peer_user: i64, text: &str, grouped_id: Option<i64>) -> tl::enums::Message {
+        tl::types::Message {
+            out: true,
+            mentioned: false,
+            media_unread: false,
+            silent: false,
+            post: false,
+            from_scheduled: false,
+            legacy: false,
+            edit_hide: false,
+            pinned: false,
+            noforwards: false,
+            invert_media: false,
+            offline: false,
+            video_processing_pending: false,
+            paid_suggested_post_stars: false,
+            paid_suggested_post_ton: false,
+            guestchat_via_from: None,
+            id,
+            from_id: Some(tl::types::PeerUser { user_id: 100 }.into()),
+            from_boosts_applied: None,
+            from_rank: None,
+            peer_id: tl::types::PeerUser { user_id: peer_user }.into(),
+            saved_peer_id: None,
+            fwd_from: None,
+            via_bot_id: None,
+            via_business_bot_id: None,
+            reply_to: None,
+            date: 1_700_000_000,
+            message: text.to_owned(),
+            media: None,
+            reply_markup: None,
+            entities: None,
+            views: None,
+            forwards: None,
+            replies: None,
+            edit_date: None,
+            post_author: None,
+            grouped_id,
+            reactions: None,
+            restriction_reason: None,
+            ttl_period: None,
+            quick_reply_shortcut_id: None,
+            effect: None,
+            factcheck: None,
+            report_delivery_until_date: None,
+            paid_message_stars: None,
+            suggested_post: None,
+            schedule_repeat_period: None,
+            summary_from_language: None,
+            rich_message: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn sent_reconciles_update_message_id_random_id_to_client_id() {
+        let account = test_account();
+        // Single message: Update::MessageId precedes Update::NewMessage in RPC Updates slice.
+        remember_random(&account, 555_001, "client-single-1");
+        let answer: tl::enums::Updates = tl::types::Updates {
+            updates: vec![
+                tl::types::UpdateMessageId { id: 42, random_id: 555_001 }.into(),
+                tl::types::UpdateNewMessage {
+                    message: raw_msg(42, 200, "hello", None),
+                    pts: 1,
+                    pts_count: 1,
+                }
+                .into(),
+            ],
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 1_700_000_000,
+            seq: 1,
+        }
+        .into();
+        let message = sent(&account, "u200", Who::User(200), "hello", None, &answer)
+            .expect("single sent message");
+        assert_eq!(message.id, "42");
+        assert_eq!(message.client_id.as_deref(), Some("client-single-1"));
+
+        // Album: Update::MessageId maps random_id -> client_id before Update::NewMessage folds.
+        remember_random(&account, 555_002, "client-album-1");
+        let album_answer: tl::enums::Updates = tl::types::Updates {
+            updates: vec![
+                tl::types::UpdateMessageId { id: 43, random_id: 555_002 }.into(),
+                tl::types::UpdateNewMessage {
+                    message: raw_msg(43, 200, "caption", Some(999)),
+                    pts: 2,
+                    pts_count: 1,
+                }
+                .into(),
+                tl::types::UpdateNewMessage {
+                    message: raw_msg(44, 200, "", Some(999)),
+                    pts: 3,
+                    pts_count: 1,
+                }
+                .into(),
+            ],
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 1_700_000_001,
+            seq: 2,
+        }
+        .into();
+        let album_msg = sent(&account, "u200", Who::User(200), "caption", None, &album_answer)
+            .expect("album sent message");
+        assert_eq!(album_msg.client_id.as_deref(), Some("client-album-1"));
+    }
 }

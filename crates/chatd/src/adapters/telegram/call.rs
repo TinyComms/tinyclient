@@ -249,20 +249,73 @@ fn mont_mul(a: &Words, b: &Words, m: &Words, n0_inv: u64) -> Words {
     }
 }
 
-/// Computes `base^exp mod modulus` for 256-byte big-endian unsigned integers where `modulus` is odd
-/// and has its high bit set (a 2048-bit prime).
+/// Computes `2^2048 mod m` for any odd modulus `m >= 3` (works for both 2048-bit `p` and
+/// 2047-bit `q = (p - 1) / 2`).
+fn r_mod(m: &Words) -> Words {
+    let mut r = [0u64; 32];
+    r[0] = 1;
+    for _ in 0..2048 {
+        r = add_mod(&r, &r, m);
+    }
+    r
+}
+
+/// Computes `(a + b) mod modulus` for 256-byte big-endian unsigned integers `< modulus`.
+pub(super) fn add_mod_2048(a: &[u8; 256], b: &[u8; 256], modulus: &[u8; 256]) -> [u8; 256] {
+    let m = from_be_bytes(modulus);
+    let mut aw = from_be_bytes(a);
+    let mut bw = from_be_bytes(b);
+    while cmp_words(&aw, &m) != std::cmp::Ordering::Less {
+        let (reduced, _) = sub_words(&aw, &m);
+        aw = reduced;
+    }
+    while cmp_words(&bw, &m) != std::cmp::Ordering::Less {
+        let (reduced, _) = sub_words(&bw, &m);
+        bw = reduced;
+    }
+    to_be_bytes(&add_mod(&aw, &bw, &m))
+}
+
+/// Computes `(a * b) mod modulus` for 256-byte big-endian unsigned integers with odd `modulus`.
+pub(super) fn mul_mod_2048(a: &[u8; 256], b: &[u8; 256], modulus: &[u8; 256]) -> [u8; 256] {
+    let m = from_be_bytes(modulus);
+    let mut aw = from_be_bytes(a);
+    let mut bw = from_be_bytes(b);
+    while cmp_words(&aw, &m) != std::cmp::Ordering::Less {
+        let (reduced, _) = sub_words(&aw, &m);
+        aw = reduced;
+    }
+    while cmp_words(&bw, &m) != std::cmp::Ordering::Less {
+        let (reduced, _) = sub_words(&bw, &m);
+        bw = reduced;
+    }
+    let n0_inv = mont_inv(m[0]);
+    let r_mod_m = r_mod(&m);
+    let mut r2 = r_mod_m;
+    for _ in 0..2048 {
+        r2 = add_mod(&r2, &r2, &m);
+    }
+    let a_mont = mont_mul(&aw, &r2, &m, n0_inv);
+    let b_mont = mont_mul(&bw, &r2, &m, n0_inv);
+    let prod_mont = mont_mul(&a_mont, &b_mont, &m, n0_inv);
+    let mut one = [0u64; 32];
+    one[0] = 1;
+    let out = mont_mul(&prod_mont, &one, &m, n0_inv);
+    to_be_bytes(&out)
+}
+
+/// Computes `base^exp mod modulus` for 256-byte big-endian unsigned integers where `modulus` is odd.
 pub fn modpow_2048(base: &[u8; 256], exp: &[u8; 256], modulus: &[u8; 256]) -> [u8; 256] {
     let m = from_be_bytes(modulus);
     let mut b = from_be_bytes(base);
-    if cmp_words(&b, &m) != std::cmp::Ordering::Less {
+    while cmp_words(&b, &m) != std::cmp::Ordering::Less {
         let (reduced, _) = sub_words(&b, &m);
         b = reduced;
     }
     let e = from_be_bytes(exp);
     let n0_inv = mont_inv(m[0]);
 
-    // R mod m = 2^2048 - m (since m >= 2^2047).
-    let (r_mod_m, _) = sub_words(&[0u64; 32], &m);
+    let r_mod_m = r_mod(&m);
     // R^2 mod m by doubling R mod m 2048 times modulo m.
     let mut r2 = r_mod_m;
     for _ in 0..2048 {
@@ -326,7 +379,7 @@ fn is_probable_prime_2048(n_bytes: &[u8; 256]) -> bool {
             continue;
         }
         let n0_inv = mont_inv(n[0]);
-        let (r_mod_n, _) = sub_words(&[0u64; 32], &n);
+        let r_mod_n = r_mod(&n);
         let mut r2 = r_mod_n;
         for _ in 0..2048 {
             r2 = add_mod(&r2, &r2, &n);
@@ -376,19 +429,16 @@ pub fn validate_dh_params(g: i32, p: &[u8]) -> Result<[u8; 256], String> {
         if !is_probable_prime_2048(&p_arr) {
             return Err("DH modulus p is not prime".to_owned());
         }
-        // Check (p - 1) / 2 is prime as well (safe prime).
+        // Check (p - 1) / 2 is prime as well (safe prime) via Miller-Rabin, not just small divisors.
         let mut q = pw;
         q[0] = q[0].saturating_sub(1);
         for i in 0..31 {
             q[i] = (q[i] >> 1) | (q[i + 1] << 63);
         }
         q[31] >>= 1;
-        // Shift left by 1 bit only if needed? No: q is 2047 bits, check small divisors + Miller-Rabin
-        // by verifying 2^((p-1)/2) mod p == p-1 or 1, and small prime sieve on q.
-        for &small in &[3u64, 5, 7, 11, 13, 17, 19, 23, 29, 31] {
-            if rem_u64(&q, small) == 0 {
-                return Err("DH modulus (p - 1)/2 is composite".to_owned());
-            }
+        let q_arr = to_be_bytes(&q);
+        if !is_probable_prime_2048(&q_arr) {
+            return Err("DH modulus (p - 1)/2 is composite".to_owned());
         }
     }
     Ok(p_arr)
@@ -434,13 +484,13 @@ pub fn verify_g_a_hash(g_a: &[u8], g_a_hash: &[u8]) -> bool {
     diff == 0
 }
 
-fn random_secret(server_random: &[u8]) -> [u8; 256] {
+fn random_secret(server_random: &[u8]) -> Result<[u8; 256], String> {
     let mut secret = [0u8; 256];
-    let _ = getrandom::fill(&mut secret);
+    getrandom::fill(&mut secret).map_err(|err| format!("OS random generator failed: {err}"))?;
     for (dst, &src) in secret.iter_mut().zip(server_random.iter()) {
         *dst ^= src;
     }
-    secret
+    Ok(secret)
 }
 
 fn random_i32() -> i32 {
@@ -820,7 +870,13 @@ pub(super) fn join_direct(account: &Account, peer: Who, requested_video: bool) {
 
     if let Some((id, access_hash, video, g_a_hash)) = incoming {
         // Answer incoming call with `phone.acceptCall`.
-        let b = random_secret(&server_random);
+        let b = match random_secret(&server_random) {
+            Ok(secret) => secret,
+            Err(why) => {
+                account.ctx.call_failed(&conv_id, CallFailure::Encryption, &why);
+                return;
+            }
+        };
         let g_b = modpow_u64_base(dh.g as u64, &b, &dh.p);
         if let Err(why) = validate_dh_public(&g_b, &dh.p) {
             account.ctx.call_failed(&conv_id, CallFailure::Encryption, &why);
@@ -859,7 +915,13 @@ pub(super) fn join_direct(account: &Account, peer: Who, requested_video: bool) {
         account.ctx.call_failed(&conv_id, CallFailure::Refused, "That person can't be called right now.");
         return;
     };
-    let a = random_secret(&server_random);
+    let a = match random_secret(&server_random) {
+        Ok(secret) => secret,
+        Err(why) => {
+            account.ctx.call_failed(&conv_id, CallFailure::Encryption, &why);
+            return;
+        }
+    };
     let g_a = modpow_u64_base(dh.g as u64, &a, &dh.p);
     if let Err(why) = validate_dh_public(&g_a, &dh.p) {
         account.ctx.call_failed(&conv_id, CallFailure::Encryption, &why);
@@ -1058,5 +1120,44 @@ mod tests {
         let mut p_minus_1 = p;
         p_minus_1[255] -= 1;
         assert!(validate_dh_public(&p_minus_1, &p).is_err());
+    }
+
+    #[test]
+    fn dh_safe_prime_validation_accepts_prime_q_and_rejects_composite_q() {
+        // Known Telegram safe prime: both p (2048-bit) and q = (p - 1)/2 (2047-bit) are prime.
+        let known = known_prime();
+        assert!(is_probable_prime_2048(&known));
+        let mut known_q = from_be_bytes(&known);
+        known_q[0] -= 1;
+        for i in 0..31 {
+            known_q[i] = (known_q[i] >> 1) | (known_q[i + 1] << 63);
+        }
+        known_q[31] >>= 1;
+        assert!(
+            is_probable_prime_2048(&to_be_bytes(&known_q)),
+            "2047-bit Sophie Germain prime q must pass Miller-Rabin"
+        );
+
+        // 2048-bit prime p (high bit set, p % 3 == 2 for g = 3) whose q = (p - 1)/2 has NO
+        // prime factor <= 53, yet q is composite. Must be rejected by Miller-Rabin on q!
+        const NON_SAFE_PRIME_HEX: &str = "c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000075bf72f";
+        let mut p = [0u8; 256];
+        let hex = NON_SAFE_PRIME_HEX.as_bytes();
+        for i in 0..256 {
+            p[i] = (hex_nibble(hex[i * 2]) << 4) | hex_nibble(hex[i * 2 + 1]);
+        }
+        assert!(p[0] & 0x80 != 0);
+        assert!(is_probable_prime_2048(&p), "test vector p itself must be prime");
+        let mut q = from_be_bytes(&p);
+        q[0] -= 1;
+        for i in 0..31 {
+            q[i] = (q[i] >> 1) | (q[i + 1] << 63);
+        }
+        q[31] >>= 1;
+        for &small in &[3u64, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53] {
+            assert_ne!(rem_u64(&q, small), 0, "q must evade small prime sieve to test Miller-Rabin");
+        }
+        let err = validate_dh_params(3, &p).expect_err("composite q must be rejected");
+        assert!(err.contains("composite"), "unexpected error: {err}");
     }
 }

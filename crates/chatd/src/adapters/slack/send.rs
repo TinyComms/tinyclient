@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 pub(super) const LARGEST: u64 = 1 << 30;
 /// Files one message carries.
 pub(super) const FILES: usize = 10;
-/// How long the socket is given to show the shared files before the send ends without it.
-const SHOWN_WITHIN: Duration = Duration::from_secs(20);
+/// How long the socket is given to show the shared files before the send ends without it,
+/// when `files.completeUploadExternal` did not include a share timestamp.
+const SHOWN_WITHIN: Duration = Duration::from_secs(4);
 /// Slack schedules no further ahead than this.
 const SCHEDULE_AHEAD: i64 = 120 * 86_400;
 /// Slack clips (audio or video) are capped at five minutes.
@@ -33,7 +34,7 @@ enum ClipKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ClipSpec {
+pub(super) struct ClipSpec {
     kind: ClipKind,
     duration_ms: u32,
     waveform: Vec<u8>,
@@ -107,10 +108,24 @@ fn slack_wave_samples(waveform: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Extracts the shared message timestamp for `channel` from a `files.completeUploadExternal`
+/// response when Slack includes it under `files[0].shares.{public,private}[channel][0].ts`.
+fn shared_ts<'a>(completed: &'a Value, channel: &str) -> Option<&'a str> {
+    let shares = &completed["files"][0]["shares"];
+    ["public", "private"]
+        .iter()
+        .find_map(|access| shares[*access][channel][0]["ts"].as_str())
+        .filter(|ts| !ts.is_empty())
+}
+
 impl Slack {
     /// The work of one `SendWith`, run by the upload helper on a thread of its own, which reads
     /// the files and ends the send through `Context::sent`.
     pub(super) fn send_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
+        crate::sendtime::run(client_id, || self.send_with_inner(conversation, client_id, text, reply_to, with, up))
+    }
+
+    fn send_with_inner(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
         if let Some(pick) = &with.pick {
             if pick.kind == protocol::CatalogKind::Gifs {
                 let url = pick.id.trim();
@@ -149,12 +164,8 @@ impl Slack {
         let broadcast_thread = with.broadcast && thread_of(conversation).is_some();
         let clip = clip_spec(with, up)?;
         let ids = self.upload(up, with.snippet_type.as_deref(), clip.as_ref())?;
+        crate::sendtime::stage("upload");
         up.check()?;
-
-        // The socket names the message that holds the files: it is watched for before Slack is
-        // told to share them, so it cannot pass unseen.
-        let (shown, seen) = std::sync::mpsc::channel();
-        self.state().shares.insert(ids[0].clone(), shown);
         let files: Vec<Value> = ids
             .iter()
             .zip(up.files())
@@ -177,6 +188,26 @@ impl Slack {
                 None => json!({"id": id, "title": file.name}),
             })
             .collect();
+        self.complete_and_settle(conversation, channel, thread, broadcast_thread, text, with, clip.as_ref(), &ids, files)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn complete_and_settle(
+        &self,
+        conversation: &str,
+        channel: &str,
+        thread: Option<&str>,
+        broadcast_thread: bool,
+        text: &str,
+        with: &Outgoing,
+        clip: Option<&ClipSpec>,
+        ids: &[String],
+        files: Vec<Value>,
+    ) -> Result<Message, String> {
+        // The socket names the message that holds the files when Slack omits `shares`: watch
+        // before completing so an immediate echo cannot pass unseen.
+        let (shown, seen) = std::sync::mpsc::channel();
+        self.state().shares.insert(ids[0].clone(), shown);
         let files = json!(files).to_string();
         let comment = escape(text);
         let blocks = super::Slack::blocks_json(text, &with.spans);
@@ -190,35 +221,43 @@ impl Slack {
         if broadcast_thread {
             asked.push(("reply_broadcast", "true"));
         }
-        let completed = match self.api("files.completeUploadExternal", &asked) {
+        let completed = match self.api_with("files.completeUploadExternal", &asked, super::SEND_PATIENCE) {
             Ok(completed) => completed,
             Err(fault) => {
                 self.state().shares.remove(&ids[0]);
                 return Err(super::reason(fault));
             }
         };
-        let deadline = Instant::now() + SHOWN_WITHIN;
-        let message = loop {
-            match seen.recv_timeout(Duration::from_millis(500)) {
-                Ok(message) => break Some(message),
-                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline && !self.ctx.stopped() => {}
-                Err(_) => break None,
-            }
+        crate::sendtime::stage("complete");
+
+        // Inspect `completed["files"][0]["shares"]` first: if Slack already returned the share
+        // `ts` for this channel, settle immediately (0 ms wait) instead of waiting on the socket.
+        let immediate_ts = shared_ts(&completed, channel).map(str::to_owned);
+        let message = if immediate_ts.is_some() {
+            self.state().shares.remove(&ids[0]);
+            seen.try_recv().ok()
+        } else {
+            let deadline = Instant::now() + SHOWN_WITHIN;
+            let echoed = loop {
+                match seen.recv_timeout(Duration::from_millis(500)) {
+                    Ok(message) => break Some(message),
+                    Err(RecvTimeoutError::Timeout) if Instant::now() < deadline && !self.ctx.stopped() => {}
+                    Err(_) => break None,
+                }
+            };
+            self.state().shares.remove(&ids[0]);
+            crate::sendtime::stage("echo");
+            echoed
         };
-        self.state().shares.remove(&ids[0]);
         let message = if let Some(message) = message {
             message
         } else {
-            // CONTRACT: the socket did not show it in time. Slack took the files, so the send is not
-            // failed (a retry would post them twice): it ends as the message Slack's answer
-            // describes, named by the share's timestamp where it gives one. Should the socket show
-            // it later under another name, it is listed twice until reopened.
-            let shares = &completed["files"][0]["shares"];
-            let ts = ["public", "private"].iter().find_map(|access| shares[*access][channel][0]["ts"].as_str());
-            let ts = ts.map(str::to_owned).unwrap_or_else(|| format!("{}.000000", crate::hub::now()));
+            // Either `files.completeUploadExternal` already gave the share's `ts` or the socket
+            // did not echo in time. Slack took the files, so settle from the response directly.
+            let ts = immediate_ts.unwrap_or_else(|| format!("{}.000000", crate::hub::now()));
             let me = self.me.get().cloned().unwrap_or_default();
             let mut completed_files = completed["files"].clone();
-            if let (Some(spec), Some(first)) = (&clip, completed_files.get_mut(0)) {
+            if let (Some(spec), Some(first)) = (clip, completed_files.get_mut(0)) {
                 if first["subtype"].is_null() {
                     first["subtype"] = spec.subtype().into();
                 }
@@ -244,8 +283,10 @@ impl Slack {
                 text,
                 &with.spans,
             );
-            self.message(channel, &event).ok_or_else(|| "Slack took the files but described no message.".to_owned())?
+            self.settled_message(channel, &event)
+                .ok_or_else(|| "Slack took the files but described no message.".to_owned())?
         };
+        crate::sendtime::stage("parse");
         if let Some(root) = thread {
             self.report(self.bump(channel, root, &message));
             if broadcast_thread {
@@ -290,7 +331,7 @@ impl Slack {
             if let Some(spec) = clip_here {
                 params.push(("subtype", spec.subtype()));
             }
-            let address = self.api("files.getUploadURLExternal", &params);
+            let address = self.api_with("files.getUploadURLExternal", &params, super::SEND_PATIENCE);
             let address = address.map_err(|fault| format!("{name} could not be sent: {}", super::reason(fault)))?;
             let (Some(url), Some(id)) = (address["upload_url"].as_str(), address["file_id"].as_str()) else {
                 return Err(format!("{name} could not be sent: Slack gave no address for it."));
@@ -335,7 +376,8 @@ impl Slack {
         if suppress {
             asked.extend([("unfurl_links", "false"), ("unfurl_media", "false")]);
         }
-        let scheduled = self.api("chat.scheduleMessage", &asked).map_err(super::reason)?;
+        let scheduled = self.api_with("chat.scheduleMessage", &asked, super::SEND_PATIENCE).map_err(super::reason)?;
+        crate::sendtime::stage("schedule");
         let id = scheduled["scheduled_message_id"].as_str().ok_or("Slack did not say it was scheduled.")?;
         let me = self.me.get().cloned().unwrap_or_default();
         let event = super::Slack::with_blocks(
@@ -343,9 +385,10 @@ impl Slack {
             text,
             spans,
         );
-        let mut message = self.message(channel, &event).ok_or("Slack did not say it was scheduled.")?;
+        let mut message = self.settled_message(channel, &event).ok_or("Slack did not say it was scheduled.")?;
         message.id = format!("scheduled:{id}");
         message.sent = scheduled["post_at"].as_i64().unwrap_or(at);
+        crate::sendtime::stage("parse");
         Ok(message)
     }
 
@@ -439,7 +482,7 @@ impl Slack {
         if let Some(root) = thread {
             asked.push(("thread_ts", root));
         }
-        let scheduled = self.api("chat.scheduleMessage", &asked)?;
+        let scheduled = self.api_with("chat.scheduleMessage", &asked, super::SEND_PATIENCE)?;
         let new_id = scheduled["scheduled_message_id"]
             .as_str()
             .filter(|s| !s.is_empty())

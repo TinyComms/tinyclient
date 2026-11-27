@@ -1891,18 +1891,23 @@ pub(super) fn invoke_card_action(
     }
 
     pub(super) fn post_with_outgoing(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &protocol::Outgoing) {
-        let outcome = self.posted_with(conversation, client_id, text, reply_to, with, None).map_err(super::reason);
-        self.ctx.sent(conversation, client_id, outcome);
+        let _ = crate::sendtime::run(client_id, || -> Result<(), ()> {
+            let outcome = self.posted_with(conversation, client_id, text, reply_to, with, None).map_err(super::reason);
+            let ok = outcome.is_ok();
+            self.ctx.sent(conversation, client_id, outcome);
+            crate::sendtime::stage("store");
+            if ok { Ok(()) } else { Err(()) }
+        });
     }
 
     /// Asks Teams' own middle-tier unfurl service for link preview metadata.
-    /// Never fetches the target URL directly.
+    /// Never fetches the target URL directly. Uses a tight 1.5 s timeout with no 401 retry
+    /// or rate-limit wait so a slow or unresponsive `urlpreview` endpoint never delays sending.
     fn unfurl_link(&self, url: &str) -> Option<(Value, Preview)> {
         let place = self.place().ok()?;
         let endpoint = format!("{}/v1/urlpreview", place.middle);
         let body = json!({"url": url});
-        let answer = self.call("POST", &endpoint, super::Auth::Both(Audience::Spaces), Body::Json(&body), false).ok()?;
-        let info = &answer.body;
+        let info = self.call_fast_post(&endpoint, super::Auth::Both(Audience::Spaces), &body, super::URLPREVIEW_TIMEOUT)?;
         let title = [&info["title"], &info["previewTitle"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");
         let description = [&info["description"], &info["previewDescription"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");
         if title.is_empty() && description.is_empty() {
@@ -1974,6 +1979,7 @@ pub(super) fn invoke_card_action(
                     }
                     sent_previews.push(preview);
                 }
+                crate::sendtime::stage("unfurl");
             }
         }
         let (mut content, mentions_json) = if !mention_spans.is_empty() {
@@ -2039,7 +2045,8 @@ pub(super) fn invoke_card_action(
             },
             other => other,
         })?;
-        let id = id_of(&answer.body["OriginalArrivalTime"]);
+        crate::sendtime::stage("post");
+        let id = arrival_time_id(&answer.body);
         if millis(&id) == 0 {
             return Err(Fault::Net("Teams accepted the message but did not name it".to_owned()));
         }
@@ -2081,6 +2088,7 @@ pub(super) fn invoke_card_action(
             self.bump(channel, root, &[&message], false)?;
         }
         message.reply_to = quote;
+        crate::sendtime::stage("parse");
         Ok(message)
     }
 
@@ -2134,7 +2142,8 @@ pub(super) fn invoke_card_action(
             },
             other => other,
         })?;
-        let id = id_of(&answer.body["OriginalArrivalTime"]);
+        crate::sendtime::stage("post");
+        let id = arrival_time_id(&answer.body);
         if millis(&id) == 0 {
             return Err(Fault::Net("Teams accepted the message but did not name it".to_owned()));
         }
@@ -2154,6 +2163,7 @@ pub(super) fn invoke_card_action(
             self.bump(channel, root, &[&message], false)?;
         }
         message.reply_to = quote;
+        crate::sendtime::stage("parse");
         Ok(message)
     }
 
@@ -2399,6 +2409,26 @@ pub(super) fn invoke_card_action(
         }
         results
     }
+}
+
+/// Parses Teams' message POST response arrival-time id case-insensitively
+/// (`OriginalArrivalTime` or `originalarrivaltime`).
+pub(super) fn arrival_time_id(body: &Value) -> String {
+    let direct = id_of(&body["OriginalArrivalTime"]);
+    if !direct.is_empty() {
+        return direct;
+    }
+    let lower = id_of(&body["originalarrivaltime"]);
+    if !lower.is_empty() {
+        return lower;
+    }
+    body.as_object()
+        .and_then(|map| {
+            map.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("originalarrivaltime"))
+                .map(|(_, v)| id_of(v))
+        })
+        .unwrap_or_default()
 }
 
 /// How many messages one history fetch asks for. A reply chain is 200; a chat or channel is 50.

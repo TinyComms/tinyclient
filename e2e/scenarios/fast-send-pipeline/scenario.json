@@ -1,0 +1,12 @@
+{
+  "id": "fast-send-pipeline",
+  "title": "Interactive sends bypass stalled backfills, wake pace waits, resolve Page::After anchors, and keep active uploads pending",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "This driver runs desktop chatd against a local mock HTTP server and store; no native mobile GUI proof is claimed.",
+    "ios": "This driver runs desktop chatd against a local mock HTTP server and store; no native mobile GUI proof is claimed."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

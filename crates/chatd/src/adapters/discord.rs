@@ -50,8 +50,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// The pause after a history fetch.
@@ -806,6 +806,8 @@ struct Outbox {
     wake: gateway::WakePair,
 }
 
+type BgJob = Box<dyn FnOnce(&Arc<Discord>) + Send>;
+
 struct Discord {
     ctx: Context,
     rest: Rest,
@@ -825,6 +827,8 @@ struct Discord {
     search_turn: Mutex<()>,
     /// One Go Live request at a time, so a stop cannot land before the start it was meant to end.
     stream_gate: Mutex<()>,
+    /// Bounded background HTTP queue for non-critical gateway/tick tasks so the gateway loop never blocks.
+    bg: Mutex<Option<SyncSender<BgJob>>>,
 }
 
 /// The user id a token starts with (its first part is the id in base64), so the account is named
@@ -970,6 +974,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     // Nothing here touches the network or runs a program: who the session says it is (the
     // browser's version, the web client's build) is worked out on the adapter's own threads,
     // so chatd is serving before any of it.
+    let (bg_tx, bg_rx) = sync_channel::<BgJob>(64);
     let discord = Arc::new(Discord {
         rest: Rest::new(session.token.clone(), ctx.clone()),
         ctx,
@@ -985,7 +990,23 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         message_search: Mutex::new(info::MessageSearch::default()),
         search_turn: Mutex::new(()),
         stream_gate: Mutex::new(()),
+        bg: Mutex::new(Some(bg_tx)),
     });
+    let bg_rx = Arc::new(Mutex::new(bg_rx));
+    for worker in 0..2 {
+        let rx = bg_rx.clone();
+        let worker_discord = discord.clone();
+        let _ = std::thread::Builder::new().name(format!("discord-bg-{worker}")).spawn(move || loop {
+            let job = crate::hub::lock(&rx).recv();
+            let Ok(job) = job else {
+                break;
+            };
+            if worker_discord.ctx.stopped() {
+                break;
+            }
+            job(&worker_discord);
+        });
+    }
     let posting = discord.clone();
     discord.ctx.hub.calls.on_identity(move |conversation, identity| {
         if conversation.account() != posting.ctx.account || posting.ctx.stopped() {
@@ -996,30 +1017,119 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     let socket = discord.clone();
     std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
     let (commands, network_inbox) = channel();
-    let viewport = discord.clone();
-    std::thread::spawn(move || {
-        // Cache reads and desired viewport updates must not sit behind history
-        // backfill sleeps or an HTTP request. Preserve their order on one thread.
+    let (send_tx, send_rx) = channel::<(String, String, String, Option<String>)>();
+    // Single-slot coalesced typing state: latest channel overwrites stale pending ones.
+    let typing_slot: Arc<(Mutex<(Option<String>, bool)>, Condvar)> = Arc::new((Mutex::new((None, false)), Condvar::new()));
+
+    // Dedicated FIFO send worker: preserves per-account/channel message ordering without waiting
+    // behind Typing, MarkRead, Backfill, Warm, Download, CallJoin, Pinned, Catalog, etc.
+    let sender_discord = discord.clone();
+    let _ = std::thread::Builder::new().name("discord-send".into()).spawn(move || {
+        while let Ok((conversation_id, client_id, text, reply_to)) = send_rx.recv() {
+            if sender_discord.ctx.stopped() {
+                break;
+            }
+            sender_discord.asked();
+            let outcome = crate::sendtime::run(&client_id, || {
+                sender_discord.send(&conversation_id, &client_id, &text, reply_to.as_deref())
+            });
+            sender_discord.ctx.sent(&conversation_id, &client_id, outcome);
+        }
+    });
+
+    // Dedicated single-slot coalesced typing worker: drops duplicate/stale typings, short timeout,
+    // capped short 429 retry, never blocks sends or serve_commands.
+    let typing_discord = discord.clone();
+    let typing_rx = typing_slot.clone();
+    let _ = std::thread::Builder::new().name("discord-typing".into()).spawn(move || loop {
+        let channel = {
+            let (lock, cv) = &*typing_rx;
+            let mut guard = crate::hub::lock(lock);
+            while guard.0.is_none() && !guard.1 {
+                guard = cv.wait(guard).unwrap_or_else(|p| p.into_inner());
+            }
+            if guard.1 {
+                break;
+            }
+            guard.0.take()
+        };
+        if typing_discord.ctx.stopped() {
+            break;
+        }
+        if let Some(channel) = channel {
+            typing_discord.asked();
+            typing_discord.typing(&channel);
+        }
+    });
+
+    let router = discord.clone();
+    let _ = std::thread::Builder::new().name("discord-router".into()).spawn(move || {
+        // Non-blocking router thread: cache-only viewport reads stay inline, interactive sends,
+        // uploads, cancels, and typings go to their dedicated workers, and blocking
+        // thread-members fetches / general commands go to `serve_commands`.
         while let Ok(command) = inbox.recv() {
             match command {
-                command @ (Command::Members { .. } | Command::Watch(_) | Command::OpenSpace(_) | Command::SearchPeople(_)) => viewport.command(command),
+                Command::Send { conversation_id, client_id, text, reply_to } => {
+                    let _ = send_tx.send((conversation_id, client_id, text, reply_to));
+                }
+                Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                    router.asked();
+                    let sending = router.clone();
+                    let (channel, client) = (conversation_id.clone(), client_id.clone());
+                    upload::spawn(&router.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
+                        crate::sendtime::run(&client, || {
+                            sending.send_with(&channel, &client, &text, reply_to.as_deref(), &with, up)
+                        })
+                    });
+                }
+                Command::CancelSend { client_id, .. } => upload::cancel(&router.ctx.account, &client_id),
+                Command::Typing { conversation_id, activity: _ } => {
+                    let (lock, cv) = &*typing_slot;
+                    crate::hub::lock(lock).0 = Some(conversation_id);
+                    cv.notify_one();
+                }
+                Command::Members { conversation_id, offset, limit, reply } => {
+                    // Thread member lists require a blocking HTTP GET: NEVER run HTTP on the router thread.
+                    if router.is_thread_channel(&conversation_id) {
+                        let _ = commands.send(Command::Members { conversation_id, offset, limit, reply });
+                    } else {
+                        router.members(conversation_id, offset, limit, reply);
+                    }
+                }
+                Command::Backfill(id) => {
+                    // Mark the channel opened immediately on the router thread so live events
+                    // arriving while `serve_commands` is warming another channel are never dropped.
+                    crate::hub::lock(&router.state).opened.insert(id.clone());
+                    if commands.send(Command::Backfill(id)).is_err() {
+                        break;
+                    }
+                }
+                command @ (Command::Watch(_) | Command::OpenSpace(_) | Command::SearchPeople(_)) => router.command(command),
                 command => {
                     let stop = matches!(&command, Command::Stop);
-                    if commands.send(command).is_err() || stop { break; }
+                    if commands.send(command).is_err() || stop {
+                        break;
+                    }
                 }
             }
         }
+        crate::hub::lock(&router.bg).take();
+        {
+            let (lock, cv) = &*typing_slot;
+            crate::hub::lock(lock).1 = true;
+            cv.notify_all();
+        }
     });
     std::thread::spawn(move || {
-        // A send with files uploads on a thread of its own, so the commands behind it (its own
-        // cancel among them) are not held up for as long as the upload takes.
         let other = |command| match command {
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
                 discord.asked();
                 let sending = discord.clone();
                 let (channel, client) = (conversation_id.clone(), client_id.clone());
                 upload::spawn(&discord.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
-                    sending.send_with(&channel, &client, &text, reply_to.as_deref(), &with, up)
+                    crate::sendtime::run(&client, || {
+                        sending.send_with(&channel, &client, &text, reply_to.as_deref(), &with, up)
+                    })
                 });
             }
             // A post with files uploads before Discord will name the thread. That waits on its
@@ -1296,6 +1406,32 @@ impl Discord {
             self.wake();
         }
         answer
+    }
+
+    /// Interactive send request: caps 429 retry wait to `rest::SEND_PATIENCE` and wakes socket on 401.
+    fn call_send(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
+        let answer = self.rest.call_send(method, path, body);
+        if matches!(answer, Err(Refused::Expired)) {
+            self.wake();
+        }
+        answer
+    }
+
+    /// Best-effort request (typing): short timeout, no 429 retry, wakes socket on 401.
+    fn call_best_effort(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
+        let answer = self.rest.call_best_effort(method, path, body);
+        if matches!(answer, Err(Refused::Expired)) {
+            self.wake();
+        }
+        answer
+    }
+
+    /// Dispatches non-critical HTTP work off the gateway loop onto the bounded background pool.
+    pub(super) fn enqueue_bg(&self, job: impl FnOnce(&Arc<Discord>) + Send + 'static) {
+        let tx = crate::hub::lock(&self.bg).clone();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(Box::new(job));
+        }
     }
 
     /// One-shot request (never retried on 429; wakes socket on 401).
@@ -1692,7 +1828,9 @@ impl Discord {
         crate::hub::lock(&self.state).opened.insert(channel.to_owned());
         // Warming is nobody's click, so it does not run at a machine's pace.
         if crate::hub::lock(&self.state).warming.remove(channel) {
-            std::thread::sleep(jitter(400, 2500));
+            if self.ctx.pause(jitter(400, 2500)) {
+                return;
+            }
         } else {
             self.asked();
         }
@@ -3076,7 +3214,7 @@ impl Discord {
     }
 
     fn send(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, String> {
-        let premium = self.state.lock().unwrap().premium;
+        let premium = crate::hub::lock(&self.state).premium;
         if let Some(why) = too_long(premium, text) {
             return Err(why);
         }
@@ -3104,12 +3242,15 @@ impl Discord {
             body["message_reference"] = reference;
             body["allowed_mentions"] = json!({"parse": ["users", "roles", "everyone"], "replied_user": true});
         }
-        let asked = self.call("POST", &format!("/channels/{channel}/messages"), Some(body));
+        crate::sendtime::stage("prepare");
+        let asked = self.call_send("POST", &format!("/channels/{channel}/messages"), Some(body));
+        crate::sendtime::stage("post");
         self.note_send_slowmode(channel, &conversation, &asked);
         let accepted = asked.map_err(|refused| refused.reason())?;
         let posted: Posted = serde_json::from_str(&accepted).map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let _ = files.register(&self.ctx);
+        crate::sendtime::stage("convert");
         Ok(message)
     }
 
@@ -3122,7 +3263,7 @@ impl Discord {
             state.typed.retain(|_, at| at.elapsed() < TYPING_EVERY);
             state.typed.insert(channel.to_owned(), Instant::now());
         }
-        if let Err(refused) = self.call("POST", &format!("/channels/{channel}/typing"), None) {
+        if let Err(refused) = self.call_best_effort("POST", &format!("/channels/{channel}/typing"), None) {
             self.log("typing", refused);
         }
     }
@@ -3930,14 +4071,16 @@ impl Discord {
         for (guild, overrides) in due {
             let body = collapse_settings_body(&overrides);
             let path = format!("/users/@me/guilds/{guild}/settings");
-            if let Err(refused) = self.call("PATCH", &path, Some(body)) {
-                self.log("collapse", refused);
-            }
+            self.enqueue_bg(move |discord| {
+                if let Err(refused) = discord.call("PATCH", &path, Some(body)) {
+                    discord.log("collapse", refused);
+                }
+            });
         }
         remaining
     }
 
-    fn command(&self, command: Command) {
+    fn command(self: &Arc<Self>, command: Command) {
         // Everything but these is the user doing something, which is what an adapter that
         // stopped asking for a session was waiting for. The screen moving counts when it moved
         // to something of this account; a watch that lapsed names nothing.
@@ -5325,5 +5468,129 @@ mod tests {
         // Completed (3) or canceled (4) -> do not notify.
         assert!(!should_notify_scheduled_event(2, 3, true, false, false));
         assert!(!should_notify_scheduled_event(1, 4, true, false, false));
+    }
+
+    #[test]
+    fn router_thread_never_blocks_send_behind_thread_members_fetch() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let db = std::env::temp_dir().join(format!("tinyclient-discord-router-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = crate::store::Store::open(&db).unwrap();
+        let hub = Arc::new(crate::hub::Hub::new(store));
+        let account = protocol::AccountKey { network: protocol::Network::Discord, account: "router-test".into() };
+        let (_adapter, ctx, rx) = crate::adapters::local(account, hub);
+        let tx = ctx.commands.clone();
+        let mut thread_row = ConversationRow::new("thread-1", ConversationKind::Thread, "Slow thread");
+        thread_row.space = Some("guild-1".into());
+        ctx.conversation(&thread_row).unwrap();
+        let dm_row = ConversationRow::new("dm-1", ConversationKind::Direct, "Fast DM");
+        ctx.conversation(&dm_row).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let server_flag = stop_server.clone();
+        let server = std::thread::spawn(move || {
+            while !server_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                if server_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.contains("thread-members") {
+                        std::thread::sleep(Duration::from_secs(2));
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]");
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    }
+                });
+            }
+        });
+
+        let wake = gateway::WakePair::new().unwrap();
+        let discord = Arc::new(Discord {
+            rest: Rest::new("tok".into(), ctx.clone()),
+            ctx,
+            token: "tok".into(),
+            state: Mutex::new(State::default()),
+            outbox: Outbox { queue: Mutex::new(gateway::SendQueue::default()), wake },
+            sequence: AtomicU64::new(0),
+            refused_sessions: Mutex::new((0, String::new())),
+            held: AtomicBool::new(false),
+            message_search: Mutex::new(info::MessageSearch::default()),
+            search_turn: Mutex::new(()),
+            stream_gate: Mutex::new(()),
+            bg: Mutex::new(None),
+        });
+        assert!(discord.is_thread_channel("thread-1"));
+        assert!(!discord.is_thread_channel("dm-1"));
+
+        let (net_tx, net_rx) = channel();
+        let (send_tx, send_rx) = channel::<(String, String, String, Option<String>)>();
+        let router_discord = discord.clone();
+        let router_handle = std::thread::spawn(move || {
+            while let Ok(command) = rx.recv() {
+                match command {
+                    Command::Send { conversation_id, client_id, text, reply_to } => {
+                        let _ = send_tx.send((conversation_id, client_id, text, reply_to));
+                    }
+                    Command::Members { conversation_id, offset, limit, reply } => {
+                        if router_discord.is_thread_channel(&conversation_id) {
+                            let _ = net_tx.send(Command::Members { conversation_id, offset, limit, reply });
+                        } else {
+                            router_discord.members(conversation_id, offset, limit, reply);
+                        }
+                    }
+                    Command::Stop => break,
+                    other => {
+                        let _ = net_tx.send(other);
+                    }
+                }
+            }
+        });
+
+        let (members_reply_tx, members_reply_rx) = channel();
+        let net_worker = std::thread::spawn(move || {
+            if let Ok(Command::Members { reply, .. }) = net_rx.recv() {
+                let mut stream = std::net::TcpStream::connect(addr).unwrap();
+                let _ = stream.write_all(b"GET /channels/thread-1/thread-members?with_member=true HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let _ = reply.send(Ok(crate::adapters::Members { pending: false, sections: vec![], members: vec![] }));
+            }
+        });
+
+        let began = Instant::now();
+        tx.send(Command::Members {
+            conversation_id: "thread-1".into(),
+            offset: 0,
+            limit: 50,
+            reply: members_reply_tx,
+        })
+        .unwrap();
+        tx.send(Command::Send {
+            conversation_id: "dm-1".into(),
+            client_id: "c-fast-1".into(),
+            text: "fast".into(),
+            reply_to: None,
+        })
+        .unwrap();
+
+        let (conv, cid, text, _) = send_rx.recv_timeout(Duration::from_millis(500)).expect("Send must not wait behind thread Members");
+        assert_eq!((conv.as_str(), cid.as_str(), text.as_str()), ("dm-1", "c-fast-1", "fast"));
+        assert!(began.elapsed() < Duration::from_millis(500), "Send waited {:?}", began.elapsed());
+        assert!(members_reply_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+
+        let _ = tx.send(Command::Stop);
+        let _ = router_handle.join();
+        let _ = net_worker.join();
+        stop_server.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect(addr);
+        let _ = server.join();
     }
 }

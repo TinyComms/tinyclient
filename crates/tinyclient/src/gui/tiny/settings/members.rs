@@ -6,14 +6,17 @@
 
 use super::kit::{self, cell, check_box, table_head, table_row};
 use super::page_head;
+use crate::gui::components::place::{anchor, placed, Layer, Place};
 use crate::gui::components::{button, glyph, icon_button, menu, menu_item_check, menu_label, tip, Avatar, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::tiny::model;
 use crate::gui::tiny::{Float, Modal, Page as Facts};
-use gpui::{anchored, deferred, div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, SharedString, Window};
+use gpui::{canvas, div, prelude::*, px, AnyElement, Bounds, Context, Div, MouseButton, MouseDownEvent, Pixels, SharedString, Window};
 use protocol::{Request, TinyCommunity, TinyMember, TINY_FEATURE_ROLES};
+use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 /// Which of the page's lists is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +32,9 @@ pub(in crate::gui) struct Draft {
     pub selected: BTreeSet<String>,
     pub role: Option<String>,
     pub open: Option<Menu>,
+    pub filter_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub add_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub remove_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 /// The members the table lists for `query` and `role`: owners first, then by rank, then by
@@ -99,9 +105,13 @@ impl Shell {
 }
 
 /// A list under a trigger, as the page's pickers drop one.
-fn dropdown(list: Div, cx: &mut Context<Shell>) -> AnyElement {
-    let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_members_draft(cx, |draft| draft.open = None)));
-    deferred(anchored().snap_to_window().child(div().mt(px(4.)).child(list))).priority(2).into_any_element()
+fn dropdown(id: &'static str, bounds: Option<Bounds<Pixels>>, window: &Window, list: Div, cx: &mut Context<Shell>) -> AnyElement {
+    let max_w = (f32::from(window.viewport_size().width) - 16.).max(180.);
+    let list = list
+        .max_w(px(max_w))
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_members_draft(cx, |draft| draft.open = None)));
+    let at = bounds.unwrap_or_else(|| anchor(16., 140., 180., 32.));
+    placed(id, Place::Below(at), Layer::Menu, window, list)
 }
 
 pub(in crate::gui::tiny) fn members(shell: &Shell, facts: &Facts, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
@@ -118,11 +128,20 @@ pub(in crate::gui::tiny) fn members(shell: &Shell, facts: &Facts, window: &mut W
 
     // Search, filter, and how many.
     let filter_name = draft.role.as_ref().and_then(|id| community.roles.iter().find(|role| role.id == *id)).map_or("All roles".to_owned(), |role| role.name.clone());
-    let mut tools = div().flex().items_center().gap(px(8.)).child(kit::search(&fields.member_search, 260., window, cx));
+    let mut tools = div().flex().flex_wrap().items_center().gap(px(8.)).child(kit::search(&fields.member_search, 260., window, cx).max_w_full());
     if roles_known {
         let open = draft.open == Some(Menu::Filter);
+        let filter_bounds = draft.filter_bounds.clone();
         let mut filter = div().flex().flex_col().child(
             kit::picker("tiny-members-filter", "icons/shield.svg", filter_name, open, 180.)
+                .relative()
+                .child(
+                    canvas(move |bounds, _, _| filter_bounds.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| this.tiny_members_draft(cx, |draft| draft.open = if open { None } else { Some(Menu::Filter) }))),
         );
         if open {
@@ -144,7 +163,7 @@ pub(in crate::gui::tiny) fn members(shell: &Shell, facts: &Facts, window: &mut W
                     },
                 )));
             }
-            filter = filter.child(dropdown(list, cx));
+            filter = filter.child(dropdown("tiny-members-filter-menu", draft.filter_bounds.get(), window, list, cx));
         }
         tools = tools.child(filter);
     }
@@ -154,23 +173,37 @@ pub(in crate::gui::tiny) fn members(shell: &Shell, facts: &Facts, window: &mut W
     // What can be done to everyone ticked.
     if !draft.selected.is_empty() {
         let mut bar = div()
-            .h(px(44.))
+            .min_h(px(44.))
             .px(px(12.))
+            .py(px(6.))
             .rounded(px(theme::R_CARD))
             .bg(theme::accent_wash())
             .border_1()
             .border_color(theme::accent_soft())
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(8.))
             .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(format!("{} selected", draft.selected.len())))
             .child(div().flex_1());
         let assignable: Vec<_> = super::roles::ordered(community).into_iter().filter(|role| !role.default && super::roles::editable(community, role)).collect();
         if roles_known && facts.may.manage_roles && !assignable.is_empty() {
-            for (menu_kind, words) in [(Menu::Add, "Add role"), (Menu::Remove, "Remove role")] {
+            for (menu_kind, words, bounds_cell, menu_id) in [
+                (Menu::Add, "Add role", &draft.add_bounds, "tiny-members-add-menu"),
+                (Menu::Remove, "Remove role", &draft.remove_bounds, "tiny-members-remove-menu"),
+            ] {
                 let open = draft.open == Some(menu_kind);
+                let cell = bounds_cell.clone();
                 let mut wrap = div().flex().flex_col().child(
                     button(SharedString::from(format!("tiny-members-{words}")), ButtonKind::Secondary, words)
+                        .relative()
+                        .child(
+                            canvas(move |bounds, _, _| cell.set(Some(bounds)), |_, _, _, _| {})
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| this.tiny_members_draft(cx, |draft| draft.open = if open { None } else { Some(menu_kind) }))),
                 );
                 if open {
@@ -178,7 +211,7 @@ pub(in crate::gui::tiny) fn members(shell: &Shell, facts: &Facts, window: &mut W
                     let mut list = menu().w(px(220.)).child(menu_label(if add { "Give everyone ticked" } else { "Take from everyone ticked" }));
                     for (ix, role) in assignable.iter().enumerate() {
                         let id = role.id.clone();
-                        let dot = role.color.as_deref().and_then(model::hex).map(gpui::rgb).unwrap_or(theme::text_faint());
+                        let dot = role.color.as_deref().and_then(model::hex).map(theme::role_color).unwrap_or(theme::text_faint());
                         let changes = bulk_roles(community, &draft.selected, &role.id, add).len();
                         list = list.child(
                             div()
@@ -193,7 +226,7 @@ pub(in crate::gui::tiny) fn members(shell: &Shell, facts: &Facts, window: &mut W
                                 .hover(|style| style.bg(theme::hover()))
                                 .on_click(cx.listener(move |this, _, _, cx| this.tiny_members_bulk(id.clone(), add, cx)))
                                 .child(div().size(px(8.)).rounded_full().bg(dot))
-                                .child(div().flex_1().type_ui().text_color(theme::text()).child(role.name.clone()))
+                                .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(role.name.clone()))
                                 .child(div().type_small().text_color(theme::text_faint()).child(match changes {
                                     0 => "no change".to_owned(),
                                     1 => "1 change".to_owned(),
@@ -201,7 +234,7 @@ pub(in crate::gui::tiny) fn members(shell: &Shell, facts: &Facts, window: &mut W
                                 })),
                         );
                     }
-                    wrap = wrap.child(dropdown(list, cx));
+                    wrap = wrap.child(dropdown(menu_id, bounds_cell.get(), window, list, cx));
                 }
                 bar = bar.child(wrap);
             }

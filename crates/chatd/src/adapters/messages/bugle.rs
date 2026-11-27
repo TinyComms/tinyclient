@@ -615,7 +615,7 @@ fn refresh_session(saved: &mut Saved) -> Result<(), String> {
 
 /// What the keychain holds after a phone has paired. `key` is the ECDSA signing key, hex scalar,
 /// kept so a later refresh can sign. Not `Debug`.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Saved {
     #[serde(default)]
     pub cookies: std::collections::HashMap<String, String>,
@@ -1771,8 +1771,11 @@ struct Live {
 struct Waiter {
     request: String,
     session: String,
+    action: u32,
     reply: Sender<Vec<u8>>,
 }
+
+const HTTP_IDLE: Duration = Duration::from_secs(30);
 
 fn agent(timeout: Duration) -> ureq::Agent {
     // The same system TLS as the rest of chatd. ureq's default is rustls, which this crate does
@@ -1780,6 +1783,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
     crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_global(Some(timeout))
+        .max_idle_age(HTTP_IDLE)
         .http_status_as_error(false)
         .user_agent(USER_AGENT)
         .build()
@@ -1798,6 +1802,17 @@ fn post(
     body: &[u8],
     cookies: &str,
 ) -> Result<Http, String> {
+    post_with_timeout(agent, Duration::from_secs(30), url, content, body, cookies)
+}
+
+fn post_with_timeout(
+    agent: &ureq::Agent,
+    timeout: Duration,
+    url: &str,
+    content: &str,
+    body: &[u8],
+    cookies: &str,
+) -> Result<Http, String> {
     let google = google::authorization(cookies);
     let url = if google.is_some() {
         url.replace(
@@ -1809,6 +1824,9 @@ fn post(
     };
     let mut request = agent
         .post(&url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
         .header("Content-Type", content)
         .header("x-goog-api-key", API_KEY)
         .header("x-user-agent", "grpc-web-javascript/0.1")
@@ -1888,6 +1906,8 @@ pub struct Session {
     waiters: Arc<Mutex<Vec<Waiter>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     inbox: Mutex<Inbox>,
+    /// Shared pooled HTTP agent for RPCs, acks, uploads, and downloads.
+    http: ureq::Agent,
 }
 
 /// Registers a fresh browser key pair with Google's Bugle relay, emits the QR code URL and its
@@ -1962,6 +1982,7 @@ pub fn pair_qr(
     let poll_live = live.clone();
     let poll_stop = stop.clone();
     let (paired_tx, paired_rx) = channel::<Saved>();
+    let poll_http = agent(Duration::from_secs(90));
     std::thread::Builder::new()
         .name("messages-pair".into())
         .spawn(move || {
@@ -1973,6 +1994,8 @@ pub fn pair_qr(
                     poll_stop.clone(),
                     false,
                     Some(paired_tx.clone()),
+                    &poll_http,
+                    None,
                 );
                 if failed || poll_stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
@@ -2040,6 +2063,8 @@ impl Session {
             session: uuid(),
             chats: Vec::new(),
         }));
+        let http = agent(Duration::from_secs(30));
+        let poll_http = agent(Duration::from_secs(90));
         let session = Session {
             live,
             events,
@@ -2047,7 +2072,20 @@ impl Session {
             waiters: Arc::default(),
             stop: Arc::default(),
             inbox: Mutex::new(Inbox { next: None, done: true }),
+            http: http.clone(),
         };
+        let (ack_tx, ack_rx) = channel::<Vec<String>>();
+        let (ack_live, ack_http) = (session.live.clone(), http);
+        let _ = std::thread::Builder::new()
+            .name("messages-acks".into())
+            .spawn(move || {
+                while let Ok(mut batch) = ack_rx.recv() {
+                    while let Ok(more) = ack_rx.try_recv() {
+                        batch.extend(more);
+                    }
+                    google::acknowledge_ids(&batch, &ack_live, &ack_http);
+                }
+            });
         let (live, events, waiters, stop) = (
             session.live.clone(),
             session.events.clone(),
@@ -2067,18 +2105,22 @@ impl Session {
                         stop.clone(),
                         first,
                         None,
+                        &poll_http,
+                        Some(&ack_tx),
                     );
                     first = false;
                     if stop.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    // A failed refresh, connect, or refused status backs off. A normal close,
-                    // including the 90-second timeout, starts the wait over.
-                    pause = if failed { next_pause(pause) } else { POLL_FLOOR };
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
+                    // A failed refresh, connect, or refused status backs off. A normal stream
+                    // close (including the 90-second long-poll EOF) reconnects immediately with
+                    // 0 ms dead-gap and resets the error backoff.
+                    if failed {
+                        wait_or_stop(&stop, pause);
+                        pause = next_pause(pause);
+                    } else {
+                        pause = POLL_FLOOR;
                     }
-                    wait_or_stop(&stop, pause);
                 }
             })
             .map_err(|err| err.to_string())?;
@@ -2131,7 +2173,7 @@ impl Session {
 
     /// SetActiveSession. The request id is the long-poll's session id; without it the phone
     /// accepts the pair and then sends nothing.
-    fn activate(&self) -> Result<(), String> {
+    pub fn activate(&self) -> Result<(), String> {
         let session = self
             .live
             .lock()
@@ -2139,6 +2181,82 @@ impl Session {
             .session
             .clone();
         let _ = self.rpc_as(&session, 16, &[], 2)?;
+        Ok(())
+    }
+
+    fn build_rpc_payload(
+        &self,
+        request: &str,
+        action: u32,
+        plain: &[u8],
+        message_type: u32,
+    ) -> (String, Vec<u8>, String) {
+        let live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let gaia_pairing = clear_action(action);
+        let encrypted = if plain.is_empty() || gaia_pairing {
+            Vec::new()
+        } else {
+            seal(&live.aes, &live.hmac, plain)
+        };
+        let mobile = Device {
+            user: live.saved.mobile_user,
+            source: live.saved.mobile.clone(),
+        };
+        let mut body = outgoing(
+            &mobile,
+            request,
+            &live.session,
+            action,
+            &encrypted,
+            &live.token,
+            live.ttl,
+            message_type,
+        );
+        if !live.saved.dest_reg_id.is_empty() {
+            body[0][2] = "GDitto".into();
+            body.as_array_mut()
+                .unwrap()
+                .resize(9, serde_json::Value::Null);
+            body[8] = serde_json::json!([b64(live.saved.dest_reg_id.as_bytes())]);
+        }
+        if gaia_pairing {
+            let mut data = Buf::new();
+            data.text(1, request);
+            data.int(2, action as u64);
+            data.bytes(3, plain);
+            data.text(6, &live.session);
+            body[1][11] = b64(&data.0).into();
+            body[4] = "300000000".into();
+        }
+        (
+            live.session.clone(),
+            serde_json::to_vec(&body).unwrap_or_default(),
+            live.cookies.clone(),
+        )
+    }
+
+    /// Fire-and-forget RPC (typing indicator, mark read): POSTs with a short HTTP timeout and
+    /// does not register a waiter or block 20 s waiting for a phone reply.
+    fn fire_and_forget(&self, action: u32, plain: &[u8], message_type: u32) -> Result<(), String> {
+        let request = uuid();
+        let (_, body, cookies) = self.build_rpc_payload(&request, action, plain, message_type);
+        let response = post_with_timeout(
+            &self.http,
+            Duration::from_secs(5),
+            &format!("{}.Messaging/SendMessage", relay_base()),
+            "application/json+protobuf",
+            &body,
+            &cookies,
+        )?;
+        let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        live.cookies = merge_cookies(&live.cookies, &response.cookies);
+        if !live.saved.cookies.is_empty() {
+            let cookies = live.cookies.clone();
+            google::update_cookies(&mut live.saved, &cookies);
+        }
         Ok(())
     }
 
@@ -2161,53 +2279,7 @@ impl Session {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<u8>, String> {
         let request = request.to_owned();
-        let (session, body, cookies) = {
-            let live = self
-                .live
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let gaia_pairing = clear_action(action);
-            let encrypted = if plain.is_empty() || gaia_pairing {
-                Vec::new()
-            } else {
-                seal(&live.aes, &live.hmac, plain)
-            };
-            let mobile = Device {
-                user: live.saved.mobile_user,
-                source: live.saved.mobile.clone(),
-            };
-            let mut body = outgoing(
-                &mobile,
-                &request,
-                &live.session,
-                action,
-                &encrypted,
-                &live.token,
-                live.ttl,
-                message_type,
-            );
-            if !live.saved.dest_reg_id.is_empty() {
-                body[0][2] = "GDitto".into();
-                body.as_array_mut()
-                    .unwrap()
-                    .resize(9, serde_json::Value::Null);
-                body[8] = serde_json::json!([b64(live.saved.dest_reg_id.as_bytes())]);
-            }
-            if gaia_pairing {
-                let mut data = Buf::new();
-                data.text(1, &request);
-                data.int(2, action as u64);
-                data.bytes(3, plain);
-                data.text(6, &live.session);
-                body[1][11] = b64(&data.0).into();
-                body[4] = "300000000".into();
-            }
-            (
-                live.session.clone(),
-                serde_json::to_vec(&body).unwrap_or_default(),
-                live.cookies.clone(),
-            )
-        };
+        let (session, body, cookies) = self.build_rpc_payload(&request, action, plain, message_type);
         let (tx, rx) = channel();
         self.waiters
             .lock()
@@ -2215,11 +2287,11 @@ impl Session {
             .push(Waiter {
                 request: request.clone(),
                 session: session.clone(),
+                action,
                 reply: tx,
             });
-        let agent = agent(Duration::from_secs(30));
         let sent = post(
-            &agent,
+            &self.http,
             &format!("{}.Messaging/SendMessage", relay_base()),
             "application/json+protobuf",
             &body,
@@ -2279,6 +2351,11 @@ impl Session {
 
     pub fn refresh(&self) -> Result<(), String> {
         self.activate()?;
+        self.refresh_lists()
+    }
+
+    /// Loads the initial inbox, archive, and spam lists after [`activate`] succeeded.
+    pub fn refresh_lists(&self) -> Result<(), String> {
         // The first list after pairing is the annotation. Archive and spam use the ordinary call.
         let first = self.rpc(1, &list_request(CHAT_PAGE, 1, None), 16)?;
         let chats = decode_chats(&first);
@@ -2520,9 +2597,12 @@ impl Session {
             req.msg(3, &device.0);
             (b64(&req.0), live.cookies.clone())
         };
-        let http = agent(Duration::from_secs(60));
-        let mut start = http
+        let mut start = self
+            .http
             .post(UPLOAD)
+            .config()
+            .timeout_global(Some(Duration::from_secs(60)))
+            .build()
             .header("Content-Type", "text/plain")
             .header("x-goog-api-key", API_KEY)
             .header("Origin", ORIGIN)
@@ -2551,8 +2631,12 @@ impl Session {
         if url.is_empty() {
             return Err("Messages didn't give an upload address.".into());
         }
-        let mut finish = http
+        let mut finish = self
+            .http
             .post(&url)
+            .config()
+            .timeout_global(Some(Duration::from_secs(60)))
+            .build()
             .header("Content-Type", mime)
             .header("X-Goog-Upload-Command", "upload, finalize")
             .header("X-Goog-Upload-Offset", "0");
@@ -2599,9 +2683,12 @@ impl Session {
             req.msg(2, &auth_message(&uuid(), &live.token));
             (b64(&req.0), live.cookies.clone())
         };
-        let http = agent(Duration::from_secs(60));
-        let mut request = http
+        let mut request = self
+            .http
             .get(UPLOAD)
+            .config()
+            .timeout_global(Some(Duration::from_secs(60)))
+            .build()
             .header("x-goog-api-key", API_KEY)
             .header("Origin", ORIGIN)
             .header("X-Goog-Download-Metadata", &payload);
@@ -2650,13 +2737,11 @@ impl Session {
     }
 
     pub fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
-        let _ = self.rpc(10, &read_request(conversation, message), 2)?;
-        Ok(())
+        self.fire_and_forget(10, &read_request(conversation, message), 2)
     }
 
     pub fn typing(&self, conversation: &str) -> Result<(), String> {
-        let _ = self.rpc(12, &typing_request(conversation), 2)?;
-        Ok(())
+        self.fire_and_forget(12, &typing_request(conversation), 2)
     }
 
 }
@@ -2704,6 +2789,8 @@ fn poll(
     stop: Arc<std::sync::atomic::AtomicBool>,
     announce: bool,
     paired: Option<Sender<Saved>>,
+    poll_http: &ureq::Agent,
+    ack_tx: Option<&Sender<Vec<String>>>,
 ) -> bool {
     let refresh = {
         let live = live.lock().unwrap_or_else(|p| p.into_inner());
@@ -2731,7 +2818,6 @@ fn poll(
         live.saved = saved;
         live.token_refreshed = Instant::now();
     }
-    let agent = agent(Duration::from_secs(90));
     let (request, token, cookies) = {
         let held = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (uuid(), held.token.clone(), held.cookies.clone())
@@ -2749,7 +2835,7 @@ fn poll(
     } else {
         base
     };
-    let mut request = agent
+    let mut request = poll_http
         .post(&format!("{relay}.Messaging/ReceiveMessages"))
         .header("Content-Type", "application/json+protobuf")
         .header("x-goog-api-key", API_KEY)
@@ -2829,7 +2915,12 @@ fn poll(
                 return false;
             }
         }
-        google::acknowledge(&values, &live);
+        if let Some(ack_tx) = ack_tx {
+            let ids = google::extract_ack_ids(&values);
+            if !ids.is_empty() {
+                let _ = ack_tx.send(ids);
+            }
+        }
         pending.drain(..used);
     }
     stream_exit_failed()
@@ -2930,10 +3021,24 @@ fn on_payload(
         let mut waiting = waiters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(at) = waiting
+        // Match exact request id strictly first. Never allow an unsolicited UpdateEvents
+        // (action 16) carrying `live.session` to steal an in-flight SendMessage (action 3) or
+        // ResendMessage (action 25) waiter.
+        let matched = waiting
             .iter()
-            .position(|waiter| waiter.request == echoed || waiter.session == echoed)
-        {
+            .position(|waiter| waiter.request == echoed)
+            .or_else(|| {
+                if action != 16 {
+                    waiting
+                        .iter()
+                        .position(|waiter| {
+                            waiter.session == echoed && waiter.action != 3 && waiter.action != 25
+                        })
+                } else {
+                    None
+                }
+            });
+        if let Some(at) = matched {
             let waiter = waiting.remove(at);
             drop(waiting);
             let _ = waiter.reply.send(plain.clone());
@@ -4865,5 +4970,58 @@ mod tests {
         let words = "Messages did not renew the session token. Pair again.";
         assert!(matches!(gate.fail(words), crate::adapters::Failure::Dropped(_)));
         assert!(matches!(gate.fail(words), crate::adapters::Failure::SignedOut(_)));
+    }
+
+    #[test]
+    fn unsolicited_update_events_never_steals_send_message_waiter() {
+        let live = Arc::new(Mutex::new(Live {
+            saved: Saved::default(),
+            aes: vec![1u8; 32],
+            hmac: vec![2u8; 32],
+            token: Vec::new(),
+            ttl: 0,
+            session: "sess-1".into(),
+            chats: Vec::new(),
+            cookies: String::new(),
+            token_refreshed: Instant::now(),
+        }));
+        let (events_tx, _events_rx) = channel();
+        let waiters: Arc<Mutex<Vec<Waiter>>> = Arc::default();
+        let (reply_tx, reply_rx) = channel();
+        waiters.lock().unwrap().push(Waiter {
+            request: "req-send-1".into(),
+            session: "sess-1".into(),
+            action: 3,
+            reply: reply_tx,
+        });
+
+        let make_frame = |echoed: &str, action: u64, plain: &[u8]| -> serde_json::Value {
+            let mut rpc = Buf::new();
+            rpc.text(1, echoed);
+            rpc.int(4, action);
+            rpc.bytes(5, plain);
+            let mut data = vec![serde_json::Value::Null; 12];
+            data[1] = serde_json::json!(19); // route 19 (1-based index 2)
+            data[11] = serde_json::json!(b64(&rpc.0)); // message (1-based index 12)
+            serde_json::json!([serde_json::Value::Null, data])
+        };
+
+        // 1. Unsolicited UpdateEvents (action 16) echoing `live.session` must NOT steal SendMessage waiter.
+        let update_frame = make_frame("sess-1", 16, b"\x08\x01");
+        assert!(!on_payload(&update_frame, &live, &events_tx, &waiters, &None));
+        assert_eq!(waiters.lock().unwrap().len(), 1);
+        assert!(reply_rx.try_recv().is_err());
+
+        // 2. Another RPC echoing `live.session` (not exact request id) must also NOT steal SendMessage waiter.
+        let list_frame = make_frame("sess-1", 1, b"\x08\x02");
+        assert!(!on_payload(&list_frame, &live, &events_tx, &waiters, &None));
+        assert_eq!(waiters.lock().unwrap().len(), 1);
+        assert!(reply_rx.try_recv().is_err());
+
+        // 3. Exact `request == echoed` response delivers cleanly to the SendMessage waiter.
+        let send_reply = make_frame("req-send-1", 3, b"send-ack");
+        assert!(!on_payload(&send_reply, &live, &events_tx, &waiters, &None));
+        assert!(waiters.lock().unwrap().is_empty());
+        assert_eq!(reply_rx.try_recv().unwrap(), b"send-ack");
     }
 }

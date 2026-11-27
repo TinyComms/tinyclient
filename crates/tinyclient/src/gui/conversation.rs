@@ -39,7 +39,7 @@ use super::components::{button, empty_state, glyph, ButtonKind};
 use super::layout::{drags_window, TOP_BAR};
 use super::state::{Shell, Snapshot};
 use super::theme::{self, Type};
-use crate::client::ask;
+use crate::client::ask_async;
 use gpui::{
     div, prelude::*, px, Bounds, ClipboardItem, Context, Div, Entity, EventEmitter,
     FocusHandle, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, Pixels, Point,
@@ -74,6 +74,11 @@ pub struct State {
     pub(in crate::gui) windows: popout::Windows,
     /// Age-restricted channels the user clicked Continue on during this session.
     passed_age_gate: HashSet<Key>,
+    /// Overflow `…` menu in the conversation header when narrow (< 520 px usable).
+    header_overflow: Cell<bool>,
+    header_overflow_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Live top/bounds of the main conversation body (below header & any live location bar).
+    body_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl State {
@@ -803,7 +808,7 @@ impl Pane {
         list.error = None;
         cx.notify();
         self.poll_voters_task = Some(cx.spawn(async move |pane, cx| {
-            let result = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let result = ask_async(request).await;
             let _ = pane.update(cx, |this, cx| {
                 if this.open.as_ref().is_none_or(|open| open.key != conversation) {
                     return;
@@ -858,10 +863,7 @@ impl Pane {
         }
         cx.notify();
         cx.spawn(async move |pane, cx| {
-            let answer = cx
-                .background_executor()
-                .spawn(async move { ask(&Request::Transcribe { conversation, message_id }) })
-                .await;
+            let answer = ask_async(Request::Transcribe { conversation, message_id }).await;
             let _ = pane.update(cx, |this, cx| {
                 this.transcribing.remove(&slot);
                 if let Ok(Response::Error { detail, .. }) = answer {
@@ -885,17 +887,13 @@ impl Pane {
             return;
         };
         cx.spawn(async move |pane, cx| {
-            let answer = cx
-                .background_executor()
-                .spawn(async move {
-                    ask(&Request::RateTranscript {
-                        conversation,
-                        message_id,
-                        transcription_id,
-                        good,
-                    })
-                })
-                .await;
+            let answer = ask_async(Request::RateTranscript {
+                conversation,
+                message_id,
+                transcription_id,
+                good,
+            })
+            .await;
             let _ = pane.update(cx, |this, cx| {
                 if let Ok(Response::Error { detail, .. }) = answer {
                     let shell = this.shell.clone();
@@ -979,10 +977,7 @@ impl Pane {
         let target = conversation.clone();
         cx.notify();
         cx.spawn(async move |pane, cx| {
-            let answer = cx
-                .background_executor()
-                .spawn(async move { ask(&Request::Poll { conversation, message_id, votes }) })
-                .await;
+            let answer = ask_async(Request::Poll { conversation, message_id, votes }).await;
             let _ = pane.update(cx, |this, cx| {
                 if this.open.as_ref().is_none_or(|open| open.key != target) {
                     return;
@@ -1301,12 +1296,14 @@ impl Pane {
         let blocked = self.open.as_ref().is_some_and(|open| open.can.age_restricted_blocked);
         let title = self.open.as_ref().map(|open| open.title.clone()).unwrap_or_default();
         let shell = self.shell.clone();
-        let continue_btn = button("age-gate-continue", ButtonKind::Primary, "Continue")
-            .when(blocked, |btn| btn.opacity(0.45).cursor_default())
-            .when(!blocked, |btn| {
-                btn.on_click(cx.listener(|this, _, _, cx| this.pass_age_gate(cx)))
-            });
-        let nope_btn = button("age-gate-nope", ButtonKind::Secondary, "Nope").on_click(cx.listener(move |_, _, _, cx| {
+        let continue_btn = if blocked {
+            super::components::button_disabled("Continue").into_any_element()
+        } else {
+            button("age-gate-continue", ButtonKind::Primary, "Continue")
+                .on_click(cx.listener(|this, _, _, cx| this.pass_age_gate(cx)))
+                .into_any_element()
+        };
+        let nope_btn = button("age-gate-nope", ButtonKind::Secondary, "Go back").on_click(cx.listener(move |_, _, _, cx| {
             let _ = shell.update(cx, |shell, cx| shell.leave_age_gated(cx));
         }));
         div()
@@ -1421,7 +1418,7 @@ impl Pane {
         };
         let request = Request::Messages { conversation: conversation.clone(), page: page.clone(), limit };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = this.update(cx, |this, cx| this.loaded(&conversation, &page, purpose, asked, answer, cx));
         })
         .detach();
@@ -1487,6 +1484,10 @@ impl Pane {
                         purpose: purpose.clone(),
                     });
                     cx.notify();
+                }
+                if self.stale && self.refreshing == 0 {
+                    self.stale = false;
+                    self.refresh(cx);
                 }
                 return;
             }
@@ -1575,10 +1576,45 @@ impl Pane {
         if purpose == Purpose::Open {
             shot::opened(self, cx);
         }
+        if !self.window.newer {
+            let shell = self.shell.clone();
+            let conv = conversation.clone();
+            let settled: Vec<Rc<Message>> = self.window.messages.iter().rev().take(20).cloned().collect();
+            cx.defer(move |cx| {
+                let _ = shell.update(cx, |shell, cx| shell.settle_flight(&conv, &settled, cx));
+            });
+        }
         if self.stale && self.refreshing == 0 {
             self.stale = false;
             self.refresh(cx);
         }
+        cx.notify();
+    }
+
+    /// Inserts a freshly submitted pending message from `Response::Sent` immediately so the
+    /// user sees their row without waiting for the `Change::Messages` round-trip.
+    fn note_sent(&mut self, conversation: &Key, message: Message, cx: &mut Context<Self>) {
+        if self.key() != Some(conversation) || self.is_gated() || self.window.newer {
+            return;
+        }
+        if !self.open.as_ref().is_some_and(|open| open.marker_known) {
+            return;
+        }
+        if self.window.messages.iter().any(|held| {
+            held.id == message.id
+                || (message.client_id.is_some() && held.client_id == message.client_id)
+                || message.client_id.as_deref() == Some(held.id.as_str())
+        }) {
+            return;
+        }
+        let top = self.list.logical_scroll_top();
+        let rank = message.rank();
+        let at = self.window.messages.partition_point(|held| held.rank() <= rank);
+        self.window.messages.insert(at, Rc::new(message));
+        let keep = self.window.messages.len().saturating_sub(1);
+        self.window.trim(keep);
+        self.relay(true, top);
+        self.snap_to_end();
         cx.notify();
     }
 
@@ -1938,7 +1974,7 @@ impl Pane {
             max_bytes: protocol::TEXT_PREVIEW_MAX_BYTES,
         };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let Ok(Response::Media { files }) = answer else {
                 return;
             };
@@ -1963,7 +1999,7 @@ impl Pane {
         };
         let request = Request::Fetch { retry, size, span: None, account: account.clone(), ids };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let Ok(Response::Media { files }) = answer else {
                 return;
             };
@@ -2001,8 +2037,8 @@ impl Pane {
             return;
         };
         let request = Request::Fetch { retry: false, size: None, span: Some(span), account, ids: vec![id] };
-        cx.spawn(async move |_this, cx| {
-            let _ = cx.background_executor().spawn(async move { ask(&request) }).await;
+        cx.spawn(async move |_this, _cx| {
+            let _ = ask_async(request).await;
         })
         .detach();
     }
@@ -2297,7 +2333,7 @@ impl Pane {
                 };
                 let key_for_cb = cache_key.clone();
                 cx.spawn(async move |this, cx| {
-                    let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+                    let answer = ask_async(req).await;
                     let _ = this.update(cx, |this, cx| {
                         this.invite_loading.remove(&key_for_cb);
                         let outcome = match answer {
@@ -2325,7 +2361,7 @@ impl Pane {
                     event_id: ev.id.clone(),
                 };
                 cx.spawn(async move |this, cx| {
-                    let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+                    let answer = ask_async(req).await;
                     let _ = this.update(cx, |this, cx| {
                         this.invite_loading.remove(&load_key);
                         let outcome = match answer {
@@ -2369,7 +2405,7 @@ impl Pane {
         cx.notify();
         let req = Request::InviteJoin { account, code: code.clone() };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let answer = ask_async(req).await;
             let _ = this.update(cx, |this, cx| {
                 this.invite_joining.remove(&code);
                 match answer {
@@ -2432,7 +2468,7 @@ impl Pane {
             interested,
         };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let answer = ask_async(req).await;
             let _ = this.update(cx, |this, cx| {
                 this.event_toggling.remove(&key);
                 match answer {
@@ -2529,9 +2565,10 @@ impl Pane {
         let top = self.list.logical_scroll_top();
         self.relay(false, top);
         let message_id = message.id.clone();
-        cx.background_executor().spawn(async move {
-            ask(&Request::MarkUnread { conversation, message_id })
-        }).detach();
+        cx.spawn(async move |_, _| {
+            let _ = ask_async(Request::MarkUnread { conversation, message_id }).await;
+        })
+        .detach();
         cx.notify();
     }
 
@@ -2581,7 +2618,10 @@ impl Pane {
         let request = Request::MarkRead { conversation, message_id: order.5.clone() };
         self.read.sent = Some(order);
         self.read.at = Some(Instant::now());
-        cx.background_executor().spawn(async move { ask(&request) }).detach();
+        cx.spawn(async move |_, _| {
+            let _ = ask_async(request).await;
+        })
+        .detach();
     }
 
     // Keys and the clipboard.
@@ -2807,7 +2847,7 @@ impl Pane {
             values,
         };
         cx.spawn_in(window, async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.pending_actions.remove(&key);
                 match answer {
@@ -2848,7 +2888,7 @@ impl Pane {
         cx.notify();
         let request = Request::PressButton { conversation, message_id, data };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = this.update(cx, |this, cx| {
                 this.pending_actions.remove(&key);
                 match answer {
@@ -2888,17 +2928,13 @@ impl Pane {
             self.jump_to(&id, cx);
             let conv = conversation.clone();
             let message_ids = protocol::jump_mark_ids(kind, &id, done);
-            cx.spawn(async move |_, cx| {
-                let _ = cx
-                    .background_executor()
-                    .spawn(async move {
-                        crate::client::ask(&Request::MarkUnreadItemsRead {
-                            conversation: conv,
-                            kind,
-                            message_ids,
-                        })
-                    })
-                    .await;
+            cx.spawn(async move |_, _| {
+                let _ = ask_async(Request::MarkUnreadItemsRead {
+                    conversation: conv,
+                    kind,
+                    message_ids,
+                })
+                .await;
             })
             .detach();
             cx.notify();
@@ -2906,16 +2942,12 @@ impl Pane {
         }
         let conv = conversation.clone();
         cx.spawn(async move |this, cx| {
-            let answer = cx
-                .background_executor()
-                .spawn(async move {
-                    crate::client::ask(&Request::UnreadItems {
-                        conversation: conv.clone(),
-                        kind,
-                        limit: 20,
-                    })
-                })
-                .await;
+            let answer = ask_async(Request::UnreadItems {
+                conversation: conv.clone(),
+                kind,
+                limit: 20,
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 if this.key() != Some(&conversation) {
                     return;
@@ -2931,32 +2963,24 @@ impl Pane {
                         this.jump_to(&first, cx);
                         let conv_mark = conversation.clone();
                         let mark_ids = protocol::jump_mark_ids(kind, &first, done);
-                        cx.spawn(async move |_, cx| {
-                            let _ = cx
-                                .background_executor()
-                                .spawn(async move {
-                                    crate::client::ask(&Request::MarkUnreadItemsRead {
-                                        conversation: conv_mark,
-                                        kind,
-                                        message_ids: mark_ids,
-                                    })
-                                })
-                                .await;
+                        cx.spawn(async move |_, _| {
+                            let _ = ask_async(Request::MarkUnreadItemsRead {
+                                conversation: conv_mark,
+                                kind,
+                                message_ids: mark_ids,
+                            })
+                            .await;
                         })
                         .detach();
                     } else {
                         let conv_mark = conversation.clone();
-                        cx.spawn(async move |_, cx| {
-                            let _ = cx
-                                .background_executor()
-                                .spawn(async move {
-                                    crate::client::ask(&Request::MarkUnreadItemsRead {
-                                        conversation: conv_mark,
-                                        kind,
-                                        message_ids: Vec::new(),
-                                    })
-                                })
-                                .await;
+                        cx.spawn(async move |_, _| {
+                            let _ = ask_async(Request::MarkUnreadItemsRead {
+                                conversation: conv_mark,
+                                kind,
+                                message_ids: Vec::new(),
+                            })
+                            .await;
                         })
                         .detach();
                     }
@@ -3065,10 +3089,7 @@ impl Pane {
         self.saved_filtered = None;
         let account = key.account();
         cx.spawn(async move |this, cx| {
-            let answer = cx
-                .background_executor()
-                .spawn(async move { crate::client::ask(&Request::SavedDialogs { account }) })
-                .await;
+            let answer = ask_async(Request::SavedDialogs { account }).await;
             let _ = this.update(cx, |this, cx| {
                 if this.saved_loaded_for.as_ref() != Some(&key) {
                     return;
@@ -3103,7 +3124,7 @@ impl Pane {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let req = Request::SavedHistory { account, peer_id, tag, limit: 50 };
-            let answer = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+            let answer = ask_async(req).await;
             let _ = this.update(cx, |this, cx| {
                 if this.key() != Some(&key) {
                     return;
@@ -3197,7 +3218,7 @@ impl Pane {
         self.pin_bar = Some(PinBar { key: key.clone(), seen, pins, at });
         cx.spawn(async move |this, cx| {
             let request = Request::Pinned { conversation: key.clone() };
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(bar) = this.pin_bar.as_mut().filter(|bar| bar.key == key) else {
                     return;
@@ -3376,7 +3397,7 @@ impl Pane {
         };
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = this.update(cx, |this, cx| {
                 match answer {
                     Ok(Response::Ok) => {
@@ -3505,14 +3526,24 @@ impl Pane {
             return Some(bar);
         }
 
-        let avatars: Vec<gpui::Div> = occupants
-            .people
-            .iter()
-            .take(3)
-            .map(|p| crate::gui::components::Avatar::named(&p.name, 20.).build())
-            .collect();
+        let narrow = self.width > 0. && self.width < 460.;
+        let avatars: Vec<gpui::Div> = if narrow {
+            Vec::new()
+        } else {
+            occupants
+                .people
+                .iter()
+                .take(3)
+                .map(|p| crate::gui::components::Avatar::named(&p.name, 20.).build())
+                .collect()
+        };
         let handoff = call_support == protocol::CallSupport::Handoff;
-        let join_label = live_bar_words(key.network, call_support, occupants.rtmp_stream);
+        let full_join_label = live_bar_words(key.network, call_support, occupants.rtmp_stream);
+        let join_label = if handoff && narrow {
+            if key.network == Network::Slack { "Join".to_owned() } else { "Open".to_owned() }
+        } else {
+            full_join_label.clone()
+        };
         let mark = if key.network == Network::Slack {
             "icons/headphones.svg"
         } else if occupants.rtmp_stream {
@@ -3537,6 +3568,7 @@ impl Pane {
                 .gap(px(10.))
                 .child(
                     div()
+                        .flex_none()
                         .size(px(26.))
                         .rounded_full()
                         .bg(theme::accent_soft())
@@ -3549,7 +3581,7 @@ impl Pane {
                     super::call::telegram::recording_badge("live-bar-rec", since, occupants.record_video_active)
                 }))
                 .when(!avatars.is_empty(), |row| {
-                    row.child(div().flex().items_center().gap(px(2.)).children(avatars))
+                    row.child(div().flex_none().flex().items_center().gap(px(2.)).children(avatars))
                 })
                 .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text()).child(summary))
                 .child(
@@ -3558,7 +3590,7 @@ impl Pane {
                         .flex_none()
                         .h(px(26.))
                         .px(px(12.))
-                        .rounded_full()
+                        .rounded(px(theme::R_CONTROL))
                         .bg(theme::accent())
                         .text_color(theme::on_accent())
                         .flex()
@@ -3566,6 +3598,7 @@ impl Pane {
                         .cursor_pointer()
                         .type_micro()
                         .font_weight(theme::SEMIBOLD)
+                        .tooltip(crate::gui::components::tip(full_join_label, None))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             let _ = shell.update(cx, |shell, cx| {
                                 if handoff {
@@ -3610,15 +3643,11 @@ impl Pane {
         self.app_error = None;
         let expected = conversation.clone();
         cx.spawn(async move |pane, cx| {
-            let answer = cx
-                .background_executor()
-                .spawn(async move {
-                    ask(&Request::AppView {
-                        conversation,
-                        include_home,
-                    })
-                })
-                .await;
+            let answer = ask_async(Request::AppView {
+                conversation,
+                include_home,
+            })
+            .await;
             let _ = pane.update(cx, |this, cx| {
                 if this.key() != Some(&expected) {
                     return;
@@ -3679,6 +3708,7 @@ impl Pane {
                     .on_click(cx.listener(move |this, _, _, cx| this.select_app_tab(tab, cx))),
             );
         }
+        let narrow = self.width > 0. && self.width < 480.;
         Some(
             div()
                 .flex_none()
@@ -3687,9 +3717,11 @@ impl Pane {
                 .border_b_1()
                 .border_color(theme::hairline())
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
-                .gap(px(8.))
+                .gap_x(px(8.))
+                .gap_y(px(6.))
                 .child(bar)
                 .child(
                     div()
@@ -3701,8 +3733,9 @@ impl Pane {
                                 "slack-app-open",
                                 super::components::ButtonKind::Secondary,
                                 "icons/external-link.svg",
-                                "Open app in Slack",
+                                if narrow { "Open" } else { "Open app in Slack" },
                             )
+                            .tooltip(super::components::tip("Open app in Slack", None))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_external_link(&open_url, window, cx);
                             })),
@@ -3712,8 +3745,9 @@ impl Pane {
                                 "slack-app-directory",
                                 super::components::ButtonKind::Secondary,
                                 "icons/plus.svg",
-                                "Add apps",
+                                if narrow { "Apps" } else { "Add apps" },
                             )
+                            .tooltip(super::components::tip("Add apps", None))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_external_link(&dir_url, window, cx);
                             })),
@@ -4046,7 +4080,7 @@ impl Render for Pane {
                     .into_any_element()
             })
             .children((!showing_app_tab).then(|| self.live_call_row(cx)).flatten())
-            .children(self.tag_popover_layer(cx))
+            .children(self.tag_popover_layer(window, cx))
             .children(self.action_layers(window, cx))
             .children(ephemeral_strip)
             .children(self.viewer_layer(window, cx))
@@ -4270,6 +4304,24 @@ impl Shell {
         }
     }
 
+    /// True when an open message pane is showing `conversation` up to its newest end and will
+    /// refresh it on `Change::Messages`.
+    pub(super) fn pane_refreshes_newest(&self, conversation: &Key, cx: &gpui::App) -> bool {
+        self.message_panes().into_iter().any(|pane| {
+            let pane = pane.read(cx);
+            pane.key() == Some(conversation) && !pane.is_gated() && !pane.window.newer
+        })
+    }
+
+    /// Hands a freshly submitted pending message from `Response::Sent` straight to any open pane
+    /// showing `conversation`.
+    pub(super) fn conversation_note_sent(&mut self, conversation: &Key, message: Message, cx: &mut Context<Self>) {
+        for pane in self.message_panes() {
+            let msg = message.clone();
+            pane.update(cx, |pane, cx| pane.note_sent(conversation, msg, cx));
+        }
+    }
+
     /// chatd no longer knows what changed: everything held is read again.
     #[allow(dead_code)]
     pub(super) fn conversation_reset(&mut self, cx: &mut Context<Self>) {
@@ -4333,6 +4385,11 @@ impl Shell {
             }))
     }
 
+    /// Live top coordinate of the main conversation body below the strip and any top banners.
+    pub(in crate::gui) fn conversation_body_top(&self) -> Option<f32> {
+        self.conversation_state.body_bounds.get().map(|b| f32::from(b.top()))
+    }
+
     pub(super) fn conversation(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let Some(open) = snapshot.open.as_ref() else {
             return div()
@@ -4388,17 +4445,31 @@ impl Shell {
                 }))
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.phone_release_edge()));
         }
+        let body_bounds = self.conversation_state.body_bounds.clone();
         view.child(if phone {
             self.phone_strip(open, link, window, cx)
         } else {
             self.strip(open, link, window, cx)
         })
         .children((!phone && !forum_board).then(|| self.call_conversation_picture(snapshot, open, cx)).flatten())
-        .child(match (board, pane) {
-            (Some(board), _) => div().flex_1().min_h_0().child(board),
-            (_, Some(pane)) => div().flex_1().min_h_0().child(pane),
-            _ => div().flex_1(),
-        })
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(match (board, pane) {
+                    (Some(board), _) => div().size_full().child(board),
+                    (_, Some(pane)) => div().size_full().child(pane),
+                    _ => div().size_full(),
+                })
+                .child(
+                    gpui::canvas(move |bounds, _, _| body_bounds.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                ),
+        )
         .children((!gated).then(|| match open.special {
             Special::Service => self.no_composer(open, cx),
             _ => self.composer(open, link, cx),

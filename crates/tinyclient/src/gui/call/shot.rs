@@ -473,7 +473,6 @@ pub(super) fn running() -> Option<Occupants> {
         hand_raised: false,
         is_channel: false,
     };
-    (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3, ..Default::default() })
     (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3, ..Occupants::default() })
 }
 

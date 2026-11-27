@@ -501,22 +501,24 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
     }
 }
 
-/// The first requests of a connection: are we still signed in, who are we, what is muted by
-/// default, the chats, the contacts.
+/// Initial sync on connect/reconnect: verifies session (`GetState`), reads self user, app config
+/// limits, notify defaults, dialog pages, unread channel verification, contacts, blocked list,
+/// story rings, and recovered live location shares.
 pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
     account.ask(&tl::functions::updates::GetState {})?;
     let me = account.ask(&tl::functions::users::GetUsers { id: vec![tl::enums::InputUser::UserSelf] })?;
     account.learn(&me, &[]);
-    let limits = super::premium::read(account);
-    account.live().limits = limits.clone();
     let (name, premium) = {
         let dir = account.dir();
         (dir.name(Who::User(account.me)), dir.get(Who::User(account.me)).is_some_and(|known| known.premium))
     };
+    let limits = super::premium::read(account);
+    account.live().limits = limits.clone();
     // Settings shows the account name. The plan is part of it when this account is Premium.
     let shown = if premium { format!("{name} · Premium") } else { name };
     let _ = account.ctx.describe(&shown, &Who::User(account.me).text());
     account.ctx.capabilities(capabilities(premium, &limits));
+
     let kinds = [
         tl::enums::InputNotifyPeer::InputNotifyUsers,
         tl::enums::InputNotifyPeer::InputNotifyChats,
@@ -918,6 +920,7 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
             archived: list == 1,
             muted: is_muted,
             read: unread == 0,
+            unread_mark: dialog.unread_mark,
             mute_until: filing::mute_stamp(&dialog.notify_settings),
         });
         if !filed.order[list].contains(&who) {
@@ -987,6 +990,10 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
                     unread_reactions = fresh.unread_reactions_count.max(0) as u32;
                     read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
                     through = Some(fresh.top_message);
+                    filing::facts_changed(account, who, |facts| {
+                        facts.read = unread == 0;
+                        facts.unread_mark = fresh.unread_mark;
+                    });
                 }
                 None => through = None,
             }

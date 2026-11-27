@@ -199,7 +199,7 @@ impl Device {
         if !super::super::safe_id(&id) {
             return None;
         }
-        self.encrypted.insert(id.clone(), true);
+        self.note_encrypted(&id, true);
         self.notes.self_conv = Some(id.clone());
         self.save_notes();
         Some(id)
@@ -590,12 +590,32 @@ impl Device {
 /// `e2ee_commit_batch_secs`, 30 by default, and only when someone next asks) tries again a few
 /// times, asking the server about the group first.
 pub(crate) fn ask_soon(device: Shared) {
-    if !lock(&device).has_wants() {
+    let meta = {
+        let locked = lock(&device);
+        if !locked.has_wants() {
+            return;
+        }
+        locked.meta.clone()
+    };
+    if meta
+        .siblings_asking
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
         return;
     }
-    let _ = std::thread::Builder::new()
+    struct Guard(std::sync::Arc<super::FastMeta>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0
+                .siblings_asking
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let guard = Guard(meta);
+    if std::thread::Builder::new()
         .name("tiny-e2ee-siblings".into())
         .spawn(move || {
+            let _guard = guard;
             for attempt in 0..RETRIES {
                 if attempt > 0 {
                     std::thread::sleep(RETRY_AFTER);
@@ -609,7 +629,11 @@ pub(crate) fn ask_soon(device: Shared) {
                     return;
                 }
             }
-        });
+        })
+        .is_err()
+    {
+        // Guard drops on spawn failure and clears `siblings_asking`.
+    }
 }
 
 #[cfg(test)]

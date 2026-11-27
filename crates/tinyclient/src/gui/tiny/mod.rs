@@ -2029,7 +2029,7 @@ impl Shell {
         let Some(community) = self.tiny_state.community.clone() else {
             return;
         };
-        let rooms: Vec<String> = model::lines(&community, &HashSet::new(), None)
+        let rooms: Vec<String> = model::lines(&community, &HashSet::new(), None, &HashSet::new())
             .into_iter()
             .filter_map(|line| match line {
                 model::Line::Room { id } => Some(id),

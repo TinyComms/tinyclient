@@ -51,19 +51,21 @@ pub use typing::preview_for as typing_preview_for;
 pub(super) use typing::wording_for as typing_wording_for;
 
 use super::components::place::{max_height, placed, Layer, Place};
-use super::components::{button, glyph, menu, menu_item, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};
+use super::components::{button, glyph, menu, menu_item, menu_item_check, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};
 use super::input::{InputEvent, InputKey, InputList, InputPaste, PickEmoji, PickGifs, SubmitSilently, TextInput};
 use super::people::{ask_later, rough_last_seen, Hub};
 use super::playing;
 use super::state::Shell;
 use super::theme::{self, Type};
+#[cfg(test)]
 use crate::client::ask;
+use crate::client::ask_async;
 use crate::view::now;
 use attach::{Found, Staged};
 use complete::List;
 use controls::{controls, Controls};
 use gpui::{
-    canvas, deferred, div, prelude::*, px, relative, App, Bounds, Context, Div, Entity, ExternalPaths, FocusHandle, Focusable,
+    canvas, deferred, div, prelude::*, px, App, Bounds, Context, Div, Entity, ExternalPaths, FocusHandle, Focusable,
     PathPromptOptions, Pixels, Point, Rgba, Subscription, Task, WeakEntity, Window,
 };
 use hold::{Flight, Held, Hold, Outcome, Typed};
@@ -626,20 +628,91 @@ struct Picking {
     _listening: Subscription,
 }
 
-/// The buttons the picker opens from.
+/// The buttons whose popovers or menus anchor to them.
 #[derive(Clone, Copy)]
 enum Trigger {
-    Gif,
+    Actions,
     Smile,
+    Mic,
 }
 
 /// Bounds drawn last frame, for placing what opens from them.
 #[derive(Default)]
 struct Anchors {
     dock: Cell<Option<Bounds<Pixels>>>,
-    gif: Cell<Option<Bounds<Pixels>>>,
+    card: Cell<Option<Bounds<Pixels>>>,
+    actions: Cell<Option<Bounds<Pixels>>>,
     smile: Cell<Option<Bounds<Pixels>>>,
+    mic: Cell<Option<Bounds<Pixels>>>,
     send: Cell<Option<Bounds<Pixels>>>,
+    chip: Cell<Option<Bounds<Pixels>>>,
+}
+
+/// Which left-side composer actions are available in the current conversation.
+/// When only file attachment is available, the card renders a direct paperclip button;
+/// otherwise a single `+` button opens a menu containing all available actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct LeftActions {
+    pub attach: bool,
+    pub gif_file: bool,
+    pub location: bool,
+    pub poll: bool,
+    pub thread: bool,
+    pub subject: bool,
+    pub video_note: bool,
+}
+
+impl LeftActions {
+    pub(super) fn count(self) -> usize {
+        [self.attach, self.gif_file, self.location, self.poll, self.thread, self.subject, self.video_note]
+            .into_iter()
+            .filter(|&on| on)
+            .count()
+    }
+
+    pub(super) fn any(self) -> bool {
+        self.count() > 0
+    }
+
+    pub(super) fn uses_menu(self) -> bool {
+        self.count() > 1 || (self.count() == 1 && !self.attach)
+    }
+
+    /// Number of leading buttons placed directly inside the composer card (always 0 or 1).
+    pub(super) fn leading_button_count(self) -> usize {
+        usize::from(self.any())
+    }
+}
+
+/// Border color and halo flag for the composer card (`docs/design/polish/06-composer.md` §1).
+/// Focused cards use `border_strong` with no accent border and no halo; the caret is the focus.
+pub(super) fn card_focus_style(armed: bool, focused: bool) -> (gpui::Rgba, bool) {
+    match (armed, focused) {
+        (true, _) => (theme::warning(), false),
+        (false, true) => (theme::border_strong(), false),
+        (false, false) => (theme::border(), false),
+    }
+}
+
+/// Whether the bar above the composer card should render. At rest (default importance, no effect,
+/// and not a thread broadcast), nothing floats above the card.
+pub(super) fn send_options_visible(importance: protocol::Importance, has_effect: bool, broadcast_in_thread: bool) -> bool {
+    importance != protocol::Importance::Normal || has_effect || broadcast_in_thread
+}
+
+/// Whether the optional Teams channel subject row is shown inside the card.
+pub(super) fn subject_visible(can_subject: bool, subject_open: bool, subject_text: &str) -> bool {
+    can_subject && (subject_open || !subject_text.trim().is_empty())
+}
+
+/// Whether right-clicking Send opens a send options menu.
+pub(super) fn has_send_menu_for(silent: bool, schedule: bool, importance: bool, has_effects: bool) -> bool {
+    schedule::send_menu_for(silent, schedule) || importance || has_effects
+}
+
+/// Whether a network accepts markdown-style formatting in the composer.
+fn supports_formatting(network: Network) -> bool {
+    !matches!(network, Network::Messages)
 }
 
 pub struct Composer {
@@ -711,6 +784,9 @@ pub struct Composer {
     /// Member counts learned for the confirm: (members, online).
     counts: HashMap<Key, (Option<u32>, Option<u32>)>,
     send_menu: bool,
+    actions_menu: bool,
+    mic_menu: bool,
+    subject_open: bool,
     /// The day whose hours are open in the send menu. None: the presets and the days.
     schedule_day: Option<schedule::Day>,
     /// A time the send menu chose, kept while a confirm asks how many people a broadcast reaches.
@@ -990,6 +1066,9 @@ impl Composer {
             armed: None,
             counts: HashMap::new(),
             send_menu: false,
+            actions_menu: false,
+            mic_menu: false,
+            subject_open: false,
             schedule_day: None,
             schedule_at: None,
             anchors: Rc::new(Anchors::default()),
@@ -1127,9 +1206,9 @@ impl Composer {
     /// typed here is saved and waits for the next visit. `stored` is the draft on the
     /// conversation's row, which is what a conversation not visited before opens with.
     fn aim(&mut self, target: Target, stored: &str, cx: &mut Context<Self>) {
-        let discord = target.key.network == Network::Discord;
+        let formatted = supports_formatting(target.key.network);
         if self.target.as_ref() == Some(&target) && self.offered == stored {
-            self.input.update(cx, |input, cx| input.set_format_discord(discord, cx));
+            self.input.update(cx, |input, cx| input.set_format_discord(formatted, cx));
             return;
         }
         let moved = self.target.as_ref().map(|old| &old.key) != Some(&target.key);
@@ -1152,8 +1231,12 @@ impl Composer {
             self.joining = false;
             self.undo_join = None;
             self.no_preview = false;
+            self.importance = protocol::Importance::Normal;
             self.broadcast = false;
             self.effect = None;
+            self.actions_menu = false;
+            self.mic_menu = false;
+            self.subject_open = !draft.subject.trim().is_empty();
             self.armed = None;
             self.paid_confirmed = None;
             self.slowmode_timer = None;
@@ -1200,7 +1283,7 @@ impl Composer {
         let silent = controls(&target.can, false).silent;
         self.input.update(cx, |input, cx| {
             input.set_alt_submits(silent);
-            input.set_format_discord(discord, cx);
+            input.set_format_discord(formatted, cx);
         });
         self.maybe_fetch_peer_away(&target, cx);
         self.target = Some(target);
@@ -1527,7 +1610,7 @@ impl Composer {
         cx.notify();
     }
 
-    fn bot_strip(&mut self, target: &Target, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn bot_strip(&mut self, target: &Target, _window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if target.key.network != Network::Telegram {
             return None;
         }
@@ -1575,7 +1658,7 @@ impl Composer {
         }
         if let Some((message_id, board)) = self.shown_keyboard(cx) {
             any = true;
-            let hint = board.placeholder.clone().filter(|hint| self.input.read(cx).text().is_empty());
+            let hint = board.placeholder.clone().filter(|_| self.input.read(cx).text().is_empty());
             self.note_keyboard_hint(hint, cx);
             let single_use = board.single_use;
             let mut keys = div().flex().gap(px(6.)).when(board.resize, |row| row.flex_wrap());
@@ -1603,6 +1686,9 @@ impl Composer {
         self.end_edit(cx);
         self.save_draft(cx);
         self.send_menu = false;
+        self.actions_menu = false;
+        self.mic_menu = false;
+        self.subject_open = false;
         self.schedule_day = None;
         self.schedule_at = None;
         self.draft_timer = None;
@@ -1826,11 +1912,17 @@ impl Composer {
         } else if self.armed.take().is_some() || self.paid_confirmed.take().is_some() {
             self.caption = None;
             self.schedule_at = None;
-        } else if self.chip_menu.take().is_some() || self.send_menu {
+        } else if self.chip_menu.take().is_some() || self.send_menu || self.actions_menu || self.mic_menu {
             self.send_menu = false;
+            self.actions_menu = false;
+            self.mic_menu = false;
             self.schedule_day = None;
-        } else if self.thread_composer.take().is_some() || self.thread_settings.take().is_some() {
-            // Closed inline thread panel.
+        } else if self.poll_composer.take().is_some()
+            || self.location_composer.take().is_some()
+            || self.thread_composer.take().is_some()
+            || self.thread_settings.take().is_some()
+        {
+            // Closed inline composer panel.
         } else if self.editing.is_some() {
             self.end_edit(cx);
         } else if self.reply.take().is_some() {
@@ -1898,6 +1990,8 @@ impl Composer {
         }
         self.follow_text(cx);
         self.send_menu = false;
+        self.actions_menu = false;
+        self.mic_menu = false;
         self.schedule_day = None;
         let field = self.input.read(cx).text().to_owned();
         if field.trim().is_empty() && self.tray.is_empty() {
@@ -2014,7 +2108,7 @@ impl Composer {
         };
         let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
         let subject = self
-            .show_subject()
+            .show_subject(cx)
             .then(|| self.subject.read(cx).text().trim().to_owned())
             .filter(|s| !s.is_empty());
         let with = protocol::Outgoing {
@@ -2228,7 +2322,7 @@ impl Composer {
             self.pending_file = None;
         }
         let refused = match answer {
-            Ok(Response::Sent { .. }) => {
+            Ok(Response::Sent { message }) => {
                 let (key, client_id, made) = (out.key.clone(), out.client_id.clone(), out.made.clone());
                 // Hold the recorded note until the network accepts it so a refusal (e.g. Telegram's
                 // VOICE_MESSAGES_FORBIDDEN) can restore it to the tray without losing the audio.
@@ -2243,7 +2337,7 @@ impl Composer {
                     if !made.is_empty() {
                         shell.composer_state.outbox.push((key.clone(), client_id.clone(), made));
                     }
-                    shell.send_started(&key, &client_id, cx)
+                    shell.send_started(&key, &client_id, Some(message), cx)
                 });
                 None
             }
@@ -2468,6 +2562,7 @@ impl Composer {
         // More was typed while chatd answered: that is the next message, and stays.
         if self.input.read(cx).text() == out.field {
             self.set_field(&Draft::default(), cx);
+            self.subject_open = false;
             self.draft_timer = None;
             self.save_draft(cx);
         }
@@ -2766,7 +2861,7 @@ impl Composer {
         self.effect = None;
         cx.spawn(async move |this, cx| {
             let request = Request::MessageEffects { account: account.clone() };
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = this.update(cx, |this, cx| {
                 if let (Ok(Response::Catalog { items, .. }), Some((held, effects))) = (answer, this.effects.as_mut()) {
                     if *held == account {
@@ -2779,43 +2874,51 @@ impl Composer {
         .detach();
     }
 
-    /// ⌘U: the system's file panel, several at once.
+    /// Active non-default send options above the card (e.g. chosen Importance or Effect, or
+    /// Slack's thread broadcast toggle). Empty at rest so nothing floats above the composer.
     fn send_options_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
         let controls = self.controls();
-        let show_importance = controls.importance;
+        let active_importance = if controls.importance { self.importance } else { protocol::Importance::Normal };
+        let active_effect = if controls.effects { self.effect.as_deref() } else { None };
         let show_broadcast = controls.broadcast && self.thread;
-        let show_effects = controls.effects;
-        if !show_importance && !show_broadcast && !show_effects {
+        if !send_options_visible(active_importance, active_effect.is_some(), show_broadcast) {
             return None;
         }
-        let mut bar = div().pb(px(4.)).pl(px(4.)).flex().items_center().gap(px(8.));
-        if show_importance {
-            let imp = self.importance;
-            let (label, color) = match imp {
-                protocol::Importance::Normal => ("Importance: Normal", theme::text_faint()),
-                protocol::Importance::Important => ("! Important", theme::warning()),
-                protocol::Importance::Urgent => ("!! Urgent", theme::danger()),
+        let mut bar = div().pb(px(4.)).pl(px(4.)).flex().flex_wrap().items_center().gap(px(6.));
+        if active_importance != protocol::Importance::Normal {
+            let (label, color) = match active_importance {
+                protocol::Importance::Important => ("Important", theme::warning()),
+                protocol::Importance::Urgent => ("Urgent", theme::danger()),
+                protocol::Importance::Normal => unreachable!(),
             };
             bar = bar.child(
                 div()
                     .id("opt-importance")
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("Clear {label} importance"))
+                    .tab_index(0)
+                    .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                     .px(px(6.))
                     .py(px(2.))
                     .rounded(px(theme::R_CONTROL))
                     .bg(theme::raised())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
                     .type_small()
                     .text_color(color)
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::hover()))
+                    .tooltip(tip("Clear importance", None))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.importance = match this.importance {
-                            protocol::Importance::Normal => protocol::Importance::Important,
-                            protocol::Importance::Important => protocol::Importance::Urgent,
-                            protocol::Importance::Urgent => protocol::Importance::Normal,
-                        };
+                        this.importance = protocol::Importance::Normal;
                         cx.notify();
                     }))
-                    .child(label),
+                    .child(label)
+                    .child(glyph("icons/x.svg", 10., theme::text_faint())),
             );
         }
         if show_broadcast {
@@ -2834,10 +2937,16 @@ impl Composer {
             bar = bar.child(
                 div()
                     .id("opt-broadcast")
+                    .role(gpui::Role::Button)
+                    .aria_label(label.clone())
+                    .tab_index(0)
+                    .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                     .px(px(6.))
                     .py(px(2.))
                     .rounded(px(theme::R_CONTROL))
                     .bg(theme::raised())
+                    .border_1()
+                    .border_color(theme::border())
                     .flex()
                     .items_center()
                     .gap(px(4.))
@@ -2845,6 +2954,7 @@ impl Composer {
                     .text_color(if on { theme::accent_text() } else { theme::text_faint() })
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::hover()))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.broadcast = !this.broadcast;
                         cx.notify();
@@ -2857,31 +2967,38 @@ impl Composer {
                     .child(label),
             );
         }
-        if show_effects {
+        if let Some(id) = active_effect {
             let offered = self.effects.as_ref().map(|(_, items)| items.as_slice()).unwrap_or_default();
-            let label = match self.effect.as_deref() {
-                None => "✨ Effect: None".to_owned(),
-                Some(id) => format!("✨ Effect: {}", offered.iter().find(|item| item.id == id).map_or(id, |item| item.name.as_str())),
-            };
-            let active = self.effect.is_some();
+            let name = offered.iter().find(|item| item.id == id).map_or(id, |item| item.name.as_str());
             bar = bar.child(
                 div()
                     .id("opt-effect")
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("Remove {name} effect"))
+                    .tab_index(0)
+                    .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                     .px(px(6.))
                     .py(px(2.))
                     .rounded(px(theme::R_CONTROL))
                     .bg(theme::raised())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
                     .type_small()
-                    .text_color(if active { theme::accent_text() } else { theme::text_faint() })
+                    .text_color(theme::accent_text())
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::hover()))
+                    .tooltip(tip("Remove effect", None))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
-                        // Each click takes the next effect the account may send, then none again.
-                        let offered = this.effects.as_ref().map(|(_, items)| items.as_slice()).unwrap_or_default();
-                        this.effect = next_effect(offered, this.effect.as_deref());
+                        this.effect = None;
                         cx.notify();
                     }))
-                    .child(label),
+                    .child(glyph("icons/star.svg", 11., theme::accent_text()))
+                    .child(format!("Effect: {name}"))
+                    .child(glyph("icons/x.svg", 10., theme::text_faint())),
             );
         }
         Some(bar)
@@ -2947,7 +3064,7 @@ impl Composer {
             first_message,
         };
         cx.spawn(async move |composer, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = composer.update(cx, |this, cx| match answer {
                 Ok(Response::Conversation { conversation: created }) => {
                     let key = created.key;
@@ -3122,7 +3239,7 @@ impl Composer {
             slowmode_seconds,
         };
         cx.spawn(async move |composer, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = composer.update(cx, |this, cx| match answer {
                 Ok(Response::Ok) => {
                     this.shell_later(cx, move |shell, cx| shell.refresh_row(conversation, cx));
@@ -3157,7 +3274,7 @@ impl Composer {
         }
         let request = Request::DeleteThread { conversation: target.key };
         cx.spawn(async move |composer, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = composer.update(cx, |this, cx| match answer {
                 Ok(Response::Ok) => {}
                 Ok(Response::Error { detail, .. }) => {
@@ -3380,7 +3497,7 @@ impl Composer {
             with: protocol::Outgoing { poll: Some(draft), ..protocol::Outgoing::default() },
         };
         cx.spawn(async move |composer, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             if let Ok(Response::Error { detail, .. }) = answer {
                 let _ = composer.update(cx, |this, cx| {
                     this.shell_later(cx, move |shell, cx| shell.toast(None, detail, cx));
@@ -3596,17 +3713,13 @@ impl Composer {
 
         let conv = target.key;
         cx.spawn(async move |this, cx| {
-            let answer = cx
-                .background_executor()
-                .spawn(async move {
-                    ask(&Request::SendLocation {
-                        conversation: conv,
-                        client_id,
-                        point,
-                        reply_to,
-                    })
-                })
-                .await;
+            let answer = ask_async(Request::SendLocation {
+                conversation: conv,
+                client_id,
+                point,
+                reply_to,
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 match answer {
                     Ok(Response::Ok) => {
@@ -3665,19 +3778,15 @@ impl Composer {
 
         let conv = target.key;
         cx.spawn(async move |this, cx| {
-            let answer = cx
-                .background_executor()
-                .spawn(async move {
-                    ask(&Request::StartLiveLocation {
-                        conversation: conv,
-                        client_id,
-                        point,
-                        period_secs,
-                        proximity_alert_radius: proximity,
-                        reply_to,
-                    })
-                })
-                .await;
+            let answer = ask_async(Request::StartLiveLocation {
+                conversation: conv,
+                client_id,
+                point,
+                period_secs,
+                proximity_alert_radius: proximity,
+                reply_to,
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 match answer {
                     Ok(Response::LiveLocation { .. }) => {
@@ -4449,7 +4558,7 @@ impl Composer {
                 };
                 self.slash_lookup = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(LOOKUP_QUIET).await;
-                    let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                    let answer = ask_async(request).await;
                     let _ = this.update(cx, |this, cx| {
                         if this.target.as_ref().is_none_or(|t| t.key != conversation) {
                             return;
@@ -4628,7 +4737,7 @@ impl Composer {
         // so the newest answer is the only one that lands.
         self.lookup = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(LOOKUP_QUIET).await;
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let _ = this.update(cx, |this, cx| this.looked_up(&target, &trigger, answer, cx));
         }));
     }
@@ -5111,11 +5220,11 @@ impl Composer {
             }))
     }
 
-    /// Bold, italic, and the rest, while a Discord draft has a selection. A click does not
-    /// steal focus from the field: the card's own press would, so the button stops it.
+    /// Bold, italic, and the rest, while a draft with formatting support has a selection. A click
+    /// does not steal focus from the field: the card's own press would, so the button stops it.
     fn format_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let discord = self.target.as_ref().is_some_and(|target| target.key.network == Network::Discord);
-        if !discord || self.input.read(cx).selection().is_empty() {
+        let can_format = self.target.as_ref().is_some_and(|target| supports_formatting(target.key.network));
+        if !can_format || self.input.read(cx).selection().is_empty() {
             return None;
         }
         let phone = crate::gui::phone::active();
@@ -5170,16 +5279,47 @@ impl Composer {
         Some(bar)
     }
 
-    fn show_subject(&self) -> bool {
+    fn can_add_subject(&self) -> bool {
         self.controls().subject
             && !self.thread
             && self.reply.is_none()
             && self.target.as_ref().is_some_and(|t| t.kind == ConversationKind::Channel && t.locked().is_none())
     }
 
-    /// Optional one-line subject input inside the composer card for Teams channel posts.
+    fn show_subject(&self, cx: &App) -> bool {
+        subject_visible(self.can_add_subject(), self.subject_open, self.subject.read(cx).text())
+    }
+
+    fn can_share_location(&self) -> bool {
+        self.editing.is_none()
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|t| t.key.network == Network::Telegram)
+    }
+
+    fn left_actions(&self, controls: &Controls) -> LeftActions {
+        let video_note = controls.voice && self.target.as_ref().is_some_and(|t| t.can.video_notes);
+        LeftActions {
+            attach: controls.attach,
+            gif_file: controls.gif && !controls.tabs.contains(&Tab::Gifs),
+            location: self.can_share_location(),
+            poll: controls.poll,
+            thread: self.can_create_thread(),
+            subject: self.can_add_subject(),
+            video_note,
+        }
+    }
+
+    fn has_send_menu(&self, controls: &Controls) -> bool {
+        let has_effects = controls.effects && self.effects.as_ref().is_some_and(|(_, items)| !items.is_empty());
+        has_send_menu_for(controls.silent, controls.schedule, controls.importance, has_effects)
+    }
+
+    /// Optional one-line subject input inside the composer card for Teams channel posts,
+    /// shown only when toggled from the `+` menu (or when a restored draft already has a subject).
     fn subject_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
-        if !self.show_subject() {
+        if !self.show_subject(cx) {
             return None;
         }
         let focus = self.subject.focus_handle(cx);
@@ -5187,11 +5327,13 @@ impl Composer {
             div()
                 .h(px(32.))
                 .flex_none()
-                .px(px(12.))
+                .pl(px(12.))
+                .pr(px(4.))
                 .border_b_1()
                 .border_color(theme::hairline())
                 .flex()
                 .items_center()
+                .gap(px(6.))
                 .type_ui()
                 .font_weight(theme::SEMIBOLD)
                 .text_color(theme::text())
@@ -5200,7 +5342,32 @@ impl Composer {
                     cx.stop_propagation();
                     window.focus(&focus, cx);
                 })
-                .child(self.subject.clone()),
+                .child(self.subject.clone())
+                .child(
+                    div()
+                        .id("subject-close")
+                        .role(gpui::Role::Button)
+                        .aria_label("Remove subject")
+                        .tab_index(0)
+                        .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
+                        .size(px(24.))
+                        .flex_none()
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::hover()))
+                        .tooltip(tip("Remove subject", None))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.subject.update(cx, |input, cx| input.set_text("", cx));
+                            this.subject_open = false;
+                            this.focus_next = true;
+                            cx.notify();
+                        }))
+                        .child(glyph("icons/x.svg", 14., theme::text_soft())),
+                ),
         )
     }
 
@@ -5230,7 +5397,7 @@ impl Composer {
             .text_color(theme::text_soft())
             .cursor_default()
             .child(div().absolute().top_0().bottom_0().left_0().w(px(2.)).bg(theme::accent()));
-        let strong = |words: String| div().flex_none().max_w(px(if phone { 140. } else { 220. })).truncate().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(words);
+        let strong = |words: String| div().flex_initial().min_w_0().max_w(px(if phone { 140. } else { 200. })).truncate().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(words);
         let faint = |words: String| div().flex_1().min_w_0().truncate().text_color(theme::text_faint()).child(words);
         let close = div()
             .id("mode-close")
@@ -5241,6 +5408,8 @@ impl Composer {
             .items_center()
             .justify_center()
             .cursor_pointer()
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
             .hover(|style| style.bg(theme::selected()))
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| {
@@ -5274,13 +5443,23 @@ impl Composer {
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
             });
+            let left = div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(div().flex_none().child(glyph("icons/pencil.svg", 14., theme::accent_text())))
+                .child(strong("Editing message".to_owned()))
+                .children(replace_btn);
+            let edit_hint = crate::gui::shortcuts::label("Return to save · Esc to cancel");
             return Some(
-                bar.child(glyph("icons/pencil.svg", 14., theme::accent_text()))
-                    .child(strong("Editing message".to_owned()))
-                    .children(replace_btn)
-                    .child(div().flex_1())
-                    // A phone's keyboard has no Esc, and its Return is the send button.
-                    .when(!phone, |bar| bar.child(div().flex_none().text_color(theme::text_faint()).child("Return to save · Esc to cancel")))
+                bar.child(left)
+                    // A phone's keyboard has no Esc, and narrow thread panes don't have room for the full hint.
+                    .when(!phone && !self.thread, |bar| {
+                        bar.child(div().flex_initial().min_w_0().truncate().text_color(theme::text_faint()).child(edit_hint))
+                    })
                     .child(close),
             );
         }
@@ -5299,6 +5478,8 @@ impl Composer {
                 .items_center()
                 .gap(px(2.))
                 .cursor_pointer()
+                .tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                 .hover(|style| style.bg(theme::selected()))
                 .font_weight(theme::MEDIUM)
                 .text_color(if on { theme::accent_text() } else { theme::text_soft() })
@@ -5315,15 +5496,19 @@ impl Composer {
                     cx.notify();
                 }))
         });
-        Some(
-            bar.child(glyph("icons/corner-up-left.svg", 14., theme::accent_text()))
-                // A phone says only whom: the column has no room for the whole phrase.
-                .when(!phone, |bar| bar.child(div().flex_none().child("Replying to")))
-                .child(strong(reply.name.clone()))
-                .child(faint(reply.snippet.clone()))
-                .children(ping)
-                .child(close),
-        )
+        let left = div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(div().flex_none().child(glyph("icons/corner-up-left.svg", 14., theme::accent_text())))
+            // A phone or narrow thread pane says only whom: the column has no room for the whole phrase.
+            .when(!phone && !self.thread, |bar| bar.child(div().flex_none().child("Replying to")))
+            .child(strong(reply.name.clone()))
+            .child(faint(reply.snippet.clone()));
+        Some(bar.child(left).children(ping).child(close))
     }
 
     /// A 28 pt icon button on the card, its bounds kept for what it opens.
@@ -5360,22 +5545,40 @@ impl Composer {
             .as_ref()
             .is_some_and(|recording| Some(&recording.conversation) == self.target.as_ref().map(|target| &target.key) && matches!(recording.state, RecordState::Active));
         let push = crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK);
-        let video = self.video_note && self.target.as_ref().is_some_and(|target| target.can.video_notes);
-        let (icon, words) = match (hot, push, video) {
-            (true, true, _) => ("icons/square.svg", "Release to stop recording"),
-            (true, false, _) => ("icons/square.svg", "Stop recording"),
-            (false, true, true) => ("icons/video.svg", "Hold to record a video message"),
-            (false, false, true) => ("icons/video.svg", "Record a video message"),
-            (false, true, false) => ("icons/mic.svg", "Hold to record"),
-            (false, false, false) => ("icons/mic.svg", "Record a voice message"),
+        let can_video = self.target.as_ref().is_some_and(|target| target.can.video_notes);
+        let video = self.video_note && can_video;
+        let (icon, mut words) = match (hot, push, video) {
+            (true, true, _) => ("icons/square.svg", "Release to stop recording".to_owned()),
+            (true, false, _) => ("icons/square.svg", "Stop recording".to_owned()),
+            (false, true, true) => ("icons/video.svg", "Hold to record a video message".to_owned()),
+            (false, false, true) => ("icons/video.svg", "Record a video message".to_owned()),
+            (false, true, false) => ("icons/mic.svg", "Hold to record".to_owned()),
+            (false, false, false) => ("icons/mic.svg", "Record a voice message".to_owned()),
         };
+        if !hot && can_video {
+            words.push_str(if video { " · Right-click for voice message" } else { " · Right-click for video message" });
+        }
+        let slot = can_video.then_some(Trigger::Mic);
         let button = self
-            .card_button("mic", Some(icon), false, None)
+            .card_button("mic", icon, self.mic_menu, slot)
+            .aria_label(if video { "Record video message" } else { "Record voice message" })
             .tooltip(tip(words, None))
             // A recording's dot is its own: the button says what the next press does.
             .map(|button| match hot {
                 true => button.bg(theme::danger_soft()),
                 false => button,
+            })
+            .when(can_video && !hot, |button| {
+                button.on_mouse_down(
+                    gpui::MouseButton::Right,
+                    cx.listener(|this, _, _, cx| {
+                        this.mic_menu = !this.mic_menu;
+                        this.actions_menu = false;
+                        this.send_menu = false;
+                        this.close_picker(cx);
+                        cx.notify();
+                    }),
+                )
             });
         // Push-to-talk listens on the press and on the release, in or out of the button: a hold
         // ends wherever the finger lets go. A release with no hold behind it does nothing. A
@@ -5404,26 +5607,6 @@ impl Composer {
     fn record_input(&self, video: bool) -> Option<String> {
         let key = if video { protocol::settings::CAMERA } else { protocol::settings::INPUT };
         crate::gui::app::prefs::values().device(key)
-    }
-
-    /// Switches the mic between a voice note and a round video message.
-    fn video_switch(&self, on: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
-        if !on {
-            return None;
-        }
-        let chosen = self.video_note;
-        let hot = self.recording.as_ref().is_some_and(|recording| matches!(recording.state, RecordState::Active));
-        Some(
-            self.card_button("video-note", Some(if chosen { "icons/mic.svg" } else { "icons/video.svg" }), chosen, None)
-                .tooltip(tip(if chosen { "Switch to a voice message" } else { "Switch to a video message" }, None))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if hot {
-                        return;
-                    }
-                    this.video_note = !this.video_note;
-                    cx.notify();
-                })),
-        )
     }
 
     /// A circular live preview while a round video message records.
@@ -5544,28 +5727,9 @@ impl Composer {
         }
     }
 
-    fn card_button(&self, id: &'static str, icon: Option<&'static str>, toggled: bool, slot: Option<Trigger>) -> gpui::Stateful<Div> {
+    fn card_button(&self, id: &'static str, icon: &'static str, toggled: bool, slot: Option<Trigger>) -> gpui::Stateful<Div> {
         let anchors = self.anchors.clone();
-        let content = match icon {
-            Some(icon) => glyph(icon, if crate::gui::phone::active() { 18. } else { 16. }, if toggled { theme::text() } else { theme::text_soft() }).into_any_element(),
-            // CONTRACT: the design's `gif-16` glyph is not among slice A's assets; the word in a
-            // 16 × 12 outline stands in for it.
-            None => div()
-                .w(px(18.))
-                .h(px(13.))
-                .rounded(px(3.))
-                .border_1()
-                .border_color(if toggled { theme::text() } else { theme::text_soft() })
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(7.))
-                .line_height(px(8.))
-                .font_weight(theme::SEMIBOLD)
-                .text_color(if toggled { theme::text() } else { theme::text_soft() })
-                .child("GIF")
-                .into_any_element(),
-        };
+        let content = glyph(icon, if crate::gui::phone::active() { 18. } else { 16. }, if toggled { theme::text() } else { theme::text_soft() });
         div()
             .id(id)
             .role(gpui::Role::Button)
@@ -5585,8 +5749,9 @@ impl Composer {
             .child(content)
             .children(slot.map(|slot| {
                 let keep = move |bounds| match slot {
-                    Trigger::Gif => anchors.gif.set(Some(bounds)),
+                    Trigger::Actions => anchors.actions.set(Some(bounds)),
                     Trigger::Smile => anchors.smile.set(Some(bounds)),
+                    Trigger::Mic => anchors.mic.set(Some(bounds)),
                 };
                 canvas(move |bounds, _, _| keep(bounds), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
             }))
@@ -5669,58 +5834,56 @@ impl Composer {
                 (false, true) => "Send  ↩ · Silently  ⌥↩".to_owned(),
                 (false, false) => "Send  ↩".to_owned(),
             };
-            if self.editing.is_none() && controls.schedule {
-                tip_text.push_str(" · Right-click to schedule");
+            if self.editing.is_none() && self.has_send_menu(&controls) {
+                if controls.schedule && !controls.importance && !controls.effects {
+                    tip_text.push_str(" · Right-click to schedule");
+                } else {
+                    tip_text.push_str(" · Right-click for options");
+                }
             }
             tip_text
         };
-        let attach = controls.attach.then(|| {
-            self.card_button("attach", Some("icons/paperclip.svg"), false, None)
-                .aria_label("Attach files")
-                .tooltip(tip("Attach files", Some("⌘U")))
-                .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
-        });
-        let location_btn = (self.editing.is_none()
-            && self
-                .target
-                .as_ref()
-                .is_some_and(|t| t.key.network == Network::Telegram))
-        .then(|| {
-            self.card_button("attach-location", Some("icons/pin.svg"), self.location_composer.is_some(), None)
-                .aria_label("Share location")
-                .tooltip(tip("Location", None))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_location_composer(cx)))
-        });
-        let poll_btn = controls.poll.then(|| {
-            self.card_button("create-poll", Some("icons/list.svg"), self.poll_composer.is_some(), None)
-                .aria_label("Create poll")
-                .tooltip(tip("Create poll", None))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_poll_composer(cx)))
-        });
-        let thread_btn = self.can_create_thread().then(|| {
-            self.card_button("create-thread", Some("icons/messages-square.svg"), self.thread_composer.is_some(), None)
-                .aria_label("Create thread")
-                .tooltip(tip("Create thread", None))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_thread_composer(cx)))
-        });
-        let gif = controls.gif.then(|| {
-            let catalog = controls.tabs.contains(&Tab::Gifs);
-            let slot = if catalog { Some(Trigger::Gif) } else { None };
-            let button = self.card_button("gif", None, catalog && open_tab == Some(Tab::Gifs), slot);
-            if catalog {
-                button.aria_label("GIFs").tooltip(tip("GIFs", Some("⇧⌘G"))).on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Gifs, window, cx)))
-            } else {
-                button.aria_label("Attach a GIF file").tooltip(tip("Attach a GIF file", None)).on_click(cx.listener(|this, _, _, cx| this.attach_gif(cx)))
-            }
-        });
+        let actions = self.left_actions(&controls);
+        let leading = if !actions.any() {
+            None
+        } else if actions.uses_menu() {
+            let active = self.actions_menu
+                || self.poll_composer.is_some()
+                || self.location_composer.is_some()
+                || self.thread_composer.is_some();
+            Some(
+                self.card_button("composer-actions", "icons/plus.svg", active, Some(Trigger::Actions))
+                    .aria_label("Attach and more")
+                    .tooltip(tip("Attach and more", actions.attach.then_some("⌘U")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.actions_menu = !this.actions_menu;
+                        this.send_menu = false;
+                        this.mic_menu = false;
+                        this.close_picker(cx);
+                        cx.notify();
+                    })),
+            )
+        } else {
+            Some(
+                self.card_button("attach", "icons/paperclip.svg", false, None)
+                    .aria_label("Attach files")
+                    .tooltip(tip("Attach files", Some("⌘U")))
+                    .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx))),
+            )
+        };
+        let smile_tip = if controls.tabs.contains(&Tab::Gifs) { "Emoji & GIFs" } else { "Emoji" };
         let smile = controls.emoji.then(|| {
-            self.card_button("emoji", Some("icons/smile.svg"), open_tab == Some(Tab::Emoji) || open_tab == Some(Tab::Stickers), Some(Trigger::Smile))
-                .aria_label("Emoji")
-                .tooltip(tip("Emoji", Some("⌘E")))
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
+            self.card_button("emoji", "icons/smile.svg", open_tab.is_some(), Some(Trigger::Smile))
+                .aria_label(smile_tip)
+                .tooltip(tip(smile_tip, Some("⌘E")))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.actions_menu = false;
+                    this.send_menu = false;
+                    this.mic_menu = false;
+                    this.toggle_picker(Tab::Emoji, window, cx);
+                }))
         });
         let mic = self.mic_button(controls.voice, cx);
-        let video_mode = self.video_switch(controls.voice && self.target.as_ref().is_some_and(|target| target.can.video_notes), cx);
         let sim_btn = self
             .target
             .as_ref()
@@ -5821,7 +5984,10 @@ impl Composer {
                 cx.listener(|this, _, _, cx| {
                     let controls = this.controls();
                     this.schedule_day = None;
-                    this.send_menu = schedule::send_menu_for(controls.silent, controls.schedule);
+                    this.actions_menu = false;
+                    this.mic_menu = false;
+                    this.close_picker(cx);
+                    this.send_menu = this.has_send_menu(&controls);
                     cx.notify();
                 }),
             )
@@ -5845,29 +6011,58 @@ impl Composer {
             })
             .text_color(theme::text())
             .child(self.input.clone());
-        let row = if phone {
+        let has_leading = leading.is_some();
+        let has_mic = mic.is_some();
+        let dock_w = self.anchors.dock.get().map(|b| f32::from(b.size.width)).unwrap_or(0.);
+        // Keep the text field at least 140 pt wide on narrow thread panes, narrow desktop panes,
+        // and phones with extra controls (e.g. dual-SIM selector) by stacking controls onto row 2.
+        let two_row = if phone {
+            let controls_w = (usize::from(has_leading) + usize::from(smile.is_some()) + usize::from(has_mic) + 1) as f32 * 46.
+                + if sim_btn.is_some() { 76. } else { 0. }
+                + 24.;
+            dock_w > 0. && dock_w - controls_w < 140.
+        } else {
+            self.thread || (dock_w > 0. && dock_w < 340.)
+        };
+        let row = if two_row {
+            div()
+                .flex()
+                .flex_col()
+                .child(div().w_full().px(px(10.)).pt(px(6.)).pb(px(2.)).child(field))
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(5.))
+                        .pb(px(5.))
+                        .flex()
+                        .items_center()
+                        .children(leading.map(|btn| btn.mr(px(2.))))
+                        .child(div().flex_1())
+                        .children(sim_btn.map(|btn| btn.mr(px(4.))))
+                        .children(smile.map(|smile| smile.mr(px(if has_mic { 2. } else { 4. }))))
+                        .children(mic.map(|mic| mic.mr(px(4.))))
+                        .child(send),
+                )
+        } else if phone {
             // A real flex row. Every button keeps its size; only the field gives way, so nothing
-            // can overlap at 100% or at 200%. GIFs and stickers stay in the emoji picker. A
-            // video-note account adds one switch before the mic.
+            // can overlap at 100% or at 200%. Leading actions sit behind one `+` (or paperclip);
+            // right side is always `[🙂] [🎙️] [➤]`.
             div()
                 .min_h(px(52.))
-                // Without the attach button (an edit), the words keep the desktop's 12 from the edge.
-                .pl(px(if controls.attach { 4. } else { 10. }))
+                // Without the leading button (an edit), the words keep the desktop's 12 from the edge.
+                .pl(px(if has_leading { 4. } else { 10. }))
                 .pr(px(4.))
                 .py(px(4.))
                 .flex()
                 .items_end()
                 .gap(px(2.))
-                .children(attach)
-                .children(location_btn)
+                .children(leading)
                 .child(field)
                 .children(sim_btn)
-                .children(video_mode)
-                .children(mic)
                 .children(smile)
+                .children(mic)
                 .child(send)
         } else {
-            let has_leading = controls.attach || location_btn.is_some() || poll_btn.is_some() || thread_btn.is_some();
             div()
                 .min_h(px(card_height() - 2.))
                 .pl(px(if has_leading { 5. } else { 12. }))
@@ -5875,31 +6070,23 @@ impl Composer {
                 .py(px(5.))
                 .flex()
                 .items_end()
-                .children(attach.map(|attach| attach.mr(px(2.))))
-                .children(location_btn.map(|btn| btn.mr(px(2.))))
-                .children(poll_btn.map(|btn| btn.mr(px(2.))))
-                .children(thread_btn.map(|btn| btn.mr(px(2.))))
+                .children(leading.map(|btn| btn.mr(px(2.))))
                 .child(field.when(has_leading, |field| field.ml(px(2.))))
                 .children(sim_btn.map(|btn| btn.mr(px(4.))))
-                .children(gif.map(|gif| gif.mr(px(2.))))
-                .children(video_mode.map(|mode| mode.mr(px(2.))))
-                .children(mic.map(|mic| mic.mr(px(2.))))
-                .children(smile.map(|smile| smile.mr(px(4.))))
+                .children(smile.map(|smile| smile.mr(px(if has_mic { 2. } else { 4. }))))
+                .children(mic.map(|mic| mic.mr(px(4.))))
                 .child(send)
         };
         let armed = self.armed.is_some();
+        let (border_color, has_halo) = card_focus_style(armed, focused);
         div()
             .min_h(px(card_height()))
             .rounded(px(theme::R_FLOAT))
             .overflow_hidden()
             .bg(theme::over(theme::raised(), theme::canvas()))
             .border_1()
-            .border_color(match (armed, focused) {
-                (true, _) => theme::warning(),
-                (false, true) => theme::focus(),
-                (false, false) => theme::border(),
-            })
-            .when(focused && !armed, |card| card.shadow(theme::field_halo()))
+            .border_color(border_color)
+            .when(has_halo, |card| card.shadow(theme::field_halo()))
             .when(!focused && !armed, |card| card.hover(|style| style.border_color(theme::border_strong())))
             .flex()
             .flex_col()
@@ -6073,14 +6260,23 @@ impl Composer {
         )
     }
 
-    /// The completion lists, 6 pt above the card and over the messages.
-    fn popover(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// The completion lists, 6 pt above the card and over the messages, placed via `placed(..., Layer::Menu)`
+    /// so they stay inside the window, cap their height on short windows, and paint above window chrome.
+    fn popover(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let viewport = window.viewport_size();
+        let max_w = (f32::from(viewport.width) - 16.).max(180.);
+        let card = self.anchors.card.get().or_else(|| self.anchors.dock.get())?;
+        let anchor_for = |w: f32| Bounds {
+            origin: card.origin,
+            size: gpui::size(px(w), card.size.height),
+        };
         if self.slash_open(cx) {
             let query = self.slash_query(cx).unwrap_or_default();
             let rows = self.slash_rows(&query);
             let selected = if rows.is_empty() { 0 } else { self.slash_at.min(rows.len() - 1) };
             let this = cx.weak_entity();
-            let mut list = menu().w_full().max_w(px(340.));
+            let pop_w = 340.0_f32.min(max_w);
+            let mut list = menu().w(px(pop_w)).max_w(px(pop_w));
             for (ix, cmd) in rows.iter().enumerate() {
                 let command = cmd.command.clone();
                 let description = cmd.description.clone();
@@ -6108,12 +6304,12 @@ impl Composer {
                         .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(description)),
                 );
             }
-            let list = list.id("composer-slash-scroll").max_h(px(260.)).overflow_y_scroll();
-            return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(list)).priority(1).into_any_element());
+            return Some(placed("composer-slash-scroll", Place::Above(anchor_for(pop_w)), Layer::Menu, window, list));
         }
         if let Some(slash) = self.slash.as_ref().filter(|slash| !slash.rows.is_empty()) {
             let selected = slash.selected;
-            let mut panel = menu().w_full().max_w(px(360.)).gap(px(1.));
+            let pop_w = 360.0_f32.min(max_w);
+            let mut panel = menu().w(px(pop_w)).max_w(px(pop_w)).gap(px(1.));
             for (index, cmd) in slash.rows.iter().enumerate() {
                 let active = index == selected;
                 let hint = if cmd.usage.is_empty() { None } else { Some(cmd.usage.clone()) };
@@ -6174,8 +6370,7 @@ impl Composer {
                         }),
                 );
             }
-            let panel = panel.id("composer-slash-rows-scroll").max_h(px(260.)).overflow_y_scroll();
-            return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(panel)).priority(1).into_any_element());
+            return Some(placed("composer-slash-rows-scroll", Place::Above(anchor_for(pop_w)), Layer::Menu, window, panel));
         }
         if self.colon.as_ref().is_some_and(|colon| !colon.cells.is_empty()) {
             let this = cx.weak_entity();
@@ -6192,30 +6387,27 @@ impl Composer {
                     _ => None,
                 }
             };
-            let drawn = colon::draw(colon, customs, tone, image, pick)
-                .id("composer-colon-scroll")
-                .max_h(px(260.))
-                .overflow_y_scroll();
-            return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
+            let pop_w = colon::WIDTH.min(max_w);
+            let drawn = colon::draw(colon, customs, tone, image, pick).w(px(pop_w)).max_w(px(pop_w));
+            return Some(placed("composer-colon-scroll", Place::Above(anchor_for(pop_w)), Layer::Menu, window, drawn));
         }
         if let Some(slash) = self.app_slash.as_ref().filter(|slash| !slash.is_empty()) {
             let this = cx.weak_entity();
             let pick = move |row: usize, _: &mut Window, cx: &mut App| {
                 let _ = this.update(cx, |this, cx| this.complete_app_slash(row, cx));
             };
-            let drawn = slash::draw(slash, pick);
-            return Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
+            let pop_w = 360.0_f32.min(max_w);
+            let drawn = div().w(px(pop_w)).max_w(px(pop_w)).child(slash::draw(slash, pick));
+            return Some(placed("composer-app-slash-scroll", Place::Above(anchor_for(pop_w)), Layer::Menu, window, drawn));
         }
         let list = self.list.as_ref().filter(|list| !list.rows.is_empty())?;
         let this = cx.weak_entity();
         let pick = move |row: usize, _: &mut Window, cx: &mut App| {
             let _ = this.update(cx, |this, cx| this.complete(row, cx));
         };
-        let drawn = complete::draw(list, &self.hub, pick, cx)
-            .id("composer-complete-scroll")
-            .max_h(px(260.))
-            .overflow_y_scroll();
-        Some(deferred(div().absolute().left_0().right_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element())
+        let pop_w = 340.0_f32.min(max_w);
+        let drawn = complete::draw(list, &self.hub, pick, cx).w(px(pop_w)).max_w(px(pop_w));
+        Some(placed("composer-complete-scroll", Place::Above(anchor_for(pop_w)), Layer::Menu, window, drawn))
     }
 
     /// The picker, above the card, right edge on its trigger's, inside the window.
@@ -6239,17 +6431,18 @@ impl Composer {
                     .into_any_element(),
             );
         }
-        let tab = picking.picker.read(cx).tab();
-        let anchor = match tab {
-            Tab::Gifs => self.anchors.gif.get().or(self.anchors.smile.get()),
-            _ => self.anchors.smile.get(),
-        }?;
+        let anchor = self.anchors.smile.get()?;
         let place = Place::Above(anchor);
         let viewport = window.viewport_size();
-        let room = max_height(place, (f32::from(viewport.width), f32::from(viewport.height)));
-        picking.picker.update(cx, |picker, cx| picker.set_height(room.min(picker::HEIGHT), cx));
+        let wide = f32::from(viewport.width);
+        let picker_w = picker::WIDTH.min((wide - 16.).max(200.));
+        let room = max_height(place, (wide, f32::from(viewport.height)));
+        picking.picker.update(cx, |picker, cx| {
+            picker.set_width(picker_w, cx);
+            picker.set_height(room.min(picker::HEIGHT), cx);
+        });
         let panel = div()
-            .w(px(picker::WIDTH))
+            .w(px(picker_w))
             .rounded(px(theme::R_FLOAT))
             .bg(theme::overlay())
             .border_1()
@@ -6266,22 +6459,175 @@ impl Composer {
     fn choose_schedule(&mut self, at: i64, cx: &mut Context<Self>) {
         self.schedule_at = Some(at);
         self.send_menu = false;
+        self.actions_menu = false;
+        self.mic_menu = false;
         self.schedule_day = None;
         self.send(false, cx);
     }
 
-    /// Right-click on Send: send quietly, or hand the network a time when it schedules.
+    /// Unified `+` popover menu for attaching files and network-specific compose actions.
+    fn actions_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.actions_menu {
+            return None;
+        }
+        let anchor = self.anchors.actions.get()?;
+        let controls = self.controls();
+        let actions = self.left_actions(&controls);
+        if !actions.uses_menu() {
+            return None;
+        }
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(160.);
+        let mut items = menu().w(px(220.0_f32.min(max_w)));
+        if actions.attach {
+            items = items.child(
+                menu_item("action-attach", Some("icons/paperclip.svg"), "Attach files", Some("⌘U")).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.actions_menu = false;
+                        this.attach_files(cx);
+                    }),
+                ),
+            );
+        }
+        if actions.gif_file {
+            items = items.child(
+                menu_item("action-gif", Some("icons/image.svg"), "Attach GIF", Some("⇧⌘G")).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.actions_menu = false;
+                        this.attach_gif(cx);
+                    }),
+                ),
+            );
+        }
+        if actions.location {
+            items = items.child(
+                menu_item("action-location", Some("icons/pin.svg"), "Share location", None).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.actions_menu = false;
+                        this.toggle_location_composer(cx);
+                    }),
+                ),
+            );
+        }
+        if actions.poll {
+            items = items.child(
+                menu_item("action-poll", Some("icons/list.svg"), "Create poll", None).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.actions_menu = false;
+                        this.toggle_poll_composer(cx);
+                    }),
+                ),
+            );
+        }
+        if actions.thread {
+            items = items.child(
+                menu_item("action-thread", Some("icons/messages-square.svg"), "Create thread", None).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.actions_menu = false;
+                        this.toggle_thread_composer(cx);
+                    }),
+                ),
+            );
+        }
+        if actions.subject {
+            let showing = self.show_subject(cx);
+            let label = if showing { "Hide subject" } else { "Add subject" };
+            items = items.child(
+                menu_item("action-subject", Some("icons/pencil.svg"), label, None).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.actions_menu = false;
+                        if this.show_subject(cx) {
+                            this.subject.update(cx, |input, cx| input.set_text("", cx));
+                            this.subject_open = false;
+                            this.focus_next = true;
+                        } else {
+                            this.subject_open = true;
+                            let focus = this.subject.focus_handle(cx);
+                            window.focus(&focus, cx);
+                        }
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        if actions.video_note {
+            let hot = self.recording.as_ref().is_some_and(|recording| matches!(recording.state, RecordState::Active));
+            let (icon, label) = if self.video_note {
+                ("icons/mic.svg", "Switch to voice message")
+            } else {
+                ("icons/video.svg", "Switch to video message")
+            };
+            if hot {
+                items = items.child(menu_item_disabled("action-video-note", Some(icon), label, None));
+            } else {
+                items = items.child(
+                    menu_item("action-video-note", Some(icon), label, None).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.actions_menu = false;
+                            this.video_note = !this.video_note;
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
+        }
+        let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.actions_menu = false;
+            cx.notify();
+        }));
+        Some(placed("composer-actions-menu", Place::Below(anchor), Layer::Menu, window, items))
+    }
+
+    /// Right-click on the mic button: switch between voice message and round video message.
+    fn mic_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.mic_menu {
+            return None;
+        }
+        let anchor = self.anchors.mic.get()?;
+        let can_video = self.controls().voice && self.target.as_ref().is_some_and(|t| t.can.video_notes);
+        if !can_video {
+            return None;
+        }
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(160.);
+        let items = menu()
+            .w(px(200.0_f32.min(max_w)))
+            .child(
+                menu_item_check("mic-mode-voice", !self.video_note, "Voice message", None).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.video_note = false;
+                        this.mic_menu = false;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                menu_item_check("mic-mode-video", self.video_note, "Video message", None).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.video_note = true;
+                        this.mic_menu = false;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.mic_menu = false;
+                cx.notify();
+            }));
+        Some(placed("composer-mic-menu", Place::Above(anchor), Layer::Menu, window, items))
+    }
+
+    /// Right-click on Send: send quietly, schedule, set importance, or pick a message effect.
     fn send_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.send_menu {
             return None;
         }
         let anchor = self.anchors.send.get()?;
         let controls = self.controls();
-        if !schedule::send_menu_for(controls.silent, controls.schedule) {
+        if !self.has_send_menu(&controls) {
             return None;
         }
         let now = now();
-        let mut items = menu().w(px(260.));
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(180.);
+        let mut items = menu().w(px(260.0_f32.min(max_w)));
         if let Some(day) = self.schedule_day {
             items = items.child(menu_item("schedule-back", Some("icons/calendar.svg"), "Schedule", None).on_click(cx.listener(|this, _, _, cx| {
                 this.schedule_day = None;
@@ -6351,15 +6697,60 @@ impl Composer {
                     }
                 }
             }
+            if controls.importance {
+                if controls.silent || controls.schedule {
+                    items = items.child(menu_separator());
+                }
+                items = items.child(menu_label("Importance"));
+                items = items.child(
+                    menu_item_check(
+                        "send-importance-normal",
+                        self.importance == protocol::Importance::Normal,
+                        "Normal",
+                        None,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.importance = protocol::Importance::Normal;
+                        this.send_menu = false;
+                        cx.notify();
+                    })),
+                );
+                items = items.child(
+                    menu_item_check(
+                        "send-importance-important",
+                        self.importance == protocol::Importance::Important,
+                        "Important",
+                        None,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.importance = protocol::Importance::Important;
+                        this.send_menu = false;
+                        cx.notify();
+                    })),
+                );
+                items = items.child(
+                    menu_item_check(
+                        "send-importance-urgent",
+                        self.importance == protocol::Importance::Urgent,
+                        "Urgent",
+                        None,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.importance = protocol::Importance::Urgent;
+                        this.send_menu = false;
+                        cx.notify();
+                    })),
+                );
+            }
             if controls.effects {
                 let offered = self.effects.as_ref().map(|(_, list)| list.as_slice()).unwrap_or_default();
                 if !offered.is_empty() {
-                    if controls.silent || controls.schedule {
+                    if controls.silent || controls.schedule || controls.importance {
                         items = items.child(menu_separator());
                     }
                     items = items.child(menu_label("Message effect"));
                     if self.effect.is_some() {
-                        items = items.child(menu_item("send-effect-none", None, "No effect", None).on_click(cx.listener(
+                        items = items.child(menu_item("send-effect-none", Some(crate::gui::components::NO_GLYPH), "No effect", None).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.effect = None;
                                 this.send_menu = false;
@@ -6370,15 +6761,15 @@ impl Composer {
                     for item in offered.iter().take(12) {
                         let row_id = format!("send-effect-{}", item.id);
                         if item.locked {
-                            items = items.child(menu_item_disabled(row_id, None, format!("✨ {}", item.name), Some("Premium")));
+                            items = items.child(menu_item_disabled(row_id, Some("icons/star.svg"), item.name.clone(), Some("Premium")));
                         } else {
                             let id = item.id.clone();
                             let picked = self.effect.as_deref() == Some(item.id.as_str());
                             items = items.child(
                                 menu_item(
                                     row_id,
-                                    Some(if picked { "icons/check.svg" } else { crate::gui::components::NO_GLYPH }),
-                                    format!("✨ {}", item.name),
+                                    Some(if picked { "icons/check.svg" } else { "icons/star.svg" }),
+                                    item.name.clone(),
                                     None,
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -6405,8 +6796,12 @@ impl Composer {
         let drag = self.drag.as_ref().filter(|drag| drag.inside)?;
         let bounds = self.anchors.dock.get()?;
         let target = self.target.as_ref()?;
-        let top = theme::STRIP;
-        let height = f32::from(bounds.bottom()) - top;
+        let top = self
+            .shell
+            .upgrade()
+            .and_then(|shell| (!self.thread).then(|| shell.read(cx).conversation_body_top()).flatten())
+            .unwrap_or(theme::STRIP);
+        let height = (f32::from(bounds.bottom()) - top).max(0.);
         let (border, wash, icon, color, title, line) = if drag.folders {
             (theme::danger(), theme::danger_soft(), "icons/circle-alert.svg", theme::danger(), "Folders can't be sent".to_owned(), "Zip it first.".to_owned())
         } else {
@@ -6516,6 +6911,9 @@ impl Composer {
                 utc_offset: None,
                 mark: None,
                 nickname: String::new(),
+                role_color: None,
+                role_icon: None,
+                role_emoji: None,
             };
             let found = vec![
                 person("Dev Patel", "devp", protocol::Presence::Online),
@@ -6690,17 +7088,6 @@ fn shot_pictures() -> Vec<PathBuf> {
 }
 
 /// Formats a UTC Unix timestamp as a compact date like `"Mon, Oct 19"` for OOO banners.
-/// The effect after `current` among those the account may send: the first for none, none
-/// after the last, and a locked (Premium) one is passed over.
-fn next_effect(offered: &[protocol::CatalogItem], current: Option<&str>) -> Option<String> {
-    let mut open = offered.iter().filter(|item| !item.locked);
-    match current {
-        None => open.next(),
-        Some(id) => open.skip_while(|item| item.id != id).nth(1),
-    }
-    .map(|item| item.id.clone())
-}
-
 fn format_ooo_until(unix_secs: i64) -> String {
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
@@ -6826,10 +7213,9 @@ impl Render for Composer {
             .role(gpui::Role::Group)
             .aria_label("Composer")
             .flex_none()
-            // A phone dock keeps the messages' 16 pt gutters, so the card's edges line up with
-            // the words above it; its first control starts at 21, past the back-swipe strip's 20.
-            .pl(px(if phone { 16. } else { 20. }))
-            .pr(px(if phone { 16. } else { 20. }))
+            // A phone dock keeps the messages' 16 pt gutters; narrow thread panes tighten to 12 pt.
+            .pl(px(if phone { 16. } else if self.thread { 12. } else { 20. }))
+            .pr(px(if phone { 16. } else if self.thread { 12. } else { 20. }))
             .pt(px(if phone { 4. } else { 0. }))
             .pb(px(if phone {
                 use crate::gui::phone::tokens;
@@ -6872,18 +7258,35 @@ impl Render for Composer {
             ),
         };
         let anchors = self.anchors.clone();
+        let card_anchors = self.anchors.clone();
         // The row sits directly over the card's text, below any banners/panels; hidden when locked.
         dock.children(self.ooo_banner(&target, cx))
-            .children(self.send_options_bar(cx))
+            .when(show_typing, |dock| dock.children(self.send_options_bar(cx)))
             .children(self.poll_composer_panel(window, cx))
             .children(self.location_composer_panel(window, cx))
             .children(self.thread_composer_panel(window, cx))
             .children(self.thread_settings_panel(window, cx))
             .when(show_typing, |dock| dock.child(div().pl(px(13.)).child(self.typing.clone())))
-            .child(div().relative().children(undo).child(body).children(self.popover(cx)))
+            .child(
+                div()
+                    .relative()
+                    .children(undo)
+                    .child(body)
+                    .child(
+                        canvas(move |bounds, _, _| card_anchors.card.set(Some(bounds)), |_, _, _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                    ),
+            )
+            .children(self.popover(window, cx))
             .children(self.caption_line(&target, cx))
             .children(self.bot_strip(&target, window, cx))
             .children(self.picker_layer(window, cx))
+            .children(self.chip_menu_layer(window, cx))
+            .children(self.actions_menu_layer(window, cx))
+            .children(self.mic_menu_layer(window, cx))
             .children(self.send_menu_layer(window, cx))
             .children(self.drop_layer(cx))
             .child(canvas(move |bounds, _, _| anchors.dock.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full())
@@ -7355,9 +7758,9 @@ impl Shell {
                 let (key, id) = (&held.conversation, held.client_id.as_str());
                 let hold = &mut shell.composer_state.hold;
                 match answer {
-                    Ok(Response::Sent { .. }) => {
+                    Ok(Response::Sent { message }) => {
                         hold.sent(key, id);
-                        shell.send_started(key, id, cx);
+                        shell.send_started(key, id, Some(message), cx);
                     }
                     Ok(Response::Error { code: ErrorCode::Offline, .. }) => hold.refused(key, id, true, "", Instant::now()),
                     Ok(Response::Error { detail, .. }) => hold.refused(key, id, false, &detail, Instant::now()),
@@ -7438,10 +7841,13 @@ impl Shell {
         crate::tiny_attach::take_verdict(&mut self.composer_state.tiny_files, client_id)
     }
 
-    /// chatd has stored the message as pending; it says so itself in a `Messages` change, which
-    /// is what brings the row. From here its outcome is followed for the sidebar's mark.
-    fn send_started(&mut self, conversation: &Key, client_id: &str, cx: &mut Context<Self>) {
+    /// chatd has stored the message as pending; show it immediately in any open pane and follow
+    /// its outcome for the sidebar's mark.
+    fn send_started(&mut self, conversation: &Key, client_id: &str, message: Option<protocol::Message>, cx: &mut Context<Self>) {
         self.composer_state.flight.started(conversation, client_id);
+        if let Some(message) = message {
+            self.conversation_note_sent(conversation, message, cx);
+        }
         cx.notify();
     }
 
@@ -7535,6 +7941,11 @@ impl Shell {
         if !self.composer_state.flight.in_flight(conversation) && !awaiting_ack {
             return;
         }
+        // If an open conversation pane is already refreshing the newest end of this conversation,
+        // it feeds the loaded messages directly into `settle_flight`, avoiding a duplicate RPC.
+        if self.pane_refreshes_newest(conversation, cx) {
+            return;
+        }
         let key = conversation.clone();
         let request = Request::Messages { conversation: key.clone(), page: Page::Newest, limit: SETTLE };
         let shell = cx.weak_entity();
@@ -7542,76 +7953,92 @@ impl Shell {
             let Ok(Response::Messages { messages, .. }) = answer else {
                 return;
             };
-            let found_state = |client_id: &str| {
-                messages.iter().find(|message| message.client_id.as_deref() == Some(client_id) || message.id == client_id).map(|message| message.state.clone())
-            };
-            let outcome_of = |client_id: &str| match found_state(client_id) {
-                None => Outcome::Gone,
-                Some(SendState::Pending) => Outcome::Pending,
-                Some(SendState::Sent) => Outcome::Sent,
-                Some(SendState::Failed { .. }) => Outcome::Failed,
-            };
+            let messages: Vec<Rc<protocol::Message>> = messages.into_iter().map(Rc::new).collect();
             let _ = shell.update(cx, |shell, cx| {
-                // A send that went no longer needs the files made for it, nor its progress.
-                let inflight = shell.composer_state.flight.sending_ids(&key);
-                let watching = shell.scans_open_in(&key, cx);
-                let changed = {
-                    let state = &mut shell.composer_state;
-                    let settled: Vec<String> = state
-                        .outbox
-                        .iter()
-                        .filter(|(held, id, _)| {
-                            *held == key
-                                && matches!(outcome_of(id), Outcome::Sent | Outcome::Gone)
-                                && !crate::tiny_attach::stay_in_flight(watching.iter().any(|open| open == id), found_state(id).as_ref())
-                        })
-                        .map(|(_, id, _)| id.clone())
-                        .collect();
-                    for id in &settled {
-                        if let Some(at) = state.outbox.iter().position(|(held, held_id, _)| *held == key && held_id == id) {
-                            let (_, _, made) = state.outbox.remove(at);
-                            delete_later(made);
-                        }
-                    }
-                    state.uploads.retain(|((held, id), _)| *held != key || outcome_of(id) == Outcome::Pending);
-                    // A scan whose row has left the newest page stays in flight. Settling it here
-                    // would drop the chips before a later Failed can name them.
-                    let for_flight = |client_id: &str| {
-                        let state = found_state(client_id);
-                        if crate::tiny_attach::stay_in_flight(watching.iter().any(|id| id == client_id), state.as_ref()) {
-                            Outcome::Pending
-                        } else {
-                            outcome_of(client_id)
-                        }
-                    };
-                    state.flight.settle(&key, for_flight) || !settled.is_empty()
-                };
-                if changed {
-                    cx.notify();
-                }
-                for id in &inflight {
-                    let voice_outcome = match found_state(id) {
-                        Some(SendState::Sent) => Some(Ok(())),
-                        Some(SendState::Failed { reason }) => Some(Err(reason)),
-                        _ => None,
-                    };
-                    if let Some(outcome) = voice_outcome {
-                        for composer in [shell.composer_state.main.get(), shell.composer_state.thread.get()].into_iter().flatten() {
-                            let (composer, key, id, outcome) = (composer.clone(), key.clone(), id.clone(), outcome.clone());
-                            cx.defer(move |cx| composer.update(cx, |composer, cx| composer.voice_settled(&key, &id, outcome, cx)));
-                        }
-                    }
-                }
-                if key.network != Network::Tiny {
-                    return;
-                }
-                let awaiting = shell.awaiting_tiny_files(&key, cx);
-                let finished = crate::tiny_attach::file_verdicts(&inflight, &awaiting, |id| crate::tiny_attach::scan_settled(found_state(id).as_ref()));
-                for (id, outcome) in finished {
-                    shell.finish_tiny_file(id, outcome, cx);
-                }
+                shell.settle_flight(&key, &messages, cx);
             });
         });
+    }
+
+    /// Reconciles in-flight sends, outbox cleanup, voice outcomes, and Tiny file verdicts against
+    /// a freshly loaded page covering the newest messages of `key`.
+    pub(super) fn settle_flight(&mut self, key: &Key, messages: &[Rc<protocol::Message>], cx: &mut Context<Self>) {
+        let awaiting_ack = !self.awaiting_tiny_files(key, cx).is_empty();
+        if !self.composer_state.flight.in_flight(key) && !awaiting_ack {
+            return;
+        }
+        let found_state = |client_id: &str| {
+            messages
+                .iter()
+                .find(|message| message.client_id.as_deref() == Some(client_id) || message.id == client_id)
+                .map(|message| message.state.clone())
+        };
+        let outcome_of = |client_id: &str| match found_state(client_id) {
+            None => Outcome::Gone,
+            Some(SendState::Pending) => Outcome::Pending,
+            Some(SendState::Sent) => Outcome::Sent,
+            Some(SendState::Failed { .. }) => Outcome::Failed,
+        };
+        // A send that went no longer needs the files made for it, nor its progress.
+        let inflight = self.composer_state.flight.sending_ids(key);
+        let watching = self.scans_open_in(key, cx);
+        let changed = {
+            let state = &mut self.composer_state;
+            let settled: Vec<String> = state
+                .outbox
+                .iter()
+                .filter(|(held, id, _)| {
+                    held == key
+                        && matches!(outcome_of(id), Outcome::Sent | Outcome::Gone)
+                        && !crate::tiny_attach::stay_in_flight(watching.iter().any(|open| open == id), found_state(id).as_ref())
+                })
+                .map(|(_, id, _)| id.clone())
+                .collect();
+            for id in &settled {
+                if let Some(at) = state.outbox.iter().position(|(held, held_id, _)| held == key && held_id == id) {
+                    let (_, _, made) = state.outbox.remove(at);
+                    delete_later(made);
+                }
+            }
+            state.uploads.retain(|((held, id), _)| held != key || outcome_of(id) == Outcome::Pending);
+            // A scan whose row has left the newest page stays in flight. Settling it here
+            // would drop the chips before a later Failed can name them.
+            let for_flight = |client_id: &str| {
+                let state = found_state(client_id);
+                if crate::tiny_attach::stay_in_flight(watching.iter().any(|id| id == client_id), state.as_ref()) {
+                    Outcome::Pending
+                } else {
+                    outcome_of(client_id)
+                }
+            };
+            state.flight.settle(key, for_flight) || !settled.is_empty()
+        };
+        if changed {
+            cx.notify();
+        }
+        for id in &inflight {
+            let voice_outcome = match found_state(id) {
+                Some(SendState::Sent) => Some(Ok(())),
+                Some(SendState::Failed { reason }) => Some(Err(reason)),
+                _ => None,
+            };
+            if let Some(outcome) = voice_outcome {
+                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                    let (composer, key, id, outcome) = (composer.clone(), key.clone(), id.clone(), outcome.clone());
+                    cx.defer(move |cx| composer.update(cx, |composer, cx| composer.voice_settled(&key, &id, outcome, cx)));
+                }
+            }
+        }
+        if key.network != Network::Tiny {
+            return;
+        }
+        let awaiting = self.awaiting_tiny_files(key, cx);
+        let finished = crate::tiny_attach::file_verdicts(&inflight, &awaiting, |id| {
+            crate::tiny_attach::scan_settled(found_state(id).as_ref())
+        });
+        for (id, outcome) in finished {
+            self.finish_tiny_file(id, outcome, cx);
+        }
     }
 
     /// Remaining slowmode cooldown for `conversation`, in seconds.
@@ -7767,24 +8194,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_effect_option_steps_through_what_the_account_may_send_and_back_to_none() {
-        let item = |id: &str, locked: bool| protocol::CatalogItem {
-            id: id.into(),
-            name: String::new(),
-            file: None,
-            pack: String::new(),
-            animated: false,
-            set: String::new(),
-            locked,
-        };
-        let offered = [item("1", false), item("2", true), item("3", false)];
-        assert_eq!(next_effect(&offered, None).as_deref(), Some("1"));
-        // A Premium effect this account cannot send is passed over.
-        assert_eq!(next_effect(&offered, Some("1")).as_deref(), Some("3"));
-        assert_eq!(next_effect(&offered, Some("3")), None);
-        // One that is no longer offered, or nothing offered at all: none.
-        assert_eq!(next_effect(&offered, Some("9")), None);
-        assert_eq!(next_effect(&[], None), None);
+    fn composer_rests_clean_without_default_floating_pills_or_extra_leading_icons() {
+        // At rest (default importance, no effect, main chat), nothing floats above the composer.
+        assert!(!send_options_visible(protocol::Importance::Normal, false, false));
+        // Only active choices or Slack thread broadcast surface above the card.
+        assert!(send_options_visible(protocol::Importance::Important, false, false));
+        assert!(send_options_visible(protocol::Importance::Urgent, false, false));
+        assert!(send_options_visible(protocol::Importance::Normal, true, false));
+        assert!(send_options_visible(protocol::Importance::Normal, false, true));
+
+        // Left side never renders more than one leading control regardless of network capabilities.
+        let telegram = LeftActions { attach: true, location: true, poll: true, video_note: true, ..Default::default() };
+        assert_eq!(telegram.leading_button_count(), 1);
+        assert!(telegram.uses_menu());
+
+        let discord_channel = LeftActions { attach: true, poll: true, thread: true, ..Default::default() };
+        assert_eq!(discord_channel.leading_button_count(), 1);
+        assert!(discord_channel.uses_menu());
+
+        let simple = LeftActions { attach: true, ..Default::default() };
+        assert_eq!(simple.leading_button_count(), 1);
+        assert!(!simple.uses_menu());
+
+        let edit_only = LeftActions::default();
+        assert_eq!(edit_only.leading_button_count(), 0);
+        assert!(!edit_only.uses_menu());
+
+        // Focused composer card uses subtle border_strong with no halo.
+        let (focused_border, focused_halo) = card_focus_style(false, true);
+        assert_eq!(focused_border, theme::border_strong());
+        assert!(!focused_halo);
+        let (armed_border, armed_halo) = card_focus_style(true, true);
+        assert_eq!(armed_border, theme::warning());
+        assert!(!armed_halo);
+
+        // Teams subject row stays hidden at rest until toggled or populated.
+        assert!(!subject_visible(true, false, ""));
+        assert!(!subject_visible(true, false, "   "));
+        assert!(subject_visible(true, true, ""));
+        assert!(subject_visible(true, false, "Standup"));
+        assert!(!subject_visible(false, true, "Standup"));
+
+        // Send right-click menu opens for Importance and Effects too, not only silent/schedule.
+        assert!(has_send_menu_for(false, false, true, false));
+        assert!(has_send_menu_for(false, false, false, true));
+        assert!(!has_send_menu_for(false, false, false, false));
     }
 
     #[test]

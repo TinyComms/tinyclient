@@ -1,12 +1,12 @@
 //! Discord administration overlays: channel/category permission overwrites (#397),
 //! server audit log (#394), and AutoMod rules & safety setup (#395).
 
-use super::components::{button, button_with_icon, glyph, icon_button, ButtonKind};
+use super::components::{button, button_disabled, button_with_icon, glyph, icon_button, segment, segmented, ButtonKind, Layer};
 use super::input::TextInput;
 use super::state::Shell;
 use super::theme::{self, Type};
 use crate::client::ask;
-use gpui::{div, prelude::*, px, Context, Entity, MouseButton, SharedString, Stateful, Div};
+use gpui::{deferred, div, prelude::*, px, AnyElement, Context, Div, Entity, MouseButton, SharedString, Stateful};
 use protocol::{
     effective_permissions, known_permission_mask, merge_overwrite_bits, would_lock_self_out,
     AuditEntry, AutomodAction, AutomodRule, AutomodTrigger, ChannelOverwrite, ChannelPermissionsInfo, Key,
@@ -500,18 +500,21 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::gui) fn discord_admin_layer(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn discord_admin_layer(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.channel_permissions_modal(window, cx)
             .or_else(|| self.audit_log_modal(window, cx))
             .or_else(|| self.safety_modal(window, cx))
     }
 
-    fn audit_log_modal(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    fn audit_log_modal(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.discord_admin_state.audit.as_ref()?;
+        let viewport = window.viewport_size();
+        let max_w = (f32::from(viewport.width) - 32.).max(200.);
+        let max_h = (f32::from(viewport.height) - 32.).max(200.);
         let title = format!("Audit log · {}", modal.name);
         let selected = modal.action;
-        let mut filters = vec![button("audit-action-any", if selected.is_none() { ButtonKind::Primary } else { ButtonKind::Ghost }, "Any action")
-            .on_click(cx.listener(|this, _, _, cx| {
+        let mut filters = segmented().flex_wrap().child(
+            segment("audit-action-any", "Any action", selected.is_none()).on_click(cx.listener(|this, _, _, cx| {
                 // A click during a load must not light a chip the in-flight page does not match.
                 let ready = this.discord_admin_state.audit.as_mut().is_some_and(|modal| {
                     if modal.loading {
@@ -524,24 +527,26 @@ impl Shell {
                 if ready {
                     this.reload_audit_log(false, cx);
                 }
-            }))];
+            })),
+        );
         for (code, label) in AUDIT_FILTERS {
             let code = *code;
-            let kind = if selected == Some(code) { ButtonKind::Primary } else { ButtonKind::Ghost };
-            filters.push(
-                button(SharedString::from(format!("audit-action-{code}")), kind, *label).on_click(cx.listener(move |this, _, _, cx| {
-                    let ready = this.discord_admin_state.audit.as_mut().is_some_and(|modal| {
-                        if modal.loading {
-                            false
-                        } else {
-                            modal.action = Some(code);
-                            true
+            filters = filters.child(
+                segment(SharedString::from(format!("audit-action-{code}")), *label, selected == Some(code)).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let ready = this.discord_admin_state.audit.as_mut().is_some_and(|modal| {
+                            if modal.loading {
+                                false
+                            } else {
+                                modal.action = Some(code);
+                                true
+                            }
+                        });
+                        if ready {
+                            this.reload_audit_log(false, cx);
                         }
-                    });
-                    if ready {
-                        this.reload_audit_log(false, cx);
-                    }
-                })),
+                    },
+                )),
             );
         }
 
@@ -612,9 +617,9 @@ impl Shell {
         let person_focused = gpui::Focusable::focus_handle(modal.person.read(cx), cx).is_focused(window);
         let card = div()
             .id("discord-audit-card")
-            .w(px(640.))
+            .w(px(640.0_f32.min(max_w)))
             .max_w_full()
-            .max_h(px(640.))
+            .max_h(px(640.0_f32.min(max_h)))
             .p(px(16.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
@@ -654,38 +659,50 @@ impl Shell {
                     )
                     .child(button("discord-audit-apply", ButtonKind::Secondary, "Apply").on_click(cx.listener(|this, _, _, cx| this.reload_audit_log(false, cx)))),
             )
-            .child(div().flex().flex_wrap().gap(px(6.)).children(filters))
+            .child(div().flex().child(filters))
             .children(modal.error.as_ref().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
-            .child(div().id("discord-audit-list").max_h(px(360.)).overflow_y_scroll().flex().flex_col().gap(px(4.)).child(body).when(more, |list| {
+            .child(div().id("discord-audit-list").flex_1().min_h_0().max_h(px(360.)).overflow_y_scroll().flex().flex_col().gap(px(4.)).child(body).when(more, |list| {
                 list.child(
-                    div().flex().justify_center().py(px(8.)).child(
-                        button("discord-audit-more", ButtonKind::Secondary, if loading { "Loading…" } else { "Load older entries" }).when(!loading, |button| {
-                            button.on_click(cx.listener(|this, _, _, cx| this.reload_audit_log(true, cx)))
-                        }),
-                    ),
+                    div().flex().justify_center().py(px(8.)).child(if loading {
+                        button_disabled("Loading…").into_any_element()
+                    } else {
+                        button("discord-audit-more", ButtonKind::Secondary, "Load older entries")
+                            .on_click(cx.listener(|this, _, _, cx| this.reload_audit_log(true, cx)))
+                            .into_any_element()
+                    }),
                 )
             }));
 
         Some(
-            div()
-                .id("discord-audit-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.discord_admin_state.audit = None;
-                    cx.notify();
-                }))
-                .child(card),
+            deferred(
+                div()
+                    .id("discord-audit-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .p(px(16.))
+                    .bg(theme::scrim())
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.discord_admin_state.audit = None;
+                        cx.notify();
+                    }))
+                    .child(card),
+            )
+            .priority(Layer::Modal as usize)
+            .into_any_element(),
         )
     }
 
-    fn channel_permissions_modal(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    fn channel_permissions_modal(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.discord_admin_state.perms.as_ref()?;
+        let viewport = window.viewport_size();
+        let wide = f32::from(viewport.width);
+        let max_w = (wide - 32.).max(200.);
+        let max_h = (f32::from(viewport.height) - 32.).max(200.);
+        let stacked = wide < 600.;
         let title = modal
             .info
             .as_ref()
@@ -996,14 +1013,16 @@ impl Shell {
                 .children(sync_row)
                 .child(
                     div()
+                        .flex_1()
+                        .min_h_0()
                         .flex()
+                        .when(stacked, |box_| box_.flex_col())
                         .gap(px(12.))
-                        .h(px(360.))
                         .child(
                             div()
                                 .id("perm-targets-col")
-                                .w(px(200.))
-                                .flex_none()
+                                .when(!stacked, |col| col.w(px(200.)).flex_none())
+                                .when(stacked, |col| col.w_full().max_h(px(176.)).flex_none())
                                 .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
@@ -1049,6 +1068,7 @@ impl Shell {
                                 .id("perm-matrix-col")
                                 .flex_1()
                                 .min_w_0()
+                                .min_h_0()
                                 .overflow_y_scroll()
                                 .pr(px(4.))
                                 .child(perm_sections),
@@ -1062,7 +1082,9 @@ impl Shell {
         let card = div()
             .id("discord-perms-card")
             .w(px(760.))
-            .max_w_full()
+            .max_w(px(max_w))
+            .h(px(580.0_f32.min(max_h)))
+            .max_h(px(max_h))
             .p(px(16.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
@@ -1075,6 +1097,7 @@ impl Shell {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1089,43 +1112,50 @@ impl Shell {
                             })),
                     ),
             )
-            .child(body)
-            .children(modal.error.as_ref().map(|e| div().type_small().text_color(theme::danger()).child(e.clone())))
+            .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+            .children(modal.error.as_ref().map(|e| div().flex_none().type_small().text_color(theme::danger()).child(e.clone())))
             .child(
                 div()
+                    .flex_none()
                     .flex()
+                    .flex_wrap()
                     .justify_end()
                     .gap(px(8.))
                     .child(button("discord-perms-done", ButtonKind::Ghost, "Close").on_click(cx.listener(|this, _, _, cx| {
                         this.discord_admin_state.perms = None;
                         cx.notify();
                     })))
-                    .child(
-                        button_with_icon(
-                            "discord-perms-save",
-                            if can_save { ButtonKind::Primary } else { ButtonKind::Ghost },
-                            "icons/check.svg",
-                            if modal.busy { "Saving…" } else { "Save overwrite" },
-                        )
-                        .when(can_save, |b| b.on_click(cx.listener(|this, _, _, cx| this.save_selected_overwrite(cx)))),
-                    ),
+                    .child(if modal.busy {
+                        button_disabled("Saving…").into_any_element()
+                    } else if can_save {
+                        button_with_icon("discord-perms-save", ButtonKind::Primary, "icons/check.svg", "Save overwrite")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_selected_overwrite(cx)))
+                            .into_any_element()
+                    } else {
+                        button_disabled("Save overwrite").into_any_element()
+                    }),
             );
 
         Some(
-            div()
-                .id("discord-perms-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.discord_admin_state.perms = None;
-                    cx.notify();
-                }))
-                .child(card),
+            deferred(
+                div()
+                    .id("discord-perms-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .bg(theme::scrim())
+                    .occlude()
+                    .p(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.discord_admin_state.perms = None;
+                        cx.notify();
+                    }))
+                    .child(card),
+            )
+            .priority(Layer::Modal as usize)
+            .into_any_element(),
         )
     }
 
@@ -1439,8 +1469,11 @@ impl Shell {
         .detach();
     }
 
-    fn safety_modal(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    fn safety_modal(&self, window: &gpui::Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let modal = self.discord_admin_state.safety.as_ref()?;
+        let viewport = window.viewport_size();
+        let max_w = (f32::from(viewport.width) - 32.).max(200.);
+        let max_h = (f32::from(viewport.height) - 32.).max(200.);
         let title = format!("Safety setup · {}", modal.name);
         let loaded = modal.loaded;
         let loading = modal.loading;
@@ -1449,56 +1482,66 @@ impl Shell {
         let read_only = modal.draft_read_only;
         let can_timeout = modal.draft_trigger == 1 || modal.draft_trigger == 5;
 
-        let mut verification = Vec::new();
+        let mut verification = segmented().flex_wrap();
         for (level, label) in VERIFY_LEVELS {
             let level = *level;
-            let kind = if modal.verification == level { ButtonKind::Primary } else { ButtonKind::Ghost };
-            verification.push(button(SharedString::from(format!("safety-verify-{level}")), kind, *label).on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(m) = this.discord_admin_state.safety.as_mut() {
-                    if !m.busy && !m.loading && m.loaded {
-                        m.verification = level;
-                        cx.notify();
-                    }
-                }
-            })));
+            verification = verification.child(
+                segment(SharedString::from(format!("safety-verify-{level}")), *label, modal.verification == level).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        if let Some(m) = this.discord_admin_state.safety.as_mut() {
+                            if !m.busy && !m.loading && m.loaded {
+                                m.verification = level;
+                                cx.notify();
+                            }
+                        }
+                    },
+                )),
+            );
         }
-        let mut explicit = Vec::new();
+        let mut explicit = segmented().flex_wrap();
         for (level, label) in EXPLICIT_FILTERS {
             let level = *level;
-            let kind = if modal.explicit == level { ButtonKind::Primary } else { ButtonKind::Ghost };
-            explicit.push(button(SharedString::from(format!("safety-explicit-{level}")), kind, *label).on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(m) = this.discord_admin_state.safety.as_mut() {
-                    if !m.busy && !m.loading && m.loaded {
-                        m.explicit = level;
-                        cx.notify();
-                    }
-                }
-            })));
+            explicit = explicit.child(
+                segment(SharedString::from(format!("safety-explicit-{level}")), *label, modal.explicit == level).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        if let Some(m) = this.discord_admin_state.safety.as_mut() {
+                            if !m.busy && !m.loading && m.loaded {
+                                m.explicit = level;
+                                cx.notify();
+                            }
+                        }
+                    },
+                )),
+            );
         }
-        let mut invites = Vec::new();
-        let mut dms = Vec::new();
+        let mut invites = segmented().flex_wrap();
+        let mut dms = segmented().flex_wrap();
         for (seconds, label) in PAUSE_CHOICES {
             let seconds = *seconds;
-            let invite_kind = if modal.invites_for == seconds { ButtonKind::Primary } else { ButtonKind::Ghost };
-            let dm_kind = if modal.dms_for == seconds { ButtonKind::Primary } else { ButtonKind::Ghost };
-            invites.push(button(SharedString::from(format!("safety-invites-{seconds}")), invite_kind, *label).on_click(
-                cx.listener(move |this, _, _, cx| {
-                    if let Some(m) = this.discord_admin_state.safety.as_mut() {
-                        if !m.busy && !m.loading && m.loaded {
-                            m.invites_for = seconds;
-                            cx.notify();
+            invites = invites.child(
+                segment(SharedString::from(format!("safety-invites-{seconds}")), *label, modal.invites_for == seconds).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(m) = this.discord_admin_state.safety.as_mut() {
+                            if !m.busy && !m.loading && m.loaded {
+                                m.invites_for = seconds;
+                                cx.notify();
+                            }
                         }
-                    }
-                }),
-            ));
-            dms.push(button(SharedString::from(format!("safety-dms-{seconds}")), dm_kind, *label).on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(m) = this.discord_admin_state.safety.as_mut() {
-                    if !m.busy && !m.loading && m.loaded {
-                        m.dms_for = seconds;
-                        cx.notify();
-                    }
-                }
-            })));
+                    }),
+                ),
+            );
+            dms = dms.child(
+                segment(SharedString::from(format!("safety-dms-{seconds}")), *label, modal.dms_for == seconds).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        if let Some(m) = this.discord_admin_state.safety.as_mut() {
+                            if !m.busy && !m.loading && m.loaded {
+                                m.dms_for = seconds;
+                                cx.notify();
+                            }
+                        }
+                    },
+                )),
+            );
         }
 
         let rows: Vec<_> = modal
@@ -1528,44 +1571,48 @@ impl Shell {
             })
             .collect();
 
-        let mut triggers = Vec::new();
+        let mut triggers = segmented().flex_wrap();
         let trigger_label = AUTOMOD_TRIGGERS.iter().find(|pair| pair.0 == modal.draft_trigger).map(|pair| pair.1).unwrap_or("Trigger");
         if modal.creating {
             for (code, label) in AUTOMOD_TRIGGERS {
                 let code = *code;
-                let kind = if modal.draft_trigger == code { ButtonKind::Primary } else { ButtonKind::Ghost };
-                triggers.push(button(SharedString::from(format!("safety-trigger-{code}")), kind, *label).on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(m) = this.discord_admin_state.safety.as_mut() {
-                        if m.busy || m.loading || m.draft_read_only || !m.creating {
-                            return;
-                        }
-                        m.draft_trigger = code;
-                        if code != 1 && code != 5 {
-                            m.draft_timeout = false;
-                        }
-                        if code == 6 {
-                            m.draft_block = false;
-                        } else {
-                            m.draft_quarantine = false;
-                        }
-                        cx.notify();
-                    }
-                })));
+                triggers = triggers.child(
+                    segment(SharedString::from(format!("safety-trigger-{code}")), *label, modal.draft_trigger == code).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            if let Some(m) = this.discord_admin_state.safety.as_mut() {
+                                if m.busy || m.loading || m.draft_read_only || !m.creating {
+                                    return;
+                                }
+                                m.draft_trigger = code;
+                                if code != 1 && code != 5 {
+                                    m.draft_timeout = false;
+                                }
+                                if code == 6 {
+                                    m.draft_block = false;
+                                } else {
+                                    m.draft_quarantine = false;
+                                }
+                                cx.notify();
+                            }
+                        },
+                    )),
+                );
             }
         }
-        let mut presets = Vec::new();
+        let mut presets = segmented().flex_wrap();
         for (ix, label) in PRESET_LABELS.iter().enumerate() {
             let on = modal.draft_presets[ix];
-            let kind = if on { ButtonKind::Primary } else { ButtonKind::Ghost };
-            presets.push(button(SharedString::from(format!("safety-preset-{ix}")), kind, *label).on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(m) = this.discord_admin_state.safety.as_mut() {
-                    if m.busy || m.loading || m.draft_read_only {
-                        return;
+            presets = presets.child(
+                segment(SharedString::from(format!("safety-preset-{ix}")), *label, on).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(m) = this.discord_admin_state.safety.as_mut() {
+                        if m.busy || m.loading || m.draft_read_only {
+                            return;
+                        }
+                        m.draft_presets[ix] = !m.draft_presets[ix];
+                        cx.notify();
                     }
-                    m.draft_presets[ix] = !m.draft_presets[ix];
-                    cx.notify();
-                }
-            })));
+                })),
+            );
         }
 
         let editor = div()
@@ -1575,7 +1622,7 @@ impl Shell {
             .child(div().type_small().text_color(theme::text()).child(if modal.creating { "New rule" } else { "Edit rule" }))
             .child(field_box("Name", modal.name_input.clone(), window, cx))
             .child(toggle_line(cx, "safety-enabled", "Enabled", modal.draft_enabled, |m| &mut m.draft_enabled))
-            .when(modal.creating, |col| col.child(div().flex().flex_wrap().gap(px(6.)).children(triggers)))
+            .when(modal.creating, |col| col.child(div().flex().child(triggers)))
             .when(!modal.creating, |col| col.child(div().type_small().text_color(theme::text_faint()).child(trigger_label)))
             .when(modal.draft_trigger == 1 || modal.draft_trigger == 6, |col| {
                 col.child(field_box("Keywords", modal.words.clone(), window, cx))
@@ -1583,7 +1630,7 @@ impl Shell {
                     .child(field_box("Allow list", modal.allow.clone(), window, cx))
             })
             .when(modal.draft_trigger == 4, |col| {
-                col.child(div().flex().flex_wrap().gap(px(6.)).children(presets))
+                col.child(div().flex().child(presets))
                     .child(field_box("Allow list", modal.allow.clone(), window, cx))
             })
             .when(modal.draft_trigger == 5, |col| {
@@ -1607,23 +1654,32 @@ impl Shell {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .justify_end()
                     .gap(px(8.))
                     .when(!modal.draft_id.is_empty(), |row| {
-                        row.child(button("safety-delete-rule", ButtonKind::Ghost, if busy { "Deleting…" } else { "Delete rule" }).when(!busy, |button| {
-                            button.on_click(cx.listener(|this, _, _, cx| this.delete_selected_rule(cx)))
-                        }))
+                        row.child(if busy {
+                            button_disabled("Deleting…").into_any_element()
+                        } else {
+                            button("safety-delete-rule", ButtonKind::Danger, "Delete rule")
+                                .on_click(cx.listener(|this, _, _, cx| this.delete_selected_rule(cx)))
+                                .into_any_element()
+                        })
                     })
-                    .child(button("safety-save-rule", if busy { ButtonKind::Ghost } else { ButtonKind::Primary }, if busy { "Saving…" } else { "Save rule" }).when(!busy, |button| {
-                        button.on_click(cx.listener(|this, _, _, cx| this.save_selected_rule(cx)))
-                    })),
+                    .child(if busy {
+                        button_disabled("Saving…").into_any_element()
+                    } else {
+                        button("safety-save-rule", ButtonKind::Primary, "Save rule")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_selected_rule(cx)))
+                            .into_any_element()
+                    }),
             );
 
         let card = div()
             .id("discord-safety-card")
             .w(px(720.))
-            .max_w_full()
-            .max_h(px(720.))
+            .max_w(px(max_w))
+            .max_h(px(720.0_f32.min(max_h)))
             .p(px(16.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
@@ -1662,18 +1718,23 @@ impl Shell {
                     .gap(px(12.))
                     .when(loading && !loaded, |col| col.child(div().py(px(12.)).type_small().text_color(theme::text_soft()).child("Loading safety setup…")))
                     .child(div().type_small().text_color(theme::text()).child("Verification"))
-                    .child(div().flex().flex_wrap().gap(px(6.)).children(verification))
+                    .child(div().flex().child(verification))
                     .child(div().type_small().text_color(theme::text()).child("Explicit content"))
-                    .child(div().flex().flex_wrap().gap(px(6.)).children(explicit))
+                    .child(div().flex().child(explicit))
                     .child(div().type_small().text_color(theme::text()).child("Pause invites"))
-                    .child(div().flex().flex_wrap().gap(px(6.)).children(invites))
+                    .child(div().flex().child(invites))
                     .child(div().type_small().text_color(theme::text()).child("Pause direct messages"))
-                    .child(div().flex().flex_wrap().gap(px(6.)).children(dms))
+                    .child(div().flex().child(dms))
                     .child(
-                        div().flex().justify_end().child(
-                            button("safety-save-levels", if loaded && !busy { ButtonKind::Primary } else { ButtonKind::Ghost }, if busy { "Saving…" } else { "Save safety" })
-                                .when(loaded && !busy && !loading, |button| button.on_click(cx.listener(|this, _, _, cx| this.save_safety_levels(cx)))),
-                        ),
+                        div().flex().justify_end().child(if busy {
+                            button_disabled("Saving…").into_any_element()
+                        } else if loaded && !loading {
+                            button("safety-save-levels", ButtonKind::Primary, "Save safety")
+                                .on_click(cx.listener(|this, _, _, cx| this.save_safety_levels(cx)))
+                                .into_any_element()
+                        } else {
+                            button_disabled("Save safety").into_any_element()
+                        }),
                     )
                     .child(div().type_small().text_color(theme::text()).child("AutoMod rules"))
                     .when(loaded, |col| {
@@ -1696,20 +1757,25 @@ impl Shell {
             );
 
         Some(
-            div()
-                .id("discord-safety-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.discord_admin_state.safety = None;
-                    cx.notify();
-                }))
-                .child(card),
+            deferred(
+                div()
+                    .id("discord-safety-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .bg(theme::scrim())
+                    .occlude()
+                    .p(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.discord_admin_state.safety = None;
+                        cx.notify();
+                    }))
+                    .child(card),
+            )
+            .priority(Layer::Modal as usize)
+            .into_any_element(),
         )
     }
 }

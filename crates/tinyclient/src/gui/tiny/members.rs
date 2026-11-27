@@ -7,7 +7,7 @@ use super::{model, Float, Page};
 use crate::gui::components::{field, glyph, tip, Avatar};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, AnyElement, Context, Div, Focusable, MouseButton, MouseDownEvent, SharedString, Window};
+use gpui::{canvas, div, prelude::*, px, AnyElement, Context, Div, Focusable, MouseButton, MouseDownEvent, SharedString, Window};
 use protocol::{CallState, Content, TinyMember, TinyRoom, TinySeat};
 
 pub(super) const MEMBERS_WIDTH: f32 = 248.;
@@ -34,8 +34,8 @@ impl Shell {
                     .gap(px(6.))
                     .type_micro()
                     .text_color(theme::text_faint())
-                    .when(group.color.is_some(), |header| header.child(div().mb(px(4.)).size(px(8.)).rounded_full().bg(color)))
-                    .child(format!("{} — {}", group.title.to_uppercase(), group.people.len())),
+                    .when(group.color.is_some(), |header| header.child(div().flex_none().mb(px(4.)).size(px(8.)).rounded_full().bg(color)))
+                    .child(div().flex_1().min_w_0().truncate().child(format!("{} — {}", group.title.to_uppercase(), group.people.len()))),
             );
             for user_id in &group.people {
                 if let Some(member) = page.community.member(user_id) {
@@ -44,6 +44,7 @@ impl Shell {
             }
         }
         div()
+            .relative()
             .w(px(MEMBERS_WIDTH))
             .h_full()
             .flex_none()
@@ -61,6 +62,13 @@ impl Shell {
                     .child(field(focused).child(glyph("icons/search.svg", 14., theme::text_faint())).child(div().flex_1().min_w_0().child(self.tiny_state.search_input.clone()))),
             )
             .child(div().flex_1().min_h_0().child(crate::gui::components::scroll::scroll_page("tiny-members-scroll-frame", list)))
+            .child(
+                canvas(|bounds, _, _| super::layer::note_members_bounds(bounds), |_, _, _, _| {})
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+            )
             .into_any_element()
     }
 
@@ -143,10 +151,11 @@ impl Shell {
                             .flex_col()
                             .child(
                                 div()
+                                    .min_w_0()
                                     .flex()
                                     .items_center()
                                     .gap(px(6.))
-                                    .child(div().min_w_0().truncate().type_ui().font_weight(theme::MEDIUM).text_color(color).child(name))
+                                    .child(div().flex_initial().min_w_0().truncate().type_ui().font_weight(theme::MEDIUM).text_color(color).child(name))
                                     .when(model::is_owner(member), |row| row.child(glyph("icons/crown.svg", 12., theme::warning())))
                                     .when(me, |row| row.child(super::channel::chip("You", theme::text_soft(), theme::hover()))),
                             )
@@ -191,6 +200,7 @@ impl Shell {
         let legacy_role = page.community.roles.is_empty().then(|| model::role_word(&member.role));
         let mut card = div()
             .w(px(if wide { 340. } else { 280. }))
+            .max_w_full()
             .flex()
             .flex_col()
             .gap(px(12.))

@@ -1,0 +1,12 @@
+{
+  "id": "responsive-shell-ux",
+  "title": "Responsive overlays, shell layout, sidebar polish, and All Unreads alignment/counts",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window; mobile-specific fixes are verified via unit tests and phone form checks.",
+    "ios": "The phone proof build does not run the desktop window; mobile-specific fixes are verified via unit tests and phone form checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

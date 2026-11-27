@@ -1,0 +1,12 @@
+{
+  "id": "curated-themes",
+  "title": "Curated themes (8 themes x Standard/HC), curated accent colors (Auto + 8 accents), visual Theme Picker, and WCAG AA/AAA contrast verification",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window; mobile 2x4 theme grid and accent swatches are verified via unit tests.",
+    "ios": "The phone proof build does not run the desktop window; mobile 2x4 theme grid and accent swatches are verified via unit tests."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

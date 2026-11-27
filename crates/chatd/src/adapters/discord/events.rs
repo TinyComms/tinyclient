@@ -4,6 +4,7 @@ use super::super::Failure;
 use super::content::{self, Place};
 use super::model::{self, number, seconds, Channel, Emoji, Member, Posted, Relationship, Role, User};
 use super::{proto, Discord, Lookup};
+use crate::hub::lock;
 use protocol::{ConversationKind, Reaction, Relation};
 use serde::Deserialize;
 use serde_json::from_str;
@@ -185,7 +186,7 @@ impl Discord {
             "READY_SUPPLEMENTAL" => self.supplemental(from_str(data)?),
             "AUTH_SESSION_CHANGE" => {
                 let change: serde_json::Value = from_str(data)?;
-                self.state.lock().unwrap().auth_session_id_hash =
+                lock(&self.state).auth_session_id_hash =
                     change["auth_session_id_hash"].as_str().map(str::to_owned);
             }
             "MESSAGE_CREATE" => self.created(from_str(data)?)?,
@@ -243,7 +244,7 @@ impl Discord {
             "RELATIONSHIP_ADD" | "RELATIONSHIP_UPDATE" => self.related(from_str(data)?)?,
             "RELATIONSHIP_REMOVE" => {
                 let gone: Relationship = from_str(data)?;
-                let mut state = self.state.lock().unwrap();
+                let mut state = lock(&self.state);
                 state.relations.remove(&gone.id);
                 state.rows.remove(&gone.id);
                 state.presence.remove(&gone.id);
@@ -275,9 +276,7 @@ impl Discord {
             "USER_NOTE_UPDATE" => {
                 let update: NoteUpdate = from_str(data)?;
                 if !update.id.is_empty() {
-                    self.state
-                        .lock()
-                        .unwrap()
+                    lock(&self.state)
                         .notes
                         .insert(update.id.clone(), update.note.unwrap_or_default());
                     self.ctx.profile_stale(&update.id);
@@ -372,7 +371,7 @@ impl Discord {
             .map(|h| model::event_cover(&ev.id, h));
         let mut notify_info: Option<(String, String, String, String)> = None;
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             let Some(info) = state.guilds.get_mut(&guild) else {
                 return Ok(());
             };
@@ -410,10 +409,7 @@ impl Discord {
         }
         if let Some((space_name, event_id, name, mut place)) = notify_info {
             if place.is_empty() {
-                if let Some(ch) = self
-                    .state
-                    .lock()
-                    .unwrap()
+                if let Some(ch) = lock(&self.state)
                     .guilds
                     .get(&guild)
                     .and_then(|g| g.events.get(&event_id))
@@ -435,7 +431,7 @@ impl Discord {
             return;
         }
         let removed = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             state
                 .guilds
                 .get_mut(&ev.guild_id)
@@ -448,7 +444,7 @@ impl Discord {
 
     fn scheduled_event_user(&self, change: model::ScheduledEventUser, added: bool) {
         let changed = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             let me = state.me.clone();
             if let Some(stored) = state
                 .guilds
@@ -473,7 +469,7 @@ impl Discord {
     fn thread_member_updated(&self, update: ThreadMemberUpdate) -> Result<(), Failure> {
         let member = model::ThreadMember { flags: update.flags.unwrap_or(0), muted: update.muted };
         let muted = member.notify() == Some(protocol::Notify::Nothing);
-        self.state.lock().unwrap().thread_members.insert(update.id.clone(), member);
+        lock(&self.state).thread_members.insert(update.id.clone(), member);
         self.ctx.muted(&update.id, muted)?;
         self.ctx.info_stale(&update.id);
         Ok(())
@@ -486,7 +482,7 @@ impl Discord {
             return Ok(());
         }
         let (channel, title) = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             if add {
                 state.users.insert(id.clone(), change.user.name().to_owned());
             }
@@ -707,7 +703,7 @@ impl Discord {
         };
         let row = user.person(relationship.nickname.as_deref());
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             state.users.insert(user.id.clone(), row.name.clone());
             state.rows.insert(user.id.clone(), row.clone());
             state.relations.insert(user.id.clone(), relationship.relation());
@@ -723,7 +719,7 @@ impl Discord {
             return;
         }
         let named = typing.member.as_ref().map(|member| member.name().to_owned()).filter(|name| !name.is_empty());
-        let named = named.or_else(|| self.state.lock().unwrap().users.get(&typing.user_id).cloned());
+        let named = named.or_else(|| lock(&self.state).users.get(&typing.user_id).cloned());
         let name = named.unwrap_or_else(|| "Someone".to_owned());
         self.ctx.typing(&typing.channel_id, &typing.user_id, &name, TYPING_SECONDS);
     }
@@ -759,7 +755,7 @@ impl Discord {
         // update still carries the whole proto Discord sent, so the blob is replaced whole.
         if update.settings.kind == 2 {
             if let Some(bytes) = proto::decode_settings(&update.settings.proto) {
-                let mut state = self.state.lock().unwrap();
+                let mut state = lock(&self.state);
                 state.frecency = bytes;
                 state.frecency_loaded = true;
             }
@@ -773,27 +769,27 @@ impl Discord {
             self.own_status(status);
         }
         if let Some(privacy) = proto::privacy_settings(&update.settings.proto) {
-            self.state.lock().unwrap().privacy_settings = privacy;
+            lock(&self.state).privacy_settings = privacy;
         }
         if let Some(text) = proto::text_and_images_settings(&update.settings.proto) {
-            self.state.lock().unwrap().text_and_images = text;
+            lock(&self.state).text_and_images = text;
         }
         if update.partial {
             return Ok(());
         }
-        self.state.lock().unwrap().show_explicit_media = !proto::blur_explicit_media(&update.settings.proto);
+        lock(&self.state).show_explicit_media = !proto::blur_explicit_media(&update.settings.proto);
         if let Some(raw_block) = proto::guild_folders_settings(&update.settings.proto) {
-            self.state.lock().unwrap().guild_folders_settings = raw_block;
+            lock(&self.state).guild_folders_settings = raw_block;
         }
         if let Some(folders) = proto::guild_folders(&update.settings.proto) {
-            self.state.lock().unwrap().folders = folders.clone();
+            lock(&self.state).folders = folders.clone();
             self.record_folders(&folders)?;
         }
         let Some(order) = proto::guild_order(&update.settings.proto) else {
             return Ok(());
         };
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock(&self.state);
             for (id, info) in &mut state.guilds {
                 if let Some(position) = order.iter().position(|placed| placed == id) {
                     info.position = position as i32;

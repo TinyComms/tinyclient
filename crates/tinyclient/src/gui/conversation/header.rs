@@ -2,12 +2,13 @@
 //! conversation. The buttons belong to the slices that own what they do; this places them.
 
 use crate::gui::pane::Layer;
-use crate::gui::components::{glyph, icon_button, network_icon, tip, Avatar, Shape};
+use crate::gui::components::place::{placed, Layer as OverlayLayer, Place};
+use crate::gui::components::{glyph, icon_button, menu, menu_item, network_icon, tip, Avatar, Shape};
 use crate::gui::chrome::{self, End};
 use crate::gui::layout::{drags_window, TOP_BAR};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
+use gpui::{canvas, div, prelude::*, px, AnyElement, Context, Div, MouseButton, Window};
 use protocol::{Conversation, ConversationKind, Key, Link, Mark, MediaFile, Network};
 
 impl Shell {
@@ -87,41 +88,52 @@ impl Shell {
             Link::Expired => Some("Signed out by the network"),
             Link::SignedOut => Some("Signed out"),
         };
-        let beside = self.beside(open);
-        let role = self.tiny_header_role(open);
         // The network's icon leads a title only where networks are mixed: a conversation in
         // no Space was reached from the Inbox, which lists every network together. One with a
         // Space says where it is in words.
         let mixed = open.space.is_none();
-        // A control, not a pill (polish/01): the system's radius and the strip's 28. Under 600
-        // of conversation it keeps only its glyph, and the tooltip keeps the words (07 §1).
-        let room = self.conversation_room();
-        let compact = room > 0. && room < 600.;
+        let controls = self.strip_controls(window, cx);
+        let sidebar_shown = self.panel_button(window, cx).is_none();
+        // True usable width in the conversation header, subtracting left chrome and
+        // Windows/Linux caption buttons (`chrome::end_pad`).
+        let raw_room = self.conversation_room();
+        let room = if raw_room > 0. { raw_room } else { f32::from(window.viewport_size().width) };
+        let left_chrome = (if !sidebar_shown { 36. } else { 0. }) + 56. + 44.;
+        let end_pad = chrome::end_pad(End::Conversation, 12.);
+        let usable = (room - theme::PANE_PAD - end_pad - left_chrome).max(0.);
+        let compact = usable < 460.;
+        let overflow_narrow = usable < 520.;
+        if !overflow_narrow {
+            self.conversation_state.header_overflow.set(false);
+        }
+        let beside = (usable >= 360.).then(|| self.beside(open)).flatten();
+        let role = (usable >= 380.).then(|| self.tiny_header_role(open)).flatten();
         let search = icon_button("search", "icons/search.svg", self.pane_shows(|layer| matches!(layer, Layer::Search)))
             .aria_label("Search in conversation")
             .tooltip(tip("Search in conversation", Some("⌘F")))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_conversation_search(window, cx)));
-        let add_people = self.can_add_people(open).then(|| {
+        let can_add = self.can_add_people(open);
+        let add_people = (!overflow_narrow && can_add).then(|| {
             let conversation = open.clone();
             icon_button("add-people", "icons/user-plus.svg", false)
                 .tooltip(tip("Add people", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, window, cx| this.open_add_people(&conversation, window, cx)))
         });
-        let threads_btn = (open.key.network == Network::Discord
-            && matches!(open.kind, ConversationKind::Channel | ConversationKind::Announcement))
-        .then(|| {
+        let can_threads = open.key.network == Network::Discord
+            && matches!(open.kind, ConversationKind::Channel | ConversationKind::Announcement);
+        let threads_btn = (!overflow_narrow && can_threads).then(|| {
             icon_button("channel-threads", "icons/messages-square.svg", self.pane_shows(|layer| matches!(layer, Layer::Threads(_))))
                 .aria_label("Threads")
                 .tooltip(tip("Threads", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_channel_threads(cx)))
         });
-        let thread_settings = (open.key.network == Network::Discord
+        let can_thread_settings = open.key.network == Network::Discord
             && open.kind == ConversationKind::Thread
-            && (open.rights.manage_threads || open.rights.rename))
-        .then(|| {
+            && (open.rights.manage_threads || open.rights.rename);
+        let thread_settings = (!overflow_narrow && can_thread_settings).then(|| {
             icon_button("thread-settings", "icons/pencil.svg", false)
                 .aria_label("Thread settings")
                 .tooltip(tip("Thread settings", None))
@@ -131,11 +143,17 @@ impl Shell {
         let thread_membership = (open.key.network == Network::Discord && open.kind == ConversationKind::Thread).then(|| {
             let key = open.key.clone();
             let joined = open.followed;
-            let label = if joined { "Leave thread" } else { "Join thread" };
+            let full_label = if joined { "Leave thread" } else { "Join thread" };
+            let label = if compact {
+                if joined { "Leave" } else { "Join" }
+            } else {
+                full_label
+            };
             div()
                 .id("thread-follow-toggle")
                 .role(gpui::Role::Button)
-                .aria_label(label)
+                .aria_label(full_label)
+                .tooltip(tip(full_label, None))
                 .tab_index(0)
                 .focus_visible(|style| style.shadow(theme::focus_ring()))
                 .h(px(theme::CONTROL))
@@ -153,7 +171,8 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_follow_thread(key.clone(), !joined, cx)))
                 .child(label)
         });
-        let setup = (open.key.network == Network::Discord && open.space.is_some()).then(|| {
+        let can_setup = open.key.network == Network::Discord && open.space.is_some();
+        let setup = (!overflow_narrow && can_setup).then(|| {
             let space = Key { id: open.space.clone().unwrap_or_default(), ..open.key.clone() };
             icon_button("server-setup", "icons/list.svg", false)
                 .aria_label("Server setup")
@@ -161,14 +180,17 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| this.open_server_gate(space.clone(), cx)))
         });
-        let live_hint = self.snapshot.as_ref().and_then(|snapshot| self.call_live_hint(snapshot, cx));
+        // When the sidebar is visible, the call dock already shows the active call; only show the
+        // top-bar live-call hint when the sidebar is collapsed/hidden.
+        let live_hint = (!sidebar_shown)
+            .then(|| self.snapshot.as_ref().and_then(|snapshot| self.call_live_hint(snapshot, cx)))
+            .flatten();
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, compact, cx)).map(|call| {
             call.whitespace_nowrap()
         });
         let stage_pill = self.snapshot.as_ref().and_then(|snapshot| self.call_return_stage_pill(snapshot, cx));
-        let controls = self.strip_controls(window, cx);
         // The window's own buttons sit over the strip's right end: a hairline keeps the actions off them.
-        let window_buttons = chrome::end_pad(End::Conversation, 12.) > 12.;
+        let window_buttons = end_pad > 12.;
         // Lit means "this kind is in the pane now". In a channel, Members and Details are two
         // values of one switch; beside a direct conversation Details is the other person.
         let members = (!direct && !teams_channel).then(|| {
@@ -188,20 +210,47 @@ impl Shell {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
         });
         let pop_key = open.key.clone();
-        let windowed = icon_button("pop-out-conversation", "icons/picture-in-picture-2.svg", false)
-            .aria_label("Open in New Window")
-            .tooltip(tip("Open in New Window", None))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, _, cx| this.pop_out_conversation(pop_key.clone(), cx)));
-        // The title keeps 96, or its whole width when shorter, so a short name is not padded
-        // away from what follows. The line after it truncates first, then the title.
+        let windowed = (!overflow_narrow).then(|| {
+            icon_button("pop-out-conversation", "icons/picture-in-picture-2.svg", false)
+                .aria_label("Open in New Window")
+                .tooltip(tip("Open in New Window", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.pop_out_conversation(pop_key.clone(), cx)))
+        });
+        let overflow_open = overflow_narrow && self.conversation_state.header_overflow.get();
+        let overflow_btn = overflow_narrow.then(|| {
+            let anchor = self.conversation_state.header_overflow_anchor.clone();
+            icon_button("header-overflow", "icons/ellipsis.svg", overflow_open)
+                .relative()
+                .aria_label("More conversation actions")
+                .tooltip(tip("More actions", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let next = !this.conversation_state.header_overflow.get();
+                    this.conversation_state.header_overflow.set(next);
+                    cx.notify();
+                }))
+                .child(
+                    canvas(move |bounds, _, _| anchor.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                )
+        });
+        let overflow_menu = overflow_open
+            .then(|| self.header_overflow_menu(open, can_setup, can_thread_settings, can_threads, can_add, window, cx))
+            .flatten();
+        // The title keeps 96 (48 when narrow), or its whole width when shorter, so a short name is
+        // not padded away from what follows. The line after it truncates first, then the title.
         let title_tip = if direct { "Open profile".to_owned() } else { open.title.clone() };
+        let title_cap = if usable < 460. { 48. } else { 96. };
         let title = div()
             .id("conversation-title")
             .role(if direct { gpui::Role::Button } else { gpui::Role::Heading })
             .aria_label(if direct { format!("Open profile for {}", open.title) } else { open.title.clone() })
             .flex_initial()
-            .min_w(title_floor(&open.title, window))
+            .min_w(title_floor(&open.title, window, title_cap))
             .truncate()
             .type_title()
             .tooltip(tip(title_tip, direct.then_some("⌘.")))
@@ -254,8 +303,9 @@ impl Shell {
         drags_window(div())
             .h(px(TOP_BAR))
             .flex_none()
+            .overflow_hidden()
             .pl(px(theme::PANE_PAD))
-            .pr(px(chrome::end_pad(End::Conversation, 12.)))
+            .pr(px(end_pad))
             .flex()
             .items_center()
             .border_b_1()
@@ -284,20 +334,100 @@ impl Shell {
                     .children(self.discord_account_label(&open.key).map(|name| div().flex_none().type_small().text_color(theme::text_faint()).child(name)))
                     .children(mark(open))
                     .children(role.map(|role| role_chip(&role.name, role.color)))
-                    .children(self.encryption_chip(open, cx))
-                    .children(self.disappearing_chip(open, cx))
-                    .children(self.meeting_chip(open, cx))
+                    .children(self.encryption_chip(open, usable, cx))
+                    .children(self.disappearing_chip(open, usable < 520., cx))
+                    .children(self.meeting_chip(open, usable < 540., cx))
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
             .children(live_hint.map(|hint| div().flex_none().ml(px(8.)).child(hint)))
-            .children(self.follow_button(open, cx).map(|follow| div().flex_none().ml(px(8.)).child(follow)))
+            .children(self.follow_button(open, compact, cx).map(|follow| div().flex_none().ml(px(8.)).child(follow)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .children(self.meeting_button(open, link, compact, cx))
             .children(stage_pill.map(|pill| div().flex_none().ml(px(8.)).child(pill)))
             .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).children(add_people).child(search).children(members).children(details).child(windowed))
+            .child(
+                div()
+                    .flex_none()
+                    .ml(px(8.))
+                    .flex()
+                    .gap(px(4.))
+                    .children(setup)
+                    .children(thread_settings)
+                    .children(threads_btn)
+                    .children(add_people)
+                    .child(search)
+                    .children(members)
+                    .children(details)
+                    .children(windowed)
+                    .children(overflow_btn),
+            )
+            .children(overflow_menu)
             .when(window_buttons, |bar| bar.child(div().flex_none().ml(px(8.)).w(px(1.)).h(px(16.)).bg(theme::hairline())))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn header_overflow_menu(
+        &self,
+        open: &Conversation,
+        can_setup: bool,
+        can_thread_settings: bool,
+        can_threads: bool,
+        can_add: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let anchor = self.conversation_state.header_overflow_anchor.get()?;
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(180.);
+        let mut items = menu().w(px(220.0_f32.min(max_w)));
+        if can_setup {
+            let space = Key { id: open.space.clone().unwrap_or_default(), ..open.key.clone() };
+            items = items.child(menu_item("header-ov-setup", Some("icons/list.svg"), "Server setup", None).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    this.conversation_state.header_overflow.set(false);
+                    this.open_server_gate(space.clone(), cx);
+                }),
+            ));
+        }
+        if can_thread_settings {
+            items = items.child(menu_item("header-ov-thread-settings", Some("icons/pencil.svg"), "Thread settings", None).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.conversation_state.header_overflow.set(false);
+                    this.composer_toggle_thread_settings(cx);
+                }),
+            ));
+        }
+        if can_threads {
+            items = items.child(menu_item("header-ov-threads", Some("icons/messages-square.svg"), "Threads", None).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.conversation_state.header_overflow.set(false);
+                    this.toggle_channel_threads(cx);
+                }),
+            ));
+        }
+        if can_add {
+            let conversation = open.clone();
+            items = items.child(menu_item("header-ov-add", Some("icons/user-plus.svg"), "Add people", None).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.conversation_state.header_overflow.set(false);
+                    this.open_add_people(&conversation, window, cx);
+                }),
+            ));
+        }
+        let pop_key = open.key.clone();
+        items = items.child(menu_item("header-ov-popout", Some("icons/picture-in-picture-2.svg"), "Open in New Window", None).on_click(
+            cx.listener(move |this, _, _, cx| {
+                this.conversation_state.header_overflow.set(false);
+                this.pop_out_conversation(pop_key.clone(), cx);
+            }),
+        ));
+        let items = items
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.conversation_state.header_overflow.set(false);
+                cx.notify();
+            }));
+        Some(placed("header-overflow-menu", Place::Below(anchor), OverlayLayer::Menu, window, items))
     }
 
     /// The Discord account's name, when two Discord accounts are signed in.
@@ -314,7 +444,7 @@ impl Shell {
     }
 
     /// Follow button in the header strip for Discord announcement channels.
-    fn follow_button(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+    fn follow_button(&self, open: &Conversation, compact: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
         if open.kind != ConversationKind::Announcement {
             return None;
         }
@@ -336,7 +466,8 @@ impl Shell {
                 .focus_visible(|style| style.shadow(theme::focus_ring()))
                 .flex_none()
                 .h(px(theme::CONTROL))
-                .px(px(10.))
+                .when(compact, |el| el.w(px(theme::CONTROL)).justify_center())
+                .when(!compact, |el| el.px(px(10.)).gap(px(5.)))
                 .rounded(px(theme::R_CONTROL))
                 .bg(theme::field())
                 .border_1()
@@ -345,7 +476,6 @@ impl Shell {
                 .active(|style| style.bg(theme::pressed()))
                 .flex()
                 .items_center()
-                .gap(px(5.))
                 .cursor_pointer()
                 .type_small()
                 .font_weight(theme::MEDIUM)
@@ -354,14 +484,14 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, window, cx| this.open_follow(&conv, window, cx)))
                 .child(glyph("icons/megaphone.svg", 13., theme::text_soft()))
-                .child("Follow"),
+                .when(!compact, |el| el.child("Follow")),
         )
     }
 
     /// Whether the conversation is end-to-end encrypted, where its network says: a lock and the
     /// words, or the plain words that the server can read it. A plaintext conversation keeps that
     /// label for good; it is never called encrypted. Opens Encryption, where the safety numbers are.
-    fn encryption_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+    fn encryption_chip(&self, open: &Conversation, usable: f32, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
         if open.encryption.is_unknown() {
             return None;
         }
@@ -369,6 +499,8 @@ impl Shell {
         // Green when only the members' devices can read it. Amber when the server can.
         // A plaintext conversation is never drawn with the lock.
         let (icon, tone) = if sealed { ("icons/lock.svg", theme::online()) } else { ("icons/triangle-alert.svg", theme::warning()) };
+        let show_words = if sealed { usable >= 760. } else { usable >= 480. };
+        let short_words = if sealed { "Encrypted" } else { "Not encrypted" };
         let conversation = open.key.clone();
         Some(
             div()
@@ -376,24 +508,26 @@ impl Shell {
                 .flex_none()
                 .self_center()
                 .h(px(20.))
+                .when(!show_words, |el| el.w(px(20.)).justify_center())
+                .when(show_words, |el| el.px(px(5.)).gap(px(4.)))
+                .rounded(px(theme::R_CONTROL))
                 .flex()
                 .items_center()
-                .gap(px(4.))
                 .cursor_pointer()
                 .type_micro()
                 .font_weight(theme::MEDIUM)
                 .text_color(tone)
-                .hover(|style| style.text_color(theme::text()))
+                .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
                 .tooltip(tip(open.encryption.explained(), None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_encryption(&conversation, sealed, window, cx)))
                 .child(glyph(icon, 12., tone))
-                .child(open.encryption.words()),
+                .when(show_words, |el| el.child(short_words)),
         )
     }
 
     /// Shows the conversation's active disappearing-messages timer in the header.
-    fn disappearing_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+    fn disappearing_chip(&self, open: &Conversation, compact: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
         let secs = open.disappearing.filter(|&s| s > 0)?;
         let label = protocol::format_disappearing(secs);
         let tip_words = if open.key.network == Network::Telegram {
@@ -407,14 +541,14 @@ impl Shell {
                 .flex_none()
                 .self_center()
                 .h(px(20.))
-                .px(px(7.))
+                .when(compact, |el| el.w(px(20.)).justify_center())
+                .when(!compact, |el| el.px(px(7.)).gap(px(4.)))
                 .rounded_full()
                 .bg(theme::hover())
                 .border_1()
                 .border_color(theme::hairline())
                 .flex()
                 .items_center()
-                .gap(px(4.))
                 .cursor_pointer()
                 .type_micro()
                 .font_weight(theme::MEDIUM)
@@ -424,24 +558,23 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
                 .child(glyph("icons/clock.svg", 12., theme::text_soft()))
-                .child(label),
+                .when(!compact, |el| el.child(label)),
         )
     }
 
     /// Today's meeting for this chat: the time, and Join when the link is https.
-    fn meeting_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+    fn meeting_chip(&self, open: &Conversation, compact: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
         if open.key.network != Network::Teams {
             return None;
         }
         let event = self.sidebar_state.home.upcoming.iter().find(|event| {
             event.conversation == open.key.id && (self.sidebar_state.home.upcoming_account.is_empty() || self.sidebar_state.home.upcoming_account == open.key.account)
         })?;
-        let mut label = crate::gui::time::meeting_display(event, crate::view::now());
+        let base_label = crate::gui::time::meeting_display(event, crate::view::now());
         let join = event.join_url.clone();
         let can_join = join.starts_with("https://");
-        if can_join {
-            label.push_str(" · Join");
-        }
+        let full_label = if can_join { format!("{base_label} · Join") } else { base_label.clone() };
+        let shown_label = if compact { base_label } else { full_label.clone() };
         Some(
             div()
                 .id("conversation-meeting")
@@ -457,6 +590,7 @@ impl Shell {
                 .type_micro()
                 .font_weight(theme::MEDIUM)
                 .text_color(theme::text_soft())
+                .tooltip(tip(full_label, None))
                 .when(can_join, |chip| {
                     chip.cursor_pointer()
                         .hover(|style| style.text_color(theme::text()))
@@ -467,7 +601,7 @@ impl Shell {
                         }))
                 })
                 .child(glyph("icons/calendar.svg", 12., theme::text_soft()))
-                .child(label),
+                .child(shown_label),
         )
     }
 
@@ -481,8 +615,17 @@ impl Shell {
         if open.kind == ConversationKind::Direct {
             if let Some(mut line) = self.peer_line(&open.key) {
                 // The avatar's dot says it; the word is its tooltip. A call and Telegram's
-                // "last seen" have no dot of their own here, so they keep their words.
-                if self.presence_dot(open).is_some_and(|shape| shape != crate::gui::people::presence::Shape::InCall) {
+                // "last seen" have no dot of their own here, so they keep their words — unless
+                // the header's own Join-call pill or our active call already shows it.
+                let call_already_shown = (open.call == protocol::CallSupport::Native
+                    && open.occupants.as_ref().is_some_and(|o| o.total > 0 || o.live))
+                    || self.snapshot.as_ref().and_then(|s| s.call.as_ref()).is_some_and(|c| {
+                        c.state == protocol::CallState::Joined
+                            && open.peer.as_deref().is_some_and(|p| c.participants.iter().any(|u| u.id == p))
+                    });
+                if self.presence_dot(open).is_some_and(|shape| shape != crate::gui::people::presence::Shape::InCall)
+                    || (call_already_shown && line.word == "In a call")
+                {
                     line.word = "";
                 }
                 return (!line.word.is_empty() || !line.extra.is_empty()).then_some(Beside::Person(line));
@@ -498,13 +641,13 @@ impl Shell {
     }
 }
 
-/// The most a title holds on to as the row narrows: 96, or all of it when it is shorter.
-fn title_floor(title: &str, window: &Window) -> gpui::Pixels {
+/// The most a title holds on to as the row narrows: `cap`, or all of it when it is shorter.
+fn title_floor(title: &str, window: &Window, cap: f32) -> gpui::Pixels {
     let mut style = window.text_style();
     style.font_weight = theme::SEMIBOLD;
     let run = style.to_run(title.len());
     let width = window.text_system().shape_line(title.to_owned().into(), theme::sized(16.), &[run]).width;
-    width.ceil().min(px(96.))
+    width.ceil().min(px(cap))
 }
 
 /// What follows the title. A person's presence is not a place, so it does not reveal the sidebar.
@@ -518,7 +661,7 @@ enum Beside {
 fn person_line(line: &crate::gui::people::PeerLine) -> Div {
     let mut row = div().flex_1().min_w_0().flex().items_center().gap(px(6.)).overflow_hidden();
     if !line.word.is_empty() {
-        row = row.child(div().flex_none().type_ui().text_color(line.tone).child(line.word));
+        row = row.child(div().min_w_0().truncate().type_ui().text_color(line.tone).child(line.word));
     }
     if !line.extra.is_empty() {
         if !line.word.is_empty() {
@@ -543,7 +686,7 @@ fn role_chip(name: &str, color: Option<u32>) -> Div {
         .items_center()
         .gap(px(4.))
         .child(div().size(px(6.)).flex_none().rounded_full().bg(tone))
-        .child(div().type_micro().font_weight(theme::MEDIUM).text_color(theme::text()).child(name.to_owned()))
+        .child(div().min_w_0().max_w(px(84.)).truncate().type_micro().font_weight(theme::MEDIUM).text_color(theme::text()).child(name.to_owned()))
 }
 
 /// One path glyph everywhere: `›`.
@@ -553,11 +696,11 @@ pub(super) fn path_line(subtitle: &str) -> String {
 }
 
 /// What the network says the other side is, as a tag after the title. A verified account is
-/// a check; the rest are words, red where they warn. A bot with no mark of its own gets the
+/// a badge-check; the rest are words, red where they warn. A bot with no mark of its own gets the
 /// row's word for one (`chat::name_mark`).
 fn mark(c: &Conversation) -> Option<Div> {
     let (words, color) = match c.mark {
-        Some(Mark::Verified) => return Some(div().flex_none().self_center().child(glyph("icons/check.svg", 14., theme::accent_text()))),
+        Some(Mark::Verified) => return Some(div().flex_none().self_center().child(glyph("icons/badge-check.svg", 14., theme::accent_text()))),
         Some(Mark::Scam) => ("Scam", theme::danger()),
         Some(Mark::Fake) => ("Fake", theme::danger()),
         Some(Mark::Guest) => ("Guest", theme::text_soft()),

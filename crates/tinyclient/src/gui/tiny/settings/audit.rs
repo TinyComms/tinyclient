@@ -10,14 +10,17 @@
 use super::kit::{self, card};
 use super::page_head;
 use crate::client::ask;
+use crate::gui::components::place::{anchor, placed, Layer, Place};
 use crate::gui::components::{button, button_disabled, glyph, menu, menu_item_check, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::tiny::model;
 use crate::gui::tiny::Page as Facts;
-use gpui::{anchored, deferred, div, prelude::*, px, AnyElement, Context, SharedString, Window};
+use gpui::{canvas, div, prelude::*, px, AnyElement, Bounds, Context, Pixels, SharedString, Window};
 use protocol::{Request, Response, TinyAudit, TinyAuditFilter, TinyCommunity, TINY_FEATURE_AUDIT_QUERY};
 use serde_json::Value;
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// Rows read per page.
 pub(in crate::gui) const PAGE: u32 = 50;
@@ -57,6 +60,8 @@ pub(in crate::gui) struct Draft {
     pub open: Option<Pick>,
     /// Bumped when the filters change, so an answer for old filters is dropped.
     pub epoch: u64,
+    pub person_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub kind_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 /// Rows with the server setup's run of rows read as one: each row and how many it stands for.
@@ -284,13 +289,23 @@ impl Shell {
     }
 }
 
-fn dropdown<E: InteractiveElement + Styled + IntoElement + 'static>(list: E, cx: &mut Context<Shell>) -> AnyElement {
-    let list = list.max_h(px(360.)).on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_audit_open(None, cx)));
-    deferred(anchored().snap_to_window().child(div().mt(px(4.)).child(list))).priority(2).into_any_element()
+fn dropdown<E: InteractiveElement + Styled + IntoElement + 'static>(
+    id: &'static str,
+    bounds: Option<Bounds<Pixels>>,
+    window: &Window,
+    list: E,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
+    let max_w = (f32::from(window.viewport_size().width) - 16.).max(180.);
+    let list = list
+        .max_w(px(max_w))
+        .max_h(px(360.))
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_audit_open(None, cx)));
+    let at = bounds.unwrap_or_else(|| anchor(16., 120., 200., 32.));
+    placed(id, Place::Below(at), Layer::Menu, window, list)
 }
 
 pub(in crate::gui::tiny) fn audit(shell: &Shell, facts: &Facts, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
-    let _ = window;
     let community = facts.community;
     let Some(overlay) = shell.tiny_state.settings.as_ref() else {
         return div().into_any_element();
@@ -302,8 +317,17 @@ pub(in crate::gui::tiny) fn audit(shell: &Shell, facts: &Facts, window: &mut Win
         let person = draft.actor.as_ref().map_or("Anyone".to_owned(), |id| model::name_by_id(community, id));
         let kind = KINDS.iter().find(|(_, prefix)| *prefix == draft.kind).map_or("Everything", |(words, _)| *words);
         let open = draft.open;
+        let person_bounds = draft.person_bounds.clone();
         let mut people = div().flex().flex_col().child(
             kit::picker("tiny-audit-person", "icons/user.svg", person, open == Some(Pick::Person), 200.)
+                .relative()
+                .child(
+                    canvas(move |bounds, _, _| person_bounds.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| this.tiny_audit_open(if open == Some(Pick::Person) { None } else { Some(Pick::Person) }, cx))),
         );
         if open == Some(Pick::Person) {
@@ -323,10 +347,19 @@ pub(in crate::gui::tiny) fn audit(shell: &Shell, facts: &Facts, window: &mut Win
                     },
                 )));
             }
-            people = people.child(dropdown(list, cx));
+            people = people.child(dropdown("tiny-audit-people-menu", draft.person_bounds.get(), window, list, cx));
         }
+        let kind_bounds = draft.kind_bounds.clone();
         let mut kinds = div().flex().flex_col().child(
             kit::picker("tiny-audit-kind", "icons/list.svg", kind, open == Some(Pick::Kind), 200.)
+                .relative()
+                .child(
+                    canvas(move |bounds, _, _| kind_bounds.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| this.tiny_audit_open(if open == Some(Pick::Kind) { None } else { Some(Pick::Kind) }, cx))),
         );
         if open == Some(Pick::Kind) {
@@ -337,9 +370,9 @@ pub(in crate::gui::tiny) fn audit(shell: &Shell, facts: &Facts, window: &mut Win
                     menu_item_check(("tiny-audit-kinds", ix), draft.kind == prefix, *words, None).on_click(cx.listener(move |this, _, _, cx| this.tiny_audit_filter(|draft| draft.kind = prefix, cx))),
                 );
             }
-            kinds = kinds.child(dropdown(list, cx));
+            kinds = kinds.child(dropdown("tiny-audit-kind-menu", draft.kind_bounds.get(), window, list, cx));
         }
-        page = page.child(div().flex().items_center().gap(px(8.)).child(people).child(kinds));
+        page = page.child(div().flex().flex_wrap().items_center().gap(px(8.)).child(people).child(kinds));
     }
     if let Some(error) = &draft.error {
         page = page.child(kit::note("icons/circle-alert.svg", theme::danger(), error.clone()));

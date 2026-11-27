@@ -37,27 +37,53 @@ fn is_clip(mime: &str) -> bool {
 /// Where Teams keeps the files sent in chats.
 const FOLDER: &str = "Microsoft Teams Chat Files";
 
+/// Where a non-image file send places its uploads, resolved once per send outside the file loop.
+enum FileDestination {
+    Channel { drive_id: String, folder_id: String },
+    Chat { emails: Vec<String> },
+}
+
 impl Teams {
     pub(super) fn send_with(self: &Arc<Self>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
         if let Some(pick) = &with.pick {
-            let outcome = self.send_pick(conversation, client_id, text, reply_to, pick, &with);
-            self.ctx.sent(conversation, client_id, outcome);
+            let _ = crate::sendtime::run(client_id, || -> Result<(), ()> {
+                let outcome = self.send_pick(conversation, client_id, text, reply_to, pick, &with);
+                let ok = outcome.is_ok();
+                self.ctx.sent(conversation, client_id, outcome);
+                crate::sendtime::stage("store");
+                if ok { Ok(()) } else { Err(()) }
+            });
             return;
         }
         if let Some(at) = with.schedule {
-            let outcome = self.schedule_chat(conversation, client_id, text, reply_to, at, &with);
-            self.ctx.sent(conversation, client_id, outcome);
+            let _ = crate::sendtime::run(client_id, || -> Result<(), ()> {
+                let outcome = self.schedule_chat(conversation, client_id, text, reply_to, at, &with);
+                let ok = outcome.is_ok();
+                self.ctx.sent(conversation, client_id, outcome);
+                crate::sendtime::stage("store");
+                if ok { Ok(()) } else { Err(()) }
+            });
             return;
         }
         if let Some(ref draft) = with.poll {
-            let outcome = self.send_poll(conversation, client_id, draft, reply_to, &with);
-            self.ctx.sent(conversation, client_id, outcome);
+            let _ = crate::sendtime::run(client_id, || -> Result<(), ()> {
+                let outcome = self.send_poll(conversation, client_id, draft, reply_to, &with);
+                let ok = outcome.is_ok();
+                self.ctx.sent(conversation, client_id, outcome);
+                crate::sendtime::stage("store");
+                if ok { Ok(()) } else { Err(()) }
+            });
             return;
         }
         if with.files.is_empty() {
             self.post_with_outgoing(conversation, client_id, text, reply_to, &with);
             return;
         }
+        self.spawn_file_send(conversation, client_id, text, reply_to, with);
+    }
+
+    /// Spawns a file or voice upload on the shared upload pool immediately (non-blocking).
+    pub(super) fn spawn_file_send(self: &Arc<Self>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
         let (teams, conversation_id, client, text, reply, outgoing) = (
             self.clone(),
             conversation.to_owned(),
@@ -73,12 +99,12 @@ impl Teams {
                 return;
             }
             upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| {
-                teams.send_voice(&conversation_id, &client, reply.as_deref(), &outgoing, up)
+                crate::sendtime::run(&client, || teams.send_voice(&conversation_id, &client, reply.as_deref(), &outgoing, up))
             });
             return;
         }
         upload::spawn(&self.ctx, conversation, client_id, &with.files, move |up| {
-            teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &outgoing, up)
+            crate::sendtime::run(&client, || teams.with_files(&conversation_id, &client, &text, reply.as_deref(), &outgoing, up))
         });
     }
 
@@ -246,13 +272,30 @@ impl Teams {
         if up.files().iter().all(|f| f.mime.starts_with("image/")) {
             return self.with_inline_images(conversation, client_id, text, reply_to, with, up);
         }
+        for file in up.files() {
+            if file.bytes == 0 {
+                return Err(format!("{} is empty.", sanitize_filename(&file.name)));
+            }
+        }
+        // Resolve destination (channel SharePoint folder or chat member emails) ONCE per send,
+        // before the per-file upload loop, so multi-file sends don't repeat N metadata round trips.
+        let thread = super::thread_of(conversation);
+        let destination = if super::tree::is_channel(thread) {
+            let (drive_id, folder_id) = self.channel_folder(thread)?;
+            FileDestination::Channel { drive_id, folder_id }
+        } else {
+            let emails = self.chat_recipients(thread)?;
+            FileDestination::Chat { emails }
+        };
+        crate::sendtime::stage("prepare");
         let mut named = Vec::new();
         let mut attachments = Vec::new();
         for at in 0..up.files().len() {
-            let (entry, attachment) = self.one_file(conversation, up, at)?;
+            let (entry, attachment) = self.one_file(&destination, up, at)?;
             named.push(entry);
             attachments.push(attachment);
         }
+        crate::sendtime::stage("upload");
         up.check()?;
         let properties = json!({"files": Value::Array(named).to_string()});
         let mut message = self.posted_with(conversation, client_id, text, reply_to, with, Some(properties)).map_err(super::reason)?;
@@ -297,6 +340,7 @@ impl Teams {
             .header("Authorization", &format!("skype_token {skype_token}"))
             .header("Content-Type", mime);
         up.send(0, &target)?;
+        crate::sendtime::stage("upload");
         up.check()?;
         let voice = with.voice.as_ref();
         let duration_secs = voice.map_or(0, |v| (u64::from(v.duration) + 500) / 1000) as u32;
@@ -366,6 +410,7 @@ impl Teams {
             images_html.push_str(&img_html);
             attachments.push(attachment);
         }
+        crate::sendtime::stage("upload");
         up.check()?;
         let mut message = self
             .posted_with_html(conversation, client_id, text, reply_to, with, None, Some(&images_html))
@@ -408,7 +453,7 @@ impl Teams {
             "filename": name,
         });
         let created = self
-            .call("POST", &create_url, Auth::Ams, Body::Json(&create_body), true)
+            .call("POST", &create_url, Auth::Ams, Body::Json(&create_body), false)
             .map_err(failed)?;
         let Some(id) = created.body["id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned) else {
             return Err(format!("{name} could not be sent: Teams media store returned no object id."));
@@ -462,7 +507,7 @@ impl Teams {
             .or_else(|| self.ctx.note(&format!("group:{thread}")));
         if group_id.as_deref().is_none_or(str::is_empty) {
             let path = format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread));
-            if let Ok(answer) = self.chat("GET", &path, Body::None, true) {
+            if let Ok(answer) = self.chat("GET", &path, Body::None, false) {
                 group_id = answer.body["properties"]["groupId"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -479,7 +524,7 @@ impl Teams {
             escaped(thread)
         );
         let folder = self
-            .call("GET", &url, Auth::Bearer(Audience::Graph), Body::None, true)
+            .call("GET", &url, Auth::Bearer(Audience::Graph), Body::None, false)
             .map_err(|fault| format!("Channel SharePoint folder could not be reached: {}", super::reason(fault)))?
             .body;
         let drive_id = folder["parentReference"]["driveId"].as_str().unwrap_or("").to_owned();
@@ -498,7 +543,7 @@ impl Teams {
         }
         let me = self.me();
         let path = format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread));
-        let mut other_ids: Vec<String> = match self.chat("GET", &path, Body::None, true) {
+        let mut other_ids: Vec<String> = match self.chat("GET", &path, Body::None, false) {
             Ok(answer) => answer.body["members"]
                 .as_array()
                 .into_iter()
@@ -538,38 +583,27 @@ impl Teams {
 
     /// Uploads one file (to the channel's SharePoint folder, or to OneDrive with per-member
     /// `/invite` sharing for chats) and returns the `properties.files` entry + local attachment.
-    fn one_file(&self, conversation: &str, up: &mut Upload, at: usize) -> Result<(Value, Attachment), String> {
+    fn one_file(&self, destination: &FileDestination, up: &mut Upload, at: usize) -> Result<(Value, Attachment), String> {
         let (raw_name, bytes) = (up.files()[at].name.clone(), up.files()[at].bytes);
         let name = sanitize_filename(&raw_name);
         let failed = |fault: Fault| format!("{name} could not be sent: {}", super::reason(fault));
         if bytes == 0 {
             return Err(format!("{name} is empty."));
         }
-        let thread = super::thread_of(conversation);
-        let is_channel = super::tree::is_channel(thread);
-        // Resolve chat recipients BEFORE uploading to OneDrive so a missing recipient never leaves
-        // an orphaned file behind.
-        let chat_emails = if is_channel {
-            Vec::new()
-        } else {
-            self.chat_recipients(thread)?
-        };
-        let session_path = if is_channel {
-            let (drive_id, folder_id) = self.channel_folder(thread)?;
-            format!(
+        let session_path = match destination {
+            FileDestination::Channel { drive_id, folder_id } => format!(
                 "{}/v1.0/drives/{}/items/{}:/{}:/createUploadSession",
                 self.graph,
-                escaped(&drive_id),
-                escaped(&folder_id),
+                escaped(drive_id),
+                escaped(folder_id),
                 escaped(&name)
-            )
-        } else {
-            format!(
+            ),
+            FileDestination::Chat { .. } => format!(
                 "{}/v1.0/me/drive/root:/{}/{}:/createUploadSession",
                 self.graph,
                 escaped(FOLDER),
                 escaped(&name)
-            )
+            ),
         };
         let session = self
             .call(
@@ -577,7 +611,7 @@ impl Teams {
                 &session_path,
                 Auth::Bearer(Audience::Graph),
                 Body::Json(&json!({"item": {"@microsoft.graph.conflictBehavior": "rename"}})),
-                true,
+                false,
             )
             .map_err(failed)?;
         let Some(url) = session.body["uploadUrl"].as_str().map(str::to_owned).filter(|u| self.upload_url_ok(u)) else {
@@ -598,36 +632,37 @@ impl Teams {
         let (Some(id), Some(web)) = (item["id"].as_str(), item["webUrl"].as_str()) else {
             return Err(format!("{name} could not be sent: OneDrive did not say where it put it."));
         };
-        let (permission_scope, service_name) = if is_channel {
-            ("channel", "sharepoint")
-        } else {
-            if !chat_emails.is_empty() {
-                let recipients: Vec<Value> = chat_emails.iter().map(|email| json!({"email": email})).collect();
-                let invite_url = format!("{}/v1.0/me/drive/items/{}/invite", self.graph, escaped(id));
-                let body = json!({
-                    "recipients": recipients,
-                    "requireSignIn": true,
-                    "sendInvitation": false,
-                    "roles": ["read"],
-                });
-                if let Err(fault) = self.call("POST", &invite_url, Auth::Bearer(Audience::Graph), Body::Json(&body), true) {
-                    // Best-effort cleanup so an unshared upload is not left orphaned in OneDrive.
-                    let item_url = format!("{}/v1.0/me/drive/items/{}", self.graph, escaped(id));
-                    if let Err(del_fault) = self.call("DELETE", &item_url, Auth::Bearer(Audience::Graph), Body::None, false) {
-                        tracing::warn!("chatd: Teams: failed to clean up unshared OneDrive file: {}", super::reason(del_fault));
-                    }
-                    return match fault {
-                        Fault::Refused { status: 400 | 403, message } => {
-                            let detail = if message.is_empty() { String::new() } else { format!(" ({message})") };
-                            Err(format!(
-                                "{name} could not be shared with external or guest chat members — organization sharing policy refused it{detail}."
-                            ))
+        let (permission_scope, service_name) = match destination {
+            FileDestination::Channel { .. } => ("channel", "sharepoint"),
+            FileDestination::Chat { emails: chat_emails } => {
+                if !chat_emails.is_empty() {
+                    let recipients: Vec<Value> = chat_emails.iter().map(|email| json!({"email": email})).collect();
+                    let invite_url = format!("{}/v1.0/me/drive/items/{}/invite", self.graph, escaped(id));
+                    let body = json!({
+                        "recipients": recipients,
+                        "requireSignIn": true,
+                        "sendInvitation": false,
+                        "roles": ["read"],
+                    });
+                    if let Err(fault) = self.call("POST", &invite_url, Auth::Bearer(Audience::Graph), Body::Json(&body), false) {
+                        // Best-effort cleanup so an unshared upload is not left orphaned in OneDrive.
+                        let item_url = format!("{}/v1.0/me/drive/items/{}", self.graph, escaped(id));
+                        if let Err(del_fault) = self.call("DELETE", &item_url, Auth::Bearer(Audience::Graph), Body::None, false) {
+                            tracing::warn!("chatd: Teams: failed to clean up unshared OneDrive file: {}", super::reason(del_fault));
                         }
-                        other => Err(failed(other)),
-                    };
+                        return match fault {
+                            Fault::Refused { status: 400 | 403, message } => {
+                                let detail = if message.is_empty() { String::new() } else { format!(" ({message})") };
+                                Err(format!(
+                                    "{name} could not be shared with external or guest chat members — organization sharing policy refused it{detail}."
+                                ))
+                            }
+                            other => Err(failed(other)),
+                        };
+                    }
                 }
+                ("users", "p2p")
             }
-            ("users", "p2p")
         };
         let share = web.to_owned();
         let kind = name.rsplit_once('.').map_or("", |(_, ext)| ext).to_ascii_lowercase();

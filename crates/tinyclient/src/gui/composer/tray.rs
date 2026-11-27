@@ -5,22 +5,23 @@
 use super::attach::{self, Kind, Options, Staged};
 use super::picker::images::{Loaded, Picture};
 use super::Composer;
+use crate::gui::components::place::{placed, Layer, Place};
 use crate::gui::components::{glyph, menu, menu_item, tip};
 use crate::gui::theme::{self, Type};
 use crate::gui::anim::{self, Play};
 use crate::gui::input::{InputEvent, InputKey, TextInput};
-use gpui::{anchored, deferred, Anchor, div, point, prelude::*, px, rgba, AnyElement, Context, Div, Focusable, MouseButton, ObjectFit, Rgba, Window};
+use gpui::{canvas, div, prelude::*, px, size, AnyElement, Bounds, Context, Div, Focusable, MouseButton, ObjectFit, Rgba, Window};
 
 const THUMB: f32 = 72.;
 const CONTROL: f32 = 18.;
 
-/// Black at 45% over a picture being uploaded or marked spoiler, and 60% under a tag.
+/// Dim scrim over a picture being uploaded or marked spoiler, and darker chip under a tag.
 fn media_dim() -> Rgba {
-    rgba(0x00000073)
+    theme::media_chip()
 }
 
 fn media_tag() -> Rgba {
-    rgba(0x00000099)
+    theme::media_dim()
 }
 
 /// "Trail map…autumn.pdf": the start and the end, so the extension stays.
@@ -162,6 +163,8 @@ impl Composer {
 
     fn chip_controls(&self, chip: &Staged, options: Options, cx: &mut Context<Self>) -> Div {
         let id = chip.id;
+        let anchors = self.anchors.clone();
+        let is_open = self.chip_menu == Some(id);
         let remove = corner(("chip-remove", id), "icons/x.svg")
             .aria_label(format!("Remove {}", chip.name))
             .on_click(cx.listener(move |this, _, _, cx| this.remove_chip(id, cx)));
@@ -172,10 +175,32 @@ impl Composer {
             .flex()
             .gap(px(3.))
             .when(options.any(), |controls| {
-                controls.child(corner(("chip-options", id), "icons/ellipsis.svg").aria_label(format!("Options for {}", chip.name)).on_click(cx.listener(move |this, _, _, cx| {
-                    this.chip_menu = if this.chip_menu == Some(id) { None } else { Some(id) };
-                    cx.notify();
-                })))
+                controls.child(
+                    corner(("chip-options", id), "icons/ellipsis.svg")
+                        .relative()
+                        .aria_label(format!("Options for {}", chip.name))
+                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            if this.chip_menu == Some(id) {
+                                this.chip_menu = None;
+                            } else {
+                                this.chip_menu = Some(id);
+                                this.anchors.chip.set(Some(Bounds {
+                                    origin: event.position(),
+                                    size: size(px(CONTROL), px(CONTROL)),
+                                }));
+                            }
+                            cx.notify();
+                        }))
+                        .when(is_open, |btn| {
+                            btn.child(
+                                canvas(move |bounds, _, _| anchors.chip.set(Some(bounds)), |_, _, _, _| {})
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full(),
+                            )
+                        }),
+                )
             })
             .child(remove)
     }
@@ -207,7 +232,6 @@ impl Composer {
                 chip.child(div().absolute().left(px(4.)).bottom(px(4.)).flex().gap(px(2.)).children(tags.into_iter().map(tag)))
             })
             .child(self.chip_controls(chip, options, cx))
-            .children(self.chip_menu_layer(chip, options, cx))
             .into_any_element()
     }
 
@@ -306,7 +330,6 @@ impl Composer {
                     ),
             )
             .child(self.chip_controls(chip, options, cx))
-            .children(self.chip_menu_layer(chip, options, cx))
             .into_any_element()
     }
 
@@ -327,16 +350,22 @@ impl Composer {
     }
 
     /// The ⋯ menu: Mark as spoiler, Send as file, Send original, each where it applies, a
-    /// check on what is set.
-    fn chip_menu_layer(&self, chip: &Staged, options: Options, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.chip_menu != Some(chip.id) || !options.any() {
+    /// check on what is set. Rendered at top level via `placed(..., Layer::Menu)` so it is never
+    /// clipped by the card's `overflow_hidden` or painted beneath window buttons.
+    pub(super) fn chip_menu_layer(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let id = self.chip_menu?;
+        let chip = self.tray.iter().find(|chip| chip.id == id)?;
+        let (can, network) = self.target.as_ref().map(|target| (target.can, target.key.network))?;
+        let options = attach::options(chip, &can, network);
+        if !options.any() {
             return None;
         }
-        let id = chip.id;
+        let anchor = self.anchors.chip.get().or_else(|| self.anchors.dock.get())?;
         // A check on what is set; the slot stays empty otherwise, so the labels line up.
         let check = |on: bool| on.then_some("icons/check.svg");
         let slot = |item: gpui::Stateful<Div>, on: bool| if on { item } else { item.pl(px(32.)) };
-        let mut items = menu().w(px(220.));
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(160.);
+        let mut items = menu().w(px(220.0_f32.min(max_w)));
         if options.spoiler {
             items = items.child(slot(menu_item(("opt-spoiler", id), check(chip.spoiler), "Mark as spoiler", None), chip.spoiler).on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_chip(id, |chip| chip.spoiler = !chip.spoiler, cx);
@@ -358,12 +387,13 @@ impl Composer {
                 this.toggle_chip(id, |chip| chip.original = !chip.original, cx);
             })));
         }
-        let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| {
-            this.chip_menu = None;
-            cx.notify();
-        }));
-        let layer = deferred(anchored().anchor(Anchor::BottomLeft).offset(point(px(0.), px(-6.))).snap_to_window_with_margin(px(8.)).child(items)).priority(2);
-        Some(div().absolute().top_0().left_0().child(layer).into_any_element())
+        let items = items
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.chip_menu = None;
+                cx.notify();
+            }));
+        Some(placed("composer-chip-menu", Place::Above(anchor), Layer::Menu, window, items))
     }
 
     /// The description field under the chips, while one picture is being described.

@@ -7,14 +7,17 @@
 
 use super::kit::switch_row;
 use super::{page_head, section, Overlay};
+use crate::gui::components::place::{anchor, placed, Layer, Place};
 use crate::gui::components::{button, button_disabled, button_with_icon, field, glyph, menu, menu_item_check, segment, segmented, Avatar, ButtonKind, Shape};
 use crate::gui::input::TextInput;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::tiny::Page as Facts;
 use crate::client::ask;
-use gpui::{anchored, deferred, div, prelude::*, px, AnyElement, App, Context, Div, Entity, Focusable, PathPromptOptions, SharedString, Window};
+use gpui::{canvas, div, prelude::*, px, AnyElement, App, Bounds, Context, Div, Entity, Focusable, PathPromptOptions, Pixels, SharedString, Window};
 use protocol::{Request, Response, TinyServerEdit, TinyServerInfo};
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// AFK timeouts offered, in seconds; 0 is off.
 const AFK: [(&str, i32); 6] = [("Off", 0), ("1 min", 60), ("5 min", 300), ("15 min", 900), ("30 min", 1_800), ("1 hour", 3_600)];
@@ -37,6 +40,8 @@ pub(in crate::gui) struct Draft {
     pub icon_error: Option<String>,
     /// `None` is the server's flag. Set when the archives switch is moved.
     pub allow_archives: Option<bool>,
+    pub default_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub afk_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 fn server_of(facts: &Facts) -> TinyServerInfo {
@@ -261,13 +266,27 @@ fn read_only(words: &str) -> Div {
 }
 
 /// A room picker: the room chosen, which opens the list of rooms.
-fn room_picker(shell: &Shell, facts: &Facts, pick: Pick, chosen: Option<String>, cx: &mut Context<Shell>) -> Div {
+fn room_picker(shell: &Shell, facts: &Facts, pick: Pick, chosen: Option<String>, window: &Window, cx: &mut Context<Shell>) -> Div {
     let name = chosen.as_ref().and_then(|id| facts.community.rooms.iter().find(|room| room.id == *id)).map(|room| room.name.clone());
-    let open = shell.tiny_state.settings.as_ref().is_some_and(|overlay| overlay.overview.picking == Some(pick));
+    let overlay = shell.tiny_state.settings.as_ref();
+    let open = overlay.is_some_and(|overlay| overlay.overview.picking == Some(pick));
+    let bounds_cell = overlay
+        .map(|overlay| match pick {
+            Pick::Default => overlay.overview.default_bounds.clone(),
+            Pick::Afk => overlay.overview.afk_bounds.clone(),
+        })
+        .unwrap_or_default();
+    let bounds_keep = bounds_cell.clone();
     let id = SharedString::from(format!("tiny-pick-{pick:?}"));
+    let label = name.clone().unwrap_or_else(|| "No channel".to_owned());
     let trigger = div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label.clone())
+        .tab_index(0)
+        .relative()
         .w(px(280.))
+        .max_w_full()
         .h(px(36.))
         .px(px(10.))
         .rounded(px(theme::R_CONTROL))
@@ -275,6 +294,7 @@ fn room_picker(shell: &Shell, facts: &Facts, pick: Pick, chosen: Option<String>,
         .border_1()
         .border_color(if open { theme::focus() } else { theme::border() })
         .hover(|style| style.border_color(theme::border_strong()))
+        .focus_visible(|style| style.shadow(theme::focus_ring()))
         .flex()
         .items_center()
         .gap(px(8.))
@@ -283,11 +303,19 @@ fn room_picker(shell: &Shell, facts: &Facts, pick: Pick, chosen: Option<String>,
             this.tiny_overview_draft(cx, |overlay| overlay.overview.picking = if open { None } else { Some(pick) });
         }))
         .child(glyph(if name.is_some() { "icons/volume-2.svg" } else { "icons/minus.svg" }, 14., theme::text_faint()))
-        .child(div().flex_1().type_ui().text_color(if name.is_some() { theme::text() } else { theme::text_soft() }).child(name.unwrap_or_else(|| "No channel".to_owned())))
-        .child(glyph("icons/chevron-down.svg", 14., theme::text_faint()));
+        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(if name.is_some() { theme::text() } else { theme::text_soft() }).child(label))
+        .child(glyph("icons/chevron-down.svg", 14., theme::text_faint()))
+        .child(
+            canvas(move |bounds, _, _| bounds_keep.set(Some(bounds)), |_, _, _, _| {})
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+        );
     let mut wrap = div().flex().flex_col().child(trigger);
     if open {
-        let mut list = menu().w(px(280.)).mt(px(4.)).child(menu_item_check("tiny-pick-none", chosen.is_none(), "No channel", None).on_click(cx.listener(move |this, _, _, cx| {
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(180.);
+        let mut list = menu().w(px(280.)).max_w(px(max_w)).child(menu_item_check("tiny-pick-none", chosen.is_none(), "No channel", None).on_click(cx.listener(move |this, _, _, cx| {
             this.tiny_overview_draft(cx, |overlay| {
                 match pick {
                     Pick::Default => overlay.overview.default_room = Some(None),
@@ -310,7 +338,8 @@ fn room_picker(shell: &Shell, facts: &Facts, pick: Pick, chosen: Option<String>,
             })));
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_overview_draft(cx, |overlay| overlay.overview.picking = None)));
-        wrap = wrap.child(deferred(anchored().snap_to_window().child(list)).priority(2));
+        let at = bounds_cell.get().unwrap_or_else(|| anchor(16., 240., 280., 36.));
+        wrap = wrap.child(placed(SharedString::from(format!("tiny-pick-menu-{pick:?}")), Place::Below(at), Layer::Menu, window, list));
     }
     wrap
 }
@@ -395,7 +424,6 @@ pub(in crate::gui::tiny) fn overview(shell: &Shell, facts: &Facts, window: &mut 
             uploads = uploads.child(
                 super::kit::card().child(
                     switch_row("tiny-allow-archives", "Allow archives", "Zip, 7z, rar, tar and gzip can be sent. Off, they are refused.", on, true)
-                        .border_b_0()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.tiny_overview_draft(cx, move |overlay| overlay.overview.allow_archives = Some(!on));
                         })),
@@ -411,11 +439,11 @@ pub(in crate::gui::tiny) fn overview(shell: &Shell, facts: &Facts, window: &mut 
     let room_name = |id: &Option<String>| id.as_ref().and_then(|id| facts.community.rooms.iter().find(|room| room.id == *id)).map(|room| room.name.clone()).unwrap_or_default();
     page = page.child(div().h(px(1.)).bg(theme::hairline()));
     page = page.child(if editable {
-        section("Default channel").child(div().type_small().text_color(theme::text_soft()).child("Where new members are pointed first. Its Join button is on the home.")).child(room_picker(shell, facts, Pick::Default, default_room, cx))
+        section("Default channel").child(div().type_small().text_color(theme::text_soft()).child("Where new members are pointed first. Its Join button is on the home.")).child(room_picker(shell, facts, Pick::Default, default_room, window, cx))
     } else {
         section("Default channel").child(read_only(&room_name(&default_room)))
     });
-    let mut timeouts = segmented();
+    let mut timeouts = segmented().flex_wrap();
     for (ix, (words, secs)) in AFK.iter().enumerate() {
         let secs = *secs;
         timeouts = timeouts.child(segment(("tiny-afk", ix), *words, afk_timeout == secs).on_click(cx.listener(move |this, _, _, cx| this.tiny_overview_draft(cx, |overlay| overlay.overview.afk_timeout = Some(secs)))));
@@ -423,7 +451,7 @@ pub(in crate::gui::tiny) fn overview(shell: &Shell, facts: &Facts, window: &mut 
     page = page.child(if editable {
         section("AFK channel")
             .child(div().type_small().text_color(theme::text_soft()).child("Someone who hasn't spoken for this long is moved here by their own tinyclient."))
-            .child(room_picker(shell, facts, Pick::Afk, afk_room, cx))
+            .child(room_picker(shell, facts, Pick::Afk, afk_room, window, cx))
             .child(div().pt(px(4.)).child(timeouts))
     } else {
         section("AFK channel").child(read_only(&match (room_name(&afk_room), afk_timeout) {

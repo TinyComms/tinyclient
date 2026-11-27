@@ -1,4 +1,4 @@
-use super::{ask, button, div, px, theme, ButtonKind, Context, Div, Entity, Key, Network, Request, Response, Shell, Stateful, Type};
+use super::{ask, button, div, px, theme, ButtonKind, Context, Entity, Key, Network, Request, Response, Shell, Type};
 use crate::gui::input::TextInput;
 use gpui::prelude::*;
 use protocol::{Conversation, ConversationKind, DiscordChannelVoice, DiscordVoiceSettings};
@@ -106,7 +106,7 @@ impl Shell {
         }).detach();
     }
 
-    pub(in crate::gui) fn voice_settings_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn voice_settings_modal(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let editor = self.sidebar_state.voice_settings.as_ref()?;
         let mut card = div()
             .id("voice-settings-card")
@@ -199,26 +199,16 @@ impl Shell {
                     })))
                 .children(editable.then(|| button("voice-settings-save", if enabled { ButtonKind::Primary } else { ButtonKind::Ghost }, if editor.saving { "Saving…" } else { "Save" })
                     .when(enabled, |button| button.on_click(cx.listener(|this, _, _, cx| this.save_discord_voice_settings(cx)))))));
-        let saving = editor.saving;
-        Some(
-            div()
-                .id("voice-settings-backdrop")
-                .absolute()
-                .inset_0()
-                .p(px(16.))
-                .bg(theme::scrim())
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .when(!saving, |backdrop| {
-                    backdrop.on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar_state.voice_settings = None;
-                        cx.notify();
-                    }))
-                })
-                .child(card),
-        )
+        Some(crate::gui::components::modal_layer_fit(
+            "voice-settings-backdrop",
+            card,
+            cx.listener(|this, _, _, cx| {
+                if this.sidebar_state.voice_settings.as_ref().is_some_and(|e| !e.saving) {
+                    this.sidebar_state.voice_settings = None;
+                    cx.notify();
+                }
+            }),
+        ))
     }
 }
 

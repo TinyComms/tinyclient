@@ -25,13 +25,16 @@ fn submits() -> &'static Mutex<HashMap<String, Instant>> {
     SUBMITS.get_or_init(Default::default)
 }
 
-/// The request for `client_id` was taken. Call it for a network whose adapter calls [`run`].
+/// The request for `client_id` was taken. Recorded for every network send; adapters that call
+/// [`run`] consume it and others age out cleanly.
 pub fn submitted(client_id: &str) {
     let mut seen = submits().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if seen.len() >= MOST {
         seen.retain(|_, at| at.elapsed() < FORGET_AFTER);
         if seen.len() >= MOST {
-            return;
+            if let Some(oldest) = seen.iter().min_by_key(|(_, at)| *at).map(|(k, _)| k.clone()) {
+                seen.remove(&oldest);
+            }
         }
     }
     seen.insert(client_id.to_owned(), Instant::now());

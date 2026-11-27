@@ -2274,7 +2274,7 @@ fn draw_search(shell: &Shell, window: &mut Window, cx: &mut Context<Shell>) -> A
             .child("Pinned"),
     );
 
-    let mut sort_row = div().flex_none().px(px(8.)).pb(px(4.)).flex().items_center().gap(px(4.));
+    let mut sort_row = div().flex_none().px(px(8.)).pb(px(4.)).flex().flex_wrap().items_center().gap(px(4.));
     sort_row = sort_row.child(div().type_micro().text_color(theme::text_faint()).child("Sort:"));
     for (id, label, sort) in [
         ("sf-sort-newest", "Newest", protocol::SearchSort::Newest),
@@ -2342,7 +2342,7 @@ fn draw_search(shell: &Shell, window: &mut Window, cx: &mut Context<Shell>) -> A
         None
     };
 
-    let mut tabs_bar = div().flex_none().px(px(8.)).pt(px(4.)).pb(px(2.)).flex().gap(px(4.));
+    let mut tabs_bar = div().flex_none().px(px(8.)).pt(px(4.)).pb(px(2.)).flex().flex_wrap().gap(px(4.));
     for tab in [SearchTab::Messages, SearchTab::Files, SearchTab::Channels, SearchTab::People] {
         let lit = page.tab == tab;
         tabs_bar = tabs_bar.child(
@@ -2399,13 +2399,14 @@ fn draw_search(shell: &Shell, window: &mut Window, cx: &mut Context<Shell>) -> A
                                 .child(div().truncate().type_small().text_color(theme::text()).child(item.title.clone()))
                                 .child(
                                     div()
+                                        .min_w_0()
                                         .flex()
                                         .items_center()
                                         .gap(px(6.))
                                         .type_micro()
                                         .text_color(theme::text_soft())
-                                        .child(item.sender.clone())
-                                        .child(age(now(), item.sent)),
+                                        .child(div().min_w_0().truncate().child(item.sender.clone()))
+                                        .child(div().flex_none().child(age(now(), item.sent))),
                                 ),
                         );
                     }

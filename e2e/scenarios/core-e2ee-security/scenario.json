@@ -1,0 +1,12 @@
+{
+  "id": "core-e2ee-security",
+  "title": "Encrypted reactions survive reload with custom emoji, stale rows auto-upgrade on e2ee_required, and live E2EE events execute on a bounded per-account worker",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd against a localhost MLS fake. The same core E2EE/security path is what this desktop run checks.",
+    "ios": "The phone proof build does not run desktop chatd against a localhost MLS fake. The same core E2EE/security path is what this desktop run checks."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 90
+}

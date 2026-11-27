@@ -673,6 +673,7 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
             Ok(end) => end,
             Err(_) => {
                 live.connected(false);
+                super::e2ee::set_ws_connected(saved, false);
                 if !ctx.panicked("connection") || ctx.pause(PANIC_PAUSE) {
                     return;
                 }
@@ -680,6 +681,7 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
             }
         };
         live.connected(false);
+        super::e2ee::set_ws_connected(saved, false);
         if ctx.stopped() || end == End::Stopped {
             return;
         }
@@ -1935,6 +1937,7 @@ fn heard_frame(
             ready_heard(ctx, saved, live, seat, heard);
             *ready = true;
             live.connected(true);
+            super::e2ee::set_ws_connected(saved, true);
             ctx.link(Link::Connected);
         }
         "resync" => return Some(End::Resync),
@@ -2214,9 +2217,10 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     // Who went offline while the socket was down is never told; the page reads it all again.
     ctx.community_changed();
     // A fresh ready has the member names already. Channels and directs are published from those,
-    // without another members read: a resume is not fresh and reads nothing here.
+    // without another members read: a resume is not fresh and reads nothing here. Skip the
+    // duplicate publish burst when startup `messages::refresh` just ran for this account.
     if fresh {
-        super::messages::publish(ctx, saved, &seat.names);
+        super::messages::publish_if_stale(ctx, saved, &seat.names);
     }
     // Both fresh ready and resume can follow a missed membership hint. UI list
     // refreshes also call publish, so catch-up belongs here rather than there.

@@ -386,15 +386,6 @@ pub fn usage_words(messages: u64, files: u64) -> (String, String, String) {
 /// keep a thumb's height).
 const PHONE_LESS: [&str; 2] = ["M1", "A3"];
 
-/// What About says tinyclient is for: the networks this form signs in to.
-fn about_line() -> &'static str {
-    if phone::active() {
-        "One small app for Slack, Discord, Telegram, Teams and Tiny servers."
-    } else {
-        "One small app for Slack, Discord, Telegram, Teams and Signal."
-    }
-}
-
 /// The P4 modal's sentence.
 pub fn retention_words(prunable: Option<(u64, u64)>) -> String {
     let rest = crate::host::removed_from_here();
@@ -459,8 +450,9 @@ impl SettingsWindow {
                 groups
             }
             Section::Appearance => vec![
+                self.group(&["A1", "AT", "AC"], None, window, cx),
                 // A phone's rows keep a thumb's height whatever the density: it has no Density.
-                self.group(if phone::active() { &["A1", "A2", "A4", "A5"] } else { &["A1", "A2", "A3", "A4", "A5"] }, None, window, cx)
+                self.group(if phone::active() { &["A2", "A4", "A5"] } else { &["A2", "A3", "A4", "A5"] }, None, window, cx)
                     // The caption is about keyboard shortcuts, which a phone has none of.
                     .when(!phone::active(), |group| group.child(caption(crate::host::APPEARANCE_CAPTION))),
             ],
@@ -813,7 +805,10 @@ impl SettingsWindow {
                     theme::Appearance::Light => 1,
                     theme::Appearance::Dark => 2,
                 };
-                self.segmented_row(id, &["System", "Light", "Dark"], at, 0, None, |this, ix, cx| {
+                let second = (choices.appearance == theme::Appearance::System
+                    && (choices.dark_theme != theme::ThemeId::Graphite || choices.light_theme != theme::ThemeId::Paper))
+                    .then(|| format!("Uses {} in Light and {} in Dark.", choices.light_theme.name(), choices.dark_theme.name()));
+                self.segmented_row(id, &["System", "Light", "Dark"], at, 0, second, |this, ix, cx| {
                     let choice = match ix {
                         1 => theme::Appearance::Light,
                         2 => theme::Appearance::Dark,
@@ -822,6 +817,8 @@ impl SettingsWindow {
                     this.choose(|c| c.appearance = choice, cx);
                 }, cx)
             }
+            "AT" => self.theme_picker_row(choices, cx),
+            "AC" => self.accent_picker_row(choices, cx),
             "A2" => wide_row(label, None, self.slider_control(id, cx)),
             "A3" => {
                 let second = choices.compact.then(|| "List rows are 40 instead of 48.".to_owned());
@@ -1096,8 +1093,8 @@ impl SettingsWindow {
             ),
             "B1" => row(
                 label,
-                Some(crate::host::diagnostics().into()),
-                controls::touch(button("B1", ButtonKind::Secondary, "Copy").w(px(controls::ABOUT_ACTION)))
+                None,
+                controls::touch(button("B1", ButtonKind::Secondary, "Copy"))
                     .on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
             ),
             "B2" => row(
@@ -1107,11 +1104,10 @@ impl SettingsWindow {
                     .flex()
                     .flex_wrap()
                     .justify_end()
-                    .gap(px(8.))
-                    .child(button("B2-view", ButtonKind::Secondary, "View logs").on_click(cx.listener(|_, _, _, cx| crate::gui::logs::open(cx))))
-                    // Three buttons do not fit at the column's width; the one under Copy keeps it.
-                    .child(button("B1-log", ButtonKind::Secondary, "Save debug log").on_click(cx.listener(|this, _, _, cx| this.save_debug_log(cx))))
-                    .child(button("B2", ButtonKind::Secondary, crate::host::REVEAL).w(px(controls::ABOUT_ACTION)).on_click(cx.listener(
+                    .gap(px(6.))
+                    .child(controls::touch(button("B2-view", ButtonKind::Secondary, "View logs")).on_click(cx.listener(|_, _, _, cx| crate::gui::logs::open(cx))))
+                    .child(controls::touch(button("B1-log", ButtonKind::Secondary, "Save debug log")).on_click(cx.listener(|this, _, _, cx| this.save_debug_log(cx))))
+                    .child(controls::touch(button("B2", ButtonKind::Secondary, crate::host::REVEAL)).on_click(cx.listener(
                         |_, _, _, cx| {
                             let logs = protocol::log_policy::logs_dir();
                             if logs.is_dir() {
@@ -1122,16 +1118,13 @@ impl SettingsWindow {
                         },
                     ))),
             ),
-            "B4" => {
-                let second = Some(crate::gui::logs::VERBOSE_NOTE.to_owned());
-                self.switch_row(id, crate::gui::logs::verbose(), false, second, |this, on, cx| {
-                    this.set("B4", GLOBAL.into(), protocol::settings::LOG_LEVEL, crate::gui::logs::verbose_value(on), cx)
-                }, cx)
-            }
+            "B4" => self.switch_row(id, crate::gui::logs::verbose(), false, None, |this, on, cx| {
+                this.set("B4", GLOBAL.into(), protocol::settings::LOG_LEVEL, crate::gui::logs::verbose_value(on), cx)
+            }, cx),
             "B3" => row(
                 label,
                 None,
-                controls::touch(button("B3", ButtonKind::Danger, "Reset…").w(px(controls::ABOUT_ACTION))).on_click(cx.listener(|this, _, _, cx| {
+                controls::touch(button("B3", ButtonKind::Danger, "Reset…")).on_click(cx.listener(|this, _, _, cx| {
                     this.confirm = Some(Confirm::Reset);
                     cx.notify();
                 })),
@@ -2702,37 +2695,58 @@ impl SettingsWindow {
             Some(commit) => format!("Version {} ({commit})", env!("CARGO_PKG_VERSION")),
             None => format!("Version {}", env!("CARGO_PKG_VERSION")),
         };
-        // The commit tells two builds of the same version apart (above); the app's own mark, as
-        // the first launch and the empty window show it.
-        let plate = crate::gui::components::brand_mark(if phone::active() { 80. } else { 96. });
-        let credit = |words: &'static str| div().px(px(controls::side())).py(px(6.)).type_small().when(phone::active(), |line| line.py(px(12.)).phone_preview()).text_color(theme::text_soft()).child(words);
+        let status = self.update_status(cx);
+        let header = if phone::active() {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(4.))
+                .pb(px(12.))
+                .child(crate::gui::components::brand_mark(64.))
+                .child(div().pt(px(2.)).type_headline().text_color(theme::text()).child("tinyclient"))
+                .child(div().type_small().text_color(theme::text_faint()).child(version))
+                .children(status)
+        } else {
+            div()
+                .w_full()
+                .pt(px(8.))
+                .pb(px(12.))
+                .px(px(controls::side()))
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .child(crate::gui::components::brand_mark(48.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_headline().text_color(theme::text()).child("tinyclient"))
+                        .child(div().type_small().text_color(theme::text_faint()).child(version))
+                        .children(status),
+                )
+        };
         // A phone has no folder to show, nor a debug log to save into one (B2).
         let tools = if phone::active() { self.group(&["B1", "B3"], None, window, cx) } else { self.group(&["B1", "B2", "B4", "B3"], None, window, cx) };
+        let credits = div()
+            .w_full()
+            .pt(px(10.))
+            .px(px(controls::side()))
+            .when(phone::active(), |line| line.text_center())
+            .type_micro()
+            .text_color(theme::text_faint())
+            .child("Icons: Dashboard Icons (Apache-2.0) · Lucide (ISC)");
         div()
+            .w_full()
             .flex()
             .flex_col()
-            .items_center()
-            .gap(px(4.))
-            .child(plate)
-            .child(div().pt(px(2.)).type_headline().text_color(theme::text()).child("tinyclient"))
-            .child(div().type_small().text_color(theme::text_faint()).child(version))
-            .children(self.update_status(cx))
-            .child(div().type_ui().when(phone::active(), |line| line.text_center().phone_row()).text_color(theme::text_soft()).child(about_line()))
-            .child(
-                div()
-                    .w_full()
-                    .pt(px(10.))
-                    .flex()
-                    .flex_col()
-                    .child(group_label("Acknowledgements"))
-                    .child(
-                        card()
-                            .child(credit("Network icons: Dashboard Icons (homarr-labs/dashboard-icons), Apache-2.0. The logos are trademarks of their owners."))
-                            .child(rule())
-                            .child(credit("Interface icons: Lucide, ISC. Sounds: made by tinyclient's own code.")),
-                    ),
-            )
-            .child(div().w_full().pt(px(8.)).child(tools))
+            .child(header)
+            .child(div().w_full().child(tools))
+            .child(credits)
     }
 
     /// Search results: each a breadcrumb and its live row, best first; or the honest line.
@@ -2791,9 +2805,367 @@ impl SettingsWindow {
     }
 }
 
+/// Zero-surprise click semantics for Settings › Appearance › Theme (AT):
+/// picking a Dark theme updates `dark_theme` and switches `appearance` to Dark if the current
+/// active polarity is Light; picking a Light theme updates `light_theme` and switches `appearance`
+/// to Light if the current active polarity is Dark. Switching A1 back to System keeps both pairs.
+pub(in crate::gui) fn pick_theme_choice(choices: &mut Choices, id: theme::ThemeId, system_dark: bool) {
+    if id.is_dark() {
+        choices.dark_theme = id;
+        if choices.appearance == theme::Appearance::Light
+            || (choices.appearance == theme::Appearance::System && !system_dark)
+        {
+            choices.appearance = theme::Appearance::Dark;
+        }
+    } else {
+        choices.light_theme = id;
+        if choices.appearance == theme::Appearance::Dark
+            || (choices.appearance == theme::Appearance::System && system_dark)
+        {
+            choices.appearance = theme::Appearance::Light;
+        }
+    }
+}
+
+impl SettingsWindow {
+    /// AT: visual Theme Picker (`4×2` desktop at `108 × 86 pt` each, `2×4` phone) with miniature
+    /// window previews drawn directly from each theme's `ThemeBase` and resolved accent.
+    fn theme_picker_row(&mut self, choices: Choices, cx: &mut Context<Self>) -> Div {
+        let touch = phone::active();
+        let active = theme::active_theme();
+        let hc = theme::is_high_contrast();
+        let customized = choices.dark_theme != theme::ThemeId::Graphite || choices.light_theme != theme::ThemeId::Paper;
+        let reset = customized.then(|| {
+            reset_button("AT-reset", "Reset Theme to Graphite and Paper".into()).on_click(cx.listener(|this, _, _, cx| {
+                this.choose(
+                    |c| {
+                        c.dark_theme = theme::ThemeId::Graphite;
+                        c.light_theme = theme::ThemeId::Paper;
+                    },
+                    cx,
+                );
+            }))
+        });
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .when(touch, |t| t.phone_row())
+                    .when(!touch, |t| t.type_ui())
+                    .text_color(theme::text())
+                    .child("Theme"),
+            )
+            .child(reset_slot(reset));
+        let cols = if touch { 2 } else { 4 };
+        let mut grid = div()
+            .id("AT-grid")
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .role(gpui::Role::RadioGroup)
+            .aria_label("Theme");
+        for (row_ix, chunk) in theme::ThemeId::PICKER_ORDER.chunks(cols).enumerate() {
+            let mut line = div().flex().gap(px(8.));
+            for (col_ix, &id) in chunk.iter().enumerate() {
+                let order_ix = row_ix * cols + col_ix;
+                let is_active = id == active;
+                let paired_opposite = choices.appearance == theme::Appearance::System
+                    && !is_active
+                    && ((id.is_light() && id == choices.light_theme) || (id.is_dark() && id == choices.dark_theme));
+                let p = theme::base_for(id, hc);
+                let preview_acc = if choices.accent == theme::Accent::Auto {
+                    id.default_accent()
+                } else {
+                    choices.accent
+                };
+                let acc_rgb = theme::accent_ramp_for(preview_acc, id.is_light(), hc).accent;
+                let aria: SharedString = if paired_opposite {
+                    let mode_word = if id.is_light() { "Light" } else { "Dark" };
+                    format!("{}, paired for {} mode", id.name(), mode_word).into()
+                } else {
+                    id.name().into()
+                };
+                let preview = div()
+                    .flex_1()
+                    .w_full()
+                    .relative()
+                    .flex()
+                    .overflow_hidden()
+                    // Left 26 pt miniature sidebar strip.
+                    .child(
+                        div()
+                            .w(px(26.))
+                            .h_full()
+                            .flex_none()
+                            .bg(gpui::rgb(p.sidebar))
+                            .border_r_1()
+                            .border_color(gpui::rgba(p.hairline))
+                            .p(px(5.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(div().w(px(14.)).h(px(3.)).rounded(px(1.5)).bg(gpui::rgba(p.selected)))
+                            .child(div().w(px(14.)).h(px(3.)).rounded(px(1.5)).bg(gpui::rgb(p.text_soft)))
+                            .child(div().w(px(11.)).h(px(3.)).rounded(px(1.5)).bg(gpui::rgb(p.text_faint))),
+                    )
+                    // Right miniature canvas with strip, message row, and accent chip.
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .bg(gpui::rgb(p.canvas))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .h(px(12.))
+                                    .w_full()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .flex()
+                                    .items_center()
+                                    .border_b_1()
+                                    .border_color(gpui::rgba(p.hairline))
+                                    .child(div().w(px(26.)).h(px(3.)).rounded(px(1.5)).bg(gpui::rgb(p.text))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .px(px(6.))
+                                    .py(px(5.))
+                                    .flex()
+                                    .flex_col()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(4.))
+                                            .child(div().size(px(10.)).flex_none().rounded_full().bg(gpui::rgb(p.raised)))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(2.))
+                                                    .child(div().w(px(36.)).h(px(3.)).rounded(px(1.5)).bg(gpui::rgb(p.text)))
+                                                    .child(div().w(px(26.)).h(px(3.)).rounded(px(1.5)).bg(gpui::rgb(p.text_faint))),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(div().w(px(20.)).h(px(3.)).rounded(px(1.5)).bg(gpui::rgb(p.text_soft)))
+                                            .child(div().w(px(16.)).h(px(6.)).rounded(px(3.)).bg(gpui::rgb(acc_rgb))),
+                                    ),
+                            ),
+                    )
+                    .when(is_active, |area| {
+                        area.child(
+                            div()
+                                .absolute()
+                                .top(px(4.))
+                                .right(px(4.))
+                                .size(px(16.))
+                                .rounded_full()
+                                .bg(theme::accent())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(glyph("icons/check.svg", 10., theme::on_accent())),
+                        )
+                    });
+                let pair_badge = paired_opposite.then(|| {
+                    let tip_words = if id.is_light() { "Paired for Light mode" } else { "Paired for Dark mode" };
+                    div()
+                        .id(("AT-pair", id as usize))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .tooltip(crate::gui::components::tip(tip_words, None))
+                        .child(glyph("icons/sun-moon.svg", 12., theme::text_faint()))
+                });
+                let footer = div()
+                    .h(px(26.))
+                    .flex_none()
+                    .px(px(8.))
+                    .bg(theme::raised())
+                    .border_t_1()
+                    .border_color(theme::hairline())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .type_small()
+                            .font_weight(theme::MEDIUM)
+                            .text_color(if is_active { theme::text() } else { theme::text_soft() })
+                            .child(id.name()),
+                    )
+                    .children(pair_badge);
+                let card = div()
+                    .id(("AT-theme", id as usize))
+                    .when(touch, |c| c.flex_1())
+                    .when(!touch, |c| c.w(px(108.)).flex_none())
+                    .h(px(86.))
+                    .rounded(px(theme::R_CARD))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .cursor_pointer()
+                    .border_2()
+                    .border_color(if is_active { theme::accent() } else { theme::border() })
+                    .when(!is_active, |c| c.hover(|s| s.border_color(theme::border_strong())))
+                    .tab_index(0)
+                    .role(gpui::Role::RadioButton)
+                    .aria_label(aria)
+                    .aria_selected(is_active)
+                    .focus_visible(|s| s.shadow(theme::focus_ring_gap(theme::raised())))
+                    .child(preview)
+                    .child(footer)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.choose(|c| pick_theme_choice(c, id, theme::system_is_dark()), cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                        let count = theme::ThemeId::PICKER_ORDER.len();
+                        let next_id = match event.keystroke.key.as_str() {
+                            "enter" | "space" => id,
+                            "left" if order_ix > 0 => theme::ThemeId::PICKER_ORDER[order_ix - 1],
+                            "right" if order_ix + 1 < count => theme::ThemeId::PICKER_ORDER[order_ix + 1],
+                            "up" if order_ix >= cols => theme::ThemeId::PICKER_ORDER[order_ix - cols],
+                            "down" if order_ix + cols < count => theme::ThemeId::PICKER_ORDER[order_ix + cols],
+                            _ => return,
+                        };
+                        cx.stop_propagation();
+                        this.choose(|c| pick_theme_choice(c, next_id, theme::system_is_dark()), cx);
+                    }));
+                line = line.child(card);
+            }
+            grid = grid.child(line);
+        }
+        div()
+            .px(px(controls::side()))
+            .py(px(10.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(header)
+            .child(grid)
+    }
+
+    /// AC: Accent color circular swatch strip (`Auto` + 8 curated accents) with keyboard radio group.
+    fn accent_picker_row(&mut self, choices: Choices, cx: &mut Context<Self>) -> Div {
+        let touch = phone::active();
+        let current = choices.accent;
+        let current_ix = theme::Accent::ALL.iter().position(|&a| a == current).unwrap_or(0);
+        let reset = (current != theme::Accent::Auto).then(|| {
+            reset_button("AC-reset", "Reset Accent color to Theme default".into()).on_click(cx.listener(|this, _, _, cx| {
+                this.choose(|c| c.accent = theme::Accent::Auto, cx);
+            }))
+        });
+        let hit = if touch { 36. } else { 28. };
+        let mut swatches = div()
+            .id("AC-swatches")
+            .flex()
+            .items_center()
+            .when(touch, |s| s.flex_wrap().gap(px(4.)))
+            .when(!touch, |s| s.gap(px(2.)))
+            .tab_index(0)
+            .role(gpui::Role::RadioGroup)
+            .aria_label("Accent color")
+            .focus_visible(|s| s.shadow(theme::focus_ring()))
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                let count = theme::Accent::ALL.len();
+                let next_ix = match event.keystroke.key.as_str() {
+                    "left" if current_ix > 0 => current_ix - 1,
+                    "right" if current_ix + 1 < count => current_ix + 1,
+                    "home" => 0,
+                    "end" => count - 1,
+                    _ => return,
+                };
+                cx.stop_propagation();
+                let next = theme::Accent::ALL[next_ix];
+                this.choose(|c| c.accent = next, cx);
+            }));
+        for &acc in &theme::Accent::ALL {
+            let selected = acc == current;
+            let fill = acc.swatch();
+            let ink = acc.swatch_ink();
+            let tip_words: SharedString = if acc == theme::Accent::Auto {
+                format!("Theme default ({})", theme::active_theme().default_accent().name()).into()
+            } else {
+                acc.name().into()
+            };
+            let dot = div()
+                .size(px(22.))
+                .rounded_full()
+                .bg(fill)
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(selected, |d| d.shadow(theme::swatch_ring(theme::raised())))
+                .when(selected, |d| d.child(glyph("icons/check.svg", 12., ink)))
+                .when(!selected && acc == theme::Accent::Auto, |d| {
+                    d.child(div().size(px(6.)).rounded_full().border_1().border_color(ink))
+                });
+            swatches = swatches.child(
+                div()
+                    .id(("AC-dot", acc as usize))
+                    .size(px(hit))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .role(gpui::Role::RadioButton)
+                    .aria_label(tip_words.clone())
+                    .aria_selected(selected)
+                    .tooltip(crate::gui::components::tip(tip_words, None))
+                    .child(dot)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.choose(|c| c.accent = acc, cx);
+                    })),
+            );
+        }
+        wide_row(
+            label_of("AC"),
+            None,
+            div()
+                .when(touch, |line| line.flex_1())
+                .flex()
+                .items_center()
+                .child(reset_slot(reset))
+                .child(swatches),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_picker_zero_surprise_click_semantics_preserve_day_night_pairing() {
+        let mut c = Choices::default();
+        // System is Dark: clicking a Dark theme keeps System and updates dark_theme.
+        pick_theme_choice(&mut c, theme::ThemeId::Mocha, true);
+        assert_eq!((c.appearance, c.dark_theme, c.light_theme), (theme::Appearance::System, theme::ThemeId::Mocha, theme::ThemeId::Paper));
+        // System is Dark: clicking a Light theme updates light_theme and switches to Light for immediate preview.
+        pick_theme_choice(&mut c, theme::ThemeId::Stone, true);
+        assert_eq!((c.appearance, c.dark_theme, c.light_theme), (theme::Appearance::Light, theme::ThemeId::Mocha, theme::ThemeId::Stone));
+        // Switching back to System keeps both pairs.
+        c.appearance = theme::Appearance::System;
+        assert_eq!((c.dark_theme, c.light_theme), (theme::ThemeId::Mocha, theme::ThemeId::Stone));
+        // System is Light: clicking a Dark theme switches to Dark and updates dark_theme.
+        pick_theme_choice(&mut c, theme::ThemeId::Nord, false);
+        assert_eq!((c.appearance, c.dark_theme, c.light_theme), (theme::Appearance::Dark, theme::ThemeId::Nord, theme::ThemeId::Stone));
+    }
 
     #[test]
     fn the_retention_question_says_how_much_goes_and_drops_what_it_does_not_know() {
@@ -2847,6 +3219,22 @@ mod tests {
         let room = controls::COLUMN - 24. - 16. - controls::RESET_SLOT - controls::POPUP_WIDTH;
         let label = "Play GIFs and animated stickers".chars().count() as f32 * 6.2;
         assert!(room + 8. >= label, "{room} for {label}");
+    }
+
+    #[test]
+    fn about_desktop_layout_fits_settings_window_without_scrolling() {
+        // Desktop Settings window is 720x560 with a 52pt title strip -> 508pt pane viewport.
+        let viewport_h = 560. - theme::STRIP;
+        let header_h = 8. + 48. + 12.; // pt(8) + 48pt mark + pb(12)
+        let header_with_update_h = header_h + 24.; // update_status row when an update is shown
+        let tools_h = 4. * 40. + 3. * 1.; // B1, B2, B4, B3 single-line rows + hairline rules
+        let credits_h = 10. + 16.; // pt(10) + 1pt micro line
+        let pane_pb = 28.;
+        let total_h = header_with_update_h + tools_h + credits_h + pane_pb;
+        assert!(
+            total_h < viewport_h,
+            "About page ({total_h}pt) must fit inside Settings viewport ({viewport_h}pt) with zero scroll"
+        );
     }
 }
 

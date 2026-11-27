@@ -173,6 +173,15 @@ pub const LINK_PREVIEWS_UNKNOWN: &str = "link_previews_unknown";
 pub const CACHE_MB: &str = "cache_mb";
 /// Preferred target language for on-demand message translation (`auto` or a short BCP-47 tag like `en`, `es`, `zh-Hans`).
 pub const TRANSLATE_LANG: &str = "translate_lang";
+/// Curated dark theme id (Settings › Appearance › Theme).
+pub const DARK_THEME: &str = "dark_theme";
+/// Curated light theme id (Settings › Appearance › Theme).
+pub const LIGHT_THEME: &str = "light_theme";
+/// Curated accent colour (Settings › Appearance › Accent color).
+pub const ACCENT: &str = "accent";
+pub const DARK_THEME_CHOICES: [&str; 6] = ["graphite", "midnight", "nord", "mocha", "dusk", "forest"];
+pub const LIGHT_THEME_CHOICES: [&str; 2] = ["paper", "stone"];
+pub const ACCENT_CHOICES: [&str; 9] = ["auto", "blue", "indigo", "violet", "emerald", "amber", "rose", "teal", "graphite"];
 /// The schema of these rows, for migrations. Not a setting anyone changes.
 pub const VERSION: &str = "version";
 
@@ -361,6 +370,9 @@ fn kind(key: &str) -> Option<Kind> {
         LOG_RING | LOG_EXPORT => Kind::Switch(true),
         CUSTOM_SOUND => Kind::CustomSound,
         TRANSLATE_LANG => Kind::Language,
+        DARK_THEME => Kind::Word(&DARK_THEME_CHOICES, "graphite"),
+        LIGHT_THEME => Kind::Word(&LIGHT_THEME_CHOICES, "paper"),
+        ACCENT => Kind::Word(&ACCENT_CHOICES, "auto"),
         _ => return None,
     })
 }
@@ -1519,5 +1531,28 @@ mod tests {
         assert_eq!(values.translate_target(), "ja");
         values.set(GLOBAL, TRANSLATE_TO, Some("fr".into()));
         assert_eq!(values.translate_target(), "fr");
+    }
+
+    #[test]
+    fn curated_theme_and_accent_settings_validate_globally() {
+        for word in DARK_THEME_CHOICES {
+            assert!(valid(GLOBAL, DARK_THEME, word), "{word}");
+        }
+        for word in LIGHT_THEME_CHOICES {
+            assert!(valid(GLOBAL, LIGHT_THEME, word), "{word}");
+        }
+        for word in ACCENT_CHOICES {
+            assert!(valid(GLOBAL, ACCENT, word), "{word}");
+        }
+        assert!(!valid(GLOBAL, DARK_THEME, "paper"));
+        assert!(!valid(GLOBAL, LIGHT_THEME, "nord"));
+        assert!(!valid(GLOBAL, ACCENT, "neon"));
+        assert!(!valid(&account_scope(&account(Network::Discord)), DARK_THEME, "nord"));
+        assert!(!valid(&account_scope(&account(Network::Discord)), LIGHT_THEME, "stone"));
+        assert!(!valid(&account_scope(&account(Network::Discord)), ACCENT, "rose"));
+        let defaults = Values::default();
+        assert_eq!(defaults.word(GLOBAL, DARK_THEME), "graphite");
+        assert_eq!(defaults.word(GLOBAL, LIGHT_THEME), "paper");
+        assert_eq!(defaults.word(GLOBAL, ACCENT), "auto");
     }
 }

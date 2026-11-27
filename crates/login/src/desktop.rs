@@ -6,8 +6,12 @@ use crate::{
     BLOCKED, CLOSED, LOAD_FAILED, NO_TOKEN, NO_TOKEN_AFTER, PAGE, SIZE, SLACK,
 };
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 use tao::dpi::{LogicalPosition, LogicalSize};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
@@ -92,12 +96,12 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str, start: Option<&str
             let nav_state = nav_state.clone();
             move |url| {
                 teams::navigated(&url);
-                let from = nav_state.lock().unwrap().current_url.clone();
+                let from = lock(&nav_state).current_url.clone();
                 let from = if from.is_empty() { None } else { Some(from.as_str()) };
                 match route(&url, from) {
                     Route::Allow => true,
                     Route::Rewrite(instead) => {
-                        nav_state.lock().unwrap().pending_load = Some(instead);
+                        lock(&nav_state).pending_load = Some(instead);
                         false
                     }
                     Route::Block => false,
@@ -108,11 +112,11 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str, start: Option<&str
             let nav_state = nav_state.clone();
             move |url, _| {
                 teams::navigated(&url);
-                let from = nav_state.lock().unwrap().current_url.clone();
+                let from = lock(&nav_state).current_url.clone();
                 let from = if from.is_empty() { None } else { Some(from.as_str()) };
                 match route(&url, from) {
-                    Route::Allow => nav_state.lock().unwrap().pending_load = Some(url),
-                    Route::Rewrite(instead) => nav_state.lock().unwrap().pending_load = Some(instead),
+                    Route::Allow => lock(&nav_state).pending_load = Some(url),
+                    Route::Rewrite(instead) => lock(&nav_state).pending_load = Some(instead),
                     Route::Block => {}
                 }
                 wry::NewWindowResponse::Deny
@@ -123,7 +127,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str, start: Option<&str
             let service = network.to_owned();
             move |event, url| {
                 if matches!(event, PageLoadEvent::Started) {
-                    state.lock().unwrap().current_url = url.clone();
+                    lock(&state).current_url = url.clone();
                 }
                 if matches!(event, PageLoadEvent::Finished) && load_failed_message(&url) {
                     tracing::warn!(network = service.as_str(), class = "network", "login failed");
@@ -154,12 +158,12 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str, start: Option<&str
 
         if last_tick.elapsed() >= Duration::from_secs(1) {
             last_tick = Instant::now();
-            let web = webview.lock().unwrap();
+            let web = lock(&webview);
             tick(&web, site, &agent_loop, &state);
         }
 
-        if let Some(url) = state.lock().unwrap().pending_load.take() {
-            let web = webview.lock().unwrap();
+        if let Some(url) = lock(&state).pending_load.take() {
+            let web = lock(&webview);
             let _ = web.load_url(&url);
         }
 
@@ -168,7 +172,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str, start: Option<&str
             ..
         } = event
         {
-            let refused = state.lock().unwrap().refused;
+            let refused = lock(&state).refused;
             std::process::exit(if refused { BLOCKED } else { CLOSED });
         }
     });
@@ -176,7 +180,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str, start: Option<&str
 
 fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
     if let Some(wanted) = site.cookie {
-        let mut guard = state.lock().unwrap();
+        let mut guard = lock(&state);
         if let Some(probed) = guard.pending_session.take() {
             if let Ok(cookies) = web.cookies() {
                 // The `d` cookie counts only for slack.com or a subdomain.
@@ -208,7 +212,7 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
             }
             return;
         }
-        let mut guard = state.lock().unwrap();
+        let mut guard = lock(&state);
         if web_client(&at) {
             let since = guard.on_client.get_or_insert_with(Instant::now);
             if since.elapsed() >= NO_TOKEN_AFTER {
@@ -232,7 +236,7 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
         };
         let url = page["url"].as_str().unwrap_or("");
         let text = page["text"].as_str().unwrap_or("");
-        let mut guard = state_page.lock().unwrap();
+        let mut guard = lock(&state_page);
         if blocked(url, text) && !guard.refused {
             guard.refused = true;
             tracing::warn!("tinyclient-login: the organization does not allow this sign-in");
@@ -264,7 +268,7 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
         let Some(_wanted) = wanted else {
             finish(session(probed, None, &agent));
         };
-        state_probe.lock().unwrap().pending_session = Some(probed);
+        lock(&state_probe).pending_session = Some(probed);
     });
 }
 

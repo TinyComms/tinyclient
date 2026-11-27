@@ -22,9 +22,41 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender as Reports};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, WaitTimeoutResult};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Recovers from a poisoned mutex so a panic in one media thread does not cascade across others.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Poison-recovering `Condvar::wait`.
+pub(crate) fn wait<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    cv.wait(guard).unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Poison-recovering `Condvar::wait_timeout`.
+pub(crate) fn wait_timeout<'a, T>(
+    cv: &Condvar,
+    guard: MutexGuard<'a, T>,
+    dur: Duration,
+) -> (MutexGuard<'a, T>, WaitTimeoutResult) {
+    cv.wait_timeout(guard, dur).unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Poison-recovering `Condvar::wait_timeout_while`.
+pub(crate) fn wait_timeout_while<'a, T, F>(
+    cv: &Condvar,
+    guard: MutexGuard<'a, T>,
+    dur: Duration,
+    condition: F,
+) -> (MutexGuard<'a, T>, WaitTimeoutResult)
+where
+    F: FnMut(&mut T) -> bool,
+{
+    cv.wait_timeout_while(guard, dur, condition).unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Identifies for one voice server, the first included.
 pub const ATTEMPTS: u32 = 3;
@@ -142,15 +174,15 @@ pub struct Controls {
 
 impl Controls {
     pub fn choose(&self, input: Option<String>, output: Option<String>) {
-        *self.chosen.lock().unwrap() = (input.clone(), output.clone());
-        *self.devices.lock().unwrap() = Some((input, output));
+        *lock(&self.chosen) = (input.clone(), output.clone());
+        *lock(&self.devices) = Some((input, output));
     }
 
     /// The device menu opened or closed. Opening it has the devices listed at once.
     pub fn meter(&self, on: bool) {
         self.meter.store(on, Ordering::Relaxed);
         if on {
-            *self.relist.lock().unwrap() = true;
+            *lock(&self.relist) = true;
             self.wake.notify_all();
         }
     }
@@ -163,27 +195,27 @@ impl Controls {
     /// Waits until the devices should be looked at again: `every`, or sooner when the menu
     /// opens. True when the list is wanted whether or not it changed.
     pub fn listing_due(&self, every: Duration) -> bool {
-        let relist = self.relist.lock().unwrap();
-        let (mut relist, _) = self.wake.wait_timeout_while(relist, every, |asked| !*asked).unwrap();
+        let relist = lock(&self.relist);
+        let (mut relist, _) = wait_timeout_while(&self.wake, relist, every, |asked| !*asked);
         std::mem::take(&mut *relist)
     }
 
     /// A Tiny server call joined again: its loop takes up this connection next.
     pub fn tiny_rejoin(&self, link: crate::tiny::Link) {
-        *self.tiny_link.lock().unwrap() = Some(link);
+        *lock(&self.tiny_link) = Some(link);
     }
 
     /// A Tiny server's new slot map, for its loop to apply.
     pub fn tiny_slots(&self, map: Vec<TinySlot>) {
-        *self.tiny_slots.lock().unwrap() = Some(map);
+        *lock(&self.tiny_slots) = Some(map);
     }
 
     pub fn push_signal_ice(&self, candidate: String) {
-        self.signal_ice.lock().unwrap().push(candidate);
+        lock(&self.signal_ice).push(candidate);
     }
 
     pub fn take_signal_ice(&self) -> Vec<String> {
-        std::mem::take(&mut *self.signal_ice.lock().unwrap())
+        std::mem::take(&mut *lock(&self.signal_ice))
     }
 
     pub fn set_share(&self, on: bool) {
@@ -227,12 +259,12 @@ impl Controls {
     }
 
     pub fn set_speaker(&self, source: Option<String>) {
-        *self.speaker.lock().unwrap() = source;
+        *lock(&self.speaker) = source;
     }
 
     /// Whom to paint, when one person was chosen. `None` keeps whoever is already showing.
     pub fn speaker(&self) -> Option<String> {
-        self.speaker.lock().unwrap().clone()
+        lock(&self.speaker).clone()
     }
 
     /// Asks a Go Live leg to return. The voice call stays up. When `watch` is true and
@@ -243,15 +275,15 @@ impl Controls {
             return;
         }
         if let Some(owner) = stream_owner {
-            if let Some(flag) = self.watch_leg_stops.lock().unwrap().get(owner) {
+            if let Some(flag) = lock(&self.watch_leg_stops).get(owner) {
                 flag.store(true, Ordering::Relaxed);
             }
-            self.watched_audio.lock().unwrap().remove(owner);
+            lock(&self.watched_audio).remove(owner);
         } else {
-            for flag in self.watch_leg_stops.lock().unwrap().values() {
+            for flag in lock(&self.watch_leg_stops).values() {
                 flag.store(true, Ordering::Relaxed);
             }
-            self.watched_audio.lock().unwrap().clear();
+            lock(&self.watched_audio).clear();
         }
     }
 
@@ -261,7 +293,7 @@ impl Controls {
             self.share_leg_stop.store(false, Ordering::Relaxed);
             return;
         }
-        let mut stops = self.watch_leg_stops.lock().unwrap();
+        let mut stops = lock(&self.watch_leg_stops);
         if let Some(owner) = stream_owner {
             stops.insert(owner.to_owned(), Arc::new(AtomicBool::new(false)));
         } else {
@@ -278,20 +310,18 @@ impl Controls {
             return self.share_leg_stop.load(Ordering::Relaxed);
         }
         let key = stream_owner.unwrap_or("");
-        self.watch_leg_stops
-            .lock()
-            .unwrap()
+        lock(&self.watch_leg_stops)
             .get(key)
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     /// The answer to the last renegotiation, taken once by the call's loop.
     pub fn picture_answer(&self, sdp: String) {
-        *self.picture_answer.lock().unwrap() = Some(sdp);
+        *lock(&self.picture_answer) = Some(sdp);
     }
 
     pub(crate) fn take_picture_answer(&self) -> Option<String> {
-        self.picture_answer.lock().unwrap().take()
+        lock(&self.picture_answer).take()
     }
 
     /// Who the single legacy video slot carries now.
@@ -301,34 +331,34 @@ impl Controls {
 
     /// Who each active video receive slot carries now, from `call.slots.videos`.
     pub fn set_pictures(&self, pictures: Vec<TinyPicture>) {
-        *self.picture_slots.lock().unwrap() = Some(pictures);
+        *lock(&self.picture_slots) = Some(pictures);
     }
 
     pub(crate) fn take_pictures(&self) -> Option<Vec<TinyPicture>> {
-        self.picture_slots.lock().unwrap().take()
+        lock(&self.picture_slots).take()
     }
 
     pub fn set_watch_sources(&self, sources: Vec<protocol::WatchSource>) {
-        *self.watch_sources.lock().unwrap() = sources;
+        *lock(&self.watch_sources) = sources;
     }
 
     pub(crate) fn watch_sources(&self) -> Vec<protocol::WatchSource> {
-        self.watch_sources.lock().unwrap().clone()
+        lock(&self.watch_sources).clone()
     }
 
     /// The devices chosen so far, for a call that opens them now. Any choice waiting for the
     /// media loop is part of it.
     pub(crate) fn take_chosen(&self) -> Devices {
-        self.devices.lock().unwrap().take();
-        self.chosen.lock().unwrap().clone()
+        lock(&self.devices).take();
+        lock(&self.chosen).clone()
     }
 
     pub fn tune(&self, tuning: Tuning) {
-        *self.tuning.lock().unwrap() = tuning;
+        *lock(&self.tuning) = tuning;
     }
 
     pub fn tuning(&self) -> Tuning {
-        *self.tuning.lock().unwrap()
+        *lock(&self.tuning)
     }
 
     /// Asks for a cue, if the user wants that kind heard. Someone joining or leaving is not
@@ -345,12 +375,12 @@ impl Controls {
             Cue::Lost | Cue::Back | Cue::Disconnected => tuning.connection,
         };
         if wanted {
-            *self.cue.lock().unwrap() = Some(cue);
+            *lock(&self.cue) = Some(cue);
         }
     }
 
     pub fn take_cue(&self) -> Option<Cue> {
-        self.cue.lock().unwrap().take()
+        lock(&self.cue).take()
     }
 
     /// Queues a decoded soundboard clip. Gain 0, an empty clip, or a deafened ear plays nothing.
@@ -358,7 +388,7 @@ impl Controls {
         if gain == 0 || samples.is_empty() || self.deafened.load(Ordering::Relaxed) {
             return;
         }
-        let mut clips = self.clips.lock().unwrap();
+        let mut clips = lock(&self.clips);
         if clips.len() >= 8 {
             clips.pop_front();
         }
@@ -367,7 +397,7 @@ impl Controls {
 
     /// Mixes queued soundboard clips into this frame. A deafened ear drops them.
     pub fn mix_clips(&self, frame: &mut [i16]) {
-        let mut clips = self.clips.lock().unwrap();
+        let mut clips = lock(&self.clips);
         if self.deafened.load(Ordering::Relaxed) {
             clips.clear();
             return;
@@ -379,7 +409,7 @@ impl Controls {
     pub fn set_audio(&self, muted: bool, deafened: bool) {
         let was = (self.muted.swap(muted, Ordering::Relaxed), self.deafened.swap(deafened, Ordering::Relaxed));
         if deafened {
-            self.watched_audio.lock().unwrap().clear();
+            lock(&self.watched_audio).clear();
         }
         if let Some(cue) = mine(was, (muted, deafened)) {
             self.cue(cue);
@@ -387,26 +417,26 @@ impl Controls {
     }
 
     pub fn set_input(&self, mode: InputMode) {
-        *self.input.lock().unwrap() = Some(mode);
+        *lock(&self.input) = Some(mode);
     }
 
     /// How the microphone opens now.
     pub fn input(&self) -> InputMode {
-        self.input.lock().unwrap().unwrap_or(InputMode::Voice { threshold: self.tuning().gate })
+        lock(&self.input).unwrap_or(InputMode::Voice { threshold: self.tuning().gate })
     }
 
     /// A push-to-talk key went down or up.
     pub fn talk(&self, held: bool, priority: bool) {
-        self.keys.lock().unwrap().press(held, priority, std::time::Instant::now());
+        lock(&self.keys).press(held, priority, std::time::Instant::now());
     }
 
     pub fn keys(&self) -> crate::talk::Keys {
-        *self.keys.lock().unwrap()
+        *lock(&self.keys)
     }
 
     /// One person's volume for me. 100 % and heard is forgotten, as never named.
     pub fn gain(&self, user_id: String, percent: u16, muted: bool) {
-        let mut ear = self.ear.lock().unwrap();
+        let mut ear = lock(&self.ear);
         if percent == 100 && !muted {
             ear.gains.remove(&user_id);
         } else {
@@ -415,28 +445,28 @@ impl Controls {
     }
 
     pub fn priority(&self, user_ids: Vec<String>) {
-        self.ear.lock().unwrap().priority = user_ids;
+        lock(&self.ear).priority = user_ids;
     }
 
     /// Everyone's volume and who holds priority, for one tick's mix.
     pub fn ear(&self) -> crate::hear::Ear {
-        self.ear.lock().unwrap().clone()
+        lock(&self.ear).clone()
     }
 
     pub fn set_processing(&self, processing: AudioProcessing) {
-        *self.processing.lock().unwrap() = Some(processing);
+        *lock(&self.processing) = Some(processing);
     }
 
     pub fn processing(&self) -> Option<AudioProcessing> {
-        *self.processing.lock().unwrap()
+        *lock(&self.processing)
     }
 
     pub fn set_quality(&self, quality: VoiceQuality) {
-        *self.quality.lock().unwrap() = quality;
+        *lock(&self.quality) = quality;
     }
 
     pub fn quality(&self) -> VoiceQuality {
-        *self.quality.lock().unwrap()
+        *lock(&self.quality)
     }
 
     pub fn set_bitrate(&self, kbps: u32) {
@@ -450,30 +480,30 @@ impl Controls {
     }
 
     pub fn publish_stats(&self, stats: CallStats) {
-        *self.stats.lock().unwrap() = Some(stats);
+        *lock(&self.stats) = Some(stats);
     }
 
     /// The connection as last measured; `None` before media has flowed for a second.
     pub fn stats(&self) -> Option<CallStats> {
-        self.stats.lock().unwrap().clone()
+        lock(&self.stats).clone()
     }
 
     /// Whether a cue is waiting to be played.
     pub fn cue_waiting(&self) -> bool {
-        self.cue.lock().unwrap().is_some()
+        lock(&self.cue).is_some()
     }
 
     /// The call moved to another voice server or session: the voice thread takes it from here.
     pub fn rejoin(&self, join: VoiceJoin) {
-        *self.moved.lock().unwrap() = Some(join);
+        *lock(&self.moved) = Some(join);
     }
 
     fn moving(&self) -> bool {
-        self.moved.lock().unwrap().is_some()
+        lock(&self.moved).is_some()
     }
 
     pub fn push_tg_signal(&self, data: Vec<u8>) {
-        let mut queue = self.tg_signals.lock().unwrap();
+        let mut queue = lock(&self.tg_signals);
         if queue.len() >= 128 {
             queue.pop_front();
         }
@@ -481,23 +511,23 @@ impl Controls {
     }
 
     pub fn take_tg_signals(&self) -> Vec<Vec<u8>> {
-        self.tg_signals.lock().unwrap().drain(..).collect()
+        lock(&self.tg_signals).drain(..).collect()
     }
 
     pub fn set_tg_sources(&self, sources: Vec<protocol::TelegramGroupSource>) {
-        *self.tg_sources.lock().unwrap() = Some(sources);
+        *lock(&self.tg_sources) = Some(sources);
     }
 
     pub fn take_tg_sources(&self) -> Option<Vec<protocol::TelegramGroupSource>> {
-        self.tg_sources.lock().unwrap().take()
+        lock(&self.tg_sources).take()
     }
 
     pub fn set_tg_video_sources(&self, sources: Vec<protocol::TelegramGroupVideoSource>) {
-        *self.tg_video_sources.lock().unwrap() = Some(sources);
+        *lock(&self.tg_video_sources) = Some(sources);
     }
 
     pub fn take_tg_video_sources(&self) -> Option<Vec<protocol::TelegramGroupVideoSource>> {
-        self.tg_video_sources.lock().unwrap().take()
+        lock(&self.tg_video_sources).take()
     }
 
     pub fn set_tg_presentation_stop(&self, stop: bool) {
@@ -509,7 +539,7 @@ impl Controls {
     }
 
     pub fn push_tg_rtmp_segment(&self, seg: crate::telegram::RtmpSegmentInput) {
-        let mut q = self.tg_rtmp_segments.lock().unwrap();
+        let mut q = lock(&self.tg_rtmp_segments);
         if q.len() >= 64 {
             q.pop_front();
         }
@@ -517,27 +547,27 @@ impl Controls {
     }
 
     pub fn take_tg_rtmp_segments(&self) -> Vec<crate::telegram::RtmpSegmentInput> {
-        self.tg_rtmp_segments.lock().unwrap().drain(..).collect()
+        lock(&self.tg_rtmp_segments).drain(..).collect()
     }
 
     pub fn set_tg_rtmp_state(&self, state: protocol::RtmpStreamState) {
-        *self.tg_rtmp_state.lock().unwrap() = Some(state);
+        *lock(&self.tg_rtmp_state) = Some(state);
     }
 
     pub fn tg_rtmp_state(&self) -> Option<protocol::RtmpStreamState> {
-        *self.tg_rtmp_state.lock().unwrap()
+        *lock(&self.tg_rtmp_state)
     }
 
     pub fn init_tg_conference(&self, my_user_id: i64, public_key: [u8; 32]) {
-        *self.tg_conf_e2ee.lock().unwrap() = Some(crate::telegram_e2ee::ConferenceE2ee::new(my_user_id, public_key));
+        *lock(&self.tg_conf_e2ee) = Some(crate::telegram_e2ee::ConferenceE2ee::new(my_user_id, public_key));
     }
 
     pub fn clear_tg_conference(&self) {
-        *self.tg_conf_e2ee.lock().unwrap() = None;
+        *lock(&self.tg_conf_e2ee) = None;
     }
 
     pub fn tg_conference_active(&self) -> bool {
-        self.tg_conf_e2ee.lock().unwrap().is_some()
+        lock(&self.tg_conf_e2ee).is_some()
     }
 
     pub fn apply_tg_conference_block(
@@ -545,7 +575,7 @@ impl Controls {
         sub_chain_id: i32,
         raw: &[u8],
     ) -> Result<protocol::CallSecurity, (crate::telegram_e2ee::E2eeError, protocol::CallSecurity)> {
-        let mut guard = self.tg_conf_e2ee.lock().unwrap();
+        let mut guard = lock(&self.tg_conf_e2ee);
         let Some(e2ee) = guard.as_mut() else {
             return Err((
                 crate::telegram_e2ee::E2eeError::NotReady,
@@ -559,7 +589,7 @@ impl Controls {
     }
 
     pub fn tg_conference_encrypt(&self, kind: u8, plaintext: &[u8]) -> Result<Vec<u8>, crate::telegram_e2ee::E2eeError> {
-        let mut guard = self.tg_conf_e2ee.lock().unwrap();
+        let mut guard = lock(&self.tg_conf_e2ee);
         let Some(e2ee) = guard.as_mut() else {
             return Err(crate::telegram_e2ee::E2eeError::NotReady);
         };
@@ -567,8 +597,8 @@ impl Controls {
     }
 
     pub fn tg_conference_decrypt(&self, packet: &[u8]) -> Result<(u8, i64, Vec<u8>), crate::telegram_e2ee::E2eeError> {
-        let guard = self.tg_conf_e2ee.lock().unwrap();
-        let Some(e2ee) = guard.as_ref() else {
+        let mut guard = lock(&self.tg_conf_e2ee);
+        let Some(e2ee) = guard.as_mut() else {
             return Err(crate::telegram_e2ee::E2eeError::NotReady);
         };
         e2ee.decrypt_frame(packet)
@@ -736,8 +766,8 @@ impl Call {
         self.seq_ack = None;
         self.transport = None;
         self.joined = false;
-        self.users.lock().unwrap().clear();
-        self.videos.lock().unwrap().clear();
+        lock(&self.users).clear();
+        lock(&self.videos).clear();
         self.assigned = None;
         self.announced.store(false, Ordering::Relaxed);
         self.last_sink_wants = None;
@@ -840,7 +870,7 @@ impl Call {
             }
         };
 
-        let first = self.dave.lock().unwrap().start(version);
+        let first = lock(&self.dave).start(version);
         self.deliver(socket, first)?;
         self.dave_version = version;
         self.dave_report();
@@ -895,7 +925,7 @@ impl Call {
         if ssrc == 0 || user_id == self.join.user_id {
             return;
         }
-        let mut users = self.users.lock().unwrap();
+        let mut users = lock(&self.users);
         if self.join.watch {
             users.retain(|&previous, user| previous == ssrc || *user != user_id);
         }
@@ -908,7 +938,7 @@ impl Call {
 
     /// DAVE may not drop to "none" on a call that requires it.
     fn encrypted(&self) -> Result<(), End> {
-        let version = self.dave.lock().unwrap().version();
+        let version = lock(&self.dave).version();
         if self.joined && version == 0 && self.join.dave.required {
             return Err(End::Fatal(CallFailure::Encryption, NOT_ENCRYPTED.to_owned()));
         }
@@ -944,10 +974,10 @@ impl Call {
                     if let Ok(id) = user_id.parse() {
                         self.connected.remove(&id);
                     }
-                    self.users.lock().unwrap().retain(|_, user| *user != user_id);
-                    self.videos.lock().unwrap().retain(|_, remote| remote.user_id != user_id);
+                    lock(&self.users).retain(|_, user| *user != user_id);
+                    lock(&self.videos).retain(|_, remote| remote.user_id != user_id);
                     if self.join.watch && self.join.stream_owner.as_deref() == Some(&user_id) {
-                        self.controls.watched_audio.lock().unwrap().remove(&user_id);
+                        lock(&self.controls.watched_audio).remove(&user_id);
                     } else if !self.join.stream {
                         out::send(&MediaResponse::Gone { user_id });
                     }
@@ -956,21 +986,21 @@ impl Call {
             dave::PREPARE_TRANSITION => {
                 let (transition, version) = (number(&d["transition_id"]), number(&d["protocol_version"]));
                 if let (Some(transition), Some(version)) = (transition, version) {
-                    let answer = self.dave.lock().unwrap().prepare_transition(transition as u16, version as u16);
+                    let answer = lock(&self.dave).prepare_transition(transition as u16, version as u16);
                     self.deliver(socket, answer)?;
                     self.encrypted()?;
                 }
             }
             dave::EXECUTE_TRANSITION => {
                 if let Some(transition) = number(&d["transition_id"]) {
-                    self.dave.lock().unwrap().execute_transition(transition as u16);
+                    lock(&self.dave).execute_transition(transition as u16);
                     self.dave_report();
                     self.encrypted()?;
                 }
             }
             dave::PREPARE_EPOCH => {
                 if let (Some(epoch), Some(version)) = (number(&d["epoch"]), number(&d["protocol_version"])) {
-                    let answer = self.dave.lock().unwrap().prepare_epoch(epoch, version as u16);
+                    let answer = lock(&self.dave).prepare_epoch(epoch, version as u16);
                     self.deliver(socket, answer)?;
                     self.dave_report();
                 }
@@ -984,7 +1014,7 @@ impl Call {
     fn binary(&mut self, socket: &mut Socket, op: u8, payload: &[u8]) -> Result<(), End> {
         let epoch = matches!(op, dave::ANNOUNCE_COMMIT | dave::WELCOME);
         let answer = {
-            let mut dave = self.dave.lock().unwrap();
+            let mut dave = lock(&self.dave);
             match op {
                 dave::EXTERNAL_SENDER => {
                     dave.external_sender(payload);
@@ -1009,7 +1039,7 @@ impl Call {
     /// The privacy code and each pairwise verification code, after a transition or a new epoch.
     /// Scrypt runs off the dave lock: `encrypt` must not wait on it.
     fn dave_report(&self) {
-        let wanted = self.dave.lock().unwrap().safety_wanted();
+        let wanted = lock(&self.dave).safety_wanted();
         let made: Vec<(u64, Vec<u8>, String)> = wanted
             .into_iter()
             .map(|(id, key, me, mine)| {
@@ -1018,7 +1048,7 @@ impl Call {
             })
             .collect();
         let report = {
-            let mut dave = self.dave.lock().unwrap();
+            let mut dave = lock(&self.dave);
             for (id, key, number) in made {
                 dave.add_safety(id, key, number);
             }
@@ -1160,7 +1190,7 @@ impl Call {
     /// no `Connected`. Sound, when the share asked for it, is Opus on this connection's audio
     /// SSRC. A failure here is a notice, not the end of the voice call.
     fn start_stream(&mut self, socket: &mut Socket, transport: Transport, seal: Cipher, opener: Cipher, version: u16) -> Result<(), End> {
-        let first = self.dave.lock().unwrap().start(version);
+        let first = lock(&self.dave).start(version);
         self.deliver(socket, first)?;
         self.dave_version = version;
         self.ssrc = transport.ssrc;
@@ -1211,7 +1241,7 @@ impl Call {
         if user_id == self.join.user_id {
             return;
         }
-        let mut videos = self.videos.lock().unwrap();
+        let mut videos = lock(&self.videos);
         videos.retain(|_, remote| remote.user_id != user_id);
         if let Some(streams) = d["streams"].as_array() {
             for stream in streams {
@@ -1256,7 +1286,7 @@ impl Call {
         if !self.joined || (self.join.stream && !self.join.watch) {
             return Ok(());
         }
-        let videos = self.videos.lock().unwrap().clone();
+        let videos = lock(&self.videos).clone();
         let watch_sources = self.controls.watch_sources();
         let speaker = self.controls.speaker();
         let Some(next) = media_sink_wants(
@@ -1718,7 +1748,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
     let (mut attempt, mut resumes) = (0, 0);
     let mut why = Why::Silent;
     loop {
-        let next = if call.join.stream { None } else { call.controls.moved.lock().unwrap().take() };
+        let next = if call.join.stream { None } else { lock(&call.controls.moved).take() };
         if let Some(next) = next {
             if call.joined {
                 out::send(&MediaResponse::Interrupted);

@@ -1,19 +1,22 @@
 //! Discord server settings overlay: Overview (name, description, icon, banner, system/AFK
 //! channels, default notifications, Danger Zone delete & transfer), Invites, Events, and Roles.
 
-use super::components::{button, glyph, icon_button, segment, segmented, ButtonKind};
+use super::components::place::{anchor, placed, Layer, Place};
+use super::components::{button, button_disabled, glyph, icon_button, menu, menu_item_check, segment, segmented, ButtonKind};
 use super::input::TextInput;
 use super::state::Shell;
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, Entity, MouseButton,
-    PathPromptOptions, Stateful, Window,
+    canvas, deferred, div, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, Entity, MouseButton,
+    PathPromptOptions, Pixels, SharedString, Window,
 };
 use protocol::{
     ConversationKind, EventPlaceKind, Key, Network, Notify, Request, Response, RoleEdit, RoleMove,
     SpaceEdit, SpaceEvent, SpaceEventEdit, SpaceInfo, SpaceInvite, SpaceRights, SpaceRole,
 };
+use std::cell::Cell;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(in crate::gui) enum Tab {
@@ -21,6 +24,29 @@ pub(in crate::gui) enum Tab {
     Invites,
     Events,
     Roles,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::gui) enum ChannelPicker {
+    System,
+    Afk,
+}
+
+/// Whether Discord settings modals should stack two-column layouts vertically.
+pub(in crate::gui) fn stacked_layout(viewport_w: f32) -> bool {
+    viewport_w < 600.
+}
+
+/// Filters all server channels for the searchable dropdown picker without truncating at 12.
+pub(in crate::gui) fn filter_channels<'a>(channels: &'a [(String, String)], query: &str) -> Vec<&'a (String, String)> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return channels.iter().collect();
+    }
+    channels
+        .iter()
+        .filter(|(_, title)| title.to_ascii_lowercase().contains(&q))
+        .collect()
 }
 
 enum PictureTarget {
@@ -64,6 +90,10 @@ pub(in crate::gui) struct Open {
     pub banner_edit: Option<String>,
     pub system_channel_id: String,
     pub afk_channel_id: String,
+    pub channel_picker: Option<ChannelPicker>,
+    pub channel_search: Entity<TextInput>,
+    pub sys_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub afk_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub afk_timeout: u32,
     pub default_notify: Notify,
 
@@ -141,6 +171,7 @@ impl Shell {
         let role_name = cx.new(|cx| TextInput::new("Role name", cx));
         let role_color = cx.new(|cx| TextInput::new("#RRGGBB", cx));
         let role_emoji = cx.new(|cx| TextInput::new("Emoji", cx));
+        let channel_search = cx.new(|cx| TextInput::new("Search channels…", cx));
         self.discord_settings.open = Some(Open {
             space: space.clone(),
             space_name,
@@ -157,6 +188,10 @@ impl Shell {
             banner_edit: None,
             system_channel_id: String::new(),
             afk_channel_id: String::new(),
+            channel_picker: None,
+            channel_search,
+            sys_bounds: Rc::new(Cell::new(None)),
+            afk_bounds: Rc::new(Cell::new(None)),
             afk_timeout: 300,
             default_notify: Notify::All,
             confirm_name,
@@ -662,35 +697,53 @@ impl Shell {
         cx.notify();
     }
 
-    pub(in crate::gui) fn discord_settings_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(in crate::gui) fn discord_settings_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let open = self.discord_settings.open.as_ref()?;
-        let mut tabs = div().w(px(176.)).flex_none().border_r_1().border_color(theme::border()).p(px(12.)).flex().flex_col().gap(px(4.));
-        tabs = tabs.child(
-            div()
-                .px(px(8.))
-                .pb(px(8.))
-                .min_w_0()
-                .truncate()
-                .type_ui()
-                .font_weight(theme::SEMIBOLD)
-                .text_color(theme::text())
-                .child(open.space_name.clone()),
-        );
+        let viewport = window.viewport_size();
+        let wide = f32::from(viewport.width);
+        let tall = f32::from(viewport.height);
+        let stacked = stacked_layout(wide);
+        let max_w = (wide - 32.).max(200.);
+        let max_h = (tall - 32.).max(200.);
+        let mut tabs = if stacked {
+            div().w_full().flex_none().border_b_1().border_color(theme::border()).p(px(10.)).flex().flex_wrap().items_center().gap(px(4.))
+        } else {
+            div().w(px(176.)).flex_none().border_r_1().border_color(theme::border()).p(px(12.)).flex().flex_col().gap(px(4.))
+        };
+        if !stacked {
+            tabs = tabs.child(
+                div()
+                    .px(px(8.))
+                    .pb(px(8.))
+                    .min_w_0()
+                    .truncate()
+                    .type_ui()
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child(open.space_name.clone()),
+            );
+        }
         let tab_btn = |id: &'static str, icon: &'static str, label: &'static str, target: Tab, active: bool, cx: &mut Context<Self>| {
             div()
                 .id(id)
+                .role(gpui::Role::Tab)
+                .aria_label(label)
+                .aria_selected(active)
+                .tab_index(0)
                 .h(px(30.))
                 .px(px(8.))
                 .rounded(px(theme::R_CONTROL))
                 .cursor_pointer()
                 .when(active, |d| d.bg(theme::selected()))
-                .hover(|s| s.bg(theme::hover()))
+                .when(!active, |d| d.hover(|s| s.bg(theme::hover())))
+                .focus_visible(|s| s.shadow(theme::focus_ring()))
                 .flex()
                 .items_center()
                 .gap(px(8.))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(open) = this.discord_settings.open.as_mut() {
                         open.tab = target;
+                        open.channel_picker = None;
                         open.error = None;
                         open.notice = None;
                         cx.notify();
@@ -719,12 +772,33 @@ impl Shell {
             Tab::Roles => self.discord_roles_tab(open, window, cx).into_any_element(),
         };
 
+        let header = div()
+            .h(px(44.))
+            .flex_none()
+            .px(px(16.))
+            .border_b_1()
+            .border_color(theme::border())
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.))
+            .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(match open.tab {
+                Tab::Overview => "Server overview",
+                Tab::Invites => "Invite links",
+                Tab::Events => "Scheduled events",
+                Tab::Roles => "Roles",
+            }))
+            .child(icon_button("ds-close", "icons/x.svg", false).aria_label("Close").on_click(cx.listener(|this, _, _, cx| {
+                this.close_discord_settings(cx);
+            })));
+
+        let mut header_opt = Some(header);
         let panel = div()
             .id("discord-settings-panel")
             .w(px(740.))
-            .max_w_full()
-            .h(px(580.))
-            .max_h_full()
+            .max_w(px(max_w))
+            .h(px(580.0_f32.min(max_h)))
+            .max_h(px(max_h))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())
             .border_1()
@@ -732,34 +806,19 @@ impl Shell {
             .shadow(theme::shadow_modal())
             .overflow_hidden()
             .flex()
+            .when(stacked, |p| p.flex_col())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(stacked.then(|| header_opt.take()).flatten())
             .child(tabs)
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
+                    .min_h_0()
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .h(px(44.))
-                            .px(px(16.))
-                            .border_b_1()
-                            .border_color(theme::border())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(div().type_title().text_color(theme::text()).child(match open.tab {
-                                Tab::Overview => "Server overview",
-                                Tab::Invites => "Invite links",
-                                Tab::Events => "Scheduled events",
-                                Tab::Roles => "Roles",
-                            }))
-                            .child(icon_button("ds-close", "icons/x.svg", false).aria_label("Close").on_click(cx.listener(|this, _, _, cx| {
-                                this.close_discord_settings(cx);
-                            }))),
-                    )
+                    .children(header_opt)
                     .child(
                         div()
                             .id("discord-settings-scroll")
@@ -777,25 +836,203 @@ impl Shell {
             );
 
         Some(
-            div()
-                .id("discord-settings-backdrop")
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .p(px(24.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.close_discord_settings(cx);
-                }))
-                .child(panel),
+            deferred(
+                div()
+                    .id("discord-settings-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .bg(theme::scrim())
+                    .occlude()
+                    .p(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.close_discord_settings(cx);
+                    }))
+                    .child(panel),
+            )
+            .priority(Layer::Modal as usize)
+            .into_any_element(),
         )
     }
 
+    fn discord_channel_dropdown(
+        &self,
+        open: &Open,
+        which: ChannelPicker,
+        channels: &[(String, String)],
+        prefix_hash: bool,
+        icon: &'static str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let current_id = match which {
+            ChannelPicker::System => &open.system_channel_id,
+            ChannelPicker::Afk => &open.afk_channel_id,
+        };
+        let is_open = open.channel_picker == Some(which);
+        let bounds_cell = match which {
+            ChannelPicker::System => open.sys_bounds.clone(),
+            ChannelPicker::Afk => open.afk_bounds.clone(),
+        };
+        let bounds_keep = bounds_cell.clone();
+        let format_name = |title: &str| {
+            if prefix_hash {
+                format!("#{}", title.trim_start_matches('#'))
+            } else {
+                title.to_owned()
+            }
+        };
+        let current_label = if current_id.is_empty() {
+            "None".to_owned()
+        } else {
+            channels
+                .iter()
+                .find(|(id, _)| id == current_id)
+                .map(|(_, title)| format_name(title))
+                .unwrap_or_else(|| current_id.clone())
+        };
+        let id = match which {
+            ChannelPicker::System => "ds-sys-picker",
+            ChannelPicker::Afk => "ds-afk-picker",
+        };
+        let trigger = div()
+            .id(id)
+            .role(gpui::Role::Button)
+            .aria_label(current_label.clone())
+            .tab_index(0)
+            .relative()
+            .w(px(300.))
+            .max_w_full()
+            .h(px(34.))
+            .px(px(10.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::field())
+            .border_1()
+            .border_color(if is_open { theme::focus() } else { theme::border() })
+            .hover(|s| s.border_color(theme::border_strong()))
+            .focus_visible(|s| s.shadow(theme::focus_ring()))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(o) = this.discord_settings.open.as_mut() {
+                    if o.channel_picker == Some(which) {
+                        o.channel_picker = None;
+                    } else {
+                        o.channel_picker = Some(which);
+                        let focus = o.channel_search.update(cx, |input, cx| {
+                            input.clear(cx);
+                            gpui::Focusable::focus_handle(input, cx)
+                        });
+                        window.focus(&focus, cx);
+                    }
+                    cx.notify();
+                }
+            }))
+            .child(glyph(if current_id.is_empty() { "icons/minus.svg" } else { icon }, 14., theme::text_faint()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .type_ui()
+                    .text_color(if current_id.is_empty() { theme::text_soft() } else { theme::text() })
+                    .child(current_label),
+            )
+            .child(glyph("icons/chevron-down.svg", 14., theme::text_faint()))
+            .child(
+                canvas(move |bounds, _, _| bounds_keep.set(Some(bounds)), |_, _, _, _| {})
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+            );
+        let mut wrap = div().flex().flex_col().child(trigger);
+        if is_open {
+            let query = open.channel_search.read(cx).text().to_owned();
+            let filtered = filter_channels(channels, &query);
+            let max_w = (f32::from(window.viewport_size().width) - 16.).max(200.);
+            let mut items = div()
+                .id(SharedString::from(format!("{id}-scroll")))
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col();
+            if query.trim().is_empty() {
+                items = items.child(
+                    menu_item_check(SharedString::from(format!("{id}-none")), current_id.is_empty(), "None", None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(o) = this.discord_settings.open.as_mut() {
+                                match which {
+                                    ChannelPicker::System => o.system_channel_id.clear(),
+                                    ChannelPicker::Afk => o.afk_channel_id.clear(),
+                                }
+                                o.channel_picker = None;
+                                cx.notify();
+                            }
+                        })),
+                );
+            }
+            if filtered.is_empty() {
+                items = items.child(
+                    div()
+                        .px(px(8.))
+                        .py(px(8.))
+                        .type_small()
+                        .text_color(theme::text_faint())
+                        .child("No matching channels"),
+                );
+            } else {
+                for (ix, (ch_id, title)) in filtered.into_iter().enumerate() {
+                    let selected = current_id == ch_id;
+                    let chosen = ch_id.clone();
+                    items = items.child(
+                        menu_item_check((id, ix), selected, format_name(title), None).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                if let Some(o) = this.discord_settings.open.as_mut() {
+                                    match which {
+                                        ChannelPicker::System => o.system_channel_id = chosen.clone(),
+                                        ChannelPicker::Afk => o.afk_channel_id = chosen.clone(),
+                                    }
+                                    o.channel_picker = None;
+                                    cx.notify();
+                                }
+                            },
+                        )),
+                    );
+                }
+            }
+            let search_focused = gpui::Focusable::focus_handle(open.channel_search.read(cx), cx).is_focused(window);
+            let dropdown = menu()
+                .w(px(300.))
+                .max_w(px(max_w))
+                .gap(px(4.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    if let Some(o) = this.discord_settings.open.as_mut() {
+                        o.channel_picker = None;
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div().px(px(4.)).pt(px(2.)).child(
+                        super::components::field(search_focused)
+                            .h(px(28.))
+                            .child(glyph("icons/search.svg", 13., theme::text_faint()))
+                            .child(div().flex_1().min_w_0().child(open.channel_search.clone())),
+                    ),
+                )
+                .child(items);
+            let at = bounds_cell.get().unwrap_or_else(|| anchor(24., 220., 300., 34.));
+            wrap = wrap.child(placed(SharedString::from(format!("{id}-menu")), Place::Below(at), Layer::Modal, window, dropdown));
+        }
+        wrap
+    }
+
     fn discord_overview_tab(&self, open: &Open, window: &Window, cx: &mut Context<Self>) -> Div {
-        let field_box = |input: Entity<TextInput>| field_box(input, window, cx);
         let tree = self.trees.get(&open.space);
         let text_channels: Vec<(String, String)> = tree
             .map(|t| {
@@ -816,66 +1053,12 @@ impl Shell {
             })
             .unwrap_or_default();
 
-        let mut sys_bar = div().flex().flex_wrap().gap(px(6.));
-        let sys_none = open.system_channel_id.is_empty();
-        sys_bar = sys_bar.child(
-            segment("ds-sys-none", "None", sys_none)
-                .px(px(8.))
-                .when(!sys_none, |s| s.bg(theme::hover()).border_1().border_color(theme::border()))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(o) = this.discord_settings.open.as_mut() {
-                        o.system_channel_id.clear();
-                        cx.notify();
-                    }
-                })),
-        );
-        for (ix, (id, title)) in text_channels.iter().take(12).enumerate() {
-            let selected = open.system_channel_id == *id;
-            let chosen = id.clone();
-            sys_bar = sys_bar.child(
-                segment(("ds-sys-ch", ix), format!("#{}", title.trim_start_matches('#')), selected)
-                    .px(px(8.))
-                    .when(!selected, |s| s.bg(theme::hover()).border_1().border_color(theme::border()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(o) = this.discord_settings.open.as_mut() {
-                            o.system_channel_id = chosen.clone();
-                            cx.notify();
-                        }
-                    })),
-            );
-        }
-
-        let mut afk_bar = div().flex().flex_wrap().gap(px(6.));
-        let afk_none = open.afk_channel_id.is_empty();
-        afk_bar = afk_bar.child(
-            segment("ds-afk-none", "None", afk_none)
-                .px(px(8.))
-                .when(!afk_none, |s| s.bg(theme::hover()).border_1().border_color(theme::border()))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(o) = this.discord_settings.open.as_mut() {
-                        o.afk_channel_id.clear();
-                        cx.notify();
-                    }
-                })),
-        );
-        for (ix, (id, title)) in voice_channels.iter().take(12).enumerate() {
-            let selected = open.afk_channel_id == *id;
-            let chosen = id.clone();
-            afk_bar = afk_bar.child(
-                segment(("ds-afk-ch", ix), title.clone(), selected)
-                    .px(px(8.))
-                    .when(!selected, |s| s.bg(theme::hover()).border_1().border_color(theme::border()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(o) = this.discord_settings.open.as_mut() {
-                            o.afk_channel_id = chosen.clone();
-                            cx.notify();
-                        }
-                    })),
-            );
-        }
+        let sys_bar = self.discord_channel_dropdown(open, ChannelPicker::System, &text_channels, true, "icons/hash.svg", window, cx);
+        let afk_bar = self.discord_channel_dropdown(open, ChannelPicker::Afk, &voice_channels, false, "icons/volume-2.svg", window, cx);
+        let field_box = |input: Entity<TextInput>| field_box(input, window, cx);
 
         let timeouts: [(u32, &str); 5] = [(60, "1 min"), (300, "5 min"), (900, "15 min"), (1800, "30 min"), (3600, "1 hour")];
-        let mut timeout_bar = segmented();
+        let mut timeout_bar = segmented().flex_wrap();
         for (ix, (secs, label)) in timeouts.into_iter().enumerate() {
             timeout_bar = timeout_bar.child(
                 segment(("ds-afk-t", ix), label, open.afk_timeout == secs)
@@ -890,6 +1073,7 @@ impl Shell {
         }
 
         let notify_bar = segmented()
+            .flex_wrap()
             .child(
                 segment("ds-notify-all", "All messages", open.default_notify == Notify::All)
                     .px(px(8.))
@@ -975,10 +1159,13 @@ impl Shell {
                     .mt(px(4.))
                     .flex()
                     .justify_end()
-                    .child(
-                        button("ds-save-overview", ButtonKind::Primary, if open.busy { "Saving…" } else { "Save changes" })
-                            .when(!open.busy, |b| b.on_click(cx.listener(|this, _, _, cx| this.save_discord_overview(cx)))),
-                    ),
+                    .child(if open.busy {
+                        button_disabled("Saving…").into_any_element()
+                    } else {
+                        button("ds-save-overview", ButtonKind::Primary, "Save changes")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_discord_overview(cx)))
+                            .into_any_element()
+                    }),
             );
 
         if open.rights.owner {

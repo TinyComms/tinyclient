@@ -25,18 +25,19 @@
 //! (`larchpress`, `larchtrail`, `closedridge`, `fullshelf`, `similarpeaks`). `flood_wait` returns
 //! a flood wait, and every other name returns USERNAME_NOT_OCCUPIED.
 
+use super::call::{add_mod_2048, modpow_2048, mul_mod_2048};
 use super::peers::Who;
 use super::wire::{Event, Fault, Wire};
 use crate::adapters::script;
-use grammers_crypto::two_factor_auth::calculate_2fa;
 use grammers_tl_types as tl;
-use sha2::{Digest, Sha256};
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, PoisonError, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use tl::{Deserializable, Identifiable, RemoteCall, Serializable};
 
 const ME: i64 = 7001;
@@ -99,6 +100,112 @@ const PRIME: &str = "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563
 
 fn unhex(text: &str) -> Vec<u8> {
     (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap_or(0)).collect()
+}
+
+struct FakeSrp {
+    p: [u8; 256],
+    v: [u8; 256],
+    g_b: [u8; 256],
+}
+
+impl FakeSrp {
+    const SALT1: [u8; 8] = [7; 8];
+    const SALT2: [u8; 16] = [9; 16];
+    const SERVER_B: [u8; 256] = [5; 256];
+
+    fn g_padded() -> [u8; 256] {
+        let mut g = [0u8; 256];
+        g[255] = 3;
+        g
+    }
+
+    fn sh(data: &[u8], salt: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(salt);
+        hasher.update(data);
+        hasher.update(salt);
+        hasher.finalize().into()
+    }
+
+    fn pad32(bytes: &[u8; 32]) -> [u8; 256] {
+        let mut out = [0u8; 256];
+        out[224..256].copy_from_slice(bytes);
+        out
+    }
+
+    fn init() -> Self {
+        let p: [u8; 256] = unhex(PRIME).try_into().expect("256-byte PRIME");
+        let g = Self::g_padded();
+        let ph1 = Self::sh(&Self::sh(PASSWORD.as_bytes(), &Self::SALT1), &Self::SALT2);
+        // PBKDF2-HMAC-SHA512(ph1, salt1, 100_000, dkLen=64) — single 64-byte block.
+        let mut mac = Hmac::<Sha512>::new_from_slice(&ph1).expect("HMAC key");
+        mac.update(&Self::SALT1);
+        mac.update(&1u32.to_be_bytes());
+        let mut u: [u8; 64] = mac.finalize().into_bytes().into();
+        let mut dk = u;
+        for _ in 1..100_000 {
+            let mut mac = Hmac::<Sha512>::new_from_slice(&ph1).expect("HMAC key");
+            mac.update(&u);
+            u = mac.finalize().into_bytes().into();
+            for i in 0..64 {
+                dk[i] ^= u[i];
+            }
+        }
+        let x = Self::sh(&dk, &Self::SALT2);
+        let v = modpow_2048(&g, &Self::pad32(&x), &p);
+        let k: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update(p);
+            hasher.update(g);
+            hasher.finalize().into()
+        };
+        let k_v = mul_mod_2048(&Self::pad32(&k), &v, &p);
+        let g_pow_b = modpow_2048(&g, &Self::SERVER_B, &p);
+        let g_b = add_mod_2048(&k_v, &g_pow_b, &p);
+        Self { p, v, g_b }
+    }
+
+    fn verify(&self, a: &[u8], m1: &[u8]) -> bool {
+        if a.len() != 256 || m1.len() != 32 {
+            return false;
+        }
+        let g_a: [u8; 256] = a.try_into().unwrap();
+        if g_a == [0u8; 256] || g_a.as_slice() >= self.p.as_slice() {
+            return false;
+        }
+        let u: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update(g_a);
+            hasher.update(self.g_b);
+            hasher.finalize().into()
+        };
+        let v_u = modpow_2048(&self.v, &Self::pad32(&u), &self.p);
+        let base = mul_mod_2048(&g_a, &v_u, &self.p);
+        let s_b = modpow_2048(&base, &Self::SERVER_B, &self.p);
+        let k_b: [u8; 32] = Sha256::digest(s_b).into();
+        let h_p: [u8; 32] = Sha256::digest(self.p).into();
+        let h_g: [u8; 32] = Sha256::digest(Self::g_padded()).into();
+        let mut p_xor_g = [0u8; 32];
+        for i in 0..32 {
+            p_xor_g[i] = h_p[i] ^ h_g[i];
+        }
+        let expected_m1: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update(p_xor_g);
+            hasher.update(Sha256::digest(Self::SALT1));
+            hasher.update(Sha256::digest(Self::SALT2));
+            hasher.update(g_a);
+            hasher.update(self.g_b);
+            hasher.update(k_b);
+            hasher.finalize().into()
+        };
+        m1 == expected_m1.as_slice()
+    }
+}
+
+fn fake_srp() -> &'static FakeSrp {
+    static SRP: OnceLock<FakeSrp> = OnceLock::new();
+    SRP.get_or_init(FakeSrp::init)
 }
 
 /// `m***@example.com`. The local part's first letter only; the rest stays hidden.
@@ -1723,18 +1830,19 @@ impl World {
     }
 
     fn password(&self) -> tl::types::account::Password {
+        let srp = fake_srp();
         let algo = tl::types::PasswordKdfAlgoSha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow {
             salt1: vec![7; 8],
             salt2: vec![9; 16],
             g: 3,
-            p: unhex(PRIME),
+            p: srp.p.to_vec(),
         };
         tl::types::account::Password {
             has_recovery: self.has_recovery,
             has_secure_values: false,
             has_password: true,
             current_algo: Some(algo.clone().into()),
-            srp_b: Some(vec![5; 256]),
+            srp_b: Some(srp.g_b.to_vec()),
             srp_id: Some(77),
             hint: Some("the old street".to_owned()),
             email_unconfirmed_pattern: None,
@@ -5772,17 +5880,7 @@ impl World {
             let tl::enums::InputCheckPasswordSrp::Srp(proof) = request.password else {
                 return Err(rpc(400, "PASSWORD_HASH_INVALID", None));
             };
-            // The proof the right password gives, made the way a client makes it. grammers'
-            // SRP bends a debug build's 256 KiB connection stack past its end, so the
-            // computation runs on its own thread with room to spare.
-            let asked = self.password();
-            let secure_random = asked.secure_random;
-            let srp = std::thread::Builder::new().name("fake srp".into()).stack_size(4 * 1024 * 1024).spawn(move || {
-                calculate_2fa(&[7; 8], &[9; 16], &unhex(PRIME), &3, vec![5; 256], secure_random, PASSWORD.as_bytes())
-            })
-            .expect("the fake's SRP thread");
-            let (m1, g_a) = srp.join().expect("the fake's SRP thread");
-            return match self.password_owed && proof.srp_id == 77 && proof.m1 == m1 && proof.a == g_a {
+            return match self.password_owed && proof.srp_id == 77 && fake_srp().verify(&proof.a, &proof.m1) {
                 true => {
                     self.signed_in = true;
                     self.password_owed = false;
@@ -6315,6 +6413,19 @@ impl World {
                 return Err(rpc(400, "PINNED_DIALOGS_TOO_MUCH", None));
             }
             self.log(&format!("ToggleDialogPin {} {}", peer.text(), request.pinned));
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::ReorderPinnedDialogs>(body) {
+            let order: Vec<Who> = request
+                .order
+                .iter()
+                .filter_map(|peer| match peer {
+                    tl::enums::InputDialogPeer::Peer(dialog) => Some(input_who(&dialog.peer)),
+                    _ => None,
+                })
+                .collect();
+            let names = order.iter().map(|w| w.text()).collect::<Vec<_>>().join(",");
+            self.log(&format!("ReorderPinnedDialogs {} {names}", request.folder_id));
             return answer(true);
         }
         if let Some(request) = asked::<f::folders::EditPeerFolders>(body) {

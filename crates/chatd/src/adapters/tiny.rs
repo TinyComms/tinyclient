@@ -140,6 +140,11 @@ pub fn prove_encrypted_reaction() -> Result<(), String> {
     e2ee::prove_encrypted_reaction()
 }
 
+/// The lab's core E2EE/security proof. See `e2ee::prove_core_e2ee_security`.
+pub fn prove_core_e2ee_security() -> Result<(), String> {
+    e2ee::prove_core_e2ee_security()
+}
+
 /// The lab's join-order proof. `call.join` is sent before the room's mediad settings.
 pub fn prove_join_before_room() -> Result<(), &'static str> {
     let steps = live::after_offer();
@@ -522,13 +527,14 @@ impl Attempt {
 
 /// Whether a request error is the connection having been closed under us.
 fn dropped(err: &ureq::Error) -> bool {
-    matches!(err, ureq::Error::Io(io) if matches!(
-        io.kind(),
-        std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::UnexpectedEof
-    ))
+    matches!(err, ureq::Error::ConnectionFailed)
+        || matches!(err, ureq::Error::Io(io) if matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ))
 }
 
 fn call_once(
@@ -1328,11 +1334,39 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
     if saved.user_id != ctx.account.account {
         return Err("the Tiny server session is for another account".to_owned());
     }
+    // Mark E2EE startup in flight before router/commands spawn so sealed sends wait cleanly for
+    // local device setup while plain sends and upload staging run immediately.
+    e2ee::mark_starting(&saved);
     let live = Arc::new(live::Live::new().map_err(|err| err.to_string())?);
     let (socket, socket_ctx, socket_live) = (saved.clone(), ctx.clone(), live.clone());
     std::thread::Builder::new()
         .name("tiny-live".into())
         .spawn(move || live::keep_live(&socket_ctx, &socket, &socket_live, &timing))
+        .map_err(|err| err.to_string())?;
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+    let (router_ctx, router_saved) = (ctx.clone(), saved.clone());
+    std::thread::Builder::new()
+        .name("tiny-router".into())
+        .spawn(move || {
+            for command in inbox {
+                match command {
+                    Command::Send { conversation_id, client_id, text, reply_to } => {
+                        messages::send_fast(&router_ctx, &router_saved, conversation_id, client_id, text, reply_to);
+                    }
+                    Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                        messages::send_with_fast(&router_ctx, &router_saved, conversation_id, client_id, text, reply_to, *with);
+                    }
+                    Command::CancelSend { client_id, .. } => {
+                        crate::blobs::upload::cancel(&router_ctx.account, &client_id);
+                    }
+                    other => {
+                        if cmd_tx.send(other).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
         .map_err(|err| err.to_string())?;
     std::thread::Builder::new()
         .name("tiny-commands".into())
@@ -1343,7 +1377,7 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
             messages::refresh(&ctx, &saved);
             // Catch missed membership hints even when this server has no live socket.
             e2ee::resume(&saved);
-            serve_inbox(&ctx, &saved, &live, inbox);
+            serve_inbox(&ctx, &saved, &live, cmd_rx);
             // The socket thread sleeps on the socket; this is how it hears the adapter stopped.
             live.wake();
         })
@@ -1486,6 +1520,7 @@ fn serve_inbox(ctx: &Context, saved: &Saved, live: &live::Live, inbox: Receiver<
             Command::SignOut(reply) => {
                 // This install stops being a device of the person: revoked on the server
                 // while the session still works, its keys and cache forgotten here.
+                messages::stop_e2ee_worker(saved);
                 e2ee::sign_out(saved);
                 delete_session(saved);
                 let _ = reply.send(Ok(()));
@@ -2353,5 +2388,21 @@ pub(crate) mod tests {
     pub(crate) fn json_body(request: &str) -> serde_json::Value {
         let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
         serde_json::from_str(body).unwrap_or_else(|err| panic!("body {err}"))
+    }
+
+    #[test]
+    fn dropped_recognises_connection_failed_and_io_resets() {
+        assert!(dropped(&ureq::Error::ConnectionFailed));
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let err = ureq::Error::Io(std::io::Error::new(kind, "closed"));
+            assert!(dropped(&err), "{kind:?} should count as a dropped connection");
+        }
+        assert!(!dropped(&ureq::Error::StatusCode(500)));
+        assert!(!dropped(&ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow"))));
     }
 }

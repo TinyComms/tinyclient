@@ -281,6 +281,18 @@ pub fn list_row_fit(
     list_row_in(id, height, selected, focused, content, true)
 }
 
+/// Shapes `content` for inside [`list_row`] / [`list_row_fit`]: a column stack left-aligns and
+/// centers vertically instead of letting `.items_center()` horizontally center its children.
+pub(in crate::gui) fn list_row_inner(mut content: Div, grow: bool) -> Div {
+    let column = content.style().flex_direction == Some(gpui::FlexDirection::Column);
+    let inner = if grow { content.w_full() } else { content.size_full() }.flex();
+    if column {
+        inner.items_start().justify_center()
+    } else {
+        inner.items_center()
+    }
+}
+
 fn list_row_in(
     id: impl Into<ElementId>,
     height: f32,
@@ -294,9 +306,7 @@ fn list_row_in(
     // A fixed height clips a cover that wraps. Growing rows take their height from the content.
     // Wrap `content` inside the stateful row face so a caller's `.group(...)` on `content` is
     // preserved rather than overwritten by `"list-row"`.
-    let inner = if grow { content.w_full() } else { content.size_full() }
-        .flex()
-        .items_center();
+    let inner = list_row_inner(content, grow);
     let face = div()
         .id("row-face")
         .group("list-row")
@@ -624,6 +634,46 @@ pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, selecte
         .child(crate::gui::shortcuts::label(&label))
 }
 
+/// Full-width compact segmented track for sidebar filter bars (fits 2–4 tabs cleanly at 260px).
+pub fn segmented_compact() -> Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .h(px(theme::CONTROL))
+        .p(px(2.))
+        .rounded(px(theme::R_CONTROL))
+        .bg(theme::hover())
+        .flex()
+        .items_center()
+        .gap(px(2.))
+}
+
+/// One tab inside [`segmented_compact`]: shares width cleanly and never overflows narrow sidebars.
+pub fn segment_compact(id: impl Into<ElementId>, label: impl Into<SharedString>, selected: bool) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    div()
+        .id(id)
+        .flex_1()
+        .min_w_0()
+        .h(px(24.))
+        .px(px(6.))
+        .rounded(px(theme::R_CHIP))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .type_small()
+        .font_weight(theme::MEDIUM)
+        .map(|segment| {
+            if selected {
+                segment.bg(theme::segment()).text_color(theme::text())
+            } else {
+                segment.text_color(theme::text_soft()).hover(|style| style.text_color(theme::text()))
+            }
+        })
+        .child(div().min_w_0().truncate().child(crate::gui::shortcuts::label(&label)))
+}
+
 /// A 1 pt line between sections.
 pub fn divider() -> Div {
     div().flex_none().h(px(1.)).w_full().bg(theme::hairline())
@@ -839,6 +889,16 @@ mod tests {
             Conversation { unread, mentions, muted, ..Conversation::new(key, kind, "Fernhill") }
         };
         assert_eq!(mute_mark(&elsewhere(ConversationKind::Group, 7, 0, true)), None);
+    }
+
+    #[test]
+    fn list_row_inner_left_aligns_column_content_instead_of_centering_it() {
+        let mut col = list_row_inner(div().flex().flex_col(), false);
+        assert_eq!(col.style().align_items, Some(gpui::AlignItems::FlexStart));
+        assert_eq!(col.style().justify_content, Some(gpui::JustifyContent::Center));
+
+        let mut row = list_row_inner(div().flex(), false);
+        assert_eq!(row.style().align_items, Some(gpui::AlignItems::Center));
     }
 }
 

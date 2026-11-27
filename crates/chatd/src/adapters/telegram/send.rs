@@ -7,10 +7,13 @@ use super::catalog::{self, Pick};
 use super::peers::Who;
 use super::wire::Fault;
 use super::{live, random_id, remember_random, reply_header, Account, Options};
-use crate::blobs::upload::{self, Upload};
+use crate::blobs::upload::{self, Upload, CANCELLED};
 use grammers_tl_types as tl;
 use protocol::{Message, Outgoing, VideoNote, VoiceNote};
-use std::sync::Arc;
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Telegram's part size, which every part but the last must be exactly.
 const PART: usize = 512 * 1024;
@@ -18,6 +21,10 @@ const PART: usize = 512 * 1024;
 const BIG: u64 = 10 * 1024 * 1024;
 /// Most items in one album.
 const ALBUM: usize = 10;
+/// Concurrent `SaveFilePart` / `SaveBigFilePart` workers per file upload.
+const UPLOAD_WORKERS: usize = 4;
+/// Progress notification cadence during pipelined chunk uploads.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 /// Pictures Telegram takes as photos (compressed); anything else goes as a document.
 const PHOTOS: &[&str] = &["image/jpeg", "image/png", "image/webp"];
 
@@ -42,27 +49,28 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
             return;
         }
     }
-    account.here();
     if super::secret::is_row(conversation) {
         let fault = Fault::Rpc { code: 400, name: "SECRET_CHAT".to_owned(), value: None };
         ctx.sent(conversation, client_id, Err(fault.words()));
         return;
     }
     if with.files.is_empty() {
-        let outcome = if let Some(contact) = &with.contact {
-            send_contact(account, conversation, client_id, text, reply_to, contact, opts)
-        } else {
-            match &with.pick {
-                Some(pick) => send_pick(account, conversation, client_id, text, reply_to, &pick.id, opts),
-                None => match pasted_place(text) {
-                    Some(found) => send_place(account, conversation, client_id, reply_to, &found, opts),
-                    None => match dice_emoticon(text) {
-                        Some(emoticon) => send_dice(account, conversation, client_id, text, reply_to, emoticon, opts),
-                        None => super::send_text(account, conversation, client_id, text, reply_to, opts, &with.spans),
+        let outcome = crate::sendtime::run(client_id, || {
+            if let Some(contact) = &with.contact {
+                send_contact(account, conversation, client_id, text, reply_to, contact, opts)
+            } else {
+                match &with.pick {
+                    Some(pick) => send_pick(account, conversation, client_id, text, reply_to, &pick.id, opts),
+                    None => match pasted_place(text) {
+                        Some(found) => send_place(account, conversation, client_id, reply_to, &found, opts),
+                        None => match dice_emoticon(text) {
+                            Some(emoticon) => send_dice(account, conversation, client_id, text, reply_to, emoticon, opts),
+                            None => super::send_text(account, conversation, client_id, text, reply_to, opts, &with.spans),
+                        },
                     },
-                },
+                }
             }
-        };
+        });
         ctx.sent(conversation, client_id, outcome.map_err(|fault| fault.words()));
         return;
     }
@@ -71,7 +79,9 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
     let voice: Option<VoiceNote> = (with.files.len() == 1).then_some(()).and_then(|_| with.voice.clone());
     let video: Option<VideoNote> = (with.files.len() == 1 && voice.is_none()).then_some(()).and_then(|_| with.video.clone());
     upload::spawn(&ctx, conversation, client_id, &with.files, move |up| {
-        files(&account, &conversation_id, &client, &text, reply.as_deref(), opts, voice.as_ref(), video.as_ref(), up)
+        crate::sendtime::run(&client, || {
+            files(&account, &conversation_id, &client, &text, reply.as_deref(), opts, voice.as_ref(), video.as_ref(), up)
+        })
     });
 }
 
@@ -116,7 +126,9 @@ fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str,
             let mut request = send_media(&target, media.into(), &plain, entities, random, opts);
             // Sending a sticker moves its pack up, as Telegram's own apps do.
             request.update_stickersets_order = sticker;
-            let answer = account.ask(&request)?;
+            crate::sendtime::stage("prepare");
+            let answer = account.ask_send(&request)?;
+            crate::sendtime::stage("rpc");
             (answer, plain.as_str())
         }
         Pick::Inline { query_id, result } => {
@@ -125,7 +137,8 @@ fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str,
                 super::send_text(account, conversation, &format!("{client_id}1"), text, None, opts, &[])?;
             }
             remember_random(account, random, client_id);
-            let sent = account.ask(&tl::functions::messages::SendInlineBotResult {
+            crate::sendtime::stage("prepare");
+            let sent = account.ask_send(&tl::functions::messages::SendInlineBotResult {
                 silent: opts.silent,
                 background: false,
                 clear_draft: true,
@@ -140,10 +153,13 @@ fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str,
                 quick_reply_shortcut: None,
                 allow_paid_stars: opts.allow_paid_stars,
             })?;
+            crate::sendtime::stage("rpc");
             (sent, "")
         }
     };
-    made(account, conversation, &target, caption, opts, &answer)
+    let out = made(account, conversation, &target, caption, opts, &answer);
+    crate::sendtime::stage("reconcile");
+    out
 }
 
 /// A message that is only a place the person pasted. Words around the numbers stay text.
@@ -206,8 +222,12 @@ fn send_place(account: &Account, conversation: &str, client_id: &str, reply_to: 
     let target = target(account, conversation, reply_to, opts.send_as)?;
     let random = random_id(client_id);
     remember_random(account, random, client_id);
-    let answer = account.ask(&send_media(&target, pasted_media(place), "", None, random, opts))?;
-    made(account, conversation, &target, "", opts, &answer)
+    crate::sendtime::stage("prepare");
+    let answer = account.ask_send(&send_media(&target, pasted_media(place), "", None, random, opts))?;
+    crate::sendtime::stage("rpc");
+    let out = made(account, conversation, &target, "", opts, &answer);
+    crate::sendtime::stage("reconcile");
+    out
 }
 
 /// A message that is only one of Telegram's dice: 🎲 🎯 🏀 ⚽ 🎳 🎰. A variation selector
@@ -225,8 +245,12 @@ fn send_dice(account: &Account, conversation: &str, client_id: &str, text: &str,
     let random = random_id(client_id);
     remember_random(account, random, client_id);
     let media = tl::types::InputMediaDice { emoticon: emoticon.to_owned() }.into();
-    let answer = account.ask(&send_media(&target, media, "", None, random, opts))?;
-    made(account, conversation, &target, text, opts, &answer)
+    crate::sendtime::stage("prepare");
+    let answer = account.ask_send(&send_media(&target, media, "", None, random, opts))?;
+    crate::sendtime::stage("rpc");
+    let out = made(account, conversation, &target, text, opts, &answer);
+    crate::sendtime::stage("reconcile");
+    out
 }
 
 /// Shares a contact card via `messages.sendMedia` (`InputMediaContact`).
@@ -269,8 +293,12 @@ pub(super) fn send_contact(
     }
     .into();
     let (plain, entities) = super::prepared(account, conversation, text);
-    let answer = account.ask(&send_media(&target, media, &plain, entities, random, opts))?;
-    made(account, conversation, &target, &plain, opts, &answer)
+    crate::sendtime::stage("prepare");
+    let answer = account.ask_send(&send_media(&target, media, &plain, entities, random, opts))?;
+    crate::sendtime::stage("rpc");
+    let out = made(account, conversation, &target, &plain, opts, &answer);
+    crate::sendtime::stage("reconcile");
+    out
 }
 
 fn send_media(
@@ -313,8 +341,9 @@ struct Uploaded {
     visual: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn files(
-    account: &Account,
+    account: &Arc<Account>,
     conversation: &str,
     client_id: &str,
     text: &str,
@@ -337,11 +366,13 @@ fn files(
         plain.as_str()
     };
     let entities = (!caption.is_empty()).then_some(entities).flatten();
+    crate::sendtime::stage("prepare");
     let mut uploaded = Vec::with_capacity(up.files().len());
     for at in 0..up.files().len() {
         // `voice` is only set for a send of one file: a voice message is one file.
         uploaded.push(file(account, conversation, client_id, at, voice, video, up)?);
     }
+    crate::sendtime::stage("upload");
     up.check()?;
     let random = random_id(client_id);
     remember_random(account, random, client_id);
@@ -349,7 +380,7 @@ fn files(
         let Some(one) = uploaded.pop() else {
             return Err("Nothing was sent.".to_owned());
         };
-        let answer = match account.ask(&send_media(&target, one.media, caption, entities.clone(), random, opts)) {
+        let answer = match account.ask_send(&send_media(&target, one.media, caption, entities.clone(), random, opts)) {
             Ok(answer) => answer,
             Err(fault) => {
                 if fault.is("VOICE_MESSAGES_FORBIDDEN") {
@@ -364,7 +395,10 @@ fn files(
                 return Err(fault.words());
             }
         };
-        return made(account, conversation, &target, caption, opts, &answer).map_err(words);
+        crate::sendtime::stage("rpc");
+        let out = made(account, conversation, &target, caption, opts, &answer).map_err(words);
+        crate::sendtime::stage("reconcile");
+        return out;
     }
     // Albums: pictures and videos together, documents together, ten at most each. The caption
     // goes under the first item, as Telegram's apps put it.
@@ -379,7 +413,7 @@ fn files(
                 let shown = if index == 0 { caption } else { "" };
                 let caption_entities = (index == 0).then(|| entities.clone()).flatten();
                 index += 1;
-                let answer = account.ask(&send_media(&target, one.media.clone(), shown, caption_entities, item_random, opts)).map_err(words)?;
+                let answer = account.ask_send(&send_media(&target, one.media.clone(), shown, caption_entities, item_random, opts)).map_err(words)?;
                 match first {
                     None => first = Some(made(account, conversation, &target, shown, opts, &answer).map_err(words)?),
                     Some(_) => live::answered(account, &answer),
@@ -390,7 +424,7 @@ fn files(
             for one in album {
                 // An album names media Telegram already holds: each upload is made one first.
                 let held = account
-                    .ask(&tl::functions::messages::UploadMedia { business_connection_id: None, peer: target.peer.clone(), media: one.media.clone() })
+                    .ask_send(&tl::functions::messages::UploadMedia { business_connection_id: None, peer: target.peer.clone(), media: one.media.clone() })
                     .map_err(words)?;
                 let media = stored(held, &one.media).ok_or_else(|| "Telegram did not keep the file for the album.".to_owned())?;
                 let item_random = if index == 0 { random } else { random_id(&format!("{client_id}:{index}")) };
@@ -404,7 +438,7 @@ fn files(
                 up.check()?;
             }
             let answer = account
-                .ask(&tl::functions::messages::SendMultiMedia {
+                .ask_send(&tl::functions::messages::SendMultiMedia {
                     silent: opts.silent,
                     background: false,
                     clear_draft: true,
@@ -429,6 +463,7 @@ fn files(
             }
         }
     }
+    crate::sendtime::stage("rpc");
     first.ok_or_else(|| "Nothing was sent.".to_owned())
 }
 
@@ -476,7 +511,7 @@ pub(super) fn upload_input_file(account: &Account, key_seed: &str, path: &str) -
 /// Uploads one replacement file for `messages.editMessage` (`media`), reusing the same
 /// part-streaming, photo/document detection, spoiler, and video/audio probing as sends.
 pub(super) fn upload_single(
-    account: &Account,
+    account: &Arc<Account>,
     conversation: &str,
     key_seed: &str,
     source: &protocol::OutgoingFile,
@@ -490,7 +525,7 @@ pub(super) fn upload_single(
 /// One file of a send, in parts, as Telegram's `InputMedia`. A voice send carries its facts in
 /// `voice` and is sent as a voice note, as Telegram's apps send one.
 fn file(
-    account: &Account,
+    account: &Arc<Account>,
     conversation: &str,
     client_id: &str,
     at: usize,
@@ -525,30 +560,172 @@ fn file(
     };
     let file_id = random_id(&format!("{client_id}/{at}/{name}"));
     let big = bytes > BIG;
-    let mut parts = 1;
-    let mut told = -1i32;
-    up.parts(at, PART, 0, |part| {
-        parts = part.count as i32;
-        let progress = if part.count == 0 { 0 } else { (((part.index as u64 + 1) * 100) / part.count as u64).min(100) as i32 };
-        if progress != told {
-            told = progress;
+    let count = bytes.div_ceil(PART as u64).max(1) as u32;
+    let parts = count as i32;
+    if count <= 1 {
+        up.parts(at, PART, 0, |part| {
+            let progress = if part.count == 0 { 0 } else { (((part.index as u64 + 1) * 100) / part.count as u64).min(100) as i32 };
             super::show_upload(account, conversation, activity, progress);
+            let saved = match big {
+                true => account.ask_send(&tl::functions::upload::SaveBigFilePart {
+                    file_id,
+                    file_part: part.index as i32,
+                    file_total_parts: part.count as i32,
+                    bytes: part.bytes.to_vec(),
+                }),
+                false => account.ask_send(&tl::functions::upload::SaveFilePart {
+                    file_id,
+                    file_part: part.index as i32,
+                    bytes: part.bytes.to_vec(),
+                }),
+            };
+            match saved {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(format!("{name} could not be sent: Telegram did not keep a part of it.")),
+                Err(fault) => Err(format!("{name} could not be sent: {}", fault.words())),
+            }
+        })?;
+    } else {
+        // Pipeline up to UPLOAD_WORKERS concurrent part uploads per file, respecting cancellation
+        // and joining all workers before returning so all parts land before `send_media`.
+        up.check()?;
+        let base_bytes: u64 = up.files()[..at].iter().map(|s| s.bytes).sum();
+        let total_bytes = up.total();
+        let next_part = AtomicU32::new(0);
+        let done_bytes = AtomicU64::new(0);
+        let abort = AtomicBool::new(false);
+        let failed: Mutex<Option<String>> = Mutex::new(None);
+        let last_progress: Mutex<Option<Instant>> = Mutex::new(None);
+        let up_guard = Mutex::new(&mut *up);
+        let workers = (count as usize).min(UPLOAD_WORKERS);
+        super::show_upload(account, conversation, activity, 0);
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let next_part = &next_part;
+                let done_bytes = &done_bytes;
+                let abort = &abort;
+                let failed = &failed;
+                let last_progress = &last_progress;
+                let up_guard = &up_guard;
+                let path = &path;
+                let name = &name;
+                scope.spawn(move || {
+                    let mut reader = match std::fs::File::open(path) {
+                        Ok(f) => f,
+                        Err(err) => {
+                            abort.store(true, Ordering::Relaxed);
+                            let mut slot = crate::hub::lock(failed);
+                            if slot.is_none() {
+                                *slot = Some(format!("{name} could not be read: {err}."));
+                            }
+                            return;
+                        }
+                    };
+                    let mut buffer = vec![0u8; PART];
+                    loop {
+                        if abort.load(Ordering::Relaxed) || crate::hub::lock(up_guard).cancelled() {
+                            abort.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        let index = next_part.fetch_add(1, Ordering::Relaxed);
+                        if index >= count {
+                            break;
+                        }
+                        let offset = u64::from(index) * PART as u64;
+                        let want = (bytes.saturating_sub(offset)).min(PART as u64) as usize;
+                        if let Err(err) = reader.seek(SeekFrom::Start(offset)) {
+                            abort.store(true, Ordering::Relaxed);
+                            let mut slot = crate::hub::lock(failed);
+                            if slot.is_none() {
+                                *slot = Some(format!("{name} could not be read: {err}."));
+                            }
+                            break;
+                        }
+                        let mut filled = 0;
+                        while filled < want {
+                            match reader.read(&mut buffer[filled..want]) {
+                                Ok(0) => {
+                                    abort.store(true, Ordering::Relaxed);
+                                    let mut slot = crate::hub::lock(failed);
+                                    if slot.is_none() {
+                                        *slot = Some(format!("{name} changed while it was being sent."));
+                                    }
+                                    return;
+                                }
+                                Ok(read) => filled += read,
+                                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(err) => {
+                                    abort.store(true, Ordering::Relaxed);
+                                    let mut slot = crate::hub::lock(failed);
+                                    if slot.is_none() {
+                                        *slot = Some(format!("{name} could not be read: {err}."));
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        if abort.load(Ordering::Relaxed) || crate::hub::lock(up_guard).cancelled() {
+                            abort.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        let saved = match big {
+                            true => account.ask_send(&tl::functions::upload::SaveBigFilePart {
+                                file_id,
+                                file_part: index as i32,
+                                file_total_parts: count as i32,
+                                bytes: buffer[..want].to_vec(),
+                            }),
+                            false => account.ask_send(&tl::functions::upload::SaveFilePart {
+                                file_id,
+                                file_part: index as i32,
+                                bytes: buffer[..want].to_vec(),
+                            }),
+                        };
+                        match saved {
+                            Ok(true) => {
+                                let file_done = done_bytes.fetch_add(want as u64, Ordering::Relaxed).saturating_add(want as u64);
+                                let total_done = (base_bytes + file_done).min(total_bytes);
+                                let progress = if bytes == 0 { 100 } else { ((file_done * 100) / bytes).min(100) as i32 };
+                                super::show_upload(account, conversation, activity, progress);
+                                let mut last = crate::hub::lock(last_progress);
+                                if total_done >= total_bytes || last.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+                                    *last = Some(Instant::now());
+                                    drop(last);
+                                    account.ctx.upload(conversation, client_id, total_done, total_bytes);
+                                }
+                            }
+                            Ok(false) => {
+                                abort.store(true, Ordering::Relaxed);
+                                let mut slot = crate::hub::lock(failed);
+                                if slot.is_none() {
+                                    *slot = Some(format!("{name} could not be sent: Telegram did not keep a part of it."));
+                                }
+                                break;
+                            }
+                            Err(fault) => {
+                                abort.store(true, Ordering::Relaxed);
+                                let mut slot = crate::hub::lock(failed);
+                                if slot.is_none() {
+                                    *slot = Some(format!("{name} could not be sent: {}", fault.words()));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let up = up_guard.into_inner().unwrap_or_else(|p| p.into_inner());
+        if up.cancelled() {
+            return Err(CANCELLED.to_owned());
         }
-        let saved = match big {
-            true => account.ask(&tl::functions::upload::SaveBigFilePart {
-                file_id,
-                file_part: part.index as i32,
-                file_total_parts: part.count as i32,
-                bytes: part.bytes.to_vec(),
-            }),
-            false => account.ask(&tl::functions::upload::SaveFilePart { file_id, file_part: part.index as i32, bytes: part.bytes.to_vec() }),
-        };
-        match saved {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(format!("{name} could not be sent: Telegram did not keep a part of it.")),
-            Err(fault) => Err(format!("{name} could not be sent: {}", fault.words())),
+        let err = crate::hub::lock(&failed).take();
+        if let Some(why) = err {
+            return Err(why);
         }
-    })?;
+    }
     let input: tl::enums::InputFile = match big {
         true => tl::types::InputFileBig { id: file_id, parts, name: name.clone() }.into(),
         // The checksum is optional; Telegram checks the parts itself.

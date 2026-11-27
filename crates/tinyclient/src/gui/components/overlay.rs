@@ -2,10 +2,11 @@
 //! edge and a shadow; panes never cast one. No blur.
 
 use super::glyph;
+use super::place::Layer;
 use crate::gui::theme::{self, Type};
 use gpui::{
-    div, prelude::*, px, Animation, AnimationElement, AnimationExt, AnyView, App, Context, Div, ElementId, Rgba,
-    SharedString, Stateful, Window,
+    deferred, div, prelude::*, px, Animation, AnimationElement, AnimationExt, AnyElement, AnyView, App, ClickEvent,
+    Context, Div, ElementId, MouseButton, Rgba, SharedString, Stateful, Window,
 };
 use std::time::Duration;
 
@@ -292,16 +293,90 @@ pub fn scrim() -> Div {
     div().absolute().top_0().left_0().size_full().bg(theme::scrim()).occlude()
 }
 
-/// A modal panel: 440 wide, title, then the caller's body and a [`modal_buttons`] row.
+/// A modal panel: up to 440 wide (clamped to its container), title, then the caller's body and a [`modal_buttons`] row.
 pub fn modal(title: impl Into<SharedString>) -> Div {
     let title = title.into();
     floating(theme::R_MODAL)
         .w(px(440.))
+        .max_w_full()
         .p(px(20.))
         .shadow(theme::shadow_modal())
         .flex()
         .flex_col()
         .child(div().id("dialog-title").role(gpui::Role::Heading).aria_label(title.clone()).type_title().child(title))
+}
+
+/// Mounts a modal panel at [`Layer::Modal`] above every pane, toast, and window button, with
+/// 16 pt outer padding, viewport width/height clamping, and vertical scrolling when tall.
+pub fn modal_layer(
+    id: impl Into<ElementId>,
+    window: &Window,
+    panel: impl IntoElement,
+    on_dismiss: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let tall = f32::from(window.viewport_size().height);
+    let max_h = (tall - 32.).max(200.);
+    deferred(
+        div()
+            .id(id)
+            .absolute()
+            .inset_0()
+            .p(px(16.))
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(on_dismiss)
+            .child(
+                div()
+                    .id("modal-scroll")
+                    .max_w_full()
+                    .max_h(px(max_h))
+                    .overflow_y_scroll()
+                    .rounded(px(theme::R_MODAL))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(panel),
+            ),
+    )
+    .priority(Layer::Modal as usize)
+    .into_any_element()
+}
+
+/// Same as [`modal_layer`] for callers without `&Window`: uses `max_h_full()` inside the 16 pt padded
+/// viewport backdrop so the modal stays clamped to `(W - 32) × (H - 32)` and scrolls when tall.
+pub fn modal_layer_fit(
+    id: impl Into<ElementId>,
+    panel: impl IntoElement,
+    on_dismiss: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    deferred(
+        div()
+            .id(id)
+            .absolute()
+            .inset_0()
+            .p(px(16.))
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(on_dismiss)
+            .child(
+                div()
+                    .id("modal-scroll")
+                    .max_w_full()
+                    .max_h_full()
+                    .overflow_y_scroll()
+                    .rounded(px(theme::R_MODAL))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(panel),
+            ),
+    )
+    .priority(Layer::Modal as usize)
+    .into_any_element()
 }
 
 pub fn accessible_modal(title: impl Into<SharedString>) -> Stateful<Div> {
@@ -340,10 +415,10 @@ pub fn modal_body(words: impl Into<SharedString>) -> Div {
     div().mt(px(8.)).type_ui().text_color(theme::text_soft()).child(words.into())
 }
 
-/// Buttons sit right, 8 apart, the main action last.
+/// Buttons sit right, 8 apart, wrapping cleanly on narrow viewports, the main action last.
 #[allow(dead_code)]
 pub fn modal_buttons() -> Div {
-    div().mt(px(20.)).flex().justify_end().gap(px(8.))
+    div().mt(px(20.)).flex().flex_wrap().justify_end().gap(px(8.))
 }
 
 /// A sheet: the same panel hung from the title bar, so its top corners are square.

@@ -216,6 +216,27 @@ impl Server {
             "POST" if path == format!("/v1/conversations/{CONVERSATION}/messages") => {
                 self.post(&caller, &body)
             }
+            "GET"
+                if path == format!("/v1/conversations/{CONVERSATION}/messages")
+                    || (path.starts_with("/v1/messages/") && path.ends_with("/thread")) =>
+            {
+                let rows: Vec<Value> = self
+                    .messages
+                    .iter()
+                    .map(|row| {
+                        json!({
+                            "id": row["id"],
+                            "author_id": row["author_id"],
+                            "created_at": "2026-11-05T00:00:00Z",
+                            "ciphertext": row["ciphertext"],
+                            "epoch": row["epoch"],
+                            "device_id": row["device_id"],
+                            "reactions": [],
+                        })
+                    })
+                    .collect();
+                (200, json!({ "messages": rows, "next_before": null }))
+            }
             // What the real server says to a plaintext reaction on an encrypted message.
             "PUT" | "DELETE" if path.starts_with("/v1/messages/") && path.ends_with("/reactions") => {
                 (400, json!({ "error": "e2ee_required" }))
@@ -632,6 +653,218 @@ fn a_message_that_did_not_open_for_want_of_the_group_is_read_again_when_it_arriv
 /// when its echo comes back. The lab sets `TINYCLIENT_PROVE=tiny-e2ee-reaction`.
 pub(crate) fn prove_encrypted_reaction() -> Result<(), String> {
     encrypted_reaction_round_trip().map_err(|err| format!("sealed reaction: {err}"))
+}
+
+/// Lab prove: encrypted reaction reload + custom-emoji persistence, stale plaintext row
+/// `400 e2ee_required` auto-upgrade + sealed retry, and bounded per-account live E2EE event
+/// worker delivery. The lab sets `TINYCLIENT_PROVE=core-e2ee-security`.
+pub(crate) fn prove_core_e2ee_security() -> Result<(), String> {
+    core_e2ee_reload_and_custom_emoji().map_err(|err| format!("reload & custom emoji: {err}"))?;
+    core_e2ee_required_retry_and_worker().map_err(|err| format!("e2ee_required & worker: {err}"))?;
+    Ok(())
+}
+
+fn core_e2ee_reload_and_custom_emoji() -> Result<(), String> {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "prove-reload-ada");
+    let mut bea = device(&fake, BEA, "prove-reload-bea");
+    ada.sync(CONVERSATION).map_err(|err| format!("Ada joins: {err}"))?;
+    bea.sync(CONVERSATION).map_err(|err| format!("Bea joins: {err}"))?;
+    ada.sync(CONVERSATION).map_err(|err| format!("Ada settles: {err}"))?;
+    let first = id_of(
+        &ada.post(
+            CONVERSATION,
+            "c-1",
+            Kind::Message,
+            None,
+            &Envelope::message("hello"),
+            &[],
+        )
+        .map_err(|err| format!("Ada posts: {err}"))?,
+    );
+    ada.react(CONVERSATION, &first, "\u{1f44d}", true)
+        .map_err(|err| format!("Ada unicode react: {err}"))?;
+    ada.react(CONVERSATION, &first, ":party_parrot:", true)
+        .map_err(|err| format!("Ada custom react: {err}"))?;
+    let landed = bea.heard_reaction(CONVERSATION);
+    if landed.len() != 2 {
+        return Err(format!("expected 2 folded reactions, got {landed:?}"));
+    }
+    let saved_bea = bea.saved.clone();
+    let shared = Arc::new(Mutex::new(bea));
+    struct Registered(Saved);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            lock(devices()).remove(&(self.0.base_url.clone(), self.0.user_id.clone()));
+            super::super::messages::stop_e2ee_worker(&self.0);
+        }
+    }
+    let _registered = Registered(saved_bea.clone());
+    lock(devices()).insert((saved_bea.base_url.clone(), saved_bea.user_id.clone()), Arc::clone(&shared));
+    let hub = Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey {
+        network: protocol::Network::Tiny,
+        account: saved_bea.user_id.clone(),
+    };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account.clone(), hub);
+    let mut row = crate::store::ConversationRow::new(
+        CONVERSATION,
+        protocol::ConversationKind::Direct,
+        "Ada",
+    );
+    row.encryption = protocol::Encryption::EndToEnd;
+    ctx.hub.store().upsert_conversation(&account, &row).map_err(|err| err.to_string())?;
+    let live = super::super::live::Live::new().map_err(|err| err.to_string())?;
+    for _ in 0..2 {
+        super::super::messages::serve(
+            &ctx,
+            &saved_bea,
+            &live,
+            crate::adapters::Command::Backfill(CONVERSATION.to_owned()),
+        );
+    }
+    let stored = ctx
+        .stored_message(CONVERSATION, &first)
+        .map_err(|err| err.to_string())?
+        .ok_or("reloaded message missing")?;
+    let chips: Vec<(&str, u32, bool)> = stored
+        .reactions
+        .iter()
+        .map(|r| (r.emoji.as_str(), r.count, r.mine))
+        .collect();
+    if !chips.contains(&("\u{1f44d}", 1, false)) || !chips.contains(&(":party_parrot:", 1, false)) {
+        return Err(format!("reloading encrypted history lost reactions: {chips:?}"));
+    }
+    let thread_id = format!("{CONVERSATION}:{first}");
+    super::super::messages::serve(
+        &ctx,
+        &saved_bea,
+        &live,
+        crate::adapters::Command::Backfill(thread_id.clone()),
+    );
+    let thread_stored = ctx
+        .stored_message(&thread_id, &first)
+        .map_err(|err| err.to_string())?
+        .ok_or("reloaded thread message missing")?;
+    let thread_chips: Vec<(&str, u32, bool)> = thread_stored
+        .reactions
+        .iter()
+        .map(|r| (r.emoji.as_str(), r.count, r.mine))
+        .collect();
+    if !thread_chips.contains(&("\u{1f44d}", 1, false))
+        || !thread_chips.contains(&(":party_parrot:", 1, false))
+    {
+        return Err(format!("reloading sealed thread lost reactions: {thread_chips:?}"));
+    }
+    Ok(())
+}
+
+fn core_e2ee_required_retry_and_worker() -> Result<(), String> {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "prove-retry-ada");
+    let mut bea = device(&fake, BEA, "prove-retry-bea");
+    bea.sync(CONVERSATION).map_err(|err| format!("Bea joins: {err}"))?;
+    let first = id_of(
+        &bea.post(
+            CONVERSATION,
+            "c-1",
+            Kind::Message,
+            None,
+            &Envelope::message("hello"),
+            &[],
+        )
+        .map_err(|err| format!("Bea posts: {err}"))?,
+    );
+    ada.encrypted.insert(CONVERSATION.to_owned(), false);
+
+    let saved_ada = ada.saved.clone();
+    let shared = Arc::new(Mutex::new(ada));
+    struct Registered(Saved);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            lock(devices()).remove(&(self.0.base_url.clone(), self.0.user_id.clone()));
+            super::super::messages::stop_e2ee_worker(&self.0);
+        }
+    }
+    let _registered = Registered(saved_ada.clone());
+    lock(devices()).insert((saved_ada.base_url.clone(), saved_ada.user_id.clone()), Arc::clone(&shared));
+    let hub = Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey {
+        network: protocol::Network::Tiny,
+        account: saved_ada.user_id.clone(),
+    };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account.clone(), hub);
+    let row = crate::store::ConversationRow::new(
+        CONVERSATION,
+        protocol::ConversationKind::Direct,
+        "Bea",
+    );
+    ctx.hub.store().upsert_conversation(&account, &row).map_err(|err| err.to_string())?;
+    // Seed Bea's message locally in Ada's store without syncing MLS yet, so React hits the
+    // plaintext route first (400 e2ee_required), upgrades the row, and retries sealed, and the
+    // subsequent live e2ee.reaction echo has a stored message to land on.
+    let seeded = protocol::Message::plain(first.clone(), "Bea", "hello", 1_700_000_000, false);
+    ctx.message(CONVERSATION, &seeded).map_err(|err| err.to_string())?;
+    let live = super::super::live::Live::new().map_err(|err| err.to_string())?;
+
+    let (reply, answer) = std::sync::mpsc::channel();
+    super::super::messages::serve(
+        &ctx,
+        &saved_ada,
+        &live,
+        crate::adapters::Command::React {
+            conversation_id: CONVERSATION.to_owned(),
+            message_id: first.clone(),
+            emoji: "\u{1f44d}".to_owned(),
+            on: true,
+            burst: false,
+            reply,
+        },
+    );
+    answer
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "React was never answered".to_owned())?
+        .map_err(|refusal| format!("400 e2ee_required did not retry sealed: {refusal:?}"))?;
+    let upgraded = ctx
+        .known(CONVERSATION)
+        .map_err(|err| err.to_string())?
+        .ok_or("conversation row missing")?;
+    if !upgraded.encryption.is_sealed() {
+        return Err("row was not upgraded to sealed after 400 e2ee_required".into());
+    }
+    let landed = bea.heard_reaction(CONVERSATION);
+    if !landed.iter().any(|r| r.message == first && r.emoji == "\u{1f44d}" && r.count == 1) {
+        return Err(format!("retried sealed reaction did not reach Bea: {landed:?}"));
+    }
+    // Dispatch the live e2ee.reaction echo through the bounded per-account worker.
+    let blob = lock(&fake.server).blobs.last().cloned().ok_or("missing reaction blob")?;
+    let frame = json!({
+        "conversation_id": CONVERSATION,
+        "id": blob["id"],
+        "ciphertext": blob["ciphertext"],
+        "epoch": blob["epoch"],
+        "created_at": "2026-11-27T00:00:00Z",
+    });
+    super::super::messages::on_live(&ctx, &saved_ada, &HashMap::new(), "e2ee.reaction", &frame);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = ctx
+            .stored_message(CONVERSATION, &first)
+            .map_err(|err| err.to_string())?
+            .ok_or("stored message missing")?;
+        if seen.reactions.iter().any(|r| r.emoji == "\u{1f44d}" && r.count == 1 && r.mine) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("bounded worker echo never landed: {:?}", seen.reactions));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 fn encrypted_reaction_round_trip() -> Result<(), String> {
@@ -1212,5 +1445,175 @@ fn a_taken_back_reaction_leaves_no_empty_entry_and_seen_stays_bounded() {
         assert!(fold.state.seen.is_empty(), "the fold kept blobs its cursor has passed");
     }
     assert!(bea.reaction_of(CONVERSATION, &first, "\u{1f44d}").is_none());
+}
+
+#[test]
+fn reloading_encrypted_history_keeps_folded_reactions_and_custom_emoji() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "reload-ada");
+    let mut bea = device(&fake, BEA, "reload-bea");
+    ada.sync(CONVERSATION).unwrap();
+    bea.sync(CONVERSATION).unwrap();
+    ada.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &ada.post(
+            CONVERSATION,
+            "c-1",
+            Kind::Message,
+            None,
+            &Envelope::message("hello"),
+            &[],
+        )
+        .unwrap(),
+    );
+    // Both a Unicode reaction and a server custom-emoji shortcode round-trip through MLS.
+    ada.react(CONVERSATION, &first, "\u{1f44d}", true).unwrap();
+    ada.react(CONVERSATION, &first, ":party_parrot:", true).unwrap();
+    let landed = bea.heard_reaction(CONVERSATION);
+    assert_eq!(landed.len(), 2, "both unicode and custom emoji should fold: {landed:?}");
+    let stood = bea.reactions_for(CONVERSATION, &first);
+    assert_eq!(stood.len(), 2, "reactions_for must return every standing reaction: {stood:?}");
+    assert!(stood.iter().any(|r| r.emoji == "\u{1f44d}" && r.count == 1 && !r.mine));
+    assert!(stood.iter().any(|r| r.emoji == ":party_parrot:" && r.count == 1 && !r.mine));
+
+    // Also verify `fetch_page` re-attaches folded reactions on a reload (and in a sealed thread)
+    // instead of wiping them with the server's empty plaintext list.
+    let saved_bea = bea.saved.clone();
+    let shared = Arc::new(Mutex::new(bea));
+    lock(devices()).insert(
+        (saved_bea.base_url.clone(), saved_bea.user_id.clone()),
+        Arc::clone(&shared),
+    );
+    let hub = Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+    ));
+    let account = protocol::AccountKey {
+        network: protocol::Network::Tiny,
+        account: saved_bea.user_id.clone(),
+    };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account.clone(), hub);
+    let mut row = crate::store::ConversationRow::new(
+        CONVERSATION,
+        protocol::ConversationKind::Direct,
+        "Ada",
+    );
+    row.encryption = protocol::Encryption::EndToEnd;
+    ctx.hub.store().upsert_conversation(&account, &row).unwrap();
+    // First fetch loads the message and attaches both folded reactions.
+    let live = super::super::live::Live::new().unwrap();
+    super::super::messages::serve(
+        &ctx,
+        &saved_bea,
+        &live,
+        crate::adapters::Command::Backfill(CONVERSATION.to_owned()),
+    );
+    // Second fetch reloads the same page (server returns empty plaintext reactions);
+    // folded reactions must survive.
+    super::super::messages::serve(
+        &ctx,
+        &saved_bea,
+        &live,
+        crate::adapters::Command::Backfill(CONVERSATION.to_owned()),
+    );
+    let stored = ctx.stored_message(CONVERSATION, &first).unwrap().unwrap();
+    let chips: Vec<(&str, u32, bool)> = stored
+        .reactions
+        .iter()
+        .map(|r| (r.emoji.as_str(), r.count, r.mine))
+        .collect();
+    assert!(
+        chips.contains(&("\u{1f44d}", 1, false)) && chips.contains(&(":party_parrot:", 1, false)),
+        "reloading encrypted history must preserve folded reactions: {chips:?}"
+    );
+
+    // Sealed thread reload must also pre-attach standing folded reactions.
+    let thread_id = format!("{CONVERSATION}:{first}");
+    super::super::messages::serve(
+        &ctx,
+        &saved_bea,
+        &live,
+        crate::adapters::Command::Backfill(thread_id.clone()),
+    );
+    let thread_stored = ctx.stored_message(&thread_id, &first).unwrap().unwrap();
+    let thread_chips: Vec<(&str, u32, bool)> = thread_stored
+        .reactions
+        .iter()
+        .map(|r| (r.emoji.as_str(), r.count, r.mine))
+        .collect();
+    assert!(
+        thread_chips.contains(&("\u{1f44d}", 1, false))
+            && thread_chips.contains(&(":party_parrot:", 1, false)),
+        "reloading a sealed thread must preserve folded reactions: {thread_chips:?}"
+    );
+    lock(devices()).remove(&(saved_bea.base_url.clone(), saved_bea.user_id.clone()));
+}
+
+#[test]
+fn e2ee_required_reaction_upgrades_row_and_retries_sealed_when_device_ready() {
+    let fake = Fake::start(0);
+    let mut ada = device(&fake, ADA, "retry-ada");
+    let mut bea = device(&fake, BEA, "retry-bea");
+    // Bea creates the encrypted conversation and posts a message while Ada's local state
+    // still believes the conversation is plaintext (stale row + stale device cache, never synced).
+    bea.sync(CONVERSATION).unwrap();
+    let first = id_of(
+        &bea.post(
+            CONVERSATION,
+            "c-1",
+            Kind::Message,
+            None,
+            &Envelope::message("hello"),
+            &[],
+        )
+        .unwrap(),
+    );
+    ada.encrypted.insert(CONVERSATION.to_owned(), false);
+
+    let saved_ada = ada.saved.clone();
+    let shared = Arc::new(Mutex::new(ada));
+    lock(devices()).insert(
+        (saved_ada.base_url.clone(), saved_ada.user_id.clone()),
+        Arc::clone(&shared),
+    );
+    let hub = Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+    ));
+    let account = protocol::AccountKey {
+        network: protocol::Network::Tiny,
+        account: saved_ada.user_id.clone(),
+    };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account.clone(), hub);
+    // Start with a STALE local row (encryption = None) even though the server requires E2EE.
+    let row = crate::store::ConversationRow::new(
+        CONVERSATION,
+        protocol::ConversationKind::Direct,
+        "Bea",
+    );
+    ctx.hub.store().upsert_conversation(&account, &row).unwrap();
+    let live = super::super::live::Live::new().unwrap();
+    let (reply, answer) = std::sync::mpsc::channel();
+    super::super::messages::serve(
+        &ctx,
+        &saved_ada,
+        &live,
+        crate::adapters::Command::React {
+            conversation_id: CONVERSATION.to_owned(),
+            message_id: first.clone(),
+            emoji: "\u{1f44d}".to_owned(),
+            on: true,
+            burst: false,
+            reply,
+        },
+    );
+    answer.recv().unwrap().expect("400 e2ee_required should auto-upgrade and retry sealed");
+    let upgraded = ctx.known(CONVERSATION).unwrap().unwrap();
+    assert!(upgraded.encryption.is_sealed(), "row must be marked encrypted after 400 e2ee_required");
+    // Bea must receive the sealed reaction through MLS.
+    let landed = bea.heard_reaction(CONVERSATION);
+    assert!(
+        landed.iter().any(|r| r.message == first && r.emoji == "\u{1f44d}" && r.count == 1),
+        "retried sealed reaction must arrive at peer: {landed:?}"
+    );
+    lock(devices()).remove(&(saved_ada.base_url.clone(), saved_ada.user_id.clone()));
 }
 

@@ -9,6 +9,7 @@ use super::super::net::address;
 use super::super::Failure;
 use super::ready::Ready;
 use super::{jitter, Discord};
+use crate::hub::lock;
 use protocol::Link;
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -256,15 +257,12 @@ impl WakePair {
     }
 
     pub fn signal(&self) {
-        if let Ok(mut write) = self.write.lock() {
-            let _ = write.write_all(&[1u8]);
-        }
+        let mut write = lock(&self.write);
+        let _ = write.write_all(&[1u8]);
     }
 
     pub fn drain(&self) {
-        let Ok(mut read) = self.read.lock() else {
-            return;
-        };
+        let mut read = lock(&self.read);
         let mut buf = [0u8; 64];
         loop {
             match read.read(&mut buf) {
@@ -387,14 +385,14 @@ impl Discord {
 
     /// Queues a gateway frame for the socket thread.
     pub(super) fn tell(&self, op: u8, d: Value) {
-        self.outbox.queue.lock().unwrap().push(op, d);
+        lock(&self.outbox.queue).push(op, d);
         self.wake();
     }
 
     /// A session was refused: the reason is kept for the user, and counted.
     pub(super) fn identify_failed(&self, why: &str) {
         self.forget_session();
-        let mut refused = self.refused_sessions.lock().unwrap();
+        let mut refused = lock(&self.refused_sessions);
         refused.0 += 1;
         refused.1 = why.to_owned();
     }
@@ -413,7 +411,7 @@ impl Discord {
     /// meanwhile.
     fn hold(&self) -> bool {
         let why = {
-            let refused = self.refused_sessions.lock().unwrap();
+            let refused = lock(&self.refused_sessions);
             if refused.0 < IDENTIFIES {
                 return false;
             }
@@ -431,7 +429,7 @@ impl Discord {
             wait_for_wake(wake, HELD);
             self.outbox.wake.drain();
         }
-        self.refused_sessions.lock().unwrap().0 = 0;
+        lock(&self.refused_sessions).0 = 0;
         if !self.rest.challenged.load(Ordering::Relaxed) {
             self.ctx.attention("");
         }
@@ -449,7 +447,7 @@ impl Discord {
     }
 
     fn forget_session(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock(&self.state);
         state.session = None;
         state.auth_session_id_hash = None;
         self.sequence.store(0, Ordering::Relaxed);
@@ -476,13 +474,13 @@ impl Discord {
     }
 
     fn run(&self) -> Result<(), Failure> {
-        let session = self.state.lock().unwrap().session.clone();
+        let session = lock(&self.state).session.clone();
         let url = match &session {
             Some(session) => session.url.clone(),
             None => address("TINYCLIENT_DISCORD_GATEWAY", GATEWAY),
         };
         let mut wire = Wire::connect(&url, &self.rest.identity().user_agent)?;
-        self.outbox.queue.lock().unwrap().reconnected(session.is_some());
+        lock(&self.outbox.queue).reconnected(session.is_some());
         let mut beat = Beat {
             every: Duration::from_millis(41_250),
             next: Instant::now() + Duration::from_secs(60),
@@ -509,7 +507,7 @@ impl Discord {
             // queue is let go before each frame is written.
             if beat.ready {
                 loop {
-                    let Some(frame) = self.outbox.queue.lock().unwrap().pop(Instant::now()) else {
+                    let Some(frame) = lock(&self.outbox.queue).pop(Instant::now()) else {
                         break;
                     };
                     wire.send(frame)?;
@@ -522,7 +520,7 @@ impl Discord {
                 let sequence = self.sequence.load(Ordering::Relaxed);
                 let sequence = if sequence == 0 { Value::Null } else { json!(sequence) };
                 wire.send(json!({"op": 1, "d": sequence}).to_string())?;
-                self.outbox.queue.lock().unwrap().beat();
+                lock(&self.outbox.queue).beat();
                 beat.acked = false;
                 beat.next = Instant::now() + beat.every;
                 if beat.ready {
@@ -534,7 +532,7 @@ impl Discord {
             let until_beat = beat.next.saturating_duration_since(Instant::now());
             let mut limit = if pending { Duration::from_millis(500) } else { IDLE };
             if beat.ready {
-                if let Some(due) = self.outbox.queue.lock().unwrap().due(Instant::now()) {
+                if let Some(due) = lock(&self.outbox.queue).due(Instant::now()) {
                     limit = limit.min(due.saturating_duration_since(Instant::now()));
                 }
             }
@@ -569,7 +567,7 @@ impl Discord {
                 beat.every = Duration::from_millis(interval);
                 beat.next = Instant::now() + Duration::from_millis(random() % interval);
                 beat.acked = true;
-                let session = self.state.lock().unwrap().session.clone();
+                let session = lock(&self.state).session.clone();
                 let sequence = self.sequence.load(Ordering::Relaxed);
                 let hello = match session {
                     Some(session) => json!({"op": 6, "d": {
@@ -586,7 +584,7 @@ impl Discord {
             }
             (11, _) => {
                 beat.acked = true;
-                self.outbox.queue.lock().unwrap().answered();
+                lock(&self.outbox.queue).answered();
             }
             // The server asked for a heartbeat now.
             (1, _) => beat.next = Instant::now(),
@@ -599,7 +597,9 @@ impl Discord {
                         self.identify_failed("Discord refused the session");
                     }
                 }
-                std::thread::sleep(jitter(1000, 5000));
+                if self.ctx.pause(jitter(1000, 5000)) {
+                    return Ok(());
+                }
                 return Err(Failure::Dropped("Discord asked for the session again".to_owned()));
             }
             (0, Some("READY")) => {
@@ -617,12 +617,12 @@ impl Discord {
                 drop(text);
                 // Release idle SQLite cache and glibc arena slack so the megabytes of READY go back to the system.
                 self.ctx.shrink_memory();
-                self.refused_sessions.lock().unwrap().0 = 0;
+                lock(&self.refused_sessions).0 = 0;
                 beat.ready = true;
                 self.ctx.link(Link::Connected);
             }
             (0, Some("RESUMED")) => {
-                self.refused_sessions.lock().unwrap().0 = 0;
+                lock(&self.refused_sessions).0 = 0;
                 beat.ready = true;
                 self.ctx.link(Link::Connected);
                 self.resumed();

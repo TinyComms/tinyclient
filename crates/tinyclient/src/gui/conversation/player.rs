@@ -408,28 +408,36 @@ impl Pane {
                         .child(quota.unwrap_or_default()),
                 );
                 if show_rate {
+                    let up_color = if rated == Some(true) { theme::accent_text() } else { theme::text_faint() };
+                    let down_color = if rated == Some(false) { theme::danger() } else { theme::text_faint() };
+                    let up_svg: &'static [u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/></svg>"##;
+                    let down_svg: &'static [u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/></svg>"##;
                     let up = div()
                         .id(SharedString::from(format!("tr-up-{}-{index}", message.id)))
-                        .px(px(4.))
+                        .size(px(20.))
                         .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .cursor_pointer()
-                        .type_micro()
-                        .text_color(if rated == Some(true) { theme::accent_text() } else { theme::text_faint() })
+                        .hover(|s| s.bg(theme::hover()))
                         .tooltip(tip("Good transcription", None))
-                        .child("👍")
+                        .child(gpui::svg().data(up_svg).size(px(12.)).flex_none().text_color(up_color))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.rate_transcript(msg_up.clone(), tr_id, true, cx);
                         }));
                     let down = div()
                         .id(SharedString::from(format!("tr-down-{}-{index}", message.id)))
-                        .px(px(4.))
+                        .size(px(20.))
                         .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .cursor_pointer()
-                        .type_micro()
-                        .text_color(if rated == Some(false) { theme::danger() } else { theme::text_faint() })
+                        .hover(|s| s.bg(theme::hover()))
                         .tooltip(tip("Poor transcription", None))
-                        .child("👎")
+                        .child(gpui::svg().data(down_svg).size(px(12.)).flex_none().text_color(down_color))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.rate_transcript(msg_down.clone(), tr_id, false, cx);

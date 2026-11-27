@@ -28,7 +28,6 @@ short=$1 profile=$2 sha=$3
 source "$HOME/.cargo/env"
 src=$HOME/tiny-dl/src/$short
 cd "$src"
-[ -e crates/chatd/telegram.env ] || : > crates/chatd/telegram.env
 export CARGO_TARGET_DIR=$HOME/tiny-lab/target
 export CARGO_BUILD_JOBS=1
 flag=--release; dir=release

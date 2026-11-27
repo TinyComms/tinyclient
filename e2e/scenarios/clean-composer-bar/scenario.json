@@ -1,0 +1,12 @@
+{
+  "id": "clean-composer-bar",
+  "title": "Composer keeps a clean unified row without text focus outlines or default floating pills",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The shared composer bar shares the same single leading button, unified right controls, and no-inner-outline TextInput.",
+    "ios": "The phone proof build does not run the desktop window. The shared composer bar shares the same single leading button, unified right controls, and no-inner-outline TextInput."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

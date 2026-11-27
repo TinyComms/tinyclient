@@ -202,7 +202,6 @@ pub struct Upload {
     client_id: String,
     files: Vec<Source>,
     meter: Meter,
-    agent: Option<ureq::Agent>,
 }
 
 impl Upload {
@@ -272,7 +271,6 @@ impl Upload {
                 halted,
             },
             files: sources,
-            agent: None,
         })
     }
 
@@ -391,7 +389,7 @@ impl Upload {
     }
 
     fn agent(&mut self) -> ureq::Agent {
-        self.agent.get_or_insert_with(agent).clone()
+        shared_agent()
     }
 
     /// One request whose body is `head`, `len` bytes of file `at` from `start`, and `tail`.
@@ -522,6 +520,13 @@ type Cancels = Vec<(AccountKey, String, Arc<AtomicBool>, bool)>;
 fn cancels() -> &'static Mutex<Cancels> {
     static CANCELS: std::sync::OnceLock<Mutex<Cancels>> = std::sync::OnceLock::new();
     CANCELS.get_or_init(Mutex::default)
+}
+
+/// Whether `client_id` on `account` currently has an active upload under way.
+pub fn is_active(account: &AccountKey, client_id: &str) -> bool {
+    crate::hub::lock(cancels())
+        .iter()
+        .any(|(of, id, _, under_way)| *under_way && of == account && id == client_id)
 }
 
 /// The user cancelled a send. Its upload stops at the next buffer or part; a send whose upload
@@ -769,9 +774,21 @@ fn uploads_to_for(account: Option<&AccountKey>, network: Network, url: &str) -> 
     hosts.iter().any(|name| super::fetch::under(&host, name))
 }
 
+fn shared_agent() -> ureq::Agent {
+    static AGENT: std::sync::OnceLock<Mutex<(u64, Option<ureq::Agent>)>> = std::sync::OnceLock::new();
+    let generation = crate::adapters::net::proxy_generation();
+    let mut held = crate::hub::lock(AGENT.get_or_init(|| Mutex::new((u64::MAX, None))));
+    if held.0 != generation || held.1.is_none() {
+        held.0 = generation;
+        held.1 = Some(agent());
+    }
+    held.1.as_ref().expect("upload agent initialized").clone()
+}
+
 fn agent() -> ureq::Agent {
     crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
+        .max_idle_age(Duration::from_secs(30))
         .timeout_connect(Some(Duration::from_secs(10)))
         // A large file on a slow line is one request, so nothing limits the body; the answer
         // after it may take the network a while to make.

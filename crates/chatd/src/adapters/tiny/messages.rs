@@ -28,6 +28,88 @@ const DIRECTS_AT: i32 = 500_000;
 const ROOMS_AT: i32 = 1_000_000;
 const TYPING_FOR: i64 = 8;
 
+/// How soon after a recent `publish` a fresh WS `ready` skips repeating the full list burst.
+const PUBLISH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn recent_publishes() -> &'static std::sync::Mutex<HashMap<(String, String), std::time::Instant>> {
+    static RECENT: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    RECENT.get_or_init(Default::default)
+}
+
+fn note_published(saved: &Saved) {
+    let key = (saved.base_url.clone(), saved.user_id.clone());
+    crate::hub::lock(recent_publishes()).insert(key, std::time::Instant::now());
+}
+
+/// Publishes from a fresh WS `ready` only when startup `refresh` did not just publish this account.
+pub(crate) fn publish_if_stale(ctx: &Context, saved: &Saved, names: &HashMap<String, String>) {
+    let key = (saved.base_url.clone(), saved.user_id.clone());
+    let fresh = crate::hub::lock(recent_publishes())
+        .get(&key)
+        .is_some_and(|at| at.elapsed() < PUBLISH_COOLDOWN);
+    if fresh {
+        return;
+    }
+    publish(ctx, saved, names);
+}
+
+fn spawn_emoji_sync(ctx: &Context, saved: &Saved) {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    let set = IN_FLIGHT.get_or_init(Default::default);
+    let key = (saved.base_url.clone(), saved.user_id.clone());
+    if !crate::hub::lock(set).insert(key.clone()) {
+        return;
+    }
+    let (ctx, saved) = (ctx.clone(), saved.clone());
+    let worker_key = key.clone();
+    if std::thread::Builder::new()
+        .name("tiny-emoji-sync".into())
+        .spawn(move || {
+            let _ = sync_emoji(&ctx, &saved);
+            crate::hub::lock(set).remove(&worker_key);
+        })
+        .is_err()
+    {
+        crate::hub::lock(set).remove(&key);
+    }
+}
+
+fn spawn_probe_survivors(ctx: &Context, saved: &Saved, stored: Vec<ConversationRow>) {
+    if stored.is_empty() {
+        return;
+    }
+    let (ctx, saved) = (ctx.clone(), saved.clone());
+    let _ = std::thread::Builder::new()
+        .name("tiny-probe-survivors".into())
+        .spawn(move || {
+            let _ = probe_survivors(&ctx, &saved, stored);
+        });
+}
+
+fn spawn_upgrade_plaintext(ctx: &Context, saved: &Saved, ids: Vec<String>) {
+    if ids.is_empty() {
+        return;
+    }
+    let (ctx, saved) = (ctx.clone(), saved.clone());
+    let _ = std::thread::Builder::new()
+        .name("tiny-e2ee-upgrade".into())
+        .spawn(move || {
+            for id in ids {
+                if ctx.stopped() {
+                    break;
+                }
+                if let Some((e2ee, history)) = upgrade_plaintext(&saved, &id) {
+                    if e2ee {
+                        let enc = encryption_of(&saved, &id, e2ee, history);
+                        let _ = ctx.mark_encryption(&id, enc);
+                    }
+                }
+            }
+        });
+}
+
 /// Lists, the space, and what this account may send. Names come from `GET /v1/members`.
 pub(crate) fn refresh(ctx: &Context, saved: &Saved) {
     publish(ctx, saved, &member_names(saved));
@@ -35,10 +117,11 @@ pub(crate) fn refresh(ctx: &Context, saved: &Saved) {
 
 /// The same as [`refresh`], with names the caller already loaded (a fresh `ready` has them).
 pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, String>) {
+    note_published(saved);
     let caps = account_caps(saved);
     ctx.capabilities(caps);
     if caps.custom_emoji != protocol::EmojiScope::None || caps.stickers {
-        sync_emoji(ctx, saved);
+        spawn_emoji_sync(ctx, saved);
     }
     let _ = ctx.spaces(&[SpaceRow {
         id: SPACE.to_owned(),
@@ -61,18 +144,18 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         }
     };
     // An empty list is checked, not trusted blindly and not allowed to freeze the rest of the
-    // tree. Stored channels/directs confirmed gone by 404 are removed; survivors (200, other
-    // status, or transport error) are carried into `rows` so `replace_tree` keeps them and their
-    // messages. Voice rooms have no per-room read endpoint, so stored voice rows are carried
-    // forward when `/v1/rooms` is empty.
+    // tree. Stored rows are carried forward immediately so `replace_tree` keeps them and their
+    // messages, and background probes remove any confirmed gone by 404 without stalling startup.
     let space = ctx.key(SPACE);
+    let mut to_probe = Vec::new();
     let surviving_channels = if channels.is_empty() {
         let stored = ctx
             .hub
             .store()
             .space_rows_of_kinds(&space, &[ConversationKind::Channel, ConversationKind::Announcement])
             .unwrap_or_default();
-        probe_survivors(ctx, saved, stored)
+        to_probe.extend(stored.iter().cloned());
+        stored
     } else {
         Vec::new()
     };
@@ -82,7 +165,8 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             .store()
             .space_rows_of_kinds(&space, &[ConversationKind::Direct])
             .unwrap_or_default();
-        probe_survivors(ctx, saved, stored)
+        to_probe.extend(stored.iter().cloned());
+        stored
     } else {
         Vec::new()
     };
@@ -104,7 +188,11 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     let (listed_groups, surviving_groups) = if caps.has(TINY_FEATURE_GROUPS) {
         match list_groups(saved) {
             Some(listed) if !listed.is_empty() => (listed, Vec::new()),
-            Some(_) => (Vec::new(), probe_survivors(ctx, saved, stored_groups())),
+            Some(_) => {
+                let stored = stored_groups();
+                to_probe.extend(stored.iter().cloned());
+                (Vec::new(), stored)
+            }
             None => (Vec::new(), stored_groups()),
         }
     } else if caps.features.is_empty() {
@@ -148,6 +236,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     let mut rows = Vec::new();
     let mut noted = Vec::new();
     let mut categories = HashSet::new();
+    let mut plain_upgrades = Vec::new();
     for channel in &channels {
         if !super::safe_id(&channel.id) {
             continue;
@@ -167,9 +256,10 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             pin: row.can_pin,
             ..protocol::ConversationRights::default()
         };
-        let (e2ee, history) =
-            sealed_state(saved, &channel.id, channel.e2ee, channel.plaintext_history);
-        row.encryption = encryption_of(saved, &channel.id, e2ee, history);
+        if !channel.e2ee {
+            plain_upgrades.push(channel.id.clone());
+        }
+        row.encryption = encryption_of(saved, &channel.id, channel.e2ee, channel.plaintext_history);
         if let Some(category) = channel
             .category_id
             .as_deref()
@@ -239,9 +329,10 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
                 ..crate::store::Filing::default()
             });
         }
-        let (e2ee, history) =
-            sealed_state(saved, &direct.id, direct.e2ee, direct.plaintext_history);
-        row.encryption = encryption_of(saved, &direct.id, e2ee, history);
+        if !direct.e2ee {
+            plain_upgrades.push(direct.id.clone());
+        }
+        row.encryption = encryption_of(saved, &direct.id, direct.e2ee, direct.plaintext_history);
         let mine = direct
             .last_message
             .as_ref()
@@ -272,8 +363,10 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             }
         }
         remember_group(saved, group);
-        let (e2ee, history) = sealed_state(saved, &group.id, group.e2ee, group.plaintext_history);
-        rows.push(group_row(saved, group, DIRECTS_AT + (directs.len() + index) as i32, e2ee, history));
+        if !group.e2ee {
+            plain_upgrades.push(group.id.clone());
+        }
+        rows.push(group_row(saved, group, DIRECTS_AT + (directs.len() + index) as i32, group.e2ee, group.plaintext_history));
         noted.push(group_note(saved, group));
     }
     rows.extend(surviving_groups);
@@ -319,6 +412,8 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             record_call(ctx, saved, names, &direct.id, call);
         }
     }
+    spawn_probe_survivors(ctx, saved, to_probe);
+    spawn_upgrade_plaintext(ctx, saved, plain_upgrades);
 }
 
 /// The server lists direct calls. A server not yet checked is asked; a 404 is an older one.
@@ -381,19 +476,20 @@ pub(crate) fn on_live(
                 }
                 if is_self(saved, &conversation) {
                     // Off the socket's thread: it may answer, and read conversations again.
-                    let (ctx, saved) = (ctx.clone(), saved.clone());
-                    let _ = std::thread::Builder::new().name("tiny-e2ee-siblings".into()).spawn(move || from_sibling(&ctx, &saved, &wire));
+                    let (ctx, saved_job) = (ctx.clone(), saved.clone());
+                    run_e2ee_event(saved, Box::new(move || from_sibling(&ctx, &saved_job, &wire)));
                 } else {
                     deliver(ctx, saved, names, &conversation, &wire);
                 }
                 // Off the socket's thread: owe_reactions takes the device mutex, which
                 // syncs and repairs can hold across network I/O.
                 if e2ee::started(saved).is_some() {
-                    let (ctx, saved, conversation) =
+                    let (ctx, saved_job, conversation) =
                         (ctx.clone(), saved.clone(), conversation.clone());
-                    let _ = std::thread::Builder::new()
-                        .name("tiny-e2ee-owed".into())
-                        .spawn(move || owe_reactions(&ctx, &saved, &conversation));
+                    run_e2ee_event(
+                        saved,
+                        Box::new(move || owe_reactions(&ctx, &saved_job, &conversation)),
+                    );
                 }
             }
         }
@@ -443,19 +539,19 @@ pub(crate) fn on_live(
             let conversation_id = field(frame, "conversation_id");
             if super::safe_id(conversation_id) {
                 if let Some(device) = e2ee::started(saved) {
-                    let (conversation_id, ctx, saved) =
+                    let (conversation_id, ctx, saved_job) =
                         (conversation_id.to_owned(), ctx.clone(), saved.clone());
-                    let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
+                    run_e2ee_event(saved, Box::new(move || {
                         // The list is paged without the device mutex: sends and the socket
                         // thread must not wait on the server.
-                        let mut landed = e2ee::fold_reactions_unlocked(&device, &saved, &conversation_id);
+                        let mut landed = e2ee::fold_reactions_unlocked(&device, &saved_job, &conversation_id);
                         let (mut applied, mut owed) = (Vec::new(), Vec::new());
                         {
                             let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
                             landed.extend(device.owed_reactions(&conversation_id));
                             for reaction in &landed {
                                 let pair = (reaction.message.clone(), reaction.emoji.clone());
-                                if apply_reaction(&ctx, &conversation_id, reaction) {
+                                if apply_reaction(&ctx, &saved_job, &conversation_id, reaction) {
                                     applied.push(pair);
                                 } else {
                                     owed.push(pair);
@@ -463,27 +559,44 @@ pub(crate) fn on_live(
                             }
                             device.settle_reactions(&conversation_id, &applied, &owed);
                         }
-                    });
+                    }));
                 }
             }
         }
         "read.updated" => read_updated(ctx, saved, frame),
         "thread.updated" => thread_updated(ctx, saved, frame),
-        "emoji.updated" => { let _ = sync_emoji(ctx, saved); }
-        "server.updated" => ctx.capabilities(account_caps(saved)),
+        "emoji.updated" => { spawn_emoji_sync(ctx, saved); }
+        "server.updated" => {
+            invalidate_upload_limits(&saved.base_url);
+            ctx.capabilities(account_caps(saved));
+        }
         // The group of an encrypted conversation changed, this device's key packages ran low, or
         // someone's devices changed. Off the socket's thread: it asks the server. A row that did
         // not open for want of the group is read again once the group is here.
         "e2ee.handshake" | "e2ee.keys_low" | "e2ee.device" => {
+            if kind == "e2ee.handshake" {
+                let conv_id = field(frame, "conversation_id");
+                if super::safe_id(conv_id) {
+                    e2ee::invalidate_synced(saved, conv_id);
+                }
+            }
             if let Some(device) = e2ee::started(saved) {
-                let (kind, frame, ctx) = (kind.to_owned(), frame.clone(), ctx.clone());
-                let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
+                let (kind, frame, ctx, saved_inner) =
+                    (kind.to_owned(), frame.clone(), ctx.clone(), saved.clone());
+                run_e2ee_event(saved, Box::new(move || {
+                    let saved = saved_inner;
                     let noticed = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).heard(&kind, &frame);
+                    if kind == "e2ee.handshake" {
+                        let conv_id = field(&frame, "conversation_id");
+                        if super::safe_id(conv_id) {
+                            e2ee::notify_handshake(&saved, conv_id);
+                        }
+                    }
                     // "New device added": the page shows it, on every device of the person.
                     if noticed {
                         ctx.community_changed();
                     }
-                });
+                }));
             }
         }
         _ => {}
@@ -1105,16 +1218,6 @@ fn encryption_of(saved: &Saved, conversation_id: &str, e2ee: bool, history: bool
     }
 }
 
-/// What the list says, after asking the server to encrypt a plaintext conversation this device
-/// can already send in. A server that has encryption off, or a conversation that cannot take
-/// the group, is left as it is.
-fn sealed_state(saved: &Saved, id: &str, e2ee: bool, history: bool) -> (bool, bool) {
-    if e2ee {
-        return (true, history);
-    }
-    upgrade_plaintext(saved, id).unwrap_or((false, false))
-}
-
 fn upgrade_skipped(id: &str) -> bool {
     skipped_upgrades().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(id)
 }
@@ -1150,11 +1253,11 @@ fn upgrade_plaintext(saved: &Saved, id: &str) -> Option<(bool, bool)> {
             let history = body.get("plaintext_history").and_then(Value::as_bool).unwrap_or(false);
             if e2ee {
                 let id = id.to_owned();
-                let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
+                run_e2ee_event(saved, Box::new(move || {
                     if let Err(why) = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sync(&id) {
                         tracing::warn!("chatd: Tiny e2ee: {id}: {why}");
                     }
-                });
+                }));
             }
             Some((e2ee, history))
         }
@@ -1184,11 +1287,11 @@ fn upgraded(ctx: &Context, saved: &Saved, frame: &Value) {
     let _ = ctx.mark_encryption(id, encryption);
     if let Some(shared) = e2ee::started(saved) {
         let id = id.to_owned();
-        let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
+        run_e2ee_event(saved, Box::new(move || {
             if let Err(why) = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sync(&id) {
                 tracing::warn!("chatd: Tiny e2ee: {id}: {why}");
             }
-        });
+        }));
     }
 }
 
@@ -1697,13 +1800,25 @@ fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
 /// One folded encrypted reaction, onto the stored message it landed on: the count and
 /// ownership as this device folds everyone's blobs. `False` when the message is not stored
 /// (yet): the fold keeps the pair owed, and it is applied when the message lands.
-fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionLanded) -> bool {
-    if !super::safe_id(&landed.message) || !unicode_emoji(&landed.emoji) {
+fn apply_reaction(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    landed: &e2ee::ReactionLanded,
+) -> bool {
+    if !super::safe_id(&landed.message) || !allowed_sealed_reaction(&landed.emoji) {
         return false;
     }
     let Ok(Some(mut message)) = ctx.stored_message(conversation_id, &landed.message) else {
         return false;
     };
+    merge_folded_reaction(saved, &mut message, landed);
+    let _ = ctx.message(conversation_id, &message);
+    true
+}
+
+fn merge_folded_reaction(saved: &Saved, message: &mut Message, landed: &e2ee::ReactionLanded) {
+    let file = custom_emoji_file(saved, &landed.emoji);
     let at = message.reactions.iter().position(|have| have.emoji == landed.emoji);
     if landed.count == 0 {
         if let Some(at) = at {
@@ -1712,11 +1827,19 @@ fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionL
     } else if let Some(at) = at {
         message.reactions[at].count = landed.count;
         message.reactions[at].mine = landed.mine;
+        if message.reactions[at].file.is_none() {
+            message.reactions[at].file = file;
+        }
     } else {
-        message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine, who: Vec::new(), ..Reaction::default() });
+        message.reactions.push(Reaction {
+            emoji: landed.emoji.clone(),
+            file,
+            count: landed.count,
+            mine: landed.mine,
+            who: Vec::new(),
+            ..Reaction::default()
+        });
     }
-    let _ = ctx.message(conversation_id, &message);
-    true
 }
 
 /// Applies the folded reactions a message's arrival still owed: a blob can fold before the
@@ -1733,7 +1856,7 @@ fn owe_reactions(ctx: &Context, saved: &Saved, conversation_id: &str) {
     let (mut applied, mut owed) = (Vec::new(), Vec::new());
     for reaction in &landed {
         let pair = (reaction.message.clone(), reaction.emoji.clone());
-        if apply_reaction(ctx, conversation_id, reaction) {
+        if apply_reaction(ctx, saved, conversation_id, reaction) {
             applied.push(pair);
         } else {
             owed.push(pair);
@@ -1762,7 +1885,7 @@ fn read_updated(ctx: &Context, saved: &Saved, frame: &Value) {
 }
 
 fn load_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option<String>, limit: u32) {
-    if !super::safe_id(conversation_id) {
+    if !super::safe_id(conversation_id) && split_thread_id(conversation_id).is_none() {
         return;
     }
     let limit = limit.clamp(1, PAGE_MAX);
@@ -1926,7 +2049,7 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
             let names = member_names(saved);
             let mut media = Vec::new();
             let opened = open_rows(ctx, saved, e2ee_conv, &wires.iter().collect::<Vec<_>>());
-            let messages: Vec<Message> = wires
+            let mut messages: Vec<Message> = wires
                 .iter()
                 .filter(|wire| wire.kind.as_deref() != Some("edit"))
                 .filter_map(|wire| {
@@ -1940,29 +2063,43 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
             if !media.is_empty() {
                 let _ = ctx.media(&media);
             }
+            // The reactions of an encrypted conversation are not rows of this page; fold any
+            // new reaction blobs now and attach every folded reaction onto the loaded messages
+            // BEFORE writing history so reloading a page never wipes existing encrypted chips.
+            let sealed_page = sealed_here(ctx, saved, e2ee_conv) == Ok(true);
+            let mut deferred_reactions = None;
+            if sealed_page {
+                if let Some(device) = e2ee::started(saved) {
+                    let mut landed = e2ee::fold_reactions_unlocked(&device, saved, e2ee_conv);
+                    {
+                        let mut locked = device.lock().unwrap_or_else(|err| err.into_inner());
+                        for msg in &mut messages {
+                            for reaction in locked.reactions_for(e2ee_conv, &msg.id) {
+                                if allowed_sealed_reaction(&reaction.emoji) {
+                                    merge_folded_reaction(saved, msg, &reaction);
+                                }
+                            }
+                        }
+                        landed.extend(locked.owed_reactions(e2ee_conv));
+                    }
+                    deferred_reactions = Some((device, landed));
+                }
+            }
             if !messages.is_empty() {
                 ctx.history(conversation_id, &messages).map_err(|err| err.to_string())?;
             }
-            // The reactions of an encrypted conversation are not rows of this page; the folded
-            // ones that changed while this device was away are asked for now, with anything a
-            // page before this one still owed. The list is paged without the device mutex,
-            // so the network holds up no other user of this device.
-            if thread.is_none() && sealed_here(ctx, saved, e2ee_conv) == Ok(true) {
-                if let Some(device) = e2ee::started(saved) {
-                    let mut landed = e2ee::fold_reactions_unlocked(&device, saved, e2ee_conv);
-                    let mut device = device.lock().unwrap_or_else(|err| err.into_inner());
-                    landed.extend(device.owed_reactions(e2ee_conv));
-                    let (mut applied, mut owed) = (Vec::new(), Vec::new());
-                    for reaction in &landed {
-                        let pair = (reaction.message.clone(), reaction.emoji.clone());
-                        if apply_reaction(ctx, e2ee_conv, reaction) {
-                            applied.push(pair);
-                        } else {
-                            owed.push(pair);
-                        }
+            if let Some((device, landed)) = deferred_reactions {
+                let mut locked = device.lock().unwrap_or_else(|err| err.into_inner());
+                let (mut applied, mut owed) = (Vec::new(), Vec::new());
+                for reaction in &landed {
+                    let pair = (reaction.message.clone(), reaction.emoji.clone());
+                    if apply_reaction(ctx, saved, conversation_id, reaction) {
+                        applied.push(pair);
+                    } else {
+                        owed.push(pair);
                     }
-                    device.settle_reactions(e2ee_conv, &applied, &owed);
                 }
+                locked.settle_reactions(e2ee_conv, &applied, &owed);
             }
             Ok(())
         }
@@ -1972,11 +2109,37 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
     }
 }
 
+/// Fast-path entry point for `tiny-router`: dispatches text sends directly onto their
+/// per-conversation lane without waiting on `tiny-commands` or startup refreshes.
+pub(crate) fn send_fast(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: String,
+    client_id: String,
+    text: String,
+    reply_to: Option<String>,
+) {
+    send(ctx, saved, conversation_id, client_id, text, reply_to);
+}
+
+/// Fast-path entry point for `tiny-router`: dispatches `SendWith` directly onto its
+/// per-conversation lane (or `upload::spawn` for files) without blocking on `tiny-commands`.
+pub(crate) fn send_with_fast(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: String,
+    client_id: String,
+    text: String,
+    reply_to: Option<String>,
+    outgoing: Outgoing,
+) {
+    send_with(ctx, saved, conversation_id, client_id, text, reply_to, outgoing);
+}
+
 /// A send of text. It never runs on the commands thread: that one serves history, previews and
-/// everything else the person is waiting on, and a send there waited behind all of it. A send
-/// goes to this account's send thread, in order, and the commands go on meanwhile. One to an
-/// encrypted conversation can wait for the people of a new group to join it (`e2ee::send`), so
-/// it has a thread of its own, and does not hold up the plain ones.
+/// everything else the person is waiting on, and a send there waited behind all of it. Each
+/// conversation gets its own ordered send lane so a conversation waiting on an E2EE join or a
+/// link preview never stalls unrelated conversations.
 fn send(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>) {
     send_spans(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), None, false);
 }
@@ -1998,12 +2161,9 @@ fn send_spans(
         ctx.sent(&conversation_id, &client_id, outcome);
         return;
     }
-    let check_conv = split_thread_id(&conversation_id).map_or(conversation_id.as_str(), |(ch, _)| ch);
-    // The same question the post asks, so a conversation the device knows is encrypted but the
-    // list has not labelled yet still goes to the sealed queue and never holds up the plain one.
-    let account = send_account(saved, sealed_here(ctx, saved, check_conv) == Ok(true));
+    let lane = send_lane(saved, &conversation_id);
     let (posting, saved) = (ctx.clone(), saved.clone());
-    in_order(account, Box::new(move || {
+    in_order(lane, Box::new(move || {
         let _ = crate::sendtime::run(&client_id, || {
             let outcome = post_message_with(&posting, &saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[], &spans, sticker_id.as_deref(), suppress_embeds);
             let sent = outcome.is_ok();
@@ -2014,39 +2174,153 @@ fn send_spans(
     }));
 }
 
-/// The send thread an account's sends of one kind go to: sealed ones apart from plain ones.
-fn send_account(saved: &Saved, sealed: bool) -> (String, String) {
-    let user = if sealed { saved.user_id.clone() } else { format!("{}#plain", saved.user_id) };
-    (saved.base_url.clone(), user)
+/// Maximum queued off-socket E2EE event jobs per Tiny account before backpressure drops extras.
+const E2EE_WORK_QUEUE_CAP: usize = 256;
+
+/// Bounded per-account single-worker dispatcher for off-socket Tiny E2EE background events
+/// (`message.created`/`message.edited` sibling & owed reactions, `e2ee.reaction`,
+/// `e2ee.handshake`, `e2ee.keys_low`, `e2ee.device`, and upgrade syncs).
+struct BoundedWorkers {
+    cap: usize,
+    queues: std::sync::Mutex<HashMap<(String, String), std::sync::mpsc::SyncSender<Job>>>,
+}
+
+impl BoundedWorkers {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            queues: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn enqueue(&self, account: (String, String), job: Job) -> bool {
+        let mut queues = self
+            .queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let job = match queues.get(&account) {
+            Some(queue) => match queue.try_send(job) {
+                Ok(()) => return true,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        "chatd: Tiny e2ee worker queue full for {}; dropping background event",
+                        account.1
+                    );
+                    return false;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(job)) => job,
+            },
+            None => job,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(self.cap);
+        let started = std::thread::Builder::new()
+            .name("tiny-e2ee-worker".into())
+            .spawn(move || {
+                for job in rx {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                        tracing::warn!("chatd: Tiny e2ee worker caught panic in background event");
+                    }
+                }
+            });
+        match started {
+            Ok(_) => {
+                let queued = tx.try_send(job).is_ok();
+                queues.insert(account, tx);
+                queued
+            }
+            Err(_) => {
+                drop(queues);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                true
+            }
+        }
+    }
+
+    fn remove(&self, account: &(String, String)) {
+        self.queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(account);
+    }
+}
+
+fn e2ee_workers() -> &'static BoundedWorkers {
+    static WORKERS: std::sync::OnceLock<BoundedWorkers> = std::sync::OnceLock::new();
+    WORKERS.get_or_init(|| BoundedWorkers::new(E2EE_WORK_QUEUE_CAP))
+}
+
+fn e2ee_account(saved: &Saved) -> (String, String) {
+    (saved.base_url.clone(), saved.user_id.clone())
+}
+
+fn run_e2ee_event(saved: &Saved, job: Job) -> bool {
+    e2ee_workers().enqueue(e2ee_account(saved), job)
+}
+
+pub(crate) fn stop_e2ee_worker(saved: &Saved) {
+    e2ee_workers().remove(&e2ee_account(saved));
+}
+
+/// Per-conversation send lane key: `(base_url, user_id, conversation_id)`.
+fn send_lane(saved: &Saved, conversation_id: &str) -> (String, String, String) {
+    (saved.base_url.clone(), saved.user_id.clone(), conversation_id.to_owned())
 }
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// The send thread of each account (server and user, and plain or sealed), by what takes its jobs.
-type Queues = HashMap<(String, String), std::sync::mpsc::Sender<Job>>;
+/// Per-conversation send lane key.
+type LaneKey = (String, String, String);
 
-/// Runs `job` on the account's send thread, after the ones before it. Made when first
-/// needed, and again if it ended.
-fn in_order(account: (String, String), job: Job) {
+/// Active send lanes keyed by `(base_url, user_id, conversation_id)` with a generation token for
+/// race-free idle shutdown/eviction.
+type Queues = HashMap<LaneKey, (u64, std::sync::mpsc::Sender<Job>)>;
+
+const LANE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn send_queues() -> &'static std::sync::Mutex<Queues> {
     static QUEUES: std::sync::OnceLock<std::sync::Mutex<Queues>> = std::sync::OnceLock::new();
-    let mut queues = QUEUES.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let job = match queues.get(&account) {
-        Some(queue) => match queue.send(job) {
+    QUEUES.get_or_init(Default::default)
+}
+
+/// Runs `job` on the conversation's send lane thread, strictly in FIFO order for that
+/// conversation. Idle lane threads shut down and evict themselves after `LANE_IDLE`.
+fn in_order(lane: LaneKey, job: Job) {
+    static NEXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let mut queues = crate::hub::lock(send_queues());
+    let job = match queues.get(&lane) {
+        Some((_, queue)) => match queue.send(job) {
             Ok(()) => return,
             Err(std::sync::mpsc::SendError(job)) => job,
         },
         None => job,
     };
+    let gen = NEXT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (queue, jobs) = std::sync::mpsc::channel::<Job>();
+    let worker_lane = lane.clone();
     let started = std::thread::Builder::new().name("tiny-send".into()).spawn(move || {
-        for job in jobs {
-            job();
+        loop {
+            match jobs.recv_timeout(LANE_IDLE) {
+                Ok(job) => job(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let mut queues = crate::hub::lock(send_queues());
+                    if let Ok(job) = jobs.try_recv() {
+                        drop(queues);
+                        job();
+                        continue;
+                    }
+                    if queues.get(&worker_lane).is_some_and(|(id, _)| *id == gen) {
+                        queues.remove(&worker_lane);
+                    }
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
     });
     match started {
         Ok(_) => {
             let _ = queue.send(job);
-            queues.insert(account, queue);
+            queues.insert(lane, (gen, queue));
         }
         // No thread to be had: this one sends it.
         Err(_) => {
@@ -2147,6 +2421,7 @@ fn mentions_from_spans(text: &str, spans: &[protocol::Span]) -> Vec<e2ee_core::e
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn post_message(
     ctx: &Context,
@@ -2344,13 +2619,32 @@ const NOT_SET_UP: &str = "This device isn't set up for encrypted messages yet. O
 
 /// Whether a send to this conversation must be end-to-end encrypted. An encrypted conversation is
 /// never sent plaintext, whatever state this device is in: it is an error instead.
+/// Uses the lock-free / `RwLock` fast cache so plaintext sends never contend on `Mutex<Device>`.
 fn sealed_here(ctx: &Context, saved: &Saved, conversation_id: &str) -> Result<bool, String> {
     let labelled = ctx.known(conversation_id).ok().flatten().is_some_and(|row| row.encryption.is_sealed());
+    let cached = e2ee::known_encrypted_fast(saved, conversation_id);
+    if !labelled && cached == Some(false) {
+        return Ok(false);
+    }
+    if labelled || cached == Some(true) {
+        e2ee::wait_begun(saved);
+        if e2ee::is_ready_fast(saved) {
+            return Ok(true);
+        }
+        if let Some(device) = e2ee::started(saved) {
+            let ready = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).ready();
+            if ready {
+                e2ee::set_ready_fast(saved, true);
+                return Ok(true);
+            }
+        }
+        return Err(NOT_SET_UP.to_owned());
+    }
     let Some(device) = e2ee::started(saved) else {
-        return if labelled { Err(NOT_SET_UP.to_owned()) } else { Ok(false) };
+        return Ok(false);
     };
     let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let encrypted = labelled || device.is_encrypted(conversation_id)?;
+    let encrypted = device.is_encrypted(conversation_id)?;
     if encrypted && !device.ready() {
         return Err(NOT_SET_UP.to_owned());
     }
@@ -2415,23 +2709,7 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
         ctx.sent(&conversation_id, &client_id, Err("Too many files.".to_owned()));
         return;
     }
-    let limits = upload_limits(saved);
-    for file in &outgoing.files {
-        let cap = cap_for(file, &limits);
-        let len = std::fs::metadata(&file.path).map(|meta| meta.len()).unwrap_or(0);
-        if len > cap {
-            ctx.sent(&conversation_id, &client_id, Err("That file is too big for this server.".to_owned()));
-            return;
-        }
-    }
     let e2ee_conv = split_thread_id(&conversation_id).map_or(conversation_id.as_str(), |(ch, _)| ch).to_owned();
-    let sealed = match sealed_here(ctx, saved, &e2ee_conv) {
-        Ok(sealed) => sealed,
-        Err(why) => {
-            ctx.sent(&conversation_id, &client_id, Err(why));
-            return;
-        }
-    };
     let saved = saved.clone();
     let posting = ctx.clone();
     let mut files = outgoing.files;
@@ -2462,10 +2740,20 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             }
         }
     }
+    let check_files = files.clone();
     let posting_id = conversation_id.clone();
     let posting_client = client_id.clone();
-    if sealed {
-        upload::spawn(ctx, &conversation_id, &client_id, &files, move |upload| {
+    upload::spawn(ctx, &conversation_id, &client_id, &files, move |upload| {
+        let limits = upload_limits(&saved);
+        for (ix, file) in check_files.iter().enumerate() {
+            let cap = cap_for(file, &limits);
+            let len = upload.files().get(ix).map(|f| f.bytes).unwrap_or(0);
+            if len > cap {
+                return Err("That file is too big for this server.".to_owned());
+            }
+        }
+        let sealed = sealed_here(&posting, &saved, &e2ee_conv)?;
+        if sealed {
             let mut refs = super::sealing::upload_sealed(upload, &saved, &e2ee_conv)?;
             if let (Some(voice), Some(last)) = (voice.as_ref(), refs.last_mut()) {
                 last.duration = voice_duration_secs.unwrap_or(0);
@@ -2474,11 +2762,8 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             }
             upload.check()?;
             let ids: Vec<String> = refs.iter().map(|file| file.id.clone()).collect();
-            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids, &spans, None, suppress_embeds)
-        });
-        return;
-    }
-    upload::spawn(ctx, &conversation_id, &client_id, &files, move |upload| {
+            return post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids, &spans, None, suppress_embeds);
+        }
         let mut ids = Vec::with_capacity(upload.files().len());
         let last_ix = upload.files().len().saturating_sub(1);
         for at in 0..upload.files().len() {
@@ -2502,15 +2787,63 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn react_sealed(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    e2ee_conv: &str,
+    message_id: &str,
+    emoji: &str,
+    on: bool,
+    reply: crate::adapters::Reply<()>,
+) {
+    let result = e2ee::started(saved)
+        .ok_or_else(|| NOT_SET_UP.to_owned())
+        .and_then(|shared| {
+            let landed = shared
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .react(e2ee_conv, message_id, emoji, on)?;
+            Ok((shared, landed))
+        });
+    match result {
+        Ok((device, landed)) => {
+            {
+                let mut locked = device.lock().unwrap_or_else(|err| err.into_inner());
+                let mut owed = Vec::new();
+                if let Some(landed) = &landed {
+                    if !apply_reaction(ctx, saved, conversation_id, landed) {
+                        // The message is not stored yet (a reaction from a
+                        // notification, say): the fold already knows, so keep the
+                        // pair owed for when the message lands.
+                        owed.push((landed.message.clone(), landed.emoji.clone()));
+                    }
+                }
+                locked.settle_reactions(e2ee_conv, &[], &owed);
+            }
+            drop(device);
+            let _ = reply.send(Ok(()));
+        }
+        Err(why) => {
+            let _ = reply.send(Err(Refusal::Refused(why)));
+        }
+    }
+}
+
 fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, emoji: &str, on: bool, reply: crate::adapters::Reply<()>) {
-    let custom_id = if unicode_emoji(emoji) {
+    let custom = if unicode_emoji(emoji) {
         None
     } else {
         let raw = strip_emoji_media_id(emoji);
         let known = super::manage::known(saved);
-        known.emoji.iter().find(|e| e.kind == "emoji" && (e.id == raw || format!(":{}:", e.name) == emoji)).map(|e| e.id.clone())
+        known
+            .emoji
+            .iter()
+            .find(|e| e.kind == "emoji" && (e.id == raw || format!(":{}:", e.name) == emoji))
+            .map(|e| (e.id.clone(), format!(":{}:", e.name)))
     };
-    if custom_id.is_none() && !unicode_emoji(emoji) {
+    if custom.is_none() && !unicode_emoji(emoji) {
         let _ = reply.send(Err(Refusal::Refused("That reaction isn't allowed here.".to_owned())));
         return;
     }
@@ -2519,39 +2852,10 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
         return;
     }
     let e2ee_conv = split_thread_id(conversation_id).map_or(conversation_id, |(ch, _)| ch);
+    let sealed_emoji = custom.as_ref().map_or(emoji, |(_, label)| label.as_str());
     match sealed_here(ctx, saved, e2ee_conv) {
         Ok(true) => {
-            let result = e2ee::started(saved)
-                .ok_or(NOT_SET_UP.to_owned())
-                .and_then(|shared| {
-                    let landed = shared
-                        .lock()
-                        .unwrap_or_else(|err| err.into_inner())
-                        .react(e2ee_conv, message_id, emoji, on)?;
-                    Ok((shared, landed))
-                });
-            match result {
-                Ok((device, landed)) => {
-                    {
-                        let mut locked = device.lock().unwrap_or_else(|err| err.into_inner());
-                        let mut owed = Vec::new();
-                        if let Some(landed) = &landed {
-                            if !apply_reaction(ctx, conversation_id, landed) {
-                                // The message is not stored yet (a reaction from a
-                                // notification, say): the fold already knows, so keep the
-                                // pair owed for when the message lands.
-                                owed.push((landed.message.clone(), landed.emoji.clone()));
-                            }
-                        }
-                        locked.settle_reactions(e2ee_conv, &[], &owed);
-                    }
-                    drop(device);
-                    let _ = reply.send(Ok(()));
-                }
-                Err(why) => {
-                    let _ = reply.send(Err(Refusal::Refused(why)));
-                }
-            }
+            react_sealed(ctx, saved, conversation_id, e2ee_conv, message_id, sealed_emoji, on, reply);
             return;
         }
         Ok(false) => {}
@@ -2559,11 +2863,28 @@ fn react(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, 
     }
     let path = format!("/v1/messages/{message_id}/reactions");
     let method = if on { "PUT" } else { "DELETE" };
-    let body = match custom_id {
-        Some(id) => json!({ "emoji_id": id }),
+    let body = match &custom {
+        Some((id, _)) => json!({ "emoji_id": id }),
         None => json!({ "emoji": emoji }),
     };
     let answer = super::asked(method, saved, &path, Some(body));
+    // If the server refuses plaintext because the conversation is encrypted (for example
+    // upgraded on another device before our local row learned about it), mark it encrypted
+    // and retry through the encrypted reactions route instead of failing with a generic error.
+    if let Ok((400, ref err_body)) = answer {
+        if err_body.get("error").and_then(Value::as_str) == Some("e2ee_required") {
+            let _ = ctx.mark_encryption(e2ee_conv, Encryption::EndToEnd);
+            let ready = e2ee::started(saved).is_some_and(|shared| {
+                shared.lock().unwrap_or_else(|err| err.into_inner()).ready()
+            });
+            if ready {
+                react_sealed(ctx, saved, conversation_id, e2ee_conv, message_id, sealed_emoji, on, reply);
+            } else {
+                let _ = reply.send(Err(Refusal::Refused(NOT_SET_UP.to_owned())));
+            }
+            return;
+        }
+    }
     answer_ok(answer, reply);
 }
 
@@ -3480,11 +3801,44 @@ pub(crate) fn unicode_emoji(emoji: &str) -> bool {
     textual
 }
 
+/// Either a Unicode emoji or a server custom-emoji shortcode (`:name:`).
+pub(crate) fn allowed_sealed_reaction(emoji: &str) -> bool {
+    if unicode_emoji(emoji) {
+        return true;
+    }
+    let Some(inner) = emoji.strip_prefix(':').and_then(|s| s.strip_suffix(':')) else {
+        return false;
+    };
+    !inner.is_empty()
+        && inner.len() <= 64
+        && inner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn custom_emoji_file(saved: &Saved, emoji: &str) -> Option<MediaFile> {
+    let inner = emoji.strip_prefix(':').and_then(|s| s.strip_suffix(':'))?;
+    let known = super::manage::known(saved);
+    let item = known
+        .emoji
+        .iter()
+        .find(|e| e.kind == "emoji" && e.name == inner)?;
+    let mut file = MediaFile::new(
+        emoji_media_id(&item.id),
+        if item.animated { MediaKind::Gif } else { MediaKind::Image },
+    );
+    if !item.path.is_empty() {
+        file.path = Some(item.path.clone());
+    }
+    Some(file)
+}
+
 fn same_server(base: &str, url: &str) -> bool {
     let base = base.trim_end_matches('/');
     !base.is_empty() && (url == base || url.starts_with(&format!("{base}/")))
 }
 
+#[derive(Clone, Copy)]
 struct UploadLimits {
     image: u64,
     file: u64,
@@ -3601,17 +3955,40 @@ pub(crate) fn group_offer() -> protocol::CallOffer {
     protocol::CallOffer::Native
 }
 
-/// The caps `GET /v1/server` reports. An older server, or one that does not answer, keeps the original 8 MiB and 25 MiB.
+const UPLOAD_LIMITS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn upload_limits_cache() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, UploadLimits)>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, UploadLimits)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn invalidate_upload_limits(base_url: &str) {
+    crate::hub::lock(upload_limits_cache()).remove(base_url);
+}
+
+/// The caps `GET /v1/server` reports, cached per server. An older server, or one that does not
+/// answer, keeps the original 8 MiB and 25 MiB.
 fn upload_limits(saved: &Saved) -> UploadLimits {
+    {
+        let cache = crate::hub::lock(upload_limits_cache());
+        if let Some((at, limits)) = cache.get(&saved.base_url) {
+            if at.elapsed() < UPLOAD_LIMITS_TTL {
+                return *limits;
+            }
+        }
+    }
     let fallback = UploadLimits { image: protocol::TINY_IMAGE_MAX_DEFAULT as u64, file: protocol::TINY_FILE_MAX_DEFAULT as u64, archives: false };
     let Ok((200, body)) = super::asked("GET", saved, "/v1/server", None) else {
         return fallback;
     };
-    UploadLimits {
+    let limits = UploadLimits {
         image: byte_cap(&body, "image_max_bytes", fallback.image),
         file: byte_cap(&body, "file_max_bytes", fallback.file),
         archives: body.get("allow_archives").and_then(Value::as_bool).unwrap_or(false),
-    }
+    };
+    crate::hub::lock(upload_limits_cache()).insert(saved.base_url.clone(), (std::time::Instant::now(), limits));
+    limits
 }
 
 /// The upload helper names a Tiny refusal `tiny-media`, then the status, then the body. The
@@ -3878,6 +4255,9 @@ const EMPTY_LIST_PROBE_CAP: usize = 50;
 fn probe_survivors(ctx: &Context, saved: &Saved, stored: Vec<ConversationRow>) -> Vec<ConversationRow> {
     let mut survivors = Vec::new();
     for (index, row) in stored.into_iter().enumerate() {
+        if ctx.stopped() {
+            break;
+        }
         if index >= EMPTY_LIST_PROBE_CAP || !super::safe_id(&row.id) {
             survivors.push(row);
             continue;
@@ -5858,10 +6238,12 @@ mod tests {
     #[test]
     fn sealed_and_plain_sends_go_to_different_send_threads() {
         let saved = saved("http://127.0.0.1:1");
-        let (sealed, plain) = (send_account(&saved, true), send_account(&saved, false));
-        assert_ne!(sealed, plain, "a sealed send that waits to join must not hold up a plain one");
-        assert_eq!(sealed.0, plain.0, "the same server");
-        assert_eq!(sealed.1, saved.user_id);
+        let (a, b) = (send_lane(&saved, "conv-a"), send_lane(&saved, "conv-b"));
+        assert_ne!(a, b, "different conversations must use independent send lanes");
+        assert_eq!(a.0, b.0, "the same server");
+        assert_eq!(a.1, saved.user_id);
+        assert_eq!(a.2, "conv-a");
+        assert_eq!(b.2, "conv-b");
     }
 
     #[test]
@@ -6123,6 +6505,10 @@ mod tests {
         let kept = Message::plain("m-kept", "Ada", "kept", 1_700_000_000, false);
         ctx.hub.store().ingest(&ctx.key("channel-1"), &kept, false).unwrap();
         refresh(&ctx, &saved);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ctx.known("channel-1").unwrap().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(ctx.known("channel-1").unwrap().is_none(), "404-confirmed deleted channel must be removed");
         assert!(ctx.known("direct-2").unwrap().is_some(), "directs must still refresh when channels is empty");
     }
@@ -7513,6 +7899,10 @@ mod tests {
         });
         assert!(ctx.known("group-gone").unwrap().is_some());
         refresh(&ctx, &saved);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ctx.known("group-gone").unwrap().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(ctx.known("group-1").unwrap().is_some(), "an empty answer is not trusted over a group that still answers");
         assert!(ctx.known("group-gone").unwrap().is_none(), "a 404 on open removes it");
     }
@@ -7831,5 +8221,190 @@ mod tests {
         refresh(&ctx, &saved);
         assert_eq!(line().as_deref(), Some("You started a call · 40 sec · Bea, Cy"));
         assert_eq!(ctx.known("group-1").unwrap().unwrap().unread, 0, "the list's unread replaces the local count and the same line does not add one");
+    }
+
+    #[test]
+    fn allowed_sealed_reaction_accepts_unicode_and_custom_shortcodes() {
+        assert!(allowed_sealed_reaction("\u{1f44d}"));
+        assert!(allowed_sealed_reaction("1\u{fe0f}\u{20e3}"));
+        assert!(allowed_sealed_reaction(":party_parrot:"));
+        assert!(allowed_sealed_reaction(":wave-2:"));
+        assert!(!allowed_sealed_reaction(""));
+        assert!(!allowed_sealed_reaction("::"));
+        assert!(!allowed_sealed_reaction(":bad space:"));
+        assert!(!allowed_sealed_reaction("../escape"));
+        assert!(!allowed_sealed_reaction("plain"));
+    }
+
+    #[test]
+    fn e2ee_required_reaction_upgrades_row_and_reports_not_set_up() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("PUT /v1/messages/m-1/reactions ") {
+                return Some(http(400, "Bad Request", &json!({ "error": "e2ee_required" }).to_string()));
+            }
+            None
+        });
+        let mut row = ConversationRow::new("direct-enc", ConversationKind::Direct, "Bea");
+        row.space = Some(SPACE.to_owned());
+        ctx.conversation(&row).unwrap();
+        let (reply, answer) = std::sync::mpsc::channel();
+        react(&ctx, &saved, "direct-enc", "m-1", "\u{1f44d}", true, reply);
+        let err = answer.recv().unwrap().unwrap_err();
+        assert_eq!(err, Refusal::Refused(NOT_SET_UP.to_owned()));
+        let upgraded = ctx.known("direct-enc").unwrap().unwrap();
+        assert!(upgraded.encryption.is_sealed(), "400 e2ee_required should mark the row encrypted");
+    }
+
+    #[test]
+    fn e2ee_bounded_worker_reuses_single_thread_and_enforces_queue_cap() {
+        use std::sync::mpsc::channel;
+        use std::thread::ThreadId;
+        use std::time::Duration;
+
+        let workers = BoundedWorkers::new(4);
+        let acct_a = ("http://127.0.0.1:1".to_owned(), "ada".to_owned());
+        let acct_b = ("http://127.0.0.1:1".to_owned(), "bea".to_owned());
+        let caller = std::thread::current().id();
+
+        // 1. Burst of jobs for one account runs FIFO on a single off-caller worker thread.
+        let (done_tx, done_rx) = channel::<(usize, ThreadId)>();
+        for i in 0..32usize {
+            let tx = done_tx.clone();
+            assert!(
+                workers.enqueue(acct_a.clone(), Box::new(move || {
+                    let _ = tx.send((i, std::thread::current().id()));
+                })),
+                "job {i} should enqueue"
+            );
+            // Drain enough so the cap of 4 never fills during the reuse/ordering check.
+            let (seq, tid) = done_rx.recv_timeout(Duration::from_secs(5)).expect("worker ran");
+            assert_eq!(seq, i, "jobs must run in FIFO order");
+            assert_ne!(tid, caller, "worker must run off the caller thread");
+        }
+
+        // Verify multiple queued jobs share the exact same single OS thread ID.
+        let (ids_tx, ids_rx) = channel::<ThreadId>();
+        for _ in 0..4 {
+            let tx = ids_tx.clone();
+            assert!(workers.enqueue(acct_a.clone(), Box::new(move || {
+                let _ = tx.send(std::thread::current().id());
+            })));
+        }
+        let seen_ids: HashSet<ThreadId> = (0..4)
+            .map(|_| ids_rx.recv_timeout(Duration::from_secs(5)).expect("worker id"))
+            .collect();
+        assert_eq!(seen_ids.len(), 1, "all jobs for one account must share a single worker thread");
+        let worker_tid = *seen_ids.iter().next().unwrap();
+
+        // 2. Bounded capacity: pause the worker, fill all 4 slots, verify overflow drops without blocking.
+        let (started_tx, started_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        assert!(workers.enqueue(acct_a.clone(), Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        })));
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("blocker started");
+
+        let (queued_tx, queued_rx) = channel::<usize>();
+        for i in 0..4usize {
+            let tx = queued_tx.clone();
+            assert!(
+                workers.enqueue(acct_a.clone(), Box::new(move || {
+                    let _ = tx.send(i);
+                })),
+                "slot {i} within cap must enqueue"
+            );
+        }
+        // 5th job exceeds cap=4 and must be rejected immediately without blocking.
+        assert!(
+            !workers.enqueue(acct_a.clone(), Box::new(|| {})),
+            "enqueue beyond bounded capacity must drop immediately"
+        );
+
+        // 3. Separate account is isolated and runs immediately even while acct_a is blocked.
+        let (b_tx, b_rx) = channel::<ThreadId>();
+        assert!(workers.enqueue(acct_b.clone(), Box::new(move || {
+            let _ = b_tx.send(std::thread::current().id());
+        })));
+        let b_tid = b_rx.recv_timeout(Duration::from_secs(5)).expect("account B ran independently");
+        assert_ne!(b_tid, worker_tid, "separate accounts must use separate workers");
+
+        // Release acct_a and confirm all 4 queued jobs drain in order.
+        let _ = release_tx.send(());
+        let drained: Vec<usize> = (0..4)
+            .map(|_| queued_rx.recv_timeout(Duration::from_secs(5)).expect("queued job drained"))
+            .collect();
+        assert_eq!(drained, vec![0, 1, 2, 3]);
+
+        // 4. Panic isolation: a panicking job does not kill the worker for subsequent jobs.
+        assert!(workers.enqueue(acct_a.clone(), Box::new(|| {
+            panic!("synthetic worker panic");
+        })));
+        let (after_tx, after_rx) = channel::<ThreadId>();
+        assert!(workers.enqueue(acct_a.clone(), Box::new(move || {
+            let _ = after_tx.send(std::thread::current().id());
+        })));
+        let after_tid = after_rx.recv_timeout(Duration::from_secs(5)).expect("worker survived panic");
+        assert_eq!(after_tid, worker_tid, "worker thread stays alive after caught panic");
+
+        workers.remove(&acct_a);
+        workers.remove(&acct_b);
+    }
+
+    #[test]
+    fn per_conversation_send_lanes_do_not_stall_unrelated_conversations() {
+        let saved = Saved {
+            base_url: "http://127.0.0.1:1".into(),
+            token: "t".into(),
+            user_id: format!("lane-test-{}", std::process::id()),
+            email: None,
+            display_name: "Ada".into(),
+            role: "member".into(),
+            plain_http_ok: true,
+            e2ee: None,
+        };
+        let (a_started_tx, a_started_rx) = std::sync::mpsc::channel();
+        let (a_release_tx, a_release_rx) = std::sync::mpsc::channel();
+        let (a_done_tx, a_done_rx) = std::sync::mpsc::channel();
+        let a_order = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let a_order_1 = a_order.clone();
+        in_order(
+            send_lane(&saved, "conv-a"),
+            Box::new(move || {
+                let _ = a_started_tx.send(());
+                let _ = a_release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                a_order_1.lock().unwrap().push(1);
+            }),
+        );
+        let a_order_2 = a_order.clone();
+        in_order(
+            send_lane(&saved, "conv-a"),
+            Box::new(move || {
+                a_order_2.lock().unwrap().push(2);
+                let _ = a_done_tx.send(());
+            }),
+        );
+        a_started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("conv-a first send started");
+
+        // While conv-a is blocked, conv-b must complete immediately on its own lane.
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel();
+        in_order(
+            send_lane(&saved, "conv-b"),
+            Box::new(move || {
+                let _ = b_done_tx.send(());
+            }),
+        );
+        b_done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("conv-b must not stall behind conv-a");
+
+        // Releasing conv-a runs both of conv-a's jobs in strict FIFO order.
+        let _ = a_release_tx.send(());
+        a_done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("conv-a second send completed");
+        assert_eq!(*a_order.lock().unwrap(), vec![1, 2]);
     }
 }

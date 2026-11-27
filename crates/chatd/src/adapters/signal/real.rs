@@ -54,6 +54,8 @@ use tokio::sync::mpsc as async_mpsc;
 
 /// How long the adapter waits for one answer from the wire's thread.
 const ANSWER: Duration = Duration::from_secs(45);
+/// How long an attachment upload + send may take before the caller gives up.
+const SEND_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long connecting may take before the attempt counts as dropped.
 const CONNECT: Duration = Duration::from_secs(60);
 /// Signal's content type for text too long for one message: the whole text travels as this
@@ -62,9 +64,40 @@ const LONG_TEXT: &str = "text/x-signal-plain";
 
 type Signal = Manager<Vault, Registered>;
 
+/// Reply handle for `Ask::Send` that tracks caller timeout/cancellation so `signal-wire` never
+/// ghost-sends a message after the UI has already shown it failed or cancelled.
+struct SendReply {
+    tx: Sender<Result<u64, Fault>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl SendReply {
+    fn channel() -> (SendReply, Receiver<Result<u64, Fault>>, Arc<AtomicBool>) {
+        let (tx, rx) = channel();
+        let closed = Arc::new(AtomicBool::new(false));
+        (SendReply { tx, closed: closed.clone() }, rx, closed)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn send(self, value: Result<u64, Fault>) {
+        let _ = self.tx.send(value);
+    }
+}
+
+/// An upload-completed message ready for serial Signal ratchet delivery on `signal-wire`.
+struct ReadySend {
+    to: Peer,
+    content: ContentBody,
+    at: u64,
+    answer: SendReply,
+}
+
 /// What the adapter's threads ask of the wire's thread.
 enum Ask {
-    Send { to: Peer, body: Body, answer: Sender<Result<u64, Fault>> },
+    Send { to: Peer, body: Body, answer: SendReply },
     Typing { to: Peer, started: bool },
     Read { read: Vec<(String, u64)>, receipts: bool, answer: Sender<Result<(), Fault>> },
     Viewed { viewed: Vec<(String, u64)>, receipts: bool, answer: Sender<Result<(), Fault>> },
@@ -115,6 +148,7 @@ enum Ask {
 
 pub struct Real {
     me: (String, String),
+    send_asks: async_mpsc::UnboundedSender<Ask>,
     asks: async_mpsc::UnboundedSender<Ask>,
     heard: Mutex<Option<Receiver<Event>>>,
     closed: Arc<AtomicBool>,
@@ -427,6 +461,7 @@ impl Real {
     pub fn open(saved: &Saved) -> Result<Real, String> {
         let vault = open_vault(saved)?;
         let (events, heard) = channel();
+        let (send_asks, mut send_asked) = async_mpsc::unbounded_channel::<Ask>();
         let (asks, mut asked) = async_mpsc::unbounded_channel::<Ask>();
         let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
         let (ready, readied) = channel::<Result<(String, String), String>>();
@@ -459,13 +494,34 @@ impl Real {
                     let aci = manager.registration_data().service_ids.aci.to_string();
                     let name = own_name(&mut manager).await.unwrap_or(fallback);
                     let (id_tx, mut id_rx) = async_mpsc::unbounded_channel();
+                    let (ready_sends_tx, mut ready_sends_rx) = async_mpsc::unbounded_channel::<ReadySend>();
                     vault.set_identity_change_sink(id_tx);
-                    let mut wire = Session { manager, vault, me: aci.clone(), events, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default(), blocked_acis: HashSet::new(), blocked_groups: HashSet::new() };
+                    let mut wire = Session {
+                        manager,
+                        vault,
+                        me: aci.clone(),
+                        events,
+                        ready_sends: ready_sends_tx,
+                        names: HashMap::new(),
+                        groups: HashMap::new(),
+                        known: GroupRevisions::default(),
+                        blocked_acis: HashSet::new(),
+                        blocked_groups: HashSet::new(),
+                    };
                     let _ = ready.send(Ok((aci, name)));
                     wire.first_run().await;
                     wire.groups_changed().await;
                     let why = loop {
                         tokio::select! {
+                            biased;
+                            _ = &mut stopped => break Event::Closed("closed".to_owned()),
+                            Some(ready_send) = ready_sends_rx.recv() => {
+                                if !ready_send.answer.is_closed() {
+                                    let res = wire.deliver(&ready_send.to, ready_send.content, ready_send.at).await.map(|()| ready_send.at);
+                                    ready_send.answer.send(res);
+                                }
+                            }
+                            Some(ask) = send_asked.recv() => wire.ask(ask).await,
                             received = messages.next() => match received {
                                 Some(received) => wire.received(received).await,
                                 None => break wire.why_closed().await,
@@ -476,7 +532,6 @@ impl Real {
                                 }
                             }
                             Some(ask) = asked.recv() => wire.ask(ask).await,
-                            _ = &mut stopped => break Event::Closed("closed".to_owned()),
                         }
                     };
                     let _ = wire.events.send(why);
@@ -489,13 +544,13 @@ impl Real {
             Ok(Err(why)) => {
                 // An unlinked device says so through its events: hand them over all the same.
                 if why == "ended" {
-                    return Ok(Real { me: (saved.aci.clone(), saved.name.clone()), asks, heard: Mutex::new(Some(heard)), closed, stop: Mutex::new(Some(stop)) });
+                    return Ok(Real { me: (saved.aci.clone(), saved.name.clone()), send_asks, asks, heard: Mutex::new(Some(heard)), closed, stop: Mutex::new(Some(stop)) });
                 }
                 return Err(why);
             }
             Err(_) => return Err("Signal did not answer".to_owned()),
         };
-        Ok(Real { me: (me, name), asks, heard: Mutex::new(Some(heard)), closed, stop: Mutex::new(Some(stop)) })
+        Ok(Real { me: (me, name), send_asks, asks, heard: Mutex::new(Some(heard)), closed, stop: Mutex::new(Some(stop)) })
     }
 
     fn ask<T>(&self, make: impl FnOnce(Sender<Result<T, Fault>>) -> Ask) -> Result<T, Fault> {
@@ -518,7 +573,28 @@ impl Wire for Real {
     }
 
     fn send(&self, to: &Peer, body: Body) -> Result<u64, Fault> {
-        self.ask(|answer| Ask::Send { to: to.clone(), body, answer })
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let timeout = if matches!(body, Body::Files { .. }) {
+            SEND_UPLOAD_TIMEOUT
+        } else {
+            ANSWER
+        };
+        let (answer, answered, caller_closed) = SendReply::channel();
+        struct CancelOnDrop(Arc<AtomicBool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _cancel = CancelOnDrop(caller_closed);
+        self.send_asks
+            .send(Ask::Send { to: to.clone(), body, answer })
+            .map_err(|_| Fault::Net("closed".into()))?;
+        answered
+            .recv_timeout(timeout)
+            .map_err(|_| Fault::Net("no answer".into()))?
     }
 
     fn typing(&self, to: &Peer, started: bool) -> Result<(), Fault> {
@@ -643,7 +719,8 @@ impl Wire for Real {
                 .collect();
             format!("{base}/v1/gifs/search?api_key=37SiWz384431444&q={encoded}&limit=25&offset={offset}&rating=pg-13")
         };
-        let mut resp = ureq::get(&url)
+        let mut resp = gif_agent()
+            .get(&url)
             .header("User-Agent", "Signal-Desktop")
             .call()
             .map_err(|err| Fault::Net(err.to_string()))?;
@@ -682,7 +759,8 @@ impl Wire for Real {
     }
 
     fn fetch_gif(&self, url: &str) -> Result<Vec<u8>, Fault> {
-        let mut resp = ureq::get(url)
+        let mut resp = gif_agent()
+            .get(url)
             .header("User-Agent", "Signal-Desktop")
             .call()
             .map_err(|err| Fault::Net(err.to_string()))?;
@@ -872,6 +950,8 @@ struct Session {
     vault: Vault,
     me: String,
     events: Sender<Event>,
+    /// Channel for offloaded upload tasks to hand back ready-to-deliver payloads.
+    ready_sends: async_mpsc::UnboundedSender<ReadySend>,
     /// Names looked up, so each person is asked for once a connection.
     names: HashMap<String, String>,
     /// Groups by public id: their master keys.
@@ -1418,7 +1498,7 @@ impl Session {
             let mut image_height = 0;
             if let Some(ptr) = &p.image {
                 if ptr.size.unwrap_or(0) <= 5 * 1024 * 1024 {
-                    if let Ok(bytes) = self.manager.get_attachment(ptr).await {
+                    if let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(3), self.manager.get_attachment(ptr)).await {
                         if !bytes.is_empty() {
                             image_width = ptr.width.unwrap_or(0);
                             image_height = ptr.height.unwrap_or(0);
@@ -2054,7 +2134,133 @@ impl Session {
     async fn ask(&mut self, ask: Ask) {
         match ask {
             Ask::Send { to, body, answer } => {
-                let _ = answer.send(self.send(&to, body).await);
+                if answer.is_closed() {
+                    return;
+                }
+                match body {
+                    Body::Files { text, quote, ranges, files, timer } => {
+                        let at = now_ms();
+                        let group_v2 = match self.group_context(&to) {
+                            Ok(ctx) => ctx,
+                            Err(err) => return answer.send(Err(err)),
+                        };
+                        let manager = self.manager.clone();
+                        let ready_tx = self.ready_sends.clone();
+                        tokio::task::spawn_local(async move {
+                            let mut attachments = Vec::with_capacity(files.len());
+                            for file in files {
+                                if answer.is_closed() {
+                                    return;
+                                }
+                                let name = file.name.clone();
+                                let gif = file.gif || file.mime == "image/gif";
+                                let voice = file.voice;
+                                let thumb = file.thumb;
+                                let spec = AttachmentSpec {
+                                    content_type: file.mime,
+                                    length: file.bytes.len(),
+                                    file_name: Some(name.clone()),
+                                    width: (file.width > 0).then_some(file.width),
+                                    height: (file.height > 0).then_some(file.height),
+                                    blur_hash: file.blurhash,
+                                    voice_note: voice.then_some(true),
+                                    ..AttachmentSpec::default()
+                                };
+                                let uploaded = match manager.upload_attachment(spec, file.bytes).await {
+                                    Ok(res) => res,
+                                    Err(err) => return answer.send(Err(fault(err))),
+                                };
+                                let mut pointer = match uploaded {
+                                    Ok(ptr) => ptr,
+                                    Err(err) => return answer.send(Err(attachment_refused(&name, &err))),
+                                };
+                                if !thumb.is_empty() {
+                                    pointer.thumbnail = Some(thumb);
+                                }
+                                if gif {
+                                    pointer.flags = Some(pointer.flags.unwrap_or(0) | super::wire::FLAG_GIF);
+                                }
+                                if voice {
+                                    pointer.flags = Some(pointer.flags.unwrap_or(0) | super::wire::FLAG_VOICE_MESSAGE);
+                                }
+                                attachments.push(pointer);
+                            }
+                            if answer.is_closed() {
+                                return;
+                            }
+                            let content = ContentBody::DataMessage(DataMessage {
+                                body: (!text.is_empty()).then_some(text),
+                                body_ranges: proto_ranges(&ranges),
+                                attachments,
+                                quote: quoted(quote),
+                                timestamp: Some(at),
+                                group_v2,
+                                expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                                expire_timer_version: (timer.version > 0).then_some(timer.version),
+                                ..Default::default()
+                            });
+                            let _ = ready_tx.send(ReadySend { to, content, at, answer });
+                        });
+                    }
+                    Body::Text { text, quote, ranges, timer, previews }
+                        if previews.iter().any(|p| p.image.as_ref().is_some_and(|b| !b.is_empty())) =>
+                    {
+                        let at = now_ms();
+                        let group_v2 = match self.group_context(&to) {
+                            Ok(ctx) => ctx,
+                            Err(err) => return answer.send(Err(err)),
+                        };
+                        let manager = self.manager.clone();
+                        let ready_tx = self.ready_sends.clone();
+                        tokio::task::spawn_local(async move {
+                            let mut proto_previews = Vec::with_capacity(previews.len());
+                            for p in previews {
+                                if answer.is_closed() {
+                                    return;
+                                }
+                                let mut image_ptr = None;
+                                if let Some(bytes) = p.image.filter(|b| !b.is_empty()) {
+                                    let spec = AttachmentSpec {
+                                        content_type: "image/jpeg".to_owned(),
+                                        length: bytes.len(),
+                                        file_name: Some("preview.jpg".to_owned()),
+                                        width: (p.image_width > 0).then_some(p.image_width),
+                                        height: (p.image_height > 0).then_some(p.image_height),
+                                        ..AttachmentSpec::default()
+                                    };
+                                    if let Ok(Ok(ptr)) = manager.upload_attachment(spec, bytes).await {
+                                        image_ptr = Some(ptr);
+                                    }
+                                }
+                                proto_previews.push(presage::proto::Preview {
+                                    url: Some(p.url),
+                                    title: (!p.title.is_empty()).then_some(p.title),
+                                    description: (!p.description.is_empty()).then_some(p.description),
+                                    date: (p.date > 0).then_some(p.date),
+                                    image: image_ptr,
+                                });
+                            }
+                            if answer.is_closed() {
+                                return;
+                            }
+                            let content = ContentBody::DataMessage(DataMessage {
+                                body: Some(text),
+                                body_ranges: proto_ranges(&ranges),
+                                quote: quoted(quote),
+                                preview: proto_previews,
+                                group_v2,
+                                expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                                expire_timer_version: (timer.version > 0).then_some(timer.version),
+                                ..Default::default()
+                            });
+                            let _ = ready_tx.send(ReadySend { to, content, at, answer });
+                        });
+                    }
+                    other => {
+                        let res = self.send(&to, other).await;
+                        answer.send(res);
+                    }
+                }
             }
             Ask::Typing { to, started } => {
                 let action = if started { typing_message::Action::Started } else { typing_message::Action::Stopped };
@@ -2075,7 +2281,16 @@ impl Session {
                 let _ = answer.send(self.unlink().await);
             }
             Ask::Picture { of, answer } => {
-                let _ = answer.send(self.picture(&of).await);
+                let mut manager = self.manager.clone();
+                let group_ctx = if matches!(of, Peer::Group(_)) {
+                    self.group_context(&of).ok().flatten()
+                } else {
+                    None
+                };
+                tokio::task::spawn_local(async move {
+                    let res = fetch_picture(&mut manager, &of, group_ctx).await;
+                    let _ = answer.send(res);
+                });
             }
             Ask::Card { answer } => {
                 let _ = answer.send(self.card().await);
@@ -2165,10 +2380,21 @@ impl Session {
                 let _ = answer.send(self.person_profile(&aci).await);
             }
             Ask::DownloadAttachment { pointer, dest, answer } => {
-                let _ = answer.send(self.download_attachment(&pointer, &dest).await);
+                let credentials = self.credentials();
+                tokio::task::spawn_local(async move {
+                    let res = match credentials {
+                        Ok(creds) => download_attachment_with(creds, &pointer, &dest).await,
+                        Err(err) => Err(err),
+                    };
+                    let _ = answer.send(res);
+                });
             }
             Ask::PreviewStickerPack { pack_id, pack_key, answer } => {
-                let _ = answer.send(self.preview_sticker_pack(&pack_id, &pack_key).await);
+                let vault = self.vault.clone();
+                tokio::task::spawn_local(async move {
+                    let res = preview_sticker_pack_with(&vault, &pack_id, &pack_key).await;
+                    let _ = answer.send(res);
+                });
             }
             Ask::InstallStickerPack { pack_id, pack_key, answer } => {
                 let _ = answer.send(self.install_sticker_pack(&pack_id, &pack_key).await);
@@ -2177,7 +2403,10 @@ impl Session {
                 let _ = answer.send(self.remove_sticker_pack(&pack_id, &pack_key).await);
             }
             Ask::DownloadSticker { pack_id, pack_key, sticker_id, dest, answer } => {
-                let _ = answer.send(self.download_sticker(&pack_id, &pack_key, sticker_id, &dest).await);
+                tokio::task::spawn_local(async move {
+                    let res = download_sticker_cdn(&pack_id, &pack_key, sticker_id, &dest).await;
+                    let _ = answer.send(res);
+                });
             }
             Ask::TurnServers { answer } => {
                 let _ = answer.send(self.turn_servers().await);
@@ -2239,56 +2468,7 @@ impl Session {
     }
 
     async fn preview_sticker_pack(&mut self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
-        use futures::AsyncReadExt;
-        use prost::Message as _;
-
-        let key_bytes = unhex(pack_key)
-            .filter(|b| b.len() == 32)
-            .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
-        if pack_id.len() != 32 || !pack_id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Fault::Refused("Invalid sticker pack id.".to_owned()));
-        }
-        let id_lower = pack_id.to_ascii_lowercase();
-        let mut push = PushService::new(SignalServers::Production, None, "tinyclient");
-        let mut ws = push
-            .ws::<presage::libsignal_service::websocket::Unidentified>("/v1/websocket/", "/v1/keepalive", &[], None)
-            .await
-            .map_err(|err| Fault::Net(err.to_string()))?;
-        let mut stream = ws
-            .get_sticker_pack_manifest(&id_lower)
-            .await
-            .map_err(|err| Fault::Net(err.to_string()))?;
-        let mut enc = Vec::new();
-        stream.read_to_end(&mut enc).await.map_err(|err| Fault::Net(err.to_string()))?;
-        let tmp = tempfile::NamedTempFile::new().map_err(|err| Fault::Net(err.to_string()))?;
-        super::files::decrypt_sticker_stream(std::io::Cursor::new(&enc), &key_bytes, tmp.path())
-            .map_err(Fault::Refused)?;
-        let plain = std::fs::read(tmp.path()).map_err(|err| Fault::Net(err.to_string()))?;
-        let pack = presage::proto::Pack::decode(plain.as_slice())
-            .map_err(|err| Fault::Refused(format!("Invalid sticker pack manifest: {err}")))?;
-        let installed = match unhex(&id_lower) {
-            Some(id) => self.vault.sticker_pack(&id).await.ok().flatten().is_some(),
-            None => false,
-        };
-        Ok(StickerPackInfo {
-            id: id_lower,
-            key: pack_key.to_ascii_lowercase(),
-            title: pack.title.unwrap_or_default(),
-            author: pack.author.unwrap_or_default(),
-            cover_id: pack.cover.and_then(|c| c.id),
-            stickers: pack
-                .stickers
-                .into_iter()
-                .filter_map(|s| {
-                    Some(StickerEntry {
-                        id: s.id?,
-                        emoji: s.emoji.unwrap_or_default(),
-                        content_type: s.content_type.unwrap_or_else(|| "image/webp".to_owned()),
-                    })
-                })
-                .collect(),
-            installed,
-        })
+        preview_sticker_pack_with(&self.vault, pack_id, pack_key).await
     }
 
     async fn install_sticker_pack(&mut self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
@@ -2320,108 +2500,6 @@ impl Session {
             .await
             .map_err(fault)?;
         Ok(())
-    }
-
-    async fn download_sticker(
-        &mut self,
-        pack_id: &str,
-        pack_key: &str,
-        sticker_id: u32,
-        dest: &std::path::Path,
-    ) -> Result<u64, Fault> {
-        use futures::AsyncReadExt;
-
-        let key_bytes = unhex(pack_key)
-            .filter(|b| b.len() == 32)
-            .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
-        let id_lower = pack_id.to_ascii_lowercase();
-        let mut push = PushService::new(SignalServers::Production, None, "tinyclient");
-        let mut ws = push
-            .ws::<presage::libsignal_service::websocket::Unidentified>("/v1/websocket/", "/v1/keepalive", &[], None)
-            .await
-            .map_err(|err| Fault::Net(err.to_string()))?;
-        let mut stream = match ws.get_sticker(&id_lower, sticker_id).await {
-            Ok(s) => s,
-            Err(ServiceError::UnhandledResponseCode { status, .. })
-                if matches!(status.as_u16(), 403 | 404 | 410) =>
-            {
-                return Err(Fault::Refused("No longer available".to_owned()));
-            }
-            Err(err) => return Err(Fault::Net(err.to_string())),
-        };
-        let mut enc = Vec::new();
-        stream.read_to_end(&mut enc).await.map_err(|err| Fault::Net(err.to_string()))?;
-        let dest = dest.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            super::files::decrypt_sticker_stream(std::io::Cursor::new(&enc), &key_bytes, &dest)
-        })
-        .await
-        .map_err(|err| Fault::Net(err.to_string()))?
-        .map_err(Fault::Refused)
-    }
-
-    async fn download_attachment(&mut self, pointer: &Pointer, dest: &std::path::Path) -> Result<u64, Fault> {
-        use futures::AsyncReadExt;
-        use std::io::Write;
-
-        let proto = proto_pointer_of(pointer).ok_or_else(|| Fault::Refused("No longer available".to_owned()))?;
-        let credentials = self.credentials()?;
-        let mut push = PushService::new(SignalServers::Production, Some(credentials), "tinyclient");
-        let mut stream = match push.get_attachment(&proto).await {
-            Ok(s) => s,
-            Err(ServiceError::UnhandledResponseCode { status, .. })
-                if matches!(status.as_u16(), 403 | 404 | 410) =>
-            {
-                return Err(Fault::Refused("No longer available".to_owned()));
-            }
-            Err(ServiceError::SendError { reason })
-                if reason.contains("404") || reason.contains("410") || reason.contains("403") =>
-            {
-                return Err(Fault::Refused("No longer available".to_owned()));
-            }
-            Err(err) => return Err(Fault::Net(err.to_string())),
-        };
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| Fault::Net(err.to_string()))?;
-        }
-        let enc_path = dest.with_extension("sigenc");
-        {
-            let mut enc_file = protocol::private::create(&enc_path).map_err(|err| Fault::Net(err.to_string()))?;
-            let mut buf = vec![0u8; 64 * 1024];
-            let mut total = 0u64;
-            let cap = super::files::MAX_FILE_BYTES + 1024 * 1024;
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        total = total.saturating_add(n as u64);
-                        if total > cap {
-                            drop(enc_file);
-                            let _ = std::fs::remove_file(&enc_path);
-                            return Err(Fault::Refused("Attachment exceeds Signal's size limit.".to_owned()));
-                        }
-                        if let Err(err) = enc_file.write_all(&buf[..n]) {
-                            drop(enc_file);
-                            let _ = std::fs::remove_file(&enc_path);
-                            return Err(Fault::Net(err.to_string()));
-                        }
-                    }
-                    Err(err) => {
-                        drop(enc_file);
-                        let _ = std::fs::remove_file(&enc_path);
-                        return Err(Fault::Net(err.to_string()));
-                    }
-                }
-            }
-        }
-        let key = pointer.key.clone();
-        let digest = pointer.digest.clone();
-        let size = pointer.size;
-        let dest = dest.to_path_buf();
-        tokio::task::spawn_blocking(move || super::files::decrypt_attachment_file(&enc_path, &key, &digest, size, &dest))
-            .await
-            .map_err(|err| Fault::Net(err.to_string()))?
-            .map_err(Fault::Refused)
     }
 
     async fn person_profile(&mut self, aci: &str) -> Result<PersonProfile, Fault> {
@@ -3241,34 +3319,12 @@ impl Session {
         Ok(())
     }
 
-    /// A person's profile picture, fetched from Signal's CDN and opened with their profile key
-    /// (which their messages or the phone's contact sync gave us), or a group's, opened with
-    /// its master key.
-    async fn picture(&mut self, of: &Peer) -> Result<Option<Vec<u8>>, Fault> {
-        match of {
-            Peer::Direct(aci) => {
-                let Ok(uuid) = Uuid::parse_str(aci) else {
-                    return Ok(None);
-                };
-                let Ok(Some(key)) = self.manager.store().profile_key(&ServiceId::Aci(Aci::from(uuid))).await else {
-                    return Ok(None);
-                };
-                self.manager.retrieve_profile_avatar_by_uuid(uuid, key).await.map_err(fault)
-            }
-            Peer::Group(_) => match self.group_context(of) {
-                Ok(Some(context)) => self.manager.retrieve_group_avatar(context).await.map_err(fault),
-                Ok(None) | Err(_) => Ok(None),
-            },
-        }
-    }
-
     fn group_context(&self, to: &Peer) -> Result<Option<GroupContextV2>, Fault> {
         let Peer::Group(id) = to else {
             return Ok(None);
         };
         let key = self.groups.get(id).ok_or_else(|| Fault::Refused("This group isn't one Signal still knows for you.".to_owned()))?;
-        let revision = self.vault.group_keys().ok().and_then(|groups| groups.into_iter().find(|(k, _)| k == key)).map_or(0, |(_, group)| group.revision);
-        Ok(Some(GroupContextV2 { master_key: Some(key.to_vec()), revision: Some(revision), group_change: None }))
+        Ok(Some(group_context_for_key(&self.vault, key)))
     }
 
     async fn deliver(&mut self, to: &Peer, body: ContentBody, at: u64) -> Result<(), Fault> {
@@ -3900,6 +3956,247 @@ fn quoted(quote: Option<super::wire::Quote>) -> Option<data_message::Quote> {
     })
 }
 
+fn group_context_for_key(vault: &Vault, key: &[u8; 32]) -> GroupContextV2 {
+    let revision = vault
+        .group_by_key(*key)
+        .ok()
+        .flatten()
+        .map_or(0, |group| group.revision);
+    GroupContextV2 {
+        master_key: Some(key.to_vec()),
+        revision: Some(revision),
+        group_change: None,
+    }
+}
+
+async fn fetch_picture(
+    manager: &mut Signal,
+    of: &Peer,
+    group_ctx: Option<GroupContextV2>,
+) -> Result<Option<Vec<u8>>, Fault> {
+    match of {
+        Peer::Direct(aci) => {
+            let Ok(uuid) = Uuid::parse_str(aci) else {
+                return Ok(None);
+            };
+            let Ok(Some(key)) = manager.store().profile_key(&ServiceId::Aci(Aci::from(uuid))).await else {
+                return Ok(None);
+            };
+            manager.retrieve_profile_avatar_by_uuid(uuid, key).await.map_err(fault)
+        }
+        Peer::Group(_) => match group_ctx {
+            Some(context) => manager.retrieve_group_avatar(context).await.map_err(fault),
+            None => Ok(None),
+        },
+    }
+}
+
+async fn preview_sticker_pack_with(
+    vault: &Vault,
+    pack_id: &str,
+    pack_key: &str,
+) -> Result<StickerPackInfo, Fault> {
+    use futures::AsyncReadExt;
+    use prost::Message as _;
+
+    let key_bytes = unhex(pack_key)
+        .filter(|b| b.len() == 32)
+        .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+    if pack_id.len() != 32 || !pack_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Fault::Refused("Invalid sticker pack id.".to_owned()));
+    }
+    let id_lower = pack_id.to_ascii_lowercase();
+    let mut push = PushService::new(SignalServers::Production, None, "tinyclient");
+    let mut ws = push
+        .ws::<presage::libsignal_service::websocket::Unidentified>("/v1/websocket/", "/v1/keepalive", &[], None)
+        .await
+        .map_err(|err| Fault::Net(err.to_string()))?;
+    let mut stream = ws
+        .get_sticker_pack_manifest(&id_lower)
+        .await
+        .map_err(|err| Fault::Net(err.to_string()))?;
+    let mut enc = Vec::new();
+    stream.read_to_end(&mut enc).await.map_err(|err| Fault::Net(err.to_string()))?;
+    let tmp = tempfile::NamedTempFile::new().map_err(|err| Fault::Net(err.to_string()))?;
+    super::files::decrypt_sticker_stream(std::io::Cursor::new(&enc), &key_bytes, tmp.path())
+        .map_err(Fault::Refused)?;
+    let plain = std::fs::read(tmp.path()).map_err(|err| Fault::Net(err.to_string()))?;
+    let pack = presage::proto::Pack::decode(plain.as_slice())
+        .map_err(|err| Fault::Refused(format!("Invalid sticker pack manifest: {err}")))?;
+    let installed = match unhex(&id_lower) {
+        Some(id) => vault.sticker_pack(&id).await.ok().flatten().is_some(),
+        None => false,
+    };
+    Ok(StickerPackInfo {
+        id: id_lower,
+        key: pack_key.to_ascii_lowercase(),
+        title: pack.title.unwrap_or_default(),
+        author: pack.author.unwrap_or_default(),
+        cover_id: pack.cover.and_then(|c| c.id),
+        stickers: pack
+            .stickers
+            .into_iter()
+            .filter_map(|s| {
+                Some(StickerEntry {
+                    id: s.id?,
+                    emoji: s.emoji.unwrap_or_default(),
+                    content_type: s.content_type.unwrap_or_else(|| "image/webp".to_owned()),
+                })
+            })
+            .collect(),
+        installed,
+    })
+}
+
+async fn download_sticker_cdn(
+    pack_id: &str,
+    pack_key: &str,
+    sticker_id: u32,
+    dest: &std::path::Path,
+) -> Result<u64, Fault> {
+    use futures::AsyncReadExt;
+
+    let key_bytes = unhex(pack_key)
+        .filter(|b| b.len() == 32)
+        .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+    let id_lower = pack_id.to_ascii_lowercase();
+    let mut push = PushService::new(SignalServers::Production, None, "tinyclient");
+    let mut ws = push
+        .ws::<presage::libsignal_service::websocket::Unidentified>("/v1/websocket/", "/v1/keepalive", &[], None)
+        .await
+        .map_err(|err| Fault::Net(err.to_string()))?;
+    let mut stream = match ws.get_sticker(&id_lower, sticker_id).await {
+        Ok(s) => s,
+        Err(ServiceError::UnhandledResponseCode { status, .. })
+            if matches!(status.as_u16(), 403 | 404 | 410) =>
+        {
+            return Err(Fault::Refused("No longer available".to_owned()));
+        }
+        Err(err) => return Err(Fault::Net(err.to_string())),
+    };
+    let mut enc = Vec::new();
+    stream.read_to_end(&mut enc).await.map_err(|err| Fault::Net(err.to_string()))?;
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        super::files::decrypt_sticker_stream(std::io::Cursor::new(&enc), &key_bytes, &dest)
+    })
+    .await
+    .map_err(|err| Fault::Net(err.to_string()))?
+    .map_err(Fault::Refused)
+}
+
+async fn download_attachment_with(
+    credentials: ServiceCredentials,
+    pointer: &Pointer,
+    dest: &std::path::Path,
+) -> Result<u64, Fault> {
+    use futures::AsyncReadExt;
+    use std::io::Write;
+
+    let proto = proto_pointer_of(pointer).ok_or_else(|| Fault::Refused("No longer available".to_owned()))?;
+    let mut push = PushService::new(SignalServers::Production, Some(credentials), "tinyclient");
+    let mut stream = match push.get_attachment(&proto).await {
+        Ok(s) => s,
+        Err(ServiceError::UnhandledResponseCode { status, .. })
+            if matches!(status.as_u16(), 403 | 404 | 410) =>
+        {
+            return Err(Fault::Refused("No longer available".to_owned()));
+        }
+        Err(ServiceError::SendError { reason })
+            if reason.contains("404") || reason.contains("410") || reason.contains("403") =>
+        {
+            return Err(Fault::Refused("No longer available".to_owned()));
+        }
+        Err(err) => return Err(Fault::Net(err.to_string())),
+    };
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| Fault::Net(err.to_string()))?;
+    }
+    let enc_path = dest.with_extension("sigenc");
+    {
+        let mut enc_file = protocol::private::create(&enc_path).map_err(|err| Fault::Net(err.to_string()))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0u64;
+        let cap = super::files::MAX_FILE_BYTES + 1024 * 1024;
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    total = total.saturating_add(n as u64);
+                    if total > cap {
+                        drop(enc_file);
+                        let _ = std::fs::remove_file(&enc_path);
+                        return Err(Fault::Refused("Attachment exceeds Signal's size limit.".to_owned()));
+                    }
+                    if let Err(err) = enc_file.write_all(&buf[..n]) {
+                        drop(enc_file);
+                        let _ = std::fs::remove_file(&enc_path);
+                        return Err(Fault::Net(err.to_string()));
+                    }
+                }
+                Err(err) => {
+                    drop(enc_file);
+                    let _ = std::fs::remove_file(&enc_path);
+                    return Err(Fault::Net(err.to_string()));
+                }
+            }
+        }
+    }
+    let key = pointer.key.clone();
+    let digest = pointer.digest.clone();
+    let size = pointer.size;
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || super::files::decrypt_attachment_file(&enc_path, &key, &digest, size, &dest))
+        .await
+        .map_err(|err| Fault::Net(err.to_string()))?
+        .map_err(Fault::Refused)
+}
+
+fn gif_agent() -> ureq::Agent {
+    static SHARED: Mutex<Option<(protocol::settings::ProxyConfig, ureq::Agent)>> = Mutex::new(None);
+    let cfg = crate::adapters::net::proxy_config();
+    let mut guard = crate::hub::lock(&SHARED);
+    if let Some((saved, agent)) = guard.as_ref() {
+        if *saved == cfg {
+            return agent.clone();
+        }
+    }
+    let built: ureq::Agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
+        .tls_config(crate::tls::config())
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_global(Some(Duration::from_secs(10)))
+        .max_idle_age(Duration::from_secs(30))
+        .user_agent("Signal-Desktop")
+        .build()
+        .into();
+    *guard = Some((cfg, built.clone()));
+    built
+}
+
+fn signal_proxy_agent(proxy_url: &str) -> Option<ureq::Agent> {
+    static SHARED: Mutex<Option<(String, ureq::Agent)>> = Mutex::new(None);
+    let mut guard = crate::hub::lock(&SHARED);
+    if let Some((saved, agent)) = guard.as_ref() {
+        if saved == proxy_url {
+            return Some(agent.clone());
+        }
+    }
+    let proxy = ureq::Proxy::new(proxy_url).ok()?;
+    let built: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(crate::tls::config())
+        .proxy(Some(proxy))
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .http_status_as_error(false)
+        .max_idle_age(Duration::from_secs(30))
+        .timeout_global(Some(Duration::from_millis(1500)))
+        .user_agent("WhatsApp/2")
+        .build()
+        .into();
+    *guard = Some((proxy_url.to_owned(), built.clone()));
+    Some(built)
+}
+
 /// Fetches a link preview strictly through Signal's content proxy (`contentproxy.signal.org`,
 /// overridable via `TINYCLIENT_SIGNAL_CONTENT_PROXY`). NEVER connects directly to target hosts.
 fn fetch_preview_via_signal_proxy(url: &str) -> Option<LinkPreview> {
@@ -3910,12 +4207,12 @@ fn fetch_preview_via_signal_proxy(url: &str) -> Option<LinkPreview> {
     const MAX_REDIRECTS: usize = 3;
     const MAX_HTML_BYTES: u64 = 512 * 1024;
     const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024;
-    const DEADLINE: Duration = Duration::from_secs(5);
+    const DEADLINE: Duration = Duration::from_millis(1500);
 
     og::validate_https_url(url).ok()?;
     let proxy_url = std::env::var("TINYCLIENT_SIGNAL_CONTENT_PROXY")
         .unwrap_or_else(|_| "https://contentproxy.signal.org:443".to_owned());
-    let proxy = ureq::Proxy::new(proxy_url.trim()).ok()?;
+    let agent = signal_proxy_agent(proxy_url.trim())?;
     let deadline = Instant::now() + DEADLINE;
 
     let fetch = |start: &str, max_bytes: u64| -> Option<(String, String, Vec<u8>)> {
@@ -3926,16 +4223,11 @@ fn fetch_preview_via_signal_proxy(url: &str) -> Option<LinkPreview> {
                 return None;
             }
             og::validate_https_url(&current).ok()?;
-            let config = ureq::Agent::config_builder()
-                .proxy(Some(proxy.clone()))
-                .max_redirects(0)
-                .http_status_as_error(false)
-                .timeout_global(Some(remaining))
-                .user_agent("WhatsApp/2")
-                .build();
-            let agent = ureq::Agent::new_with_config(config);
             let resp = agent
                 .get(&current)
+                .config()
+                .timeout_global(Some(remaining))
+                .build()
                 .header("Accept", "text/html,application/xhtml+xml,image/*;q=0.8,*/*;q=0.1")
                 .call()
                 .ok()?;
@@ -4291,7 +4583,8 @@ impl Linker for RealLinker {
         };
         // Closed before the user saw it finish: undone, never left on the account.
         if cancelled.load(Ordering::Relaxed) {
-            let mut session = Session { manager, vault: store.clone(), me: aci, events: channel().0, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default(), blocked_acis: HashSet::new(), blocked_groups: HashSet::new() };
+            let (ready_tx, _) = async_mpsc::unbounded_channel();
+            let mut session = Session { manager, vault: store.clone(), me: aci, events: channel().0, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default(), blocked_acis: HashSet::new(), blocked_groups: HashSet::new(), ready_sends: ready_tx };
             let _ = local.block_on(&runtime, session.unlink());
             drop(session);
             vault::remove(&pending);
@@ -4480,5 +4773,45 @@ mod tests {
         assert_eq!(unsupported_label(&sticker).as_deref(), Some("Sticker"));
         assert_eq!(unsupported_label(&DataMessage::default()), None);
         assert_eq!(words(&DataMessage::default()), String::new());
+    }
+
+    #[test]
+    fn group_context_for_key_reads_single_group_without_scanning_other_groups() {
+        let path = std::env::temp_dir().join(format!("tinyclient-real-group-lookup-{}.state", std::process::id()));
+        vault::remove(&path);
+        let vault = Vault::open(&path, &vault::new_key().unwrap()).unwrap();
+        let target_key = [0x42u8; 32];
+        let broken_key = [0x99u8; 32];
+        let group = Group {
+            title: "Team".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 7,
+            members: Vec::new(),
+            pending_members: Vec::new(),
+            requesting_members: Vec::new(),
+            invite_link_password: Vec::new(),
+            description: None,
+        };
+        let encoded = serde_json::to_vec(&group).unwrap();
+        vault.put(&format!("group.{}", hex(&target_key)), &encoded).unwrap();
+        // Plant an unreadable unrelated group row; a full `group_keys()` scan fails on it.
+        vault.put(&format!("group.{}", hex(&broken_key)), b"not-valid-json").unwrap();
+        assert!(vault.group_keys().is_err(), "full scan must fail on the corrupt sibling row");
+
+        let ctx = group_context_for_key(&vault, &target_key);
+        assert_eq!(ctx.master_key.as_deref(), Some(&target_key[..]));
+        assert_eq!(ctx.revision, Some(7));
+        vault::remove(&path);
+    }
+
+    #[test]
+    fn cancelled_send_reply_marks_closed_to_prevent_ghost_send() {
+        let (reply, rx, closed) = SendReply::channel();
+        assert!(!reply.is_closed());
+        closed.store(true, Ordering::Release);
+        drop(rx);
+        assert!(reply.is_closed());
     }
 }

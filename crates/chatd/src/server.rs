@@ -415,26 +415,29 @@ impl Chat {
         // between the runs costs nothing.
         const AFTER_BOOT: Duration = Duration::from_secs(60);
         const EXPIRY_EVERY: Duration = Duration::from_secs(60);
+        const PENDING_EVERY: Duration = Duration::from_secs(10);
         const RETENTION_EVERY: Duration = Duration::from_secs(86_400);
         let hub = chat.hub.clone();
         std::thread::spawn(move || {
             let boot = Instant::now();
             // Retention ran last then; its first run comes at the boot's minute.
             let mut pruned: Option<Instant> = None;
+            let mut pending_checked = Instant::now();
             loop {
-                // Sleep until the next message's own timer runs out, at most a minute — its
-                // time comes whether the account is online or not — and shorter still when a
-                // message with a timer arrived or retention is asked for. Until the boot's
-                // minute the sleep is capped there too: the sign-in has the store busy.
-                let cap = if pruned.is_none() { AFTER_BOOT } else { EXPIRY_EVERY };
+                // Sleep until the next message's own timer runs out or the next pending-send
+                // sweep (every 10 s), whichever comes first — and shorter still when a message
+                // with a timer arrived or retention is asked for.
+                let cap = if pruned.is_none() { AFTER_BOOT } else { EXPIRY_EVERY }
+                    .min(PENDING_EVERY.saturating_sub(pending_checked.elapsed()));
                 let wait = match hub.store().until_expiry(now()) {
                     Ok(at) => at.map_or(cap, |at| at.min(cap)),
                     Err(_) => cap,
                 };
                 let (asked, _) = hub.prune_due(wait);
                 // Whatever ran out is gone from the store, online or not; the conversations it
-                // was in are read again.
-                match hub.store().expire(now()) {
+                // was in are read again. Release the store lock before announcing changes.
+                let expired = hub.store().expire(now());
+                match expired {
                     Ok(gone) => {
                         for conversation in gone {
                             hub.changed(Change::Messages { conversation: conversation.clone() });
@@ -442,6 +445,36 @@ impl Chat {
                         }
                     }
                     Err(err) => tracing::warn!("chatd: messages past their time: {err}"),
+                }
+                // Sweep stuck pending/queued sends every 10 s without waiting for a messages read,
+                // excluding active file uploads so uploads over 60 s are never falsely failed.
+                if pending_checked.elapsed() >= PENDING_EVERY {
+                    pending_checked = Instant::now();
+                    let swept = {
+                        let mut store = hub.store();
+                        store
+                            .fail_pending_excluding(
+                                now() - SEND_SECONDS,
+                                "The network did not answer.",
+                                crate::blobs::upload::is_active,
+                            )
+                            .and_then(|failed| {
+                                let aged = store.fail_queued(now() - QUEUE_AGE, QUEUE_LATE)?;
+                                Ok((failed, aged))
+                            })
+                    };
+                    match swept {
+                        Ok((failed, aged)) => {
+                            let mut seen = Vec::new();
+                            for conversation in failed.into_iter().chain(aged) {
+                                if !seen.contains(&conversation) {
+                                    seen.push(conversation.clone());
+                                    hub.changed(Change::Messages { conversation });
+                                }
+                            }
+                        }
+                        Err(err) => tracing::warn!("chatd: pending send sweep: {err}"),
+                    }
                 }
                 // Retention: about a minute after the boot, then once a day, or at once when
                 // asked. Its scans are worth skipping while the boot's sign-in writes months
@@ -451,7 +484,8 @@ impl Chat {
                     || (pruned.is_none() && boot.elapsed() >= AFTER_BOOT)
                 {
                     let days = hub.settings().number(settings::KEEP_DAYS);
-                    match hub.store().prune(now(), days) {
+                    let pruned_count = hub.store().prune(now(), days);
+                    match pruned_count {
                         Ok(0) | Err(_) => {}
                         Ok(gone) => {
                             tracing::warn!("chatd: pruned {gone} old messages");
@@ -1267,19 +1301,34 @@ impl Chat {
         if let Err(err) = self.ensure_thread(&conversation) {
             return internal(err);
         }
-        let read = {
+        let (read, notify) = {
             let mut store = self.hub.store();
-            let swept = store.fail_pending(now() - SEND_SECONDS, "The network did not answer.").and_then(|failed| {
-                let aged = store.fail_queued(now() - QUEUE_AGE, QUEUE_LATE)?;
-                Ok((failed, aged))
-            });
-            if let Ok((failed, aged)) = &swept {
-                for stuck in failed.iter().chain(aged.iter()).filter(|stuck| **stuck != conversation) {
-                    self.hub.changed(Change::Messages { conversation: stuck.clone() });
+            let swept = store
+                .fail_pending_excluding(
+                    now() - SEND_SECONDS,
+                    "The network did not answer.",
+                    crate::blobs::upload::is_active,
+                )
+                .and_then(|failed| {
+                    let aged = store.fail_queued(now() - QUEUE_AGE, QUEUE_LATE)?;
+                    Ok((failed, aged))
+                });
+            match swept {
+                Ok((failed, aged)) => {
+                    let notify: Vec<Key> = failed
+                        .into_iter()
+                        .chain(aged)
+                        .filter(|stuck| *stuck != conversation)
+                        .collect();
+                    let page = store.messages(&conversation, &page, limit.min(PAGE_LIMIT), now());
+                    (page, notify)
                 }
+                Err(err) => (Err(err), Vec::new()),
             }
-            swept.and_then(|_| store.messages(&conversation, &page, limit.min(PAGE_LIMIT), now()))
         };
+        for stuck in notify {
+            self.hub.changed(Change::Messages { conversation: stuck });
+        }
         match read {
             Ok(Some(found)) => {
                 // What is stored is answered at once. The network catches it up behind that.
@@ -5190,6 +5239,21 @@ impl Chat {
                     reply,
                 })
             }
+            Request::ReorderPinned { account, folder, conversations } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_ids: Vec<String> = conversations
+                    .into_iter()
+                    .filter(|key| key.account() == account)
+                    .take(protocol::FOLDER_MEMBERS)
+                    .map(|key| key.id)
+                    .collect();
+                match self.ask(&account, |reply| Command::ReorderPinned { folder, conversation_ids, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::Remind { conversation, message_id, remind_at } => {
                 let account = conversation.account();
                 if !self.shows(&account) {
@@ -6223,9 +6287,7 @@ impl Chat {
             Request::Forget { conversation } => self.forget_conversation(conversation),
             Request::Send { conversation, client_id, text, reply_to, with } => {
                 let began = std::time::Instant::now();
-                if conversation.network == Network::Tiny {
-                    crate::sendtime::submitted(&client_id);
-                }
+                crate::sendtime::submitted(&client_id);
                 let logged = client_id.clone();
                 let message = self.new_message(&conversation, client_id, text, reply_to.as_deref(), &with);
                 let pending = began.elapsed();
@@ -6239,13 +6301,16 @@ impl Chat {
                     Ok(message) => message,
                     Err(refused) => return *refused,
                 };
-                if message.waiting {
-                    let conversation_id = conversation.id.clone();
-                    self.command(&conversation.account(), Command::CancelSend { conversation_id, client_id: client_id.clone() });
+                let account = conversation.account();
+                let conversation_id = conversation.id.clone();
+                // An offline-queued message (`waiting` while disconnected) is owned by the store
+                // and dropped immediately; a connected `waiting` message (e.g. locally scheduled)
+                // is owned by the adapter, which cancels it via `Context::sent`.
+                if message.waiting && self.hub.link(&account) != Link::Connected {
+                    self.command(&account, Command::CancelSend { conversation_id, client_id: client_id.clone() });
                     return self.drop_unsent(conversation, &client_id, &message);
                 }
-                let conversation_id = conversation.id.clone();
-                self.command(&conversation.account(), Command::CancelSend { conversation_id, client_id });
+                self.command(&account, Command::CancelSend { conversation_id, client_id });
                 Response::Ok
             }
             Request::Retry { conversation, client_id } => match self.unsent(&conversation, &client_id) {
@@ -8156,20 +8221,79 @@ fn serve_connection(chat: &Chat, mut stream: ChatStream) -> io::Result<()> {
     }
 }
 
+/// Maximum concurrent IPC connection threads served at once so stalled clients cannot
+/// exhaust OS threads or stack memory.
+const MAX_CONNECTIONS: usize = 64;
+
+struct ConnectionPermits {
+    active: Mutex<usize>,
+    released: Condvar,
+    limit: usize,
+}
+
+struct ConnectionPermit {
+    permits: Arc<ConnectionPermits>,
+}
+
+impl ConnectionPermits {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            active: Mutex::new(0),
+            released: Condvar::new(),
+            limit: limit.max(1),
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> ConnectionPermit {
+        let mut active = lock(&self.active);
+        while *active >= self.limit {
+            active = self.released.wait(active).unwrap_or_else(PoisonError::into_inner);
+        }
+        *active += 1;
+        ConnectionPermit { permits: Arc::clone(self) }
+    }
+
+    #[cfg(test)]
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut active = lock(&self.active);
+        if *active >= self.limit {
+            return None;
+        }
+        *active += 1;
+        Some(ConnectionPermit { permits: Arc::clone(self) })
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        *lock(&self.active)
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut active = lock(&self.permits.active);
+        *active = active.saturating_sub(1);
+        self.permits.released.notify_one();
+    }
+}
+
 /// Answers requests until the process is killed. A connection may send many requests, and a
 /// slow one (a sign-in, a wait) holds up only its own connection. The sessions are read once
-/// the socket is answering (`Chat::read_sessions`). A failed accept or thread spawn (out of
-/// file descriptors) drops that one connection and goes on.
+/// the socket is answering (`Chat::read_sessions`). Active connection threads are capped at
+/// [`MAX_CONNECTIONS`]; a failed accept or thread spawn drops that one connection and goes on.
 pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
     let chat = Arc::new(chat);
     let _ = chat.this.set(Arc::downgrade(&chat));
     crate::notify::start(chat.hub.clone(), Arc::downgrade(&chat));
     chat.arm_queue();
     Chat::read_sessions(&chat, Network::ALL.to_vec(), true);
+    let permits = ConnectionPermits::new(MAX_CONNECTIONS);
     loop {
+        let permit = permits.acquire();
         let stream = match listener.accept() {
             Ok(stream) => stream,
             Err(err) => {
+                drop(permit);
                 tracing::warn!("chatd: accept: {err}");
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
@@ -8180,6 +8304,7 @@ pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
         // contract and scripted wire grow. Leave headroom so sign-in returns a reply instead of aborting chatd.
         let stack = if cfg!(debug_assertions) { 4 * 1024 * 1024 } else { 1024 * 1024 };
         let spawned = std::thread::Builder::new().name("connection".into()).stack_size(stack).spawn(move || {
+            let _permit = permit;
             if let Err(err) = serve_connection(&chat, stream) {
                 tracing::warn!("chatd: connection: {err}");
             }
@@ -9931,5 +10056,88 @@ mod tests {
         // Only Telegram ever received a Command::Translate.
         let log = dispatched.lock().unwrap().clone();
         assert_eq!(log, vec![(Network::Telegram, "u7".to_owned(), "99".to_owned(), "fr".to_owned())]);
+    }
+
+    #[test]
+    fn connection_permits_bound_active_slots_and_release_on_drop() {
+        let permits = super::ConnectionPermits::new(2);
+        let p1 = permits.try_acquire().expect("first permit");
+        let p2 = permits.try_acquire().expect("second permit");
+        assert!(permits.try_acquire().is_none(), "third permit must be capped");
+        assert_eq!(permits.active_count(), 2);
+
+        let waiter_permits = std::sync::Arc::clone(&permits);
+        let acquired = std::thread::spawn(move || {
+            let p3 = waiter_permits.acquire();
+            let count = waiter_permits.active_count();
+            drop(p3);
+            count
+        });
+
+        drop(p1);
+        assert_eq!(acquired.join().unwrap(), 2);
+        drop(p2);
+        assert_eq!(permits.active_count(), 0);
+    }
+
+    #[test]
+    fn messages_sweep_skips_active_upload_past_send_timeout() {
+        use crate::adapters;
+        use crate::hub::{lock, now};
+        use crate::server::{Chat, SEND_SECONDS};
+        use crate::store::{ConversationRow, Store};
+        use protocol::{AccountKey, ConversationKind, Key, Link, Message, Network, OutgoingFile, Page, Request, Response, SendState};
+
+        let chat = Chat::new(Store::open(std::path::Path::new(":memory:")).unwrap());
+        let account = AccountKey { network: Network::Discord, account: "up-acct".into() };
+        let (adapter, ctx, _inbox) = adapters::local(account.clone(), chat.hub.clone());
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        ctx.link(Link::Connected);
+        ctx.conversation(&ConversationRow::new("c1", ConversationKind::Direct, "Ada")).unwrap();
+        let key = Key::new(&account, "c1");
+
+        // Stage a real temp file so Upload::with_progress marks `cid-active` as under_way.
+        let dir = std::env::temp_dir().join(format!("tinyclient-active-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("clip.bin");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let outgoing = OutgoingFile {
+            path: file_path.to_string_lossy().into_owned(),
+            name: "clip.bin".into(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+            alt: String::new(),
+            media: None,
+            view_once: false,
+        };
+        let _active_upload = crate::blobs::upload::Upload::with_progress(&account, "cid-active", &[outgoing], |_, _| {}).unwrap();
+        assert!(crate::blobs::upload::is_active(&account, "cid-active"));
+
+        let old = now() - SEND_SECONDS - 30;
+        let mut active_msg = Message::plain("cid-active", "me", "uploading", old, true);
+        active_msg.state = SendState::Pending;
+        active_msg.client_id = Some("cid-active".into());
+        let mut stuck_msg = Message::plain("cid-stuck", "me", "stuck", old, true);
+        stuck_msg.state = SendState::Pending;
+        stuck_msg.client_id = Some("cid-stuck".into());
+        {
+            let mut store = chat.hub.store();
+            store.ingest(&key, &active_msg, true).unwrap();
+            store.ingest(&key, &stuck_msg, true).unwrap();
+        }
+
+        let resp = chat.handle(Request::Messages { conversation: key.clone(), page: Page::Newest, limit: 20 });
+        let Response::Messages { messages, .. } = resp else {
+            panic!("expected messages, got {resp:?}");
+        };
+        let active_after = messages.iter().find(|m| m.id == "cid-active").expect("active row present");
+        assert_eq!(active_after.state, SendState::Pending, "active upload must not be failed at 60s");
+        let stuck_after = messages.iter().find(|m| m.id == "cid-stuck").expect("stuck row present");
+        assert!(matches!(stuck_after.state, SendState::Failed { .. }), "inactive row past 60s must fail");
+
+        drop(_active_upload);
+        assert!(!crate::blobs::upload::is_active(&account, "cid-active"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

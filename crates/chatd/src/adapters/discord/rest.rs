@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 /// The web client speaks v9.
@@ -47,6 +46,12 @@ fn build(user_agent: &str) -> Option<u64> {
 
 /// A wait longer than this is the user's to decide, not ours to sit through.
 const PATIENCE: f64 = 30.;
+/// Interactive message sends cap 429 retry waits here so sends fail fast instead of stalling.
+pub(super) const SEND_PATIENCE: f64 = 8.;
+/// Short timeout for best-effort calls like typing indicators.
+const BEST_EFFORT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum route -> bucket mappings kept in memory.
+const BUCKETS_LIMIT: usize = 512;
 /// Discord bans an address for a day after 10,000 answers of 401, 403 or 429 in ten minutes.
 /// This many in that time and nothing more is asked until the ten minutes are over.
 const REFUSALS: usize = 50;
@@ -185,9 +190,13 @@ pub struct Rest {
     /// Made on first use, on an adapter thread: naming the browser runs a program, and chatd
     /// must be serving before anything of the kind.
     agent: OnceLock<ureq::Agent>,
+    /// Short-timeout agent for best-effort calls such as typing indicators.
+    short_agent: OnceLock<ureq::Agent>,
     identity: OnceLock<Identity>,
     token: String,
     windows: Mutex<HashMap<String, Window>>,
+    /// Dynamic `route -> X-RateLimit-Bucket` map learned from Discord response headers.
+    buckets: Mutex<HashMap<String, String>>,
     /// Set by a 429 that covers every route.
     everything_waits: Mutex<Option<Instant>>,
     /// Discord challenged this account. Every request is refused until the next sign-in or
@@ -240,7 +249,8 @@ fn limit(problem: &Value, header: impl Fn(&str) -> Option<String>) -> Limit {
     let scope = header("x-ratelimit-scope").unwrap_or_default();
     let flagged = header("x-ratelimit-global").is_some_and(|value| value == "true");
     // A 429 that is not Discord's own (no JSON, no scope) is the edge refusing the address:
-    // nothing else will get through either.
+    // nothing else will get through either. Route-scoped Discord 429s (`"global": false` or
+    // `x-ratelimit-scope: user`/`shared`) stay on their own route/bucket.
     let unexplained = problem.is_null() && scope.is_empty();
     Limit {
         wait: stated.unwrap_or(if unexplained { 5. } else { 1. }).max(0.),
@@ -254,14 +264,50 @@ impl Rest {
         Rest {
             ctx,
             agent: OnceLock::new(),
+            short_agent: OnceLock::new(),
             identity: OnceLock::new(),
             token,
             windows: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(HashMap::new()),
             everything_waits: Mutex::new(None),
             challenged: AtomicBool::new(false),
             expired: AtomicBool::new(false),
             refusals: Mutex::new((VecDeque::new(), None)),
         }
+    }
+
+    fn short_agent(&self) -> &ureq::Agent {
+        self.short_agent.get_or_init(|| {
+            crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
+                .tls_config(crate::tls::config())
+                .timeout_global(Some(BEST_EFFORT_TIMEOUT))
+                .http_status_as_error(false)
+                .user_agent(browser())
+                .build()
+                .into()
+        })
+    }
+
+    fn bucket_key(&self, route: &str) -> String {
+        let buckets = crate::hub::lock(&self.buckets);
+        match buckets.get(route) {
+            Some(bucket) => format!("bucket:{bucket}"),
+            None => route.to_owned(),
+        }
+    }
+
+    fn remember_window(&self, route: &str, bucket: Option<&str>, window: Window) {
+        let key = if let Some(bucket) = bucket.filter(|b| !b.is_empty()) {
+            let mut buckets = crate::hub::lock(&self.buckets);
+            if buckets.len() >= BUCKETS_LIMIT && !buckets.contains_key(route) {
+                buckets.clear();
+            }
+            buckets.insert(route.to_owned(), bucket.to_owned());
+            format!("bucket:{bucket}")
+        } else {
+            self.bucket_key(route)
+        };
+        crate::hub::lock(&self.windows).insert(key, window);
     }
 
     /// Who the session says it is. The first call reads the web client's build, waiting at most
@@ -279,23 +325,32 @@ impl Rest {
     }
 
     /// Waits out what is already known about this route's limit. A long wait is refused instead.
-    fn pace(&self, route: &str) -> Result<(), Refused> {
+    fn pace(&self, route: &str, max_wait: f64) -> Result<(), Refused> {
         let now = Instant::now();
+        let bucket = self.bucket_key(route);
         let window = {
             let mut windows = crate::hub::lock(&self.windows);
             if windows.len() > 64 {
                 windows.retain(|_, window| window.resets > now);
             }
-            windows.get(route).filter(|window| window.remaining == 0).map(|window| window.resets)
+            let by_bucket = windows.get(&bucket).filter(|window| window.remaining == 0).map(|window| window.resets);
+            let by_route = if bucket != route {
+                windows.get(route).filter(|window| window.remaining == 0).map(|window| window.resets)
+            } else {
+                None
+            };
+            by_bucket.into_iter().chain(by_route).max()
         };
         let everything = *crate::hub::lock(&self.everything_waits);
         let until = window.into_iter().chain(everything).max().filter(|until| *until > now);
         if let Some(until) = until {
             let wait = until - now;
-            if wait.as_secs_f64() > PATIENCE {
+            if wait.as_secs_f64() > max_wait {
                 return Err(Refused::Limited(wait.as_secs_f64()));
             }
-            sleep(wait);
+            if self.ctx.pause(wait) {
+                return Err(Refused::Network("stopped".to_owned()));
+            }
         }
         Ok(())
     }
@@ -346,9 +401,10 @@ impl Rest {
         url: &str,
         body: Option<&Value>,
         extra: &[(&str, &str)],
+        short_timeout: bool,
     ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let identity = self.identity();
-        let agent = self.agent.get_or_init(agent);
+        let agent = if short_timeout { self.short_agent() } else { self.agent.get_or_init(agent) };
         macro_rules! dressed {
             ($request:expr) => {{
                 let mut request = $request
@@ -386,18 +442,28 @@ impl Rest {
         self.call_with(method, path, body, &[])
     }
 
+    /// Interactive send call: caps 429 retry waits at [`SEND_PATIENCE`] so sends do not stall.
+    pub fn call_send(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
+        self.call_inner(method, path, body, &[], true, true, SEND_PATIENCE, false)
+    }
+
+    /// Best-effort call (e.g. typing indicators): short timeout, capped short retry on 429, no session captcha lock.
+    pub fn call_best_effort(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
+        self.call_inner(method, path, body, &[], true, false, BEST_EFFORT_TIMEOUT.as_secs_f64(), true)
+    }
+
     /// One call, with headers of its own beside the session's. The answer is the body as text,
     /// so a caller parses it straight into what it needs. A 429 is waited out in full and
     /// tried once more, then reported.
     pub fn call_with(&self, method: &str, path: &str, body: Option<Value>, extra: &[(&str, &str)]) -> Result<String, Refused> {
-        self.call_inner(method, path, body, extra, true, true)
+        self.call_inner(method, path, body, extra, true, true, PATIENCE, false)
     }
 
     /// One-shot call for anti-abuse sensitive endpoints (friend requests, server invites): never
     /// retries on HTTP 429, and a CAPTCHA fails only this request without locking the rest of the
     /// Discord session.
     pub fn call_once_with(&self, method: &str, path: &str, body: Option<Value>, extra: &[(&str, &str)]) -> Result<String, Refused> {
-        self.call_inner(method, path, body, extra, false, false)
+        self.call_inner(method, path, body, extra, false, false, PATIENCE, false)
     }
 
     /// One-shot `POST` with a `multipart/form-data` body (e.g. guild sticker uploads).
@@ -414,7 +480,7 @@ impl Rest {
         }
         let url = format!("{}{path}", address("TINYCLIENT_DISCORD_API", API));
         let route = route("POST", path);
-        self.pace(&route)?;
+        self.pace(&route, PATIENCE)?;
         let identity = self.identity();
         let agent = self.agent.get_or_init(agent);
         let mut request = agent
@@ -434,6 +500,7 @@ impl Rest {
         let mut response = request.send(body).map_err(|err| Refused::Network(err.to_string()))?;
         let headers = response.headers().clone();
         let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok()).map(str::to_owned);
+        let bucket = header("x-ratelimit-bucket");
         let remaining = header("x-ratelimit-remaining").and_then(|value| value.parse::<u32>().ok());
         let reset = header("x-ratelimit-reset-after").as_deref().and_then(seconds_of);
         if let (Some(remaining), Some(reset)) = (remaining, reset) {
@@ -441,7 +508,7 @@ impl Rest {
                 remaining,
                 resets: Instant::now() + Duration::from_secs_f64(reset.clamp(0., 3600.)),
             };
-            crate::hub::lock(&self.windows).insert(route.clone(), window);
+            self.remember_window(&route, bucket.as_deref(), window);
         }
         let status = response.status().as_u16();
         let text = response.body_mut().read_to_string().unwrap_or_default();
@@ -468,7 +535,7 @@ impl Rest {
                 if limit.global {
                     *crate::hub::lock(&self.everything_waits) = Some(until);
                 }
-                crate::hub::lock(&self.windows).insert(route, Window { remaining: 0, resets: until });
+                self.remember_window(&route, bucket.as_deref(), Window { remaining: 0, resets: until });
                 Err(Refused::Limited(limit.wait))
             }
             _ => {
@@ -485,6 +552,7 @@ impl Rest {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn call_inner(
         &self,
         method: &str,
@@ -493,6 +561,8 @@ impl Rest {
         extra: &[(&str, &str)],
         retry_429: bool,
         session_captcha: bool,
+        max_wait: f64,
+        short_timeout: bool,
     ) -> Result<String, Refused> {
         if self.challenged.load(Ordering::Relaxed) {
             return Err(Refused::Challenge);
@@ -507,11 +577,12 @@ impl Rest {
         let route = route(method, path);
         let mut waited = false;
         loop {
-            self.pace(&route)?;
+            self.pace(&route, max_wait)?;
             let mut response =
-                self.request(method, &url, body.as_ref(), extra).map_err(|err| Refused::Network(err.to_string()))?;
+                self.request(method, &url, body.as_ref(), extra, short_timeout).map_err(|err| Refused::Network(err.to_string()))?;
             let headers = response.headers().clone();
             let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok()).map(str::to_owned);
+            let bucket = header("x-ratelimit-bucket");
             let remaining = header("x-ratelimit-remaining").and_then(|value| value.parse::<u32>().ok());
             let reset = header("x-ratelimit-reset-after").as_deref().and_then(seconds_of);
             if let (Some(remaining), Some(reset)) = (remaining, reset) {
@@ -519,7 +590,7 @@ impl Rest {
                     remaining,
                     resets: Instant::now() + Duration::from_secs_f64(reset.clamp(0., 3600.)),
                 };
-                crate::hub::lock(&self.windows).insert(route.clone(), window);
+                self.remember_window(&route, bucket.as_deref(), window);
             }
             let status = response.status().as_u16();
             let text = response.body_mut().read_to_string().unwrap_or_default();
@@ -551,9 +622,8 @@ impl Rest {
                     if limit.global {
                         *crate::hub::lock(&self.everything_waits) = Some(until);
                     }
-                    let window = Window { remaining: 0, resets: until };
-                    crate::hub::lock(&self.windows).insert(route.clone(), window);
-                    if !retry_429 || waited || limit.wait > PATIENCE || self.paused().is_some() {
+                    self.remember_window(&route, bucket.as_deref(), Window { remaining: 0, resets: until });
+                    if !retry_429 || waited || limit.wait > max_wait || self.paused().is_some() {
                         return Err(Refused::Limited(limit.wait));
                     }
                     waited = true;
@@ -590,10 +660,10 @@ mod tests {
         let headers = |pairs: &'static [(&'static str, &'static str)]| {
             move |name: &str| pairs.iter().find(|(known, _)| *known == name).map(|(_, value)| (*value).to_owned())
         };
-        // Cloudflare: a page, a Retry-After, nothing else. Every route waits.
+        // Cloudflare: a page, a Retry-After, nothing Discord wrote. Global, and counts as ours.
         let edge = limit(&Value::Null, headers(&[("retry-after", "64")]));
         assert_eq!((edge.wait, edge.global, edge.shared), (64., true, false));
-        // Discord's own, with the body lost: the scope says whose limit it is.
+        // Discord's own, with the body lost: its scope says who is limited.
         let user = limit(&Value::Null, headers(&[("retry-after", "2"), ("x-ratelimit-scope", "user")]));
         assert_eq!((user.wait, user.global), (2., false));
         let global = limit(&Value::Null, headers(&[("retry-after", "3"), ("x-ratelimit-scope", "global")]));
@@ -609,6 +679,143 @@ mod tests {
             let _ = Duration::from_secs_f64(odd.wait.min(3600.));
         }
         assert_eq!(seconds_of(" 1.5 "), Some(1.5));
+    }
+
+    #[test]
+    fn non_global_429_does_not_set_everything_waits_and_send_caps_retry_to_send_patience() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        let db = std::env::temp_dir().join(format!("tinyclient-discord-rest-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = crate::store::Store::open(&db).unwrap();
+        let hub = Arc::new(crate::hub::Hub::new(store));
+        let account = protocol::AccountKey { network: protocol::Network::Discord, account: "rest-test".into() };
+        let (_adapter, ctx, _rx) = crate::adapters::local(account, hub);
+
+        // Spin up a tiny local HTTP server that serves scripted responses in sequence.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http_reply = |status: &str, headers: &str, body: &str| {
+            format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        };
+        let responses: Arc<StdMutex<VecDeque<String>>> = Arc::new(StdMutex::new(VecDeque::from([
+            // 1. Route-scoped non-global 429 on typing -> must NOT set everything_waits.
+            http_reply(
+                "429 Too Many Requests",
+                "X-RateLimit-Scope: user\r\nContent-Type: application/json\r\n",
+                r#"{"message":"rl","retry_after":5,"global":false}"#,
+            ),
+            // 2. Send hits 429 with retry_after > SEND_PATIENCE (15s) -> must fail immediately without sleeping.
+            http_reply(
+                "429 Too Many Requests",
+                "Content-Type: application/json\r\n",
+                r#"{"message":"rl","retry_after":15,"global":false}"#,
+            ),
+            // 3. Send hits short 429 (0.05s <= SEND_PATIENCE) -> retries once and succeeds.
+            http_reply(
+                "429 Too Many Requests",
+                "Content-Type: application/json\r\n",
+                r#"{"message":"rl","retry_after":0.05,"global":false}"#,
+            ),
+            http_reply(
+                "200 OK",
+                "X-RateLimit-Bucket: shared-bkt\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-After: 12\r\n",
+                "{}",
+            ),
+            // 4. Explicit `"global": true` 429 -> MUST set everything_waits.
+            http_reply(
+                "429 Too Many Requests",
+                "Content-Type: application/json\r\n",
+                r#"{"message":"rl","retry_after":12,"global":true}"#,
+            ),
+        ])));
+        let server_responses = responses.clone();
+        let server = std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let next = server_responses.lock().unwrap().pop_front();
+                match next {
+                    Some(reply) => {
+                        let _ = stream.write_all(reply.as_bytes());
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        let rest = Rest::new("tok".to_owned(), ctx);
+        let base = format!("http://{addr}");
+
+        // Helper calling against our local server without touching process env.
+        let call_local = |method: &str, path: &str, retry_429: bool, max_wait: f64| -> Result<String, Refused> {
+            let url = format!("{base}{path}");
+            let r = route(method, path);
+            let mut waited = false;
+            loop {
+                rest.pace(&r, max_wait)?;
+                let mut response = rest.request(method, &url, None, &[], false).map_err(|e| Refused::Network(e.to_string()))?;
+                let headers = response.headers().clone();
+                let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+                let bucket = header("x-ratelimit-bucket");
+                if let (Some(rem), Some(reset)) = (
+                    header("x-ratelimit-remaining").and_then(|v| v.parse::<u32>().ok()),
+                    header("x-ratelimit-reset-after").as_deref().and_then(seconds_of),
+                ) {
+                    rest.remember_window(&r, bucket.as_deref(), Window {
+                        remaining: rem,
+                        resets: Instant::now() + Duration::from_secs_f64(reset.clamp(0., 3600.)),
+                    });
+                }
+                let status = response.status().as_u16();
+                let text = response.body_mut().read_to_string().unwrap_or_default();
+                if (200..300).contains(&status) {
+                    return Ok(text);
+                }
+                let problem: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                let lim = limit(&problem, header);
+                let until = Instant::now() + Duration::from_secs_f64(lim.wait.min(3600.));
+                if lim.global {
+                    *crate::hub::lock(&rest.everything_waits) = Some(until);
+                }
+                rest.remember_window(&r, bucket.as_deref(), Window { remaining: 0, resets: until });
+                if !retry_429 || waited || lim.wait > max_wait {
+                    return Err(Refused::Limited(lim.wait));
+                }
+                waited = true;
+            }
+        };
+
+        // 1. Edge 429 on typing: no retry, everything_waits stays None.
+        assert!(matches!(call_local("POST", "/channels/1/typing", false, 0.), Err(Refused::Limited(5.0))));
+        assert!(crate::hub::lock(&rest.everything_waits).is_none(), "non-global 429 must not set everything_waits");
+
+        // 2. Send hits 15s 429 (> SEND_PATIENCE=8s): returns immediately without sleeping 15s.
+        let began = Instant::now();
+        assert!(matches!(call_local("POST", "/channels/2/messages", true, SEND_PATIENCE), Err(Refused::Limited(15.0))));
+        assert!(began.elapsed() < Duration::from_secs(2), "send must not sleep past SEND_PATIENCE");
+        assert!(crate::hub::lock(&rest.everything_waits).is_none());
+
+        // 3. Send hits 0.05s 429 (<= SEND_PATIENCE): retries and succeeds, recording bucket `shared-bkt`.
+        assert_eq!(call_local("POST", "/channels/3/messages", true, SEND_PATIENCE).unwrap(), "{}");
+        assert_eq!(rest.bucket_key(&route("POST", "/channels/3/messages")), "bucket:shared-bkt");
+
+        // Another route mapped to the same bucket coordinates proactively and respects SEND_PATIENCE.
+        rest.remember_window(&route("POST", "/channels/4/messages"), Some("shared-bkt"), Window {
+            remaining: 0,
+            resets: Instant::now() + Duration::from_secs(12),
+        });
+        assert!(matches!(rest.pace(&route("POST", "/channels/4/messages"), SEND_PATIENCE), Err(Refused::Limited(_))));
+
+        // 4. Explicit `"global": true` sets everything_waits.
+        assert!(matches!(call_local("POST", "/channels/5/messages", true, SEND_PATIENCE), Err(Refused::Limited(12.0))));
+        assert!(crate::hub::lock(&rest.everything_waits).is_some(), "global=true 429 must set everything_waits");
+
+        // Wake and end the local server cleanly.
+        let _ = std::net::TcpStream::connect(addr);
+        let _ = server.join();
     }
 
     #[test]

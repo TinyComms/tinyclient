@@ -2,15 +2,15 @@
 
 use super::components::{
     accessible_modal, button, button_disabled, field_on, icon_button, modal_body, modal_buttons,
-    scrim, tip, ButtonKind,
+    modal_layer, tip, ButtonKind,
 };
 use super::input::TextInput;
 use super::state::Shell;
 use super::theme::{self, Type};
 use crate::{client::ask, view::now};
 use gpui::{
-    div, prelude::*, px, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, Stateful,
-    Subscription, Window,
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, Entity, Focusable, MouseButton,
+    Stateful, Subscription, Window,
 };
 use protocol::{
     Conversation, ConversationKind, Key, Link, MeetingDraft, MeetingEvent, MeetingSchedule,
@@ -66,8 +66,11 @@ impl Shell {
         };
         Some(
             control
+                .flex_none()
+                .when(!super::phone::active(), |button| button.ml(px(8.)))
                 .aria_label("Teams meeting")
                 .tooltip(tip("Meet now or schedule a meeting", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.open_meeting(&to, window, cx)),
                 ),
@@ -218,7 +221,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn close_meeting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_meeting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.meeting_form.as_ref().is_some_and(|form| !form.busy) {
             self.meeting_form = None;
             window.focus(&self.focus, cx);
@@ -226,7 +229,7 @@ impl Shell {
         }
     }
 
-    pub(super) fn meeting_layer(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn meeting_layer(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let form = self.meeting_form.as_ref()?;
         let title = if form.created.is_some() {
             "Meeting created"
@@ -294,21 +297,30 @@ impl Shell {
                             .then(|| modal_body(form.attendee_note.clone())),
                     )
                     .child(
-                        button(
-                            "meeting-weekly",
-                            ButtonKind::Ghost,
-                            if form.weekly {
-                                "Repeat weekly (UTC)"
-                            } else {
-                                "Does not repeat"
-                            },
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(form) = &mut this.meeting_form {
-                                form.weekly = !form.weekly;
-                                cx.notify();
-                            }
-                        })),
+                        div()
+                            .id("meeting-weekly")
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .py(px(4.))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.meeting_form {
+                                    form.weekly = !form.weekly;
+                                    cx.notify();
+                                }
+                            }))
+                            .child(super::settings::controls::switch(
+                                "meeting-weekly-switch",
+                                "Repeat weekly",
+                                form.weekly,
+                            ))
+                            .child(
+                                div()
+                                    .type_ui()
+                                    .text_color(theme::text())
+                                    .child("Repeat weekly"),
+                            ),
                     );
             }
             let action = if form.scheduled {
@@ -349,24 +361,12 @@ impl Shell {
                         .child(confirm),
                 )
         };
-        Some(
-            div().absolute().inset_0().child(scrim()).child(
-                div()
-                    .id("meeting-scrim")
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p(px(12.))
-                    .on_click(cx.listener(|this, _, window, cx| this.close_meeting(window, cx)))
-                    .child(
-                        panel
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(|_, _, cx| cx.stop_propagation()),
-                    ),
-            ),
-        )
+        Some(modal_layer(
+            "meeting-scrim",
+            window,
+            panel,
+            cx.listener(|this, _, window, cx| this.close_meeting(window, cx)),
+        ))
     }
 }
 

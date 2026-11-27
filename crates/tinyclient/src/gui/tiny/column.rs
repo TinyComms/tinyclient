@@ -6,11 +6,11 @@
 
 use super::model::{self, Line};
 use super::{Dragged, Float, Modal, Page};
-use crate::gui::components::{badge_for, badge_look, glyph, list_row, network_icon, row_badge, tip, Avatar, Shape as AvatarShape};
+use crate::gui::components::{badge_for, badge_look, glyph, list_row, network_icon, row_badge, section_header, tip, Avatar, Shape as AvatarShape};
 use crate::gui::sidebar::Mode;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window};
+use gpui::{canvas, div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window};
 use protocol::{
     Call, CallState, CallSupport, Conversation, ConversationKind, Key, Network, TinyChannel, TinyLayoutItem, TinyLayoutItemKind, TinyRoom, TinySeat,
     TINY_FEATURE_CHANNEL_LAYOUT, TINY_FEATURE_DIRECT_CALLS,
@@ -120,9 +120,15 @@ fn directs_in_server(chats: &[Rc<Conversation>]) -> (Vec<Rc<Conversation>>, bool
 fn text_row(chat: &Conversation, open: Option<&Key>, draggable: bool, cx: &mut Context<Shell>) -> Stateful<Div> {
     let selected = open.is_some_and(|open| open == &chat.key);
     let badge = badge_for(badge_look(chat));
-    let unread = chat.unread > 0 || badge.is_some();
+    let unread = !chat.muted && (chat.unread > 0 || badge.is_some());
     let icon = if chat.kind == ConversationKind::Direct { "icons/user.svg" } else { "icons/hash.svg" };
-    let tone = if selected || unread { theme::text() } else { theme::text_soft() };
+    let tone = if selected || unread {
+        theme::text()
+    } else if chat.muted {
+        theme::text_faint()
+    } else {
+        theme::text_soft()
+    };
     let content = div()
         .w_full()
         .flex()
@@ -135,7 +141,7 @@ fn text_row(chat: &Conversation, open: Option<&Key>, draggable: bool, cx: &mut C
                 .min_w_0()
                 .truncate()
                 .type_ui()
-                .when(unread, |el| el.font_weight(theme::MEDIUM))
+                .when(unread, |el| el.font_weight(theme::SEMIBOLD))
                 .text_color(tone)
                 .child(chat.title.clone()),
         )
@@ -237,6 +243,7 @@ impl Shell {
         let open = self.tiny_state.float == Some(Float::Header);
         div()
             .id("tiny-header")
+            .relative()
             .flex_1()
             .min_w_0()
             .h(px(36.))
@@ -260,6 +267,13 @@ impl Shell {
             .child(avatar)
             .child(div().flex_1().min_w_0().truncate().type_title().text_color(theme::text()).child(name))
             .child(glyph(if open { "icons/x.svg" } else { "icons/chevron-down.svg" }, 14., theme::text_soft()))
+            .child(
+                canvas(|bounds, _, _| super::layer::note_header_bounds(bounds), |_, _, _, _| {})
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+            )
     }
 
     /// The channel list. Loading shows the rows it will hold as shapes; a failure says so in its
@@ -375,34 +389,24 @@ impl Shell {
         if rows.is_empty() {
             return list;
         }
-        let header = div()
-            .px(px(theme::INSET + 2.))
-            .pt(px(10.))
-            .pb(px(2.))
-            .flex()
-            .items_center()
-            .gap(px(4.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(11. + theme::text_step() as f32))
-                    .line_height(px(14. + theme::text_step() as f32))
-                    .font_weight(theme::SEMIBOLD)
-                    .text_color(theme::text_faint())
-                    .child("DIRECT MESSAGES"),
-            )
+        let header = section_header("Direct messages", true)
+            .pl(px(theme::INSET + 2.))
+            .pr(px(theme::INSET + 4.))
+            .child(div().flex_1())
             .child(
                 div()
                     .id("tiny-direct-add")
+                    .role(gpui::Role::Button)
+                    .aria_label("New direct message")
                     .size(px(18.))
                     .rounded(px(theme::R_CHIP))
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
+                    .tab_index(0)
                     .hover(|style| style.bg(theme::hover()))
+                    .focus_visible(|style| style.shadow(theme::focus_ring()))
                     .tooltip(tip("New direct message", None))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.tiny_open_modal(Modal::NewDirect, window, cx);
@@ -456,10 +460,11 @@ impl Shell {
         } else {
             let mut avatar = Avatar::new(&avatar_key, &chat.title, 20.).image_at(picture);
             if let Some(presence) = peer_id.and_then(|id| page.online(id)) {
-                avatar = avatar.presence(presence, theme::sidebar());
+                avatar = avatar.presence(presence, theme::row_surface(selected));
             }
             avatar.build().into_any_element()
         };
+        let phone = crate::gui::phone::active();
         let row_group: SharedString = format!("tiny-direct-row-{}", chat.key.id).into();
         let live_pill = call_info.pill_label.map(|label| {
             div()
@@ -486,24 +491,28 @@ impl Shell {
             };
             div()
                 .id(SharedString::from(format!("tiny-direct-call-{}", chat.key.id)))
+                .role(gpui::Role::Button)
+                .aria_label(tip_words.clone())
                 .flex_none()
-                .size(px(22.))
+                .size(px(if phone { 32. } else { 22. }))
                 .rounded(px(theme::R_CHIP))
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .invisible()
-                .group_hover(row_group.clone(), |style| style.visible())
-                .when(join, |btn| btn.bg(theme::positive_soft()).hover(|style| style.bg(theme::positive_soft())))
-                .when(!join, |btn| btn.hover(|style| style.bg(theme::hover())))
+                .when(!phone, |btn| btn.invisible().group_hover(row_group.clone(), |style| style.visible()))
+                .when(join, |btn| {
+                    btn.bg(theme::positive_soft())
+                        .hover(|style| style.bg(theme::over(theme::hover(), theme::positive_soft())))
+                })
+                .when(!join, |btn| btn.hover(|style| style.bg(theme::selected())))
                 .tooltip(tip(tip_words, None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.call_start(call_key.clone(), cx);
                 }))
-                .child(glyph("icons/phone.svg", 13., if join { theme::positive() } else { theme::text_soft() }))
+                .child(glyph("icons/phone.svg", if phone { 15. } else { 13. }, if join { theme::positive() } else { theme::text_soft() }))
         });
         let content = div()
             .gap(px(8.))
@@ -564,8 +573,8 @@ impl Shell {
             .flex_1()
             .min_w_0()
             .truncate()
-            .text_size(px(11. + theme::text_step() as f32))
-            .line_height(px(14. + theme::text_step() as f32))
+            .text_size(theme::sized(11.))
+            .line_height(theme::sized(14.))
             .font_weight(theme::SEMIBOLD)
             .child(name.to_uppercase());
         let mut row = div()
@@ -593,16 +602,18 @@ impl Shell {
             .when(folded && rooms > 0, |row| row.child(div().type_micro().text_color(theme::text_faint()).child(rooms.to_string())));
         if page.may.make_room {
             let category = id.map(str::to_owned);
+            let phone = crate::gui::phone::active();
             row = row.child(
                 div()
                     .id(SharedString::from(format!("tiny-cat-add-{key}")))
-                    .size(px(18.))
+                    .role(gpui::Role::Button)
+                    .aria_label("Create channel")
+                    .size(px(if phone { 28. } else { 18. }))
                     .rounded(px(theme::R_CHIP))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .invisible()
-                    .group_hover("tiny-cat", |style| style.visible())
+                    .when(!phone, |btn| btn.invisible().group_hover("tiny-cat", |style| style.visible()))
                     .hover(|style| style.bg(theme::hover()))
                     .tooltip(tip("Create channel", None))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -647,14 +658,60 @@ impl Shell {
                 .text_color(if model::full(room) { theme::warning() } else { theme::text_faint() })
                 .child(model::occupancy(room))
         });
+        let joinable = page.mine != Some(room.id.as_str()) && page.community.allowed("community.calls.join");
+        let phone = crate::gui::phone::active();
+        let join_btn = joinable.then(|| {
+            let join_id = room.id.clone();
+            let row_bg = if phone {
+                theme::row_surface(selected)
+            } else {
+                theme::over(if selected { theme::selected() } else { theme::hover() }, theme::sidebar())
+            };
+            div()
+                .absolute()
+                .right(px(6.))
+                .top_0()
+                .bottom_0()
+                .pl(px(8.))
+                .bg(row_bg)
+                .flex()
+                .items_center()
+                .when(!phone, |el| el.invisible().group_hover("list-row", |style| style.visible()))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("tiny-room-join-{}", room.id)))
+                        .role(gpui::Role::Button)
+                        .aria_label(format!("Join {}", room.name))
+                        .h(px(if phone { 28. } else { 22. }))
+                        .px(px(if phone { 10. } else { 8. }))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::accent_soft())
+                        .hover(|style| style.bg(theme::accent()).text_color(theme::on_accent()))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .cursor_pointer()
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .text_color(theme::accent_text())
+                        .tooltip(tip(format!("Join {}", room.name), None))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.tiny_join(join_id.clone(), cx);
+                        }))
+                        .child("Join"),
+                )
+        });
         let content = div()
+            .relative()
             .gap(px(8.))
             .child(glyph("icons/volume-2.svg", 16., icon_tone))
             .child(div().flex_1().min_w_0().truncate().type_ui().when(mine, |name| name.font_weight(theme::MEDIUM)).text_color(tone).child(room.name.clone()))
             .when(room.ptt_only, |row| row.child(glyph("icons/radio.svg", 12., theme::text_faint())))
-            .children(count);
+            .children(count)
+            .children(join_btn);
         let (pick, join, menu) = (room.id.clone(), room.id.clone(), room.id.clone());
-        let joinable = page.mine != Some(room.id.as_str()) && page.community.allowed("community.calls.join");
         let mut row = list_row(SharedString::from(format!("tiny-room-{}", room.id)), theme::row_height(theme::ROW_ONE), selected, false, content)
             .on_mouse_down(
                 MouseButton::Left,
