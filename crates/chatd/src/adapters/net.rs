@@ -3,13 +3,19 @@
 use base64::Engine as _;
 use protocol::settings::{ProxyConfig, ProxyMode, ProxyScheme, Values};
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+static PROXY_GEN: AtomicU64 = AtomicU64::new(0);
 
 static PROXY: RwLock<ProxyConfig> = RwLock::new(ProxyConfig {
     mode: ProxyMode::System,
@@ -25,6 +31,12 @@ pub fn configure_proxy(values: &Values) {
     if let Ok(mut guard) = PROXY.write() {
         *guard = config;
     }
+    PROXY_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// Monotonic generation bumped on every [`configure_proxy`] call, so pooled HTTP agents can rebuild.
+pub fn proxy_generation() -> u64 {
+    PROXY_GEN.load(Ordering::Acquire)
 }
 
 /// Returns the currently active proxy configuration.
@@ -94,6 +106,9 @@ pub fn redact(text: &str) -> String {
 pub fn agent() -> ureq::Agent {
     apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
+        .max_idle_age(Duration::from_secs(30))
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(Duration::from_secs(20)))
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
         .user_agent(browser())
@@ -257,6 +272,18 @@ pub fn tunnel_socks5(
     Ok(())
 }
 
+/// Resolves `(host, port)` and connects with a bounded TCP connect timeout per address.
+fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
+    let mut last = None;
+    for addr in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::new(ErrorKind::AddrNotAvailable, "could not resolve address")))
+}
+
 /// Dials a TCP stream to `(target_host, target_port)` through `cfg` when `ProxyMode::Custom`.
 /// Always fails closed if `Custom` is incomplete or unreachable.
 pub fn dial_via_proxy(cfg: &ProxyConfig, target_host: &str, target_port: u16) -> io::Result<Option<TcpStream>> {
@@ -270,7 +297,7 @@ pub fn dial_via_proxy(cfg: &ProxyConfig, target_host: &str, target_port: u16) ->
             "custom proxy enabled without host or port (failing closed)",
         ));
     }
-    let mut stream = TcpStream::connect((host, cfg.port))?;
+    let mut stream = connect_tcp(host, cfg.port, CONNECT_TIMEOUT)?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let auth = cfg.user.as_deref().map(|u| (u, ""));
@@ -291,21 +318,23 @@ impl Socket {
             let value = HeaderValue::from_str(value).map_err(io::Error::other)?;
             request.headers_mut().insert(*name, value);
         }
+        let (host, port, _is_tls) = parse_ws_target(url)?;
         let cfg = proxy_config();
-        let socket = if cfg.mode == ProxyMode::Custom {
-            let (host, port, _is_tls) = parse_ws_target(url)?;
-            let tcp = dial_via_proxy(&cfg, &host, port)?
-                .ok_or_else(|| io::Error::new(ErrorKind::ConnectionRefused, "proxy dial failed closed"))?;
-            let (ws, _) = tungstenite::client_tls(request, tcp).map_err(io::Error::other)?;
-            ws
+        let tcp = if cfg.mode == ProxyMode::Custom {
+            dial_via_proxy(&cfg, &host, port)?
+                .ok_or_else(|| io::Error::new(ErrorKind::ConnectionRefused, "proxy dial failed closed"))?
         } else {
-            let (ws, _) = tungstenite::connect(request).map_err(io::Error::other)?;
-            ws
+            connect_tcp(&host, port, CONNECT_TIMEOUT)?
         };
+        let _ = tcp.set_nodelay(true);
+        tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let (socket, _) = tungstenite::client_tls(request, tcp).map_err(io::Error::other)?;
         let Some(tcp) = crate::tls::tcp(socket.get_ref()) else {
             return Err(io::Error::other("unexpected stream"));
         };
         tcp.set_read_timeout(Some(tick))?;
+        tcp.set_write_timeout(None)?;
         Ok(Socket(socket))
     }
 

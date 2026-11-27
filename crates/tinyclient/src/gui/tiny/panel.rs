@@ -25,8 +25,33 @@ pub(super) enum StatsTab {
 
 /// One of the panel's three buttons. `off` draws it struck through in `danger`.
 fn panel_button(id: &'static str, icon: &'static str, off: bool, label: &'static str) -> Stateful<Div> {
+    let icon_el: gpui::AnyElement = if off {
+        div()
+            .relative()
+            .size(px(18.))
+            .flex_none()
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .group_hover(id, |s| s.opacity(0.))
+                    .child(glyph(icon, 18., theme::danger())),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(0.)
+                    .group_hover(id, |s| s.opacity(1.))
+                    .child(glyph(icon, 18., theme::on_accent())),
+            )
+            .into_any_element()
+    } else {
+        glyph(icon, 18., theme::text_soft()).into_any_element()
+    };
     div()
         .id(id)
+        .group(id)
         .role(gpui::Role::Button)
         .aria_label(label)
         .flex_none()
@@ -37,11 +62,11 @@ fn panel_button(id: &'static str, icon: &'static str, off: bool, label: &'static
         .justify_center()
         .cursor_pointer()
         .tab_index(0)
-        .when(off, |button| button.bg(theme::danger_soft()).hover(|style| style.bg(theme::danger_soft()).opacity(0.88)))
+        .when(off, |button| button.bg(theme::danger_soft()).hover(|style| style.bg(theme::danger_fill())))
         .when(!off, |button| button.hover(|style| style.bg(theme::hover())))
         .active(|style| style.bg(theme::pressed()))
         .focus_visible(|style| style.shadow(theme::focus_ring()))
-        .child(glyph(icon, 18., if off { theme::danger() } else { theme::text_soft() }))
+        .child(icon_el)
 }
 
 /// How good the link is, from its round trip, loss and jitter: the colour of the panel's words.
@@ -369,6 +394,7 @@ impl Shell {
             .on_click(|_, _, cx| crate::gui::settings::open(crate::gui::settings::Section::Voice, cx));
         Some(
             div()
+                .relative()
                 .flex_none()
                 .h(px(PANEL))
                 .px(px(8.))
@@ -403,7 +429,14 @@ impl Shell {
                         .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(name))
                         .child(status),
                 )
-                .child(div().flex_none().flex().items_center().gap(px(2.)).child(mic).child(ears).child(cog)),
+                .child(div().flex_none().flex().items_center().gap(px(2.)).child(mic).child(ears).child(cog))
+                .child(
+                    canvas(|bounds, _, _| super::layer::note_panel_bounds(bounds), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                ),
         )
     }
 
@@ -430,7 +463,7 @@ impl Shell {
         let hints = health.hints();
         let details = hints.iter().map(|hint| hint.words.as_str()).collect::<Vec<_>>().join("\n");
         let video_tab = self.tiny_state.stats_tab == StatsTab::Video;
-        let mut card = div().w(px(320.)).flex().flex_col()
+        let mut card = div().w(px(320.)).max_w_full().flex().flex_col()
             .child(div().pb(px(10.)).flex().items_center().justify_between().gap(px(8.))
                 .child(div().flex().items_center().gap(px(8.))
                     .child(health::bars(grade, 14.))
@@ -531,6 +564,33 @@ impl Shell {
         }
         card
     }
+}
+
+/// Verifies the Tiny server responsive layout invariants (no desktop settings overlay on phone,
+/// stats card clearance above the call dock, and no inline directory when the sidebar is hidden
+/// or the viewport is too narrow).
+pub(in crate::gui) fn prove_tiny_responsive() -> Result<(), &'static str> {
+    if super::layer::desktop_settings_overlay_shown(true, true) {
+        return Err("desktop Tiny Server Settings overlay remained active on phone");
+    }
+    if !super::layer::desktop_settings_overlay_shown(true, false) {
+        return Err("desktop Tiny Server Settings overlay failed to open on desktop");
+    }
+    if (super::layer::stats_anchor_base(true) - (PANEL + 112.)).abs() > 0.5
+        || (super::layer::stats_anchor_base(false) - PANEL).abs() > 0.5
+    {
+        return Err("Tiny stats popover did not reserve call dock clearance");
+    }
+    if super::pane::inline_directory_shown(false, false, true, 900.) {
+        return Err("inline Tiny directory remained forced when sidebar was hidden");
+    }
+    if super::pane::inline_directory_shown(false, false, false, 520.) {
+        return Err("inline Tiny directory remained forced below 580 px");
+    }
+    if !super::pane::inline_directory_shown(false, false, false, 700.) {
+        return Err("inline Tiny directory did not appear at 700 px with sidebar unpinned");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

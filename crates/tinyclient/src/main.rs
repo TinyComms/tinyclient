@@ -490,6 +490,42 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's curated-themes driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("curated-themes") {
+        if let Err(err) = gui::prove_curated_themes() {
+            eprintln!("curated-themes: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's responsive-shell-ux driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("responsive-shell-ux") {
+        if let Err(err) = gui::prove_responsive_shell_ux() {
+            eprintln!("responsive-shell-ux: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's clean-composer-bar driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("clean-composer-bar") {
+        if let Err(err) = gui::prove_clean_composer() {
+            eprintln!("clean-composer-bar: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // The lab's calls-tiny-responsive driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("calls-tiny-responsive") {
+        if let Err(err) = gui::prove_calls_tiny_responsive() {
+            eprintln!("calls-tiny-responsive: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     let _log = protocol::log_policy::install("tinyclient", protocol::log_policy::LogPolicy::from_env());
     #[cfg(feature = "gui")]
     if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() && export_target.is_none() {

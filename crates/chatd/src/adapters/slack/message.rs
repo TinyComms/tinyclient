@@ -892,6 +892,48 @@ pub(super) fn prove_call_cards() -> Result<(), String> {
     Ok(())
 }
 
+/// Cache-only `Names` implementation that never issues synchronous HTTP calls (`emoji.list`,
+/// `users.info`, `conversations.info`, `usergroups.list`). Used while constructing a settled
+/// outgoing `Message` in `Slack::post()` / `send_with()` so `ctx.sent()` completes at once.
+struct CachedNames<'a>(&'a Slack);
+
+impl Names for CachedNames<'_> {
+    fn me(&self) -> &str {
+        self.0.me.get().map_or("", String::as_str)
+    }
+
+    fn user(&self, id: &str) -> String {
+        self.0.cached(id).map_or_else(|| id.to_owned(), |user| user.name)
+    }
+
+    fn channel(&self, id: &str) -> Option<String> {
+        if let Some(known) = self.0.ctx.known(id).ok().flatten() {
+            return Some(known.title);
+        }
+        self.0.ctx.note(&format!("c:{id}"))
+    }
+
+    fn usergroup(&self, id: &str) -> Option<String> {
+        self.0.ctx.note(&format!("g:{id}"))
+    }
+
+    fn in_usergroup(&self, id: &str) -> bool {
+        self.0.state().my_groups.contains(id)
+    }
+
+    fn custom(&self, name: &str) -> Option<Custom> {
+        if name.is_empty() {
+            return None;
+        }
+        let known = self.0.ctx.note(&format!("e:{name}"))?;
+        if known.is_empty() { None } else { self.0.custom_known(name, &known) }
+    }
+
+    fn hosted(&self, url: &str) -> bool {
+        Slack::hosted(self.0, url)
+    }
+}
+
 impl Names for Slack {
     fn me(&self) -> &str {
         self.me.get().map_or("", String::as_str)
@@ -1038,9 +1080,24 @@ impl Slack {
         }
     }
 
+    /// Writes `e:{name}` only when its value changed relative to memory or SQLite, avoiding
+    /// thousands of redundant SQLite commits on `emoji.list`.
+    fn set_emoji_note(&self, name: &str, value: &str) {
+        if self.state().emoji_cache.get(name).map(String::as_str) == Some(value) {
+            return;
+        }
+        let note = format!("e:{name}");
+        if self.ctx.note(&note).as_deref() == Some(value) {
+            self.state().emoji_cache.insert(name.to_owned(), value.to_owned());
+            return;
+        }
+        self.ctx.set_note(&note, value);
+        self.state().emoji_cache.insert(name.to_owned(), value.to_owned());
+    }
+
     /// The workspace's custom emoji, written to the store once a day at most. The picker asks,
-    /// and so does the first message that names one the store has no note for. Nothing of the
-    /// list stays in memory. True when this call fetched it.
+    /// and so does the first message that names one the store has no note for. True when this
+    /// call fetched it.
     pub(super) fn list_emoji(&self) -> bool {
         let now = crate::hub::now();
         let listed = self.ctx.note("emoji").and_then(|at| at.parse::<i64>().ok());
@@ -1057,7 +1114,10 @@ impl Slack {
         // The names, for the picker: one note, not one read per emoji.
         let mut names: Vec<&str> = all.keys().map(String::as_str).collect();
         names.sort_unstable();
-        self.ctx.set_note("emoji:names", &names.join(","));
+        let joined = names.join(",");
+        if self.ctx.note("emoji:names").as_deref() != Some(joined.as_str()) {
+            self.ctx.set_note("emoji:names", &joined);
+        }
         for (name, value) in all {
             let mut value = value.as_str().unwrap_or("");
             // `alias:other` names another custom emoji or a standard one.
@@ -1065,7 +1125,7 @@ impl Slack {
                 match value.strip_prefix("alias:") {
                     Some(other) => match emoji::standard(other) {
                         Some(standard) => {
-                            self.ctx.set_note(&format!("e:{name}"), &format!("={standard}"));
+                            self.set_emoji_note(name, &format!("={standard}"));
                             value = "";
                         }
                         None => value = all.get(other).and_then(Value::as_str).unwrap_or(""),
@@ -1074,7 +1134,7 @@ impl Slack {
                 }
             }
             if self.hosted(value) {
-                self.ctx.set_note(&format!("e:{name}"), value);
+                self.set_emoji_note(name, value);
             }
         }
         self.repaint_emoji();
@@ -1087,7 +1147,7 @@ impl Slack {
             Some("add") => {
                 let (name, value) = (event["name"].as_str().unwrap_or(""), event["value"].as_str().unwrap_or(""));
                 if !name.is_empty() && self.hosted(value) {
-                    self.ctx.set_note(&format!("e:{name}"), value);
+                    self.set_emoji_note(name, value);
                     let names = self.ctx.note("emoji:names").unwrap_or_default();
                     if !names.split(',').any(|known| known == name) {
                         self.ctx.set_note("emoji:names", &format!("{names},{name}"));
@@ -1097,7 +1157,7 @@ impl Slack {
             }
             Some("remove") => {
                 for name in event["names"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-                    self.ctx.set_note(&format!("e:{name}"), "");
+                    self.set_emoji_note(name, "");
                 }
                 self.repaint_emoji();
             }
@@ -1120,9 +1180,9 @@ impl Slack {
                     self.ctx.note(&format!("e:{old_name}")).unwrap_or_default()
                 };
                 if !picture.is_empty() {
-                    self.ctx.set_note(&format!("e:{new_name}"), &picture);
+                    self.set_emoji_note(new_name, &picture);
                 }
-                self.ctx.set_note(&format!("e:{old_name}"), "");
+                self.set_emoji_note(old_name, "");
                 let names = self.ctx.note("emoji:names").unwrap_or_default();
                 self.ctx.set_note("emoji:names", &renamed_names(&names, old_name, new_name));
                 self.repaint_emoji();
@@ -1233,10 +1293,14 @@ impl Slack {
 
     /// A reaction's emoji as the model writes it: the emoji itself, or `:name:` with its picture.
     pub(super) fn reaction(&self, name: &str) -> (String, Option<MediaFile>) {
+        self.reaction_with(name, self)
+    }
+
+    fn reaction_with(&self, name: &str, names: &dyn Names) -> (String, Option<MediaFile>) {
         if let Some(standard) = emoji::standard(name) {
             return (standard, None);
         }
-        match self.custom(name) {
+        match names.custom(name) {
             Some(Custom::Unicode(emoji)) => (emoji, None),
             Some(Custom::File(file)) => (format!(":{name}:"), Some(file)),
             None => (format!(":{name}:"), None),
@@ -1252,12 +1316,27 @@ impl Slack {
         }
     }
 
-    fn sender(&self, event: &Value, media: &mut Registered) -> Sender {
+    fn sender(&self, event: &Value, media: &mut Registered, fetch_missing: bool) -> Sender {
         let by_app = event["bot_id"].is_string() || event["subtype"] == "bot_message";
         // An app may post under a name and picture of its own choosing.
         let chosen = first(&[&event["username"]]).filter(|_| by_app);
         if let (Some(id), None) = (event["user"].as_str(), chosen) {
-            let user = self.user(id);
+            let user = if fetch_missing {
+                self.user(id)
+            } else {
+                self.cached(id).unwrap_or_else(|| {
+                    let fallback = if id == Names::me(self) {
+                        let handle = self.state().handle.clone();
+                        if !handle.is_empty() { handle } else { id.to_owned() }
+                    } else {
+                        id.to_owned()
+                    };
+                    super::people::User {
+                        name: fallback,
+                        ..super::people::User::default()
+                    }
+                })
+            };
             return Sender {
                 id: id.to_owned(),
                 avatar: user.avatar(),
@@ -1353,14 +1432,14 @@ impl Slack {
     }
 
     /// Maps a legacy Slack Post (`mode == "post"`, `filetype` `post`/`space`) into a read-only card.
-    fn post_card(&self, file: &Value, fallback_link: &str) -> Card {
+    fn post_card(&self, file: &Value, fallback_link: &str, names: &dyn Names) -> Card {
         let title = first(&[&file["title"], &file["name"]]).unwrap_or("Slack Post").trim().to_owned();
         let link = first(&[&file["permalink"], &file["url_private"]])
             .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
             .unwrap_or(fallback_link)
             .to_owned();
         let text = first(&[&file["preview_plain_text"], &file["plain_text"], &file["preview"], &file["preview_highlight"]])
-            .map(|raw| if raw.contains('<') && raw.contains('>') { strip_html(raw) } else { self.words(raw) })
+            .map(|raw| if raw.contains('<') && raw.contains('>') { strip_html(raw) } else { words_with(names, raw) })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Shared Slack post".to_owned());
         Card {
@@ -1539,17 +1618,19 @@ impl Slack {
             variants: Vec::new(),
         })
     }
+}
 
-    /// Slack's markup as plain words, for a card's description.
-    fn words(&self, text: &str) -> String {
-        let mut rich = Rich::new(self);
-        rich.mrkdwn(text);
-        rich.finish();
-        rich.text
-    }
+/// Slack's markup as plain words, for a card's description.
+fn words_with(names: &dyn Names, text: &str) -> String {
+    let mut rich = Rich::new(names);
+    rich.mrkdwn(text);
+    rich.finish();
+    rich.text
+}
 
+impl Slack {
     /// A link's card as Slack built it. The picture is kept only when Slack serves it.
-    fn preview(&self, card: &Value, url: &str, media: &mut Registered) -> Preview {
+    fn preview(&self, card: &Value, url: &str, media: &mut Registered, names: &dyn Names) -> Preview {
         let wide = first(&[&card["image_url"]]).map(|url| (url, &card["image_width"], &card["image_height"]));
         let small = first(&[&card["thumb_url"]]).map(|url| (url, &card["thumb_width"], &card["thumb_height"]));
         let image = wide.or(small).filter(|(url, ..)| self.hosted(url)).map(|(url, width, height)| {
@@ -1561,7 +1642,7 @@ impl Slack {
             media.push((file.clone(), url.to_owned()));
             file
         });
-        let description = self.words(first(&[&card["text"], &card["fallback"]]).unwrap_or(""));
+        let description = words_with(names, first(&[&card["text"], &card["fallback"]]).unwrap_or(""));
         Preview {
             url: url.to_owned(),
             site: first(&[&card["service_name"], &card["author_name"]]).unwrap_or("").to_owned(),
@@ -1578,8 +1659,8 @@ impl Slack {
     /// `None` when the card says nothing in a form a `Card` holds.
     // CONTRACT: the store previews a message by its text or first attachment, so a row whose
     // newest message is only a card previews as nothing.
-    fn framed(&self, card: &Value, rich: &mut Rich, media: &mut Registered) -> Option<Card> {
-        let words = |value: &Value| self.words(value.as_str().unwrap_or(""));
+    fn framed(&self, card: &Value, rich: &mut Rich, media: &mut Registered, names: &dyn Names) -> Option<Card> {
+        let words = |value: &Value| words_with(names, value.as_str().unwrap_or(""));
         let fields = card["fields"].as_array().into_iter().flatten().take(CARD_FIELDS);
         let hosted_image = |url: Option<&str>, w: &Value, h: &Value, media: &mut Registered| -> Option<MediaFile> {
             let url = url.filter(|u| self.hosted(u))?;
@@ -1596,7 +1677,7 @@ impl Slack {
         let mut text = words(&card["text"]);
         let mut card_fields: Vec<(String, String)> = fields.map(|field| (words(&field["title"]), words(&field["value"]))).collect();
         if let Some(blocks) = card["blocks"].as_array() {
-            let mut inner = Rich::new(self);
+            let mut inner = Rich::new(names);
             inner.blocks(blocks);
             inner.finish();
             if !inner.text.is_empty() {
@@ -1612,7 +1693,7 @@ impl Slack {
                             break;
                         }
                         if let Some(val) = f["text"].as_str().filter(|s| !s.is_empty()) {
-                            let w = self.words(val);
+                            let w = words_with(names, val);
                             if let Some((k, v)) = w.split_once('\n') {
                                 card_fields.push((k.trim().to_owned(), v.trim().to_owned()));
                             } else {
@@ -1651,7 +1732,7 @@ impl Slack {
 
     /// A huddle can carry a Canvas file or just name it. `canvas_thread_ts` is a timestamp,
     /// so it is never used as a file id. The workspace's document URL works for a bare id.
-    fn huddle_notes(&self, event: &Value, files: &[Value]) -> (Option<usize>, Option<Card>) {
+    fn huddle_notes(&self, event: &Value, files: &[Value], names: &dyn Names) -> (Option<usize>, Option<Card>) {
         let room = &event[field::ROOM];
         let references = [&room["canvas"], &room["notes_canvas"], &event["canvas"], &event["notes_canvas"]];
         let valid_id = |id: &str| id.starts_with('F') && id.len() > 1 && id.bytes().all(|byte| byte.is_ascii_alphanumeric());
@@ -1675,7 +1756,7 @@ impl Slack {
         let link = file_id.or_else(|| file["id"].as_str().filter(|id| valid_id(id)))
             .map(|id| format!("{}docs/{}/{id}", self.session.url, self.session.team_id))
             .unwrap_or_default();
-        let mut card = self.canvas_card(file, &link);
+        let mut card = self.canvas_card(file, &link, names);
         if card.title_link.is_empty() {
             return (None, None);
         }
@@ -1693,7 +1774,7 @@ impl Slack {
 
     /// Maps a Slack Canvas file (`filetype` `quip` / `canvas` / `slack_canvas`) into a structured
     /// readable card with an "Open in Slack" link instead of a bare download chip.
-    fn canvas_card(&self, file: &Value, fallback_link: &str) -> Card {
+    fn canvas_card(&self, file: &Value, fallback_link: &str, names: &dyn Names) -> Card {
         let title = first(&[&file["title"], &file["name"]]).unwrap_or("Untitled Canvas").trim().to_owned();
         let title = if title.is_empty() { "Untitled Canvas".to_owned() } else { title };
         let link = first(&[&file["permalink"], &file["url_private"]])
@@ -1725,7 +1806,7 @@ impl Slack {
                         if raw.contains('<') && raw.contains('>') {
                             strip_html(raw)
                         } else {
-                            self.words(raw)
+                            words_with(names, raw)
                         }
                     })
                     .unwrap_or_default();
@@ -1737,7 +1818,7 @@ impl Slack {
 
         // Canvas Block Kit document content when present.
         if let Some(blocks) = file["blocks"].as_array().filter(|b| !b.is_empty()) {
-            let mut inner = Rich::new(self);
+            let mut inner = Rich::new(names);
             inner.blocks(blocks);
             inner.finish();
             if !inner.text.is_empty() {
@@ -1757,7 +1838,7 @@ impl Slack {
                 let cleaned = if raw.contains('<') && raw.contains('>') {
                     strip_html(raw)
                 } else {
-                    self.words(raw)
+                    words_with(names, raw)
                 };
                 if !cleaned.is_empty() {
                     text = cleaned;
@@ -1791,7 +1872,7 @@ impl Slack {
 
     /// Maps a Slack List file (`filetype` `list` / `slack_list`) into a structured readable card
     /// with columns/items summary and an "Open in Slack" link instead of a bare download chip.
-    fn list_card(&self, file: &Value, fallback_link: &str) -> Card {
+    fn list_card(&self, file: &Value, fallback_link: &str, names: &dyn Names) -> Card {
         let title = first(&[&file["title"], &file["name"]]).unwrap_or("Untitled List").trim().to_owned();
         let title = if title.is_empty() { "Untitled List".to_owned() } else { title };
         let link = first(&[&file["permalink"], &file["url_private"]])
@@ -1815,7 +1896,7 @@ impl Slack {
             &file["plain_text"],
             &file["preview"],
         ])
-        .map(|raw| if raw.contains('<') && raw.contains('>') { strip_html(raw) } else { self.words(raw) })
+        .map(|raw| if raw.contains('<') && raw.contains('>') { strip_html(raw) } else { words_with(names, raw) })
         .unwrap_or_default();
 
         let mut fields: Vec<(String, String)> = Vec::new();
@@ -1941,8 +2022,8 @@ impl Slack {
     /// A message shared from elsewhere ("Share message"): where it came from, and what it said.
     /// When the forwarder also wrote a note (`rich.text` is non-empty), the note stays in
     /// `Message::text` and the forwarded message's body sits in `Forwarded::text` so both stay distinct.
-    fn forwarded(&self, card: &Value, rich: &mut Rich, media: &mut Registered, variants: &mut Sizes, attachments: &mut Vec<Attachment>) -> Forwarded {
-        let mut quoted = Rich::new(self);
+    fn forwarded(&self, card: &Value, rich: &mut Rich, media: &mut Registered, variants: &mut Sizes, attachments: &mut Vec<Attachment>, names: &dyn Names) -> Forwarded {
+        let mut quoted = Rich::new(names);
         let blocks = card["message_blocks"][0]["message"]["blocks"].as_array();
         if !blocks.is_some_and(|blocks| quoted.blocks(blocks)) {
             quoted.mrkdwn(first(&[&card["text"], &card["fallback"]]).unwrap_or(""));
@@ -2034,6 +2115,17 @@ impl Slack {
     /// A message event, or one entry of a page of history. `None` only for what Slack itself
     /// hides. Registers every file the message refers to.
     pub(super) fn message(&self, channel: &str, event: &Value) -> Option<Message> {
+        self.build_message(channel, event, true)
+    }
+
+    /// Builds a settled outgoing `Message` purely from cached state and the server's response,
+    /// never issuing synchronous HTTP calls (`emoji.list`, `users.info`, `conversations.info`,
+    /// `usergroups.list`) before `ctx.sent()` completes.
+    pub(super) fn settled_message(&self, channel: &str, event: &Value) -> Option<Message> {
+        self.build_message(channel, event, false)
+    }
+
+    fn build_message(&self, channel: &str, event: &Value, fetch_missing: bool) -> Option<Message> {
         let ts = event["ts"].as_str()?;
         let subtype = event["subtype"].as_str();
         let ephemeral = event["is_ephemeral"] == true
@@ -2044,25 +2136,29 @@ impl Slack {
         if handled_apart || (event["hidden"] == true && !ephemeral) {
             return None;
         }
+        let cached_names = CachedNames(self);
+        let names: &dyn Names = if fetch_missing { self } else { &cached_names };
         let thread = event["thread_ts"].as_str();
         let mut media = Registered::new();
         let mut variants = Sizes::new();
-        let sender = self.sender(event, &mut media);
+        let sender = self.sender(event, &mut media, fetch_missing);
         let outgoing = !sender.id.is_empty() && sender.id == Names::me(self);
         let link = self.permalink(channel, ts, thread.filter(|thread| *thread != ts));
 
-        let mut rich = Rich::new(self);
+        let mut rich = Rich::new(names);
         let system = subtype.is_some_and(|subtype| SYSTEM.contains(&subtype));
         let room = &event[field::ROOM];
         // Slack's old calls have a room object too. Only huddles get its summary card.
         let huddle = is_huddle(subtype, room).then(|| huddle_note(room));
         if let Some(note) = &huddle {
-            let people = std::iter::once(&note.caller_id)
-                .chain(note.participants.iter().take(THREAD_FACES))
-                .filter(|id| !id.is_empty())
-                .cloned()
-                .collect::<Vec<_>>();
-            self.users(&people);
+            if fetch_missing {
+                let people = std::iter::once(&note.caller_id)
+                    .chain(note.participants.iter().take(THREAD_FACES))
+                    .filter(|id| !id.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.users(&people);
+            }
             rich.text = huddle_line(note);
         } else if room.is_object() {
             rich.text = if subtype == Some("sh_room_created") {
@@ -2082,15 +2178,15 @@ impl Slack {
         }
         for card in event["attachments"].as_array().into_iter().flatten() {
             if (card["is_share"] == true || card["is_msg_unfurl"] == true) && forwarded.is_none() {
-                forwarded = Some(Box::new(self.forwarded(card, &mut rich, &mut media, &mut variants, &mut attachments)));
+                forwarded = Some(Box::new(self.forwarded(card, &mut rich, &mut media, &mut variants, &mut attachments, names)));
                 continue;
             }
             let is_rich_card = card["fields"].as_array().is_some_and(|f| !f.is_empty())
                 || card["blocks"].as_array().is_some_and(|b| !b.is_empty())
                 || card["color"].as_str().is_some_and(|c| !c.is_empty());
             match first(&[&card["from_url"], &card["original_url"]]) {
-                Some(url) if !is_rich_card => previews.push(self.preview(card, url, &mut media)),
-                _ => match self.framed(card, &mut rich, &mut media) {
+                Some(url) if !is_rich_card => previews.push(self.preview(card, url, &mut media, names)),
+                _ => match self.framed(card, &mut rich, &mut media, names) {
                     Some(c) => {
                         if framed.is_none() {
                             framed = Some(Box::new(c));
@@ -2099,7 +2195,7 @@ impl Slack {
                         }
                     }
                     None => match first(&[&card["from_url"], &card["original_url"], &card["title_link"]]) {
-                        Some(url) => previews.push(self.preview(card, url, &mut media)),
+                        Some(url) => previews.push(self.preview(card, url, &mut media, names)),
                         None => self.card(card, &mut rich),
                     },
                 },
@@ -2108,7 +2204,7 @@ impl Slack {
         if framed.is_none() {
             if let Some(blocks) = event["blocks"].as_array() {
                 if let Some((mut card, join)) = meeting_from(blocks) {
-                    card.title = self.words(&card.title);
+                    card.title = words_with(names, &card.title);
                     framed = Some(Box::new(card));
                     previews.extend(join);
                 }
@@ -2116,7 +2212,7 @@ impl Slack {
         }
         let files = event["files"].as_array().map_or(&[][..], Vec::as_slice);
         let notes_file = if huddle.is_some() {
-            let (file, card) = self.huddle_notes(event, files);
+            let (file, card) = self.huddle_notes(event, files, names);
             if let Some(card) = card {
                 push_card(&mut framed, &mut extra_cards, card);
             }
@@ -2140,15 +2236,15 @@ impl Slack {
                 _ => {}
             }
             if is_canvas(file) {
-                push_card(&mut framed, &mut extra_cards, self.canvas_card(file, &link));
+                push_card(&mut framed, &mut extra_cards, self.canvas_card(file, &link, names));
                 continue;
             }
             if is_list(file) {
-                push_card(&mut framed, &mut extra_cards, self.list_card(file, &link));
+                push_card(&mut framed, &mut extra_cards, self.list_card(file, &link, names));
                 continue;
             }
             if is_post(file) {
-                push_card(&mut framed, &mut extra_cards, self.post_card(file, &link));
+                push_card(&mut framed, &mut extra_cards, self.post_card(file, &link, names));
                 continue;
             }
             if self.is_external(file) {
@@ -2194,7 +2290,7 @@ impl Slack {
 
         let mine = Names::me(self);
         let reactions = event["reactions"].as_array().into_iter().flatten().filter_map(|reaction| {
-            let (emoji, file) = self.reaction(reaction["name"].as_str()?);
+            let (emoji, file) = self.reaction_with(reaction["name"].as_str()?, names);
             let users = reaction["users"].as_array();
             // The payload names everyone: the ids the shell draws faces and names from.
             let who: Vec<String> = users

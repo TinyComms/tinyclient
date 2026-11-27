@@ -17,7 +17,7 @@
 use super::{in_call, Menu};
 use crate::client::ask;
 use crate::gui::app::prefs;
-use crate::gui::components::{button_with_icon, glyph, menu_item, menu_separator, ButtonKind};
+use crate::gui::components::{button_disabled, button_with_icon, glyph, menu_item, menu_separator, ButtonKind};
 use crate::gui::settings;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
@@ -431,8 +431,7 @@ impl Shell {
                 .rounded(px(4.))
                 .border_1()
                 .border_color(theme::hairline())
-                .text_size(px(10.))
-                .line_height(px(13.))
+                .type_micro()
                 .text_color(theme::text_faint())
                 .child("virtual")
         });
@@ -447,7 +446,7 @@ impl Shell {
             .items_center()
             .gap(px(8.))
             .cursor_pointer()
-            .text_size(px(13.))
+            .type_ui()
             .text_color(if row.chosen { theme::text() } else { theme::text_soft() })
             .hover(|style| style.bg(theme::hover()))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -470,15 +469,15 @@ impl Shell {
                             .child(
                                 div()
                                     .truncate()
-                                    .line_height(px(16.))
+                                    .type_ui()
                                     .when(row.chosen, |d| d.font_weight(FontWeight::MEDIUM))
                                     .child(SharedString::from(row.label)),
                             )
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(11.))
-                                    .line_height(px(14.))
+                                    .type_micro()
+                                    .font_weight(FontWeight::NORMAL)
                                     .text_color(theme::text_faint())
                                     .child(detail),
                             ),
@@ -501,9 +500,7 @@ impl Shell {
                 .py(px(1.))
                 .rounded(px(4.))
                 .bg(bg)
-                .text_size(px(10.))
-                .line_height(px(13.))
-                .font_weight(FontWeight::MEDIUM)
+                .type_micro()
                 .text_color(fg)
                 .child(text)
         });
@@ -551,7 +548,7 @@ impl Shell {
             .children(back)
             .child(
                 div()
-                    .text_size(px(11.5))
+                    .type_small()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_soft())
                     .child(title),
@@ -573,8 +570,7 @@ impl Shell {
                 .mt(px(4.))
                 .flex()
                 .items_center()
-                .text_size(px(10.5))
-                .font_weight(FontWeight::MEDIUM)
+                .type_micro()
                 .text_color(theme::text_faint())
                 .child(words)
         };
@@ -655,7 +651,7 @@ impl Shell {
             div()
                 .px(px(8.))
                 .py(px(8.))
-                .text_size(px(12.))
+                .type_small()
                 .text_color(theme::text_faint())
                 .child("No cameras detected")
         } else {
@@ -719,8 +715,7 @@ impl Shell {
                     .flex_col()
                     .child(
                         div()
-                            .text_size(px(12.5))
-                            .line_height(px(16.))
+                            .type_ui()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::text())
                             .child(title),
@@ -728,8 +723,8 @@ impl Shell {
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(11.))
-                            .line_height(px(14.))
+                            .type_micro()
+                            .font_weight(FontWeight::NORMAL)
                             .text_color(if warning { theme::warning() } else { theme::text_faint() })
                             .child(summary),
                     ),
@@ -740,21 +735,35 @@ impl Shell {
     /// Small popover above the Camera button: live preview of the chosen camera, camera list, and
     /// "Turn on camera".
     pub(super) fn call_camera_preview_menu(&self, call: &Call, cx: &mut Context<Self>) -> Div {
-        let preview = match self.call_self_frame(Some(call), false) {
-            Some(frame) => img(frame)
-                .size_full()
-                .object_fit(ObjectFit::Contain)
-                .into_any_element(),
-            None => div()
+        let has_cameras = !call.cameras.is_empty();
+        let preview = if !has_cameras {
+            div()
                 .size_full()
                 .flex()
                 .flex_col()
                 .items_center()
                 .justify_center()
                 .gap(px(6.))
-                .child(glyph("icons/video.svg", 22., gpui::rgba(0xffffff80)))
-                .child(div().type_small().text_color(gpui::rgba(0xffffffb3)).child("Starting camera preview…"))
-                .into_any_element(),
+                .child(glyph("icons/video-off.svg", 22., theme::on_media_soft()))
+                .child(div().type_small().text_color(theme::on_media_soft()).child("No camera found"))
+                .into_any_element()
+        } else {
+            match self.call_self_frame(Some(call), false) {
+                Some(frame) => img(frame)
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+                None => div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(6.))
+                    .child(glyph("icons/video.svg", 22., theme::on_media_soft()))
+                    .child(div().type_small().text_color(theme::on_media_soft()).child("Starting camera preview…"))
+                    .into_any_element(),
+            }
         };
         let choice = prefs::values().device_choice(CAMERA);
         let items = camera_rows(&choice, &call.cameras, &call.camera_id);
@@ -767,15 +776,23 @@ impl Shell {
         for (ix, row) in items.into_iter().enumerate() {
             list = list.child(self.call_device_row(Side::Camera, ix, row, cx));
         }
-        let go = button_with_icon("call-camera-preview-on", ButtonKind::Primary, "icons/video.svg", "Turn on camera")
-            .h(px(32.))
-            .w_full()
-            .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.call_state.camera_used = true;
-                this.call_menu_set(None, cx);
-                this.call_ask(Request::Media(MediaRequest::Camera { on: true }), cx);
-            }));
+        let go = if has_cameras {
+            button_with_icon("call-camera-preview-on", ButtonKind::Primary, "icons/video.svg", "Turn on camera")
+                .h(px(32.))
+                .w_full()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_state.camera_used = true;
+                    this.call_menu_set(None, cx);
+                    this.call_ask(Request::Media(MediaRequest::Camera { on: true }), cx);
+                }))
+                .into_any_element()
+        } else {
+            button_disabled("Turn on camera")
+                .h(px(32.))
+                .w_full()
+                .into_any_element()
+        };
         div().child(
             div()
                 .id("call-camera-preview-menu")
@@ -787,13 +804,13 @@ impl Shell {
                         .w_full()
                         .h(px(150.))
                         .rounded(px(8.))
-                        .bg(gpui::rgb(0x0b0b0d))
+                        .bg(theme::media_stage())
                         .border_1()
                         .border_color(theme::hairline())
                         .overflow_hidden()
                         .child(preview),
                 )
-                .when(!call.cameras.is_empty(), |box_div| box_div.child(list))
+                .when(has_cameras, |box_div| box_div.child(list))
                 .child(go),
         )
     }
@@ -841,7 +858,7 @@ impl Shell {
             .items_center()
             .gap(px(10.))
             .child(div().flex_none().flex().gap(px(2.)).children((0..SEGMENTS).map(segment)))
-            .child(div().min_w_0().truncate().text_size(px(11.5)).text_color(theme::text_soft()).child(words))
+            .child(div().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(words))
     }
 
     /// Why a device in use is not the one chosen, or that one is silent, at the top of the menu.
@@ -856,8 +873,7 @@ impl Shell {
                 .py(px(6.))
                 .rounded(px(theme::R_CONTROL))
                 .bg(theme::warning_soft())
-                .text_size(px(12.))
-                .line_height(px(16.))
+                .type_small()
                 .text_color(color)
                 .child(words),
         )

@@ -110,8 +110,8 @@ pub fn connection_row(id: impl Into<ElementId>, conn: &protocol::ProfileConnecti
                 .flex()
                 .items_center()
                 .gap(px(4.))
-                .child(div().type_ui().truncate().child(conn.name.clone()))
-                .when(conn.verified, |inner| inner.child(glyph("icons/check.svg", 12., theme::accent_text())))
+                .child(div().min_w_0().type_ui().truncate().child(conn.name.clone()))
+                .when(conn.verified, |inner| inner.child(glyph("icons/badge-check.svg", 13., theme::accent_text())))
                 .child(div().flex_none().type_small().text_color(theme::text_faint()).child(conn.service.clone())),
         )
         .when(clickable, |row| row.child(glyph("icons/external-link.svg", 13., theme::text_faint())))
@@ -149,9 +149,8 @@ pub fn mark_of(person: &Person) -> Option<Div> {
     if person.bot {
         return Some(tag(bot_word(person.key.network), false));
     }
-    // CONTRACT: `badge-check` is not in the asset list; the plain check stands in.
     Some(match person.mark? {
-        Mark::Verified => glyph("icons/check.svg", 14., theme::text_soft()).into_any_element(),
+        Mark::Verified => glyph("icons/badge-check.svg", 14., theme::accent_text()).into_any_element(),
         Mark::Scam => tag("Scam", true).into_any_element(),
         Mark::Fake => tag("Fake", true).into_any_element(),
         Mark::Guest => tag("Guest", false).into_any_element(),
@@ -342,6 +341,7 @@ pub fn role_chip(words: String) -> Div {
     // is not drawn.
     div()
         .flex_none()
+        .max_w_full()
         .h(px(20.))
         .px(px(6.))
         .rounded(px(4.))
@@ -350,7 +350,7 @@ pub fn role_chip(words: String) -> Div {
         .items_center()
         .type_small()
         .text_color(theme::text_soft())
-        .child(words)
+        .child(div().min_w_0().truncate().child(words))
 }
 
 /// Role: title and department, or the nickname in a Space and its roles.
@@ -444,34 +444,9 @@ pub fn heads_up_line(words: &HeadsUpWords) -> Div {
         .child(div().min_w_0().line_clamp(2).child(words.line.clone()))
 }
 
-/// An on/off switch, 32 × 18. On is accent.
+/// An on/off switch: 32 × 18 on desktop, 48 × 28 on phones, unified with Settings controls.
 pub fn switch(id: impl Into<ElementId>, on: bool) -> Stateful<Div> {
-    let track = if on {
-        theme::accent()
-    } else if theme::is_light() {
-        gpui::rgba(0x00000029)
-    } else {
-        theme::selected()
-    };
-    let hover = if on { theme::accent_hover() } else { theme::border_strong() };
-    div()
-        .id(id)
-        .role(gpui::Role::Switch)
-        .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
-        .tab_index(0)
-        .flex_none()
-        .w(px(32.))
-        .h(px(18.))
-        .p(px(if on { 2. } else { 1. }))
-        .rounded(px(9.))
-        .cursor_pointer()
-        .bg(track)
-        .when(!on, |track| track.border_1().border_color(theme::border_strong()))
-        .hover(move |style| style.bg(hover))
-        .focus_visible(|style| style.shadow(theme::focus_ring_gap(theme::canvas())))
-        .flex()
-        .when(on, |track| track.justify_end())
-        .child(div().size(px(14.)).rounded(px(7.)).bg(theme::on_accent()))
+    crate::gui::settings::controls::switch(id, "Toggle", on)
 }
 
 /// "Notifications" left, the control right, wrapping cleanly when narrow.

@@ -1528,7 +1528,7 @@ impl Picker {
                     .justify_center()
                     .cursor_pointer()
                     .tooltip(crate::gui::components::tip(star_tip, None))
-                    .child(glyph("icons/star.svg", 14., if star_lit { gpui::rgb(0xffc44d) } else { theme::on_media() }))
+                    .child(glyph("icons/star.svg", 14., if star_lit { theme::media_star() } else { theme::on_media() }))
                     // The star is not the cell: a click here never sends.
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {

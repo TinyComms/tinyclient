@@ -9,12 +9,24 @@
 use super::model::{self, Posted};
 use super::Discord;
 use crate::adapters::Refusal;
-use crate::blobs::upload::{size_refusal, Target, Upload};
+use crate::blobs::upload::{size_refusal, Target, Upload, CANCELLED};
 use base64::Engine;
 use protocol::{CatalogKind, ConversationKind, Message, Network, Outgoing, VoiceNote};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Maximum concurrent attachment PUTs for a multi-file Discord send.
+const UPLOAD_CONCURRENCY: usize = 3;
+/// Minimum total payload size before spawning parallel attachment PUT workers.
+/// Small multi-file sends upload sequentially to reuse connections and preserve file order.
+const PARALLEL_THRESHOLD: u64 = 256 * 1024;
+/// Progress reporting cadence for parallel multi-attachment uploads.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 /// Discord's own message flags.
 const SUPPRESS_EMBEDS: u64 = 1 << 2;
@@ -218,7 +230,7 @@ impl Discord {
     /// The work of one `SendWith`, run by the upload helper on a thread of its own, which reads
     /// the files and ends the send through `Context::sent`.
     pub(super) fn send_with(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
-        let premium = self.state.lock().unwrap().premium;
+        let premium = crate::hub::lock(&self.state).premium;
         if let Some(why) = super::too_long(premium, text) {
             return Err(why);
         }
@@ -238,7 +250,7 @@ impl Discord {
         };
         let tier = guild
             .as_deref()
-            .and_then(|guild| self.state.lock().unwrap().guilds.get(guild).map(|info| info.premium_tier))
+            .and_then(|guild| crate::hub::lock(&self.state).guilds.get(guild).map(|info| info.premium_tier))
             .unwrap_or(0);
         let most = upload_limit(premium, tier);
         if up.files().len() > FILES {
@@ -283,7 +295,12 @@ impl Discord {
                 _ => {}
             }
         }
-        let attachments = self.upload(channel, up, with.voice.as_ref())?;
+        crate::sendtime::stage("prepare");
+        let had_files = !up.files().is_empty();
+        let attachments = self.upload(channel, client_id, up, with.voice.as_ref())?;
+        if had_files {
+            crate::sendtime::stage("upload");
+        }
         up.check()?;
 
         let mut flags = 0;
@@ -321,19 +338,22 @@ impl Discord {
             // The ping toggle: the author of the original is notified only when it is on.
             body["allowed_mentions"] = json!({"parse": ["users", "roles", "everyone"], "replied_user": with.ping});
         }
-        let asked = self.call("POST", &format!("/channels/{channel}/messages"), Some(body));
+        let asked = self.call_send("POST", &format!("/channels/{channel}/messages"), Some(body));
+        crate::sendtime::stage("post");
         self.note_send_slowmode(channel, &conversation, &asked);
         let accepted = asked.map_err(|refused| refused.reason())?;
         let posted: Posted = serde_json::from_str(&accepted).map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let _ = files.register(&self.ctx);
+        crate::sendtime::stage("convert");
         Ok(message)
     }
 
     /// Uploads each file to the address Discord hands out for it and answers what the message
-    /// names them by. Nothing is asked when there are no files. What already went up is taken
-    /// back when a later file fails or the send is cancelled, as the web client does.
-    pub(super) fn upload(&self, channel: &str, up: &mut Upload, voice: Option<&VoiceNote>) -> Result<Vec<Value>, String> {
+    /// names them by. Nothing is asked when there are no files. Multiple files upload concurrently
+    /// (up to [`UPLOAD_CONCURRENCY`] PUTs in flight). What already went up is taken back when a
+    /// later file fails or the send is cancelled, as the web client does.
+    pub(super) fn upload(&self, channel: &str, client_id: &str, up: &mut Upload, voice: Option<&VoiceNote>) -> Result<Vec<Value>, String> {
         if up.files().is_empty() {
             return Ok(Vec::new());
         }
@@ -355,23 +375,29 @@ impl Discord {
             .enumerate()
             .map(|(at, (file, name))| json!({"id": at.to_string(), "filename": name, "file_size": file.bytes, "is_clip": false}))
             .collect();
-        let asked = self.call("POST", &format!("/channels/{channel}/attachments"), Some(json!({"files": named})));
+        let asked = self.call_send("POST", &format!("/channels/{channel}/attachments"), Some(json!({"files": named})));
         let slots: Slots = serde_json::from_str(&asked.map_err(|refused| refused.reason())?).map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
         if slots.attachments.len() != names.len() {
             return Err("Discord did not take every file.".to_owned());
         }
         let agent = self.rest.identity().user_agent.clone();
         let content_type = if voice.is_some() { "audio/ogg" } else { "application/octet-stream" };
+        if names.len() == 1 || up.total() <= PARALLEL_THRESHOLD {
+            for (at, slot) in slots.attachments.iter().enumerate() {
+                // The address is the storage bucket's own: the session's headers do not go there.
+                let target = Target::put(&slot.upload_url).header("Content-Type", content_type).header("User-Agent", &agent);
+                if let Err(why) = up.send(at, &target) {
+                    for gone in &slots.attachments[..at] {
+                        let _ = self.call("DELETE", &format!("/attachments/{}", gone.upload_filename), None);
+                    }
+                    return Err(why);
+                }
+            }
+        } else {
+            self.upload_parallel(channel, client_id, up, &slots.attachments, content_type, &agent)?;
+        }
         let mut attachments = Vec::with_capacity(names.len());
         for (at, (slot, name)) in slots.attachments.iter().zip(&names).enumerate() {
-            // The address is the storage bucket's own: the session's headers do not go there.
-            let target = Target::put(&slot.upload_url).header("Content-Type", content_type).header("User-Agent", &agent);
-            if let Err(why) = up.send(at, &target) {
-                for gone in &slots.attachments[..at] {
-                    let _ = self.call("DELETE", &format!("/attachments/{}", gone.upload_filename), None);
-                }
-                return Err(why);
-            }
             let mut entry = json!({"id": at.to_string(), "filename": name, "uploaded_filename": slot.upload_filename});
             // A description goes on the message only, and only when there is one.
             if let Some(alt) = up.files().get(at).map(|file| file.alt.as_str()).filter(|alt| !alt.is_empty()) {
@@ -384,6 +410,124 @@ impl Discord {
             attachments.push(entry);
         }
         Ok(attachments)
+    }
+
+    fn upload_parallel(
+        &self,
+        channel: &str,
+        client_id: &str,
+        up: &mut Upload,
+        slots: &[Slot],
+        content_type: &str,
+        user_agent: &str,
+    ) -> Result<(), String> {
+        up.check()?;
+        let jobs: Vec<(String, std::path::PathBuf, u64, String, String)> = up
+            .files()
+            .iter()
+            .zip(slots)
+            .map(|(file, slot)| {
+                (
+                    file.name.clone(),
+                    file.path.clone(),
+                    file.bytes,
+                    slot.upload_url.clone(),
+                    slot.upload_filename.clone(),
+                )
+            })
+            .collect();
+        for (name, _, _, url, _) in &jobs {
+            if !discord_upload_host_allowed(url) {
+                return Err(format!("{name} could not be sent: Discord does not take files at that address."));
+            }
+        }
+        let total = up.total();
+        let next = AtomicUsize::new(0);
+        let sent_bytes = AtomicU64::new(0);
+        let abort = AtomicBool::new(false);
+        let last_progress: Mutex<Option<Instant>> = Mutex::new(None);
+        let failed: Mutex<Option<String>> = Mutex::new(None);
+        let completed: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let up_guard = Mutex::new(up);
+        let workers = jobs.len().min(UPLOAD_CONCURRENCY);
+        let http: ureq::Agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
+            .tls_config(crate::tls::config())
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(Duration::from_secs(120)))
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .http_status_as_error(false)
+            .user_agent(user_agent)
+            .build()
+            .into();
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let jobs = &jobs;
+                let next = &next;
+                let sent_bytes = &sent_bytes;
+                let abort = &abort;
+                let last_progress = &last_progress;
+                let failed = &failed;
+                let completed = &completed;
+                let up_guard = &up_guard;
+                let http = http.clone();
+                scope.spawn(move || {
+                    loop {
+                        if abort.load(Ordering::Relaxed) || crate::hub::lock(up_guard).cancelled() {
+                            abort.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((name, path, len, url, upload_filename)) = jobs.get(at) else {
+                            break;
+                        };
+                        let outcome = put_one_file(
+                            &http,
+                            name,
+                            path,
+                            *len,
+                            url,
+                            content_type,
+                            user_agent,
+                            abort,
+                            up_guard,
+                            |delta| {
+                                let cur = sent_bytes.fetch_add(delta, Ordering::Relaxed).saturating_add(delta).min(total);
+                                let mut last = crate::hub::lock(last_progress);
+                                if cur >= total || last.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+                                    *last = Some(Instant::now());
+                                    drop(last);
+                                    self.ctx.upload(channel, client_id, cur, total);
+                                }
+                            },
+                        );
+                        match outcome {
+                            Ok(()) => crate::hub::lock(completed).push(upload_filename.clone()),
+                            Err(why) => {
+                                abort.store(true, Ordering::Relaxed);
+                                let mut slot = crate::hub::lock(failed);
+                                if slot.is_none() {
+                                    *slot = Some(why);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let up = up_guard.into_inner().unwrap_or_else(|p| p.into_inner());
+        let cancelled = up.check().err();
+        let err = cancelled.or_else(|| crate::hub::lock(&failed).take());
+        if let Some(why) = err {
+            for gone in crate::hub::lock(&completed).iter() {
+                let _ = self.call("DELETE", &format!("/attachments/{gone}"), None);
+            }
+            return Err(why);
+        }
+        Ok(())
     }
 
     /// A new post in a forum or media channel. One request, and only when the user asked:
@@ -431,20 +575,21 @@ impl Discord {
         if with.schedule.is_some() {
             return Err(refuse("Discord cannot schedule a message.".to_owned()));
         }
-        let premium = self.state.lock().unwrap().premium;
+        let premium = crate::hub::lock(&self.state).premium;
         if let Some(why) = super::too_long(premium, text) {
             return Err(refuse(why));
         }
         let tier = guild
             .as_deref()
-            .and_then(|guild| self.state.lock().unwrap().guilds.get(guild).map(|info| info.premium_tier))
+            .and_then(|guild| crate::hub::lock(&self.state).guilds.get(guild).map(|info| info.premium_tier))
             .unwrap_or(0);
         let most = upload_limit(premium, tier);
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let upload_id = format!("post-{forum}-{stamp}");
         let mut upload = if with.files.is_empty() {
             None
         } else {
-            let up = Upload::new(&self.ctx, forum, &format!("post-{forum}-{stamp}"), &with.files).map_err(refuse)?;
+            let up = Upload::new(&self.ctx, forum, &upload_id, &with.files).map_err(refuse)?;
             if up.files().len() > FILES {
                 return Err(refuse(format!("Discord takes {FILES} files in one message.")));
             }
@@ -454,7 +599,7 @@ impl Discord {
             Some(up)
         };
         let attachments = match upload.as_mut() {
-            Some(up) => self.upload(forum, up, None).map_err(refuse)?,
+            Some(up) => self.upload(forum, &upload_id, up, None).map_err(refuse)?,
             None => Vec::new(),
         };
         if let Some(up) = upload.as_ref() {
@@ -533,6 +678,106 @@ impl Discord {
             let _ = self.call("DELETE", &format!("/attachments/{name}"), None);
         }
     }
+}
+
+fn discord_upload_host_allowed(url: &str) -> bool {
+    let (secure, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|s| s.split_once(']').map(|(h, _)| h))
+        .unwrap_or_else(|| authority.split(':').next().unwrap_or(""))
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if !crate::session::enabled() {
+        let local = std::env::var("TINYCLIENT_MEDIA_HOSTS").unwrap_or_default();
+        if host == "127.0.0.1" || host == "localhost" || local.split(',').any(|named| named == host) {
+            return true;
+        }
+    }
+    if !secure {
+        return false;
+    }
+    ["discord.com", "discordapp.com", "discord-attachments-uploads-prd.storage.googleapis.com"]
+        .iter()
+        .any(|name| host == *name || host.ends_with(&format!(".{name}")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_one_file<'a, 'b>(
+    agent: &ureq::Agent,
+    name: &str,
+    path: &std::path::Path,
+    len: u64,
+    url: &str,
+    content_type: &str,
+    user_agent: &str,
+    abort: &'a AtomicBool,
+    up_guard: &'a Mutex<&'b mut Upload>,
+    on_bytes: impl Fn(u64),
+) -> Result<(), String> {
+    struct ParallelFeed<'a, 'b, F: Fn(u64)> {
+        file: std::fs::File,
+        left: u64,
+        shrank: bool,
+        abort: &'a AtomicBool,
+        up_guard: &'a Mutex<&'b mut Upload>,
+        on_bytes: F,
+    }
+    impl<F: Fn(u64)> Read for ParallelFeed<'_, '_, F> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Ok(0);
+            }
+            if self.abort.load(Ordering::Relaxed) || crate::hub::lock(self.up_guard).cancelled() {
+                self.abort.store(true, Ordering::Relaxed);
+                return Err(std::io::Error::other(CANCELLED));
+            }
+            let most = buf.len().min(self.left as usize);
+            let read = self.file.read(&mut buf[..most])?;
+            if read == 0 {
+                self.shrank = true;
+                return Err(std::io::Error::other("the file got shorter"));
+            }
+            self.left -= read as u64;
+            (self.on_bytes)(read as u64);
+            Ok(read)
+        }
+    }
+
+    let file = std::fs::File::open(path).map_err(|err| format!("{name} could not be read: {err}."))?;
+    let mut feed = ParallelFeed { file, left: len, shrank: false, abort, up_guard, on_bytes };
+    let sent = agent
+        .put(url)
+        .header("Content-Type", content_type)
+        .header("User-Agent", user_agent)
+        .header("Content-Length", &len.to_string())
+        .send(ureq::SendBody::from_reader(&mut feed));
+    let shrank = feed.shrank;
+    drop(feed);
+    if abort.load(Ordering::Relaxed) || crate::hub::lock(up_guard).cancelled() {
+        return Err(CANCELLED.to_owned());
+    }
+    if shrank {
+        return Err(format!("{name} changed while it was being sent."));
+    }
+    let response = sent.map_err(|err| format!("{name} could not be sent: {}.", crate::adapters::net::redact(&err.to_string())))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("{name} could not be sent: the server answered {status}."));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

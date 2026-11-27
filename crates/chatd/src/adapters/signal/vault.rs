@@ -88,7 +88,7 @@ struct Inner {
     on_identity_changed: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct IdentityRecord {
     #[serde(default)]
     state: IdentityState,
@@ -141,7 +141,7 @@ impl Vault {
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
         db.execute_batch(
-            "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA cache_size = -256;
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -256;
              CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;",
         )
         .map_err(|err| err.to_string())?;
@@ -204,23 +204,47 @@ impl Vault {
     }
 
     fn remove_prefix(&self, prefix: &str) -> Held<usize> {
-        Ok(self.db().execute("DELETE FROM kv WHERE substr(k, 1, length(?1)) = ?1", [prefix])?)
+        let db = self.db();
+        let count = match prefix_upper_bound(prefix) {
+            Some(upper) => db.execute("DELETE FROM kv WHERE k >= ?1 AND k < ?2", params![prefix, upper])?,
+            None => db.execute("DELETE FROM kv WHERE k >= ?1", [prefix])?,
+        };
+        Ok(count)
     }
 
-    /// The names under a prefix, in order.
+    /// The names under a prefix, in order, using an indexable range scan on `k`.
     fn names(&self, prefix: &str) -> Held<Vec<String>> {
         let db = self.db();
-        let mut query = db.prepare("SELECT k FROM kv WHERE substr(k, 1, length(?1)) = ?1 ORDER BY k")?;
-        let names = query.query_map([prefix], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+        let names = match prefix_upper_bound(prefix) {
+            Some(upper) => {
+                let mut query = db.prepare("SELECT k FROM kv WHERE k >= ?1 AND k < ?2 ORDER BY k")?;
+                let rows = query.query_map(params![prefix, upper], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                rows
+            }
+            None => {
+                let mut query = db.prepare("SELECT k FROM kv WHERE k >= ?1 ORDER BY k")?;
+                let rows = query.query_map([prefix], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                rows
+            }
+        };
         Ok(names)
     }
 
     fn values(&self, prefix: &str) -> Held<Vec<(String, Vec<u8>)>> {
         let rows: Vec<(String, Vec<u8>)> = {
             let db = self.db();
-            let mut query = db.prepare("SELECT k, v FROM kv WHERE substr(k, 1, length(?1)) = ?1 ORDER BY k")?;
-            let rows = query.query_map([prefix], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
-            rows
+            match prefix_upper_bound(prefix) {
+                Some(upper) => {
+                    let mut query = db.prepare("SELECT k, v FROM kv WHERE k >= ?1 AND k < ?2 ORDER BY k")?;
+                    let rows = query.query_map(params![prefix, upper], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+                    rows
+                }
+                None => {
+                    let mut query = db.prepare("SELECT k, v FROM kv WHERE k >= ?1 ORDER BY k")?;
+                    let rows = query.query_map([prefix], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+                    rows
+                }
+            }
         };
         rows.into_iter().map(|(name, sealed)| Ok((name.clone(), self.open_value(&name, &sealed)?))).collect()
     }
@@ -308,22 +332,29 @@ impl Vault {
     }
 
     /// Applies an identity record from Signal's Storage Service without silently clearing a newer
-    /// local unapproved key change for a different key.
+    /// local unapproved key change for a different key. Skips redundant writes when neither the
+    /// trusted key bytes nor the identity record changed.
     pub fn sync_storage_identity(&self, aci: &str, state: IdentityState, key: &[u8]) {
         let existing = self.identity_record(aci);
         if existing.unapproved_change && !key.is_empty() && !existing.key.is_empty() && existing.key.as_slice() != key {
             return;
         }
-        let mut rec = existing;
+        let mut rec = existing.clone();
         rec.state = state;
         if !key.is_empty() {
             rec.key = key.to_vec();
-            let _ = self.put(&format!("aci.trusted.{aci}"), key);
+            let trusted_name = format!("aci.trusted.{aci}");
+            let current_trusted = self.get(&trusted_name).ok().flatten();
+            if current_trusted.as_deref() != Some(key) {
+                let _ = self.put(&trusted_name, key);
+            }
         }
         if state == IdentityState::Verified && !key.is_empty() && rec.key.as_slice() == key {
             rec.unapproved_change = false;
         }
-        let _ = self.put_identity_record(aci, &rec);
+        if rec != existing {
+            let _ = self.put_identity_record(aci, &rec);
+        }
     }
 
     /// Computes the 60-digit Signal v2 safety number for `remote_aci` using our stored ACI identity
@@ -338,6 +369,11 @@ impl Vault {
         Some(SafetyNumber { digits, state, changed })
     }
 
+    /// Loads one group directly by its master key without scanning every group in the vault.
+    pub fn group_by_key(&self, master_key: GroupMasterKeyBytes) -> Held<Option<Group>> {
+        self.json(&format!("group.{}", hex(&master_key)))
+    }
+
     /// Every group the account is in, with its master key.
     pub fn group_keys(&self) -> Held<Vec<(GroupMasterKeyBytes, Group)>> {
         let mut groups = Vec::new();
@@ -349,6 +385,25 @@ impl Vault {
         }
         Ok(groups)
     }
+}
+
+/// Computes the exclusive lexicographical upper bound for a UTF-8 prefix so SQLite can satisfy
+/// prefix queries with a primary-key range scan (`WHERE k >= ?1 AND k < ?2`). Returns `None`
+/// only when `prefix` is empty or consists solely of `'\u{10FFFF}'`.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let next = match last as u32 {
+            0xD7FF => Some('\u{E000}'),
+            code if code < 0x10_FFFF => char::from_u32(code + 1),
+            _ => None,
+        };
+        if let Some(ch) = next {
+            chars.push(ch);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -523,7 +578,7 @@ impl ContentsStore for Vault {
     }
 
     async fn group(&self, master_key: GroupMasterKeyBytes) -> Held<Option<Group>> {
-        self.json(&format!("group.{}", hex(&master_key)))
+        self.group_by_key(master_key)
     }
 
     async fn save_group_avatar(&self, _master_key: GroupMasterKeyBytes, _avatar: &AvatarBytes) -> Held<()> {
@@ -1000,6 +1055,82 @@ mod tests {
         assert_eq!(keys.next("prekey").unwrap(), 42);
         keys.issued("prekey", MAX_KEY_ID).unwrap();
         assert_eq!(keys.next("prekey").unwrap(), 1);
+        remove(&path);
+    }
+
+    #[test]
+    fn sync_storage_identity_skips_unchanged_writes() {
+        let path = std::env::temp_dir().join(format!("tinyclient-vault-id-skip-{}.state", std::process::id()));
+        remove(&path);
+        let vault = Vault::open(&path, &new_key().unwrap()).unwrap();
+        let aci = "11111111-1111-1111-1111-111111111111";
+        let key1 = [0x11u8; 33];
+        let key2 = [0x22u8; 33];
+        let raw_row = |k: &str| -> Vec<u8> {
+            vault.db().query_row("SELECT v FROM kv WHERE k = ?1", [k], |row| row.get(0)).unwrap()
+        };
+
+        vault.sync_storage_identity(aci, IdentityState::Verified, &key1);
+        let trusted_before = raw_row(&format!("aci.trusted.{aci}"));
+        let state_before = raw_row(&format!("identity_state.{aci}"));
+
+        // Identical sync must skip writing both rows (ciphertexts keep the exact same random nonce).
+        vault.sync_storage_identity(aci, IdentityState::Verified, &key1);
+        assert_eq!(raw_row(&format!("aci.trusted.{aci}")), trusted_before);
+        assert_eq!(raw_row(&format!("identity_state.{aci}")), state_before);
+
+        // Changing state with same key updates identity_state but leaves aci.trusted untouched.
+        vault.sync_storage_identity(aci, IdentityState::Default, &key1);
+        assert_eq!(raw_row(&format!("aci.trusted.{aci}")), trusted_before);
+        assert_ne!(raw_row(&format!("identity_state.{aci}")), state_before);
+        assert_eq!(vault.identity_state(aci).0, IdentityState::Default);
+
+        // Changing key updates both rows.
+        let state_mid = raw_row(&format!("identity_state.{aci}"));
+        vault.sync_storage_identity(aci, IdentityState::Verified, &key2);
+        assert_ne!(raw_row(&format!("aci.trusted.{aci}")), trusted_before);
+        assert_ne!(raw_row(&format!("identity_state.{aci}")), state_mid);
+        assert_eq!(vault.peer_identity_key(aci).as_deref(), Some(&key2[..]));
+        remove(&path);
+    }
+
+    #[test]
+    fn range_scan_prefix_queries_match_exact_prefix_boundaries() {
+        assert_eq!(prefix_upper_bound(""), None);
+        assert_eq!(prefix_upper_bound("group.").as_deref(), Some("group/"));
+        assert_eq!(prefix_upper_bound("ab\u{10FFFF}").as_deref(), Some("ac"));
+        assert_eq!(prefix_upper_bound("\u{10FFFF}"), None);
+
+        let path = std::env::temp_dir().join(format!("tinyclient-vault-range-{}.state", std::process::id()));
+        remove(&path);
+        let vault = Vault::open(&path, &new_key().unwrap()).unwrap();
+        for (k, v) in [
+            ("group-", b"before".as_slice()),
+            ("group.", b"exact"),
+            ("group.a", b"one"),
+            ("group.z", b"two"),
+            ("group/", b"after"),
+            ("group0", b"after2"),
+            ("session.1", b"s1"),
+        ] {
+            vault.put(k, v).unwrap();
+        }
+        assert_eq!(vault.names("group.").unwrap(), vec!["group.", "group.a", "group.z"]);
+        let vals = vault.values("group.").unwrap();
+        assert_eq!(
+            vals,
+            vec![
+                ("group.".to_owned(), b"exact".to_vec()),
+                ("group.a".to_owned(), b"one".to_vec()),
+                ("group.z".to_owned(), b"two".to_vec()),
+            ]
+        );
+        assert_eq!(vault.remove_prefix("group.").unwrap(), 3);
+        assert!(vault.names("group.").unwrap().is_empty());
+        assert_eq!(vault.get("group-").unwrap().as_deref(), Some(&b"before"[..]));
+        assert_eq!(vault.get("group/").unwrap().as_deref(), Some(&b"after"[..]));
+        assert_eq!(vault.get("group0").unwrap().as_deref(), Some(&b"after2"[..]));
+        assert_eq!(vault.get("session.1").unwrap().as_deref(), Some(&b"s1"[..]));
         remove(&path);
     }
 }

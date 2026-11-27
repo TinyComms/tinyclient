@@ -429,13 +429,17 @@ impl Shell {
                     let dismiss_account = hit.conversation.account();
                     let dismiss_id = hit.message_id.clone();
                     let content = div()
+                        .w_full()
                         .flex_1()
                         .min_w_0()
                         .flex()
                         .flex_col()
+                        .items_start()
                         .gap(px(2.))
                         .child(
                             div()
+                                .w_full()
+                                .min_w_0()
                                 .flex()
                                 .items_center()
                                 .gap(px(6.))
@@ -453,8 +457,9 @@ impl Shell {
                                 .child(
                                     div()
                                         .id(("mention-dismiss", ix))
-                                        .size(px(18.))
-                                        .rounded(px(4.))
+                                        .flex_none()
+                                        .size(px(24.))
+                                        .rounded(px(theme::R_CONTROL))
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -469,7 +474,7 @@ impl Shell {
                                 ),
                         )
                         .when(!snippet.is_empty(), |col| {
-                            col.child(div().truncate().type_small().text_color(theme::text_soft()).child(snippet))
+                            col.child(div().w_full().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(snippet))
                         });
                     list_box = list_box.child(
                         list_row(("mention-hit", ix), theme::row_height(theme::ROW_TWO), false, false, content)
@@ -570,13 +575,17 @@ impl Shell {
                     && !revealed.contains(&item.id);
                 let picked = item.clone();
                 let content = div()
+                    .w_full()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_col()
+                    .items_start()
                     .gap(px(2.))
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap(px(6.))
@@ -610,6 +619,8 @@ impl Shell {
                     .when(!hide && !snippet.is_empty(), |col| {
                         col.child(
                             div()
+                                .w_full()
+                                .min_w_0()
                                 .truncate()
                                 .type_small()
                                 .text_color(if item.unread { theme::text() } else { theme::text_soft() })

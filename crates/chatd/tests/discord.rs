@@ -276,7 +276,14 @@ fn me() -> Value {
 fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
     let path = seen.path.split('?').next().unwrap();
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    if let Some(answer) = shared.scripted.lock().unwrap().get_mut(path).and_then(VecDeque::pop_front) {
+    let method_key = format!("{} {path}", seen.method);
+    if let Some(answer) = {
+        let mut scripted = shared.scripted.lock().unwrap();
+        scripted
+            .get_mut(&method_key)
+            .and_then(VecDeque::pop_front)
+            .or_else(|| scripted.get_mut(path).and_then(VecDeque::pop_front))
+    } {
         return answer;
     }
     if shared.forbidden.lock().unwrap().iter().any(|under| path.starts_with(under.as_str())) {
@@ -2503,6 +2510,9 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
     free.send("3002", "free-3000", &three, None);
     assert_eq!(free.failure("3002", "free-3000"), "Message too long: Discord allows 2000 characters.");
     assert_eq!(free.discord.requests_to("POST", "/channels/3002/messages").len(), before);
+    wait("history of 3001 before edit", || {
+        free.messages("3001").iter().any(|message| message.id == "1300000000000000009").then_some(())
+    });
     let edit = free.ask(Request::Edit {
         conversation: free.key("3001"),
         message_id: "1300000000000000009".into(),
@@ -12576,8 +12586,11 @@ fn automod_lists_and_edits_with_manage_guild_and_refuses_without() {
     assert!(invites.ends_with('Z'));
     assert!(incidents[0].body["dms_disabled_until"].is_null());
 
+    wait("history of 4101 before automod send", || {
+        Some(world.messages("4101")).filter(|messages| !messages.is_empty())
+    });
     world.discord.script(
-        "/channels/4101/messages",
+        "POST /channels/4101/messages",
         400,
         json!({"message": "This message was blocked by AutoMod", "code": 200000}),
     );

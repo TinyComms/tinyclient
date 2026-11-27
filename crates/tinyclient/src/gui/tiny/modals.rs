@@ -897,36 +897,53 @@ fn handoff_facts(origin: &str, role: &str, legacy: bool) -> (String, Option<&'st
 
 /// A modal panel, centered over a scrim that closes it when `scrim_closes` (not for one that
 /// holds secrets shown once: see [`super::Modal::holds_secrets`]).
-pub(super) fn layer(panel: Div, scrim_closes: bool, cx: &mut Context<Shell>) -> AnyElement {
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .child(
-            div()
-                .id("tiny-modal-scrim")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .bg(theme::scrim())
-                .occlude()
-                .when(scrim_closes, |scrim| scrim.on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
-        )
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .pb(px(60.))
-                .child(div().id("tiny-modal").occlude().on_click(|_, _, cx| cx.stop_propagation()).child(crate::gui::components::fade_in("tiny-modal-fade", 160, panel))),
-        )
-        .into_any_element()
+pub(super) fn layer(panel: Div, scrim_closes: bool, window: &Window, cx: &mut Context<Shell>) -> AnyElement {
+    let viewport = window.viewport_size();
+    let max_h = (f32::from(viewport.height) - 32.).max(200.);
+    let max_w = (f32::from(viewport.width) - 32.).max(200.);
+    gpui::deferred(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                div()
+                    .id("tiny-modal-scrim")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(theme::scrim())
+                    .occlude()
+                    .when(scrim_closes, |scrim| scrim.on_click(cx.listener(|this, _, _, cx| this.close_modal(cx)))),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .p(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("tiny-modal")
+                            .max_w(px(max_w))
+                            .max_h(px(max_h))
+                            .overflow_hidden()
+                            .overflow_y_scroll()
+                            .rounded(px(theme::R_MODAL))
+                            .occlude()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(crate::gui::components::fade_in("tiny-modal-fade", 160, panel.max_w(px(max_w)))),
+                    ),
+            ),
+    )
+    .priority(crate::gui::components::Layer::Modal as usize)
+    .into_any_element()
 }
 
 #[cfg(test)]

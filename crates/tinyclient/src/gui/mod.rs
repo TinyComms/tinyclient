@@ -348,6 +348,220 @@ pub(crate) fn prove_ui_wave2_polish() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The lab's curated-themes driver. Verifies all 8 themes × 9 accents × {Standard, HC} WCAG
+/// contrast floors, `--theme` / `--accent` override parsing, `shell.prefs` round-tripping with
+/// forward-compatible `theme\tlight`, protocol settings validation, Settings search (`AT`/`AC`),
+/// and zero-surprise Theme Picker click semantics.
+pub(crate) fn prove_curated_themes() -> Result<(), &'static str> {
+    if theme::verify_all_wcag().is_err() {
+        return Err("one or more curated theme/accent/HC combinations failed WCAG verification");
+    }
+    for id in theme::ThemeId::ALL {
+        if !theme::set_override(Some(id.word())) || theme::active_theme() != id || theme::is_high_contrast() {
+            return Err("--theme override failed to activate standard curated theme");
+        }
+        let hc_word = format!("{}-hc", id.word());
+        if !theme::set_override(Some(&hc_word)) || theme::active_theme() != id || !theme::is_high_contrast() {
+            return Err("--theme <id>-hc override failed to activate high-contrast curated theme");
+        }
+    }
+    if !theme::set_override(Some("nord")) || !theme::set_accent_override(Some("auto")) || theme::active_accent() != theme::Accent::Teal {
+        return Err("Auto accent did not resolve Nord signature Teal accent");
+    }
+    if !theme::set_accent_override(Some("emerald")) || theme::active_accent() != theme::Accent::Emerald {
+        return Err("--accent override failed to select Emerald");
+    }
+    theme::set_accent_override(None);
+    theme::set_override(None);
+
+    for word in protocol::settings::DARK_THEME_CHOICES {
+        if !protocol::settings::valid(protocol::settings::GLOBAL, protocol::settings::DARK_THEME, word) {
+            return Err("protocol settings rejected a curated dark_theme choice");
+        }
+    }
+    for word in protocol::settings::LIGHT_THEME_CHOICES {
+        if !protocol::settings::valid(protocol::settings::GLOBAL, protocol::settings::LIGHT_THEME, word) {
+            return Err("protocol settings rejected a curated light_theme choice");
+        }
+    }
+    for word in protocol::settings::ACCENT_CHOICES {
+        if !protocol::settings::valid(protocol::settings::GLOBAL, protocol::settings::ACCENT, word) {
+            return Err("protocol settings rejected a curated accent choice");
+        }
+    }
+
+    let prefs = app::prefs::Prefs {
+        choices: app::prefs::Choices {
+            dark_theme: theme::ThemeId::Mocha,
+            light_theme: theme::ThemeId::Stone,
+            accent: theme::Accent::Rose,
+            ..app::prefs::Choices::default()
+        },
+        ..app::prefs::Prefs::default()
+    };
+    let parsed = app::prefs::parse(&app::prefs::write(&prefs));
+    if parsed.choices.dark_theme != theme::ThemeId::Mocha
+        || parsed.choices.light_theme != theme::ThemeId::Stone
+        || parsed.choices.accent != theme::Accent::Rose
+    {
+        return Err("shell.prefs did not round-trip dark_theme, light_theme, and accent");
+    }
+    if app::prefs::parse("theme\tlight\n").kept != ["theme\tlight"] {
+        return Err("shell.prefs broke forward-compatible preservation of unknown theme\\tlight line");
+    }
+
+    if !settings::rows::search("accent").iter().any(|r| r.id == "AC") || settings::rows::not_yet("accent").is_some() {
+        return Err("Settings search did not surface AC for 'accent' or left stale NOT_YET entry");
+    }
+    if !settings::rows::search("mocha").iter().any(|r| r.id == "AT") || !settings::rows::search("warm stone").iter().any(|r| r.id == "AT") {
+        return Err("Settings search did not surface AT for curated theme names");
+    }
+
+    let mut c = app::prefs::Choices::default();
+    settings::pages::pick_theme_choice(&mut c, theme::ThemeId::Stone, true);
+    if c.light_theme != theme::ThemeId::Stone || c.appearance != theme::Appearance::Light {
+        return Err("picking a Light theme while System is Dark did not switch appearance to Light for immediate preview");
+    }
+    settings::pages::pick_theme_choice(&mut c, theme::ThemeId::Nord, false);
+    if c.dark_theme != theme::ThemeId::Nord || c.appearance != theme::Appearance::Dark {
+        return Err("picking a Dark theme while Light did not switch appearance to Dark for immediate preview");
+    }
+    Ok(())
+}
+
+/// The lab's responsive-shell-ux driver. Verifies narrow overlay width clamping, `All unreads`
+/// message/chat count & canonical DM vs channel badges, and `list_row`'s `flex_col` left-alignment safeguard.
+pub(crate) fn prove_responsive_shell_ux() -> Result<(), &'static str> {
+    use components::place::{anchor, fit, max_width, Place, MARGIN};
+    let narrow = (360., 640.);
+    if (max_width(narrow) - 344.).abs() > 0.5 {
+        return Err("narrow window max_width did not reserve margins");
+    }
+    let picker = fit(Place::Above(anchor(310., 580., 36., 36.)), (352., 400.), narrow);
+    if picker.x < MARGIN || picker.x + picker.w > narrow.0 - MARGIN || (picker.w - 344.).abs() > 0.5 {
+        return Err("wide overlay was not clamped inside a 360 px window");
+    }
+    let wide_menu = fit(Place::Below(anchor(10., 10., 20., 20.)), (600., 100.), (540., 440.));
+    if wide_menu.x < MARGIN || (wide_menu.w - (540. - 2. * MARGIN)).abs() > 0.5 {
+        return Err("oversized dropdown menu overflowed the viewport width");
+    }
+
+    let mut col = components::list_row_inner(gpui::div().flex().flex_col(), false);
+    if col.style().align_items != Some(gpui::AlignItems::FlexStart)
+        || col.style().justify_content != Some(gpui::JustifyContent::Center)
+    {
+        return Err("list_row_inner did not left-align flex_col content");
+    }
+    let mut row = components::list_row_inner(gpui::div().flex(), false);
+    if row.style().align_items != Some(gpui::AlignItems::Center) {
+        return Err("list_row_inner broke vertical centering for horizontal rows");
+    }
+
+    let mut dm = protocol::Conversation::new(
+        protocol::Key { network: protocol::Network::Slack, account: "a".into(), id: "dm".into() },
+        protocol::ConversationKind::Direct,
+        "Geekbot",
+    );
+    dm.unread = 2;
+    dm.mentions = 2;
+    if sidebar::home_view::unread_group_badge(&dm, 2) != components::BadgeLook::Count(2) {
+        return Err("1:1 DM in All unreads used a mention pill instead of an outlined count");
+    }
+    let mut ch = protocol::Conversation::new(
+        protocol::Key { network: protocol::Network::Slack, account: "a".into(), id: "ch".into() },
+        protocol::ConversationKind::Channel,
+        "standup",
+    );
+    ch.unread = 1;
+    let groups = vec![
+        std::rc::Rc::new(protocol::UnreadGroup { conversation: dm, messages: Vec::new(), total_unread: 2 }),
+        std::rc::Rc::new(protocol::UnreadGroup { conversation: ch, messages: Vec::new(), total_unread: 1 }),
+    ];
+    let (msgs, chats, summary) = sidebar::home_view::unreads_summary(&groups);
+    if msgs != 3 || chats != 2 || summary != "3 messages · 2 chats" {
+        return Err("All unreads summary did not report accurate message and chat counts");
+    }
+    Ok(())
+}
+
+/// The lab's clean-composer-bar driver. Verifies TextInput draws no inset focus outline when
+/// typing, the composer card uses subtle `border_strong` focus without a glow halo, no default
+/// floating pills appear above the composer at rest, left-side actions stay consolidated behind
+/// a single button, and the Teams subject bar stays hidden until requested.
+pub(crate) fn prove_clean_composer() -> Result<(), &'static str> {
+    if input::text_input_inner_focus_ring().is_some() {
+        return Err("TextInput still draws an inner inset focus ring while typing");
+    }
+    let (focused_border, focused_halo) = composer::card_focus_style(false, true);
+    if focused_border != theme::border_strong() || focused_halo {
+        return Err("focused composer card still draws an accent border or halo");
+    }
+    if composer::send_options_visible(protocol::Importance::Normal, false, false) {
+        return Err("default floating pills still render above the composer at rest");
+    }
+    if !composer::send_options_visible(protocol::Importance::Important, false, false)
+        || !composer::send_options_visible(protocol::Importance::Normal, true, false)
+    {
+        return Err("active non-default send options stopped showing above the composer");
+    }
+    let telegram = composer::LeftActions {
+        attach: true,
+        location: true,
+        poll: true,
+        video_note: true,
+        ..Default::default()
+    };
+    if telegram.leading_button_count() != 1 || !telegram.uses_menu() {
+        return Err("Telegram composer still lays out multiple leading icons instead of one menu");
+    }
+    if composer::subject_visible(true, false, "") {
+        return Err("Teams channel subject row still renders at rest when unused");
+    }
+    if !composer::has_send_menu_for(false, false, true, false) || !composer::has_send_menu_for(false, false, false, true) {
+        return Err("Send right-click menu does not open for Importance or Effects");
+    }
+    Ok(())
+}
+
+/// The lab's calls-tiny-responsive driver. Verifies responsive call popover clamping, incoming
+/// overlay live-bar clearance, stream tile clamping, Tiny Server phone/sidebar/dock layout guards,
+/// Discord modal narrow stacking, and searchable full-list channel pickers.
+pub(crate) fn prove_calls_tiny_responsive() -> Result<(), &'static str> {
+    if call::dock::dock_popover_width(320., 260., 360.) > 260. {
+        return Err("call dock popover overflowed a 260 px sidebar");
+    }
+    if call::dock::dock_popover_width(320., 260., 240.) > 224. {
+        return Err("call dock popover overflowed a 240 px viewport");
+    }
+    let (narrow_w, top_plain) = call::dock::incoming_overlay_frame(300., false);
+    let (_, top_live) = call::dock::incoming_overlay_frame(300., true);
+    if narrow_w > 268. {
+        return Err("incoming call overlay overflowed a 300 px viewport");
+    }
+    if (top_live - top_plain - theme::BANNER).abs() > 0.5 {
+        return Err("incoming call overlay did not offset below the live-location banner");
+    }
+    let (stream_w, stream_h) = call::view::Size::Big(640.).stream_fit(360.);
+    if stream_w > 312. || stream_h > stream_w {
+        return Err("call stream tile did not clamp to narrow stage width");
+    }
+    tiny::panel::prove_tiny_responsive()?;
+    if !discord_settings::stacked_layout(599.) || discord_settings::stacked_layout(600.) {
+        return Err("Discord server settings modal did not stack below 600 px");
+    }
+    let channels: Vec<(String, String)> = (1..=25)
+        .map(|i| (format!("ch-{i}"), format!("channel-{i:02}")))
+        .collect();
+    if discord_settings::filter_channels(&channels, "").len() != 25 {
+        return Err("Discord channel picker still truncated channels past 12");
+    }
+    let hits = discord_settings::filter_channels(&channels, "24");
+    if hits.len() != 1 || hits[0].0 != "ch-24" {
+        return Err("Discord channel picker search did not find channel 24");
+    }
+    Ok(())
+}
+
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, MenuItem, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
@@ -1184,6 +1398,9 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
     if let Some(word) = flag("--theme") {
         theme::set_override(Some(&word));
     }
+    if let Some(word) = flag("--accent") {
+        theme::set_accent_override(Some(&word));
+    }
     attention::read_launch();
     time::read_clock_preference();
     // Read before the window opens, so its first frame draws where the user was.
@@ -1484,6 +1701,11 @@ mod tests {
     fn letters_typed_at_the_lists_go_to_the_composer_and_list_keys_do_not() {
         assert!(typed_text("a") && typed_text("É") && typed_text("?"));
         assert!(!typed_text("") && !typed_text("\n") && !typed_text("\t") && !typed_text(" "));
+    }
+
+    #[test]
+    fn calls_tiny_discord_responsive_invariants_hold() {
+        assert_eq!(prove_calls_tiny_responsive(), Ok(()));
     }
 
 }

@@ -10,7 +10,7 @@ use super::theme;
 use super::components::{menu, menu_item, menu_item_disabled, menu_separator};
 use palette::IntoColor;
 use gpui::{
-    actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context,
+    actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context,
     CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, Font, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent,
@@ -999,7 +999,7 @@ impl TextInput {
         cx.notify();
     }
 
-    fn draw_edit_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn draw_edit_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let edit = self.edit_menu.clone()?;
         let (at, can_paste, has_image) = (edit.at, edit.can_paste, edit.has_image);
         let selected = !self.editor.selection().is_empty();
@@ -1038,7 +1038,8 @@ impl TextInput {
             cx.notify();
         })));
         let spell = edit.miss.as_ref().map(|miss| self.spell_rows(miss, cx)).unwrap_or_default();
-        let mut menu = menu().id("input-edit-menu").w(px(200.)).occlude()
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(160.);
+        let mut menu = menu().id("input-edit-menu").w(px(200.0_f32.min(max_w))).occlude()
             // Menu clicks must not move the caret or replace the field's selection.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -1047,7 +1048,13 @@ impl TextInput {
             menu = menu.children(spell).child(menu_separator());
         }
         let menu = menu.children(cut).children(copy).child(paste).children(picture).child(menu_separator()).child(all);
-        Some(deferred(anchored().position(at).snap_to_window().child(menu)).priority(super::components::place::Layer::Menu as usize).into_any_element())
+        Some(super::components::place::placed(
+            "input-edit-menu-scroll",
+            super::components::place::Place::Pointer(at),
+            super::components::place::Layer::Menu,
+            window,
+            menu,
+        ))
     }
 
     fn spell_rows(&self, miss: &super::spell::Miss, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1748,8 +1755,15 @@ impl Element for TextElement {
     }
 }
 
+/// `TextInput` is the unpadded inner text element; its outer container (`components::field` or
+/// `composer::card`) and blinking caret indicate focus. Returning `None` ensures keyboard typing
+/// never paints a duplicate inset rectangle around the text bounds.
+pub(super) fn text_input_inner_focus_ring() -> Option<Vec<gpui::BoxShadow>> {
+    None
+}
+
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("text-input")
             .role(if self.secret { gpui::Role::PasswordInput } else if self.editor.is_multiline() {
@@ -1825,7 +1839,7 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(TextElement { input: cx.entity() })
-            .children(self.draw_edit_menu(cx))
+            .children(self.draw_edit_menu(window, cx))
     }
 }
 
@@ -1913,7 +1927,7 @@ mod secret_input_gui_tests {
         window.update(|input, window, cx| {
             input.set_text("secret café 🔑", cx);
             input.editor.select_all();
-            cx.write_to_clipboard(ClipboardItem::new_string("clipboard sentinel"));
+            cx.write_to_clipboard(ClipboardItem::new_string("clipboard sentinel".to_owned()));
             input.copy(&Copy, window, cx);
             input.cut(&Cut, window, cx);
             input.publish_primary(cx);

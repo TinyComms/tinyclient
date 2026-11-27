@@ -287,8 +287,13 @@ pub(in crate::gui::tiny) fn roles(shell: &Shell, facts: &Facts, window: &mut Win
             .into_any_element();
     }
 
+    let stacked = crate::gui::phone::active() || f32::from(window.viewport_size().width) < 900.;
     // The list, most senior first.
-    let mut list = div().w(px(232.)).flex_none().flex().flex_col().gap(px(2.));
+    let mut list = if stacked {
+        div().w_full().flex_none().flex().flex_col().gap(px(2.))
+    } else {
+        div().w(px(232.)).flex_none().flex().flex_col().gap(px(2.))
+    };
     list = list.child(div().pb(px(8.)).child(if shell.tiny_state.busy {
         button_disabled("Create role").w_full().into_any_element()
     } else {
@@ -346,7 +351,12 @@ pub(in crate::gui::tiny) fn roles(shell: &Shell, facts: &Facts, window: &mut Win
         Some(role) => editor(shell, facts, &role, window, cx).into_any_element(),
         None => kit::empty("icons/shield.svg", "Pick a role to edit it.").into_any_element(),
     };
-    page = page.child(div().flex().items_start().gap(px(28.)).child(list).child(div().flex_1().min_w_0().child(editor)));
+    let body = if stacked {
+        div().flex().flex_col().gap(px(20.)).child(list).child(div().w_full().min_w_0().child(editor))
+    } else {
+        div().flex().items_start().gap(px(28.)).child(list).child(div().flex_1().min_w_0().child(editor))
+    };
+    page = page.child(body);
     page.into_any_element()
 }
 
@@ -416,7 +426,6 @@ fn editor(shell: &Shell, facts: &Facts, role: &TinyRole, window: &mut Window, cx
         column = column.child(
             card().child(
                 switch_row("tiny-role-hoist", "Show separately in the member list", "People with this role get their own group, above everyone else online.", hoist, mine)
-                    .border_b_0()
                     .when(mine, |row| row.on_click(cx.listener(move |this, _, _, cx| this.tiny_roles_draft(cx, |draft| draft.hoist = Some(!hoist))))),
             ),
         );
@@ -428,9 +437,11 @@ fn editor(shell: &Shell, facts: &Facts, role: &TinyRole, window: &mut Window, cx
             let bit = *bit;
             let on = bits & bit != 0;
             let can = mine && grantable_for(community, role, bit);
+            if ix > 0 {
+                box_ = box_.child(kit::rule());
+            }
             box_ = box_.child(
                 switch_row(SharedString::from(format!("tiny-role-perm-{group}-{ix}")), name, help, on, can)
-                    .when(ix + 1 == rows.len(), |row| row.border_b_0())
                     .when(can, |row| row.on_click(cx.listener(move |this, _, _, cx| this.tiny_roles_draft(cx, |draft| draft.permissions = Some(bits ^ bit))))),
             );
         }

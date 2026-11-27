@@ -91,9 +91,23 @@ impl Window {
             next.extend(self.messages[..before].iter().cloned());
         }
         // An answer may reach a row past what it says it covers (201 rows for a limit of 200,
-        // or the same row twice): the answer's copy is the one kept, once.
+        // or the same row twice): the answer's copy is the one kept, once. A settled message
+        // carrying `client_id` also replaces any held Pending/Failed row whose `id` is that
+        // `client_id`, even when that held row sits outside `covered`.
         let mut answered: HashSet<String> = HashSet::with_capacity(found.len());
-        next.retain(|held: &Rc<Message>| !found.iter().any(|message| message.id == held.id));
+        let mut answered_clients: HashSet<String> = HashSet::new();
+        for message in &found {
+            if let Some(client_id) = &message.client_id {
+                answered_clients.insert(client_id.clone());
+            }
+        }
+        next.retain(|held: &Rc<Message>| {
+            !found.iter().any(|message| {
+                message.id == held.id
+                    || (held.state != protocol::SendState::Sent
+                        && message.client_id.as_deref() == Some(held.id.as_str()))
+            })
+        });
         for message in found {
             if !answered.insert(message.id.clone()) {
                 continue;
@@ -106,7 +120,13 @@ impl Window {
         let kept_after = !apart && after > 0;
         if kept_after {
             let tail = self.messages[self.messages.len() - after..].iter();
-            next.extend(tail.filter(|held| !answered.contains(&held.id)).cloned());
+            next.extend(
+                tail.filter(|held| {
+                    !answered.contains(&held.id)
+                        && !(held.state != protocol::SendState::Sent && answered_clients.contains(&held.id))
+                })
+                .cloned(),
+            );
         }
 
         let next_older = if kept_before { self.older } else { older };
@@ -399,5 +419,26 @@ mod tests {
         }
         assert!(Rc::ptr_eq(&window.messages[2], &plain));
         assert!(!window.landed(&landed));
+    }
+
+    #[test]
+    fn merge_replaces_pending_row_by_client_id_even_when_scrolled_up() {
+        let mut window = Window::default();
+        let mut pending = Message::plain("cid-42", "me", "hello", 500, true);
+        pending.state = protocol::SendState::Pending;
+        pending.client_id = Some("cid-42".into());
+        window.merge(&Page::Newest, vec![said(10), said(20), pending], false, false);
+        assert_eq!(window.messages.len(), 3);
+
+        // Simulate scrolled-up Page::After anchored at the pending row's id, where the store
+        // resolved `cid-42` via `client_id` and returned the settled server row inclusive.
+        let mut settled = Message::plain("srv-900", "me", "hello", 501, true);
+        settled.state = protocol::SendState::Sent;
+        settled.client_id = Some("cid-42".into());
+        assert!(window.merge(&Page::After { id: "cid-42".into() }, vec![settled], true, false));
+
+        let ids: Vec<&str> = window.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["10", "20", "srv-900"]);
+        assert_eq!(window.messages[2].state, protocol::SendState::Sent);
     }
 }

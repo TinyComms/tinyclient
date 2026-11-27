@@ -1233,7 +1233,7 @@ impl Shell {
     }
 
     /// The switcher's sheet, over the window, or nothing when it is closed.
-    pub(in crate::gui) fn switcher(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+    pub(in crate::gui) fn switcher(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let switcher = self.sidebar_state.switcher.as_ref()?;
         let query = switcher.input.read(cx).text().trim().to_owned();
         let viewport = window.viewport_size();
@@ -1435,10 +1435,12 @@ impl Shell {
                 div()
                     .h(px(32.))
                     .flex_none()
+                    .min_w_0()
+                    .overflow_hidden()
                     .px(px(12.))
                     .flex()
                     .items_center()
-                    .gap(px(16.))
+                    .gap(px(12.))
                     .border_t_1()
                     .border_color(theme::hairline())
                     .type_small()
@@ -1448,17 +1450,21 @@ impl Shell {
                     .when(switcher.adding.is_none(), |hints| hints.child(hint("↵", "Open")).child(hint("#", "Channels")).child(hint("@", "People")).child(hint(">", "Commands"))),
             ));
         Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .pt(px(frame.y))
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_switcher(window, cx)))
-                .child(fade_in("switcher", 120, sheet)),
+            gpui::deferred(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .pt(px(frame.y))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_switcher(window, cx)))
+                    .child(fade_in("switcher", 120, sheet)),
+            )
+            .priority(crate::gui::components::Layer::Switcher as usize)
+            .into_any_element(),
         )
     }
 }

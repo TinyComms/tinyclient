@@ -1,6 +1,15 @@
 use protocol::{chat_sock_path, read_frame, write_frame, ChatStream, ErrorCode, Request, Response};
+use std::collections::VecDeque;
 use std::io;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
+
+/// Maximum concurrent OS worker threads serving async IPC calls.
+const MAX_IPC_WORKERS: usize = 32;
+/// Maximum queued async IPC jobs waiting for a worker before failing fast with `WouldBlock`.
+const MAX_IPC_QUEUED: usize = 128;
+/// Idle IPC workers exit after this long without a job.
+const IPC_WORKER_IDLE: Duration = Duration::from_secs(30);
 
 /// Writing a request never takes longer than this: chatd reads every frame at once.
 const WRITE: Duration = Duration::from_secs(5);
@@ -48,12 +57,105 @@ pub async fn ask_within_async(request: Request, read: Option<Duration>) -> io::R
     on_thread(move || ask_within(&request, read)).await
 }
 
+type IpcJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct PoolState {
+    queue: VecDeque<IpcJob>,
+    workers: usize,
+    idle: usize,
+}
+
+struct IpcPool {
+    state: Mutex<PoolState>,
+    wake: Condvar,
+    max_workers: usize,
+    max_queued: usize,
+    idle_timeout: Duration,
+}
+
+impl IpcPool {
+    fn new(max_workers: usize, max_queued: usize, idle_timeout: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(PoolState { queue: VecDeque::new(), workers: 0, idle: 0 }),
+            wake: Condvar::new(),
+            max_workers: max_workers.max(1),
+            max_queued: max_queued.max(1),
+            idle_timeout,
+        })
+    }
+
+    fn shared() -> &'static Arc<Self> {
+        static POOL: OnceLock<Arc<IpcPool>> = OnceLock::new();
+        POOL.get_or_init(|| Self::new(MAX_IPC_WORKERS, MAX_IPC_QUEUED, IPC_WORKER_IDLE))
+    }
+
+    fn submit(self: &Arc<Self>, job: IpcJob) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.queue.len() >= self.max_queued {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "too many in-flight IPC requests"));
+        }
+        state.queue.push_back(job);
+        let need_worker = state.idle == 0 && state.workers < self.max_workers;
+        if need_worker {
+            state.workers += 1;
+            let pool = Arc::clone(self);
+            drop(state);
+            match std::thread::Builder::new().name("tinyclient-ipc".into()).spawn(move || pool.run_worker()) {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    state.workers = state.workers.saturating_sub(1);
+                    if state.workers == 0 {
+                        let _ = state.queue.pop_back();
+                        return Err(err);
+                    }
+                    self.wake.notify_one();
+                    Ok(())
+                }
+            }
+        } else {
+            self.wake.notify_one();
+            Ok(())
+        }
+    }
+
+    fn run_worker(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(job) = state.queue.pop_front() {
+                drop(state);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            state.idle += 1;
+            let (next, waited) = self
+                .wake
+                .wait_timeout(state, self.idle_timeout)
+                .unwrap_or_else(PoisonError::into_inner);
+            state = next;
+            state.idle = state.idle.saturating_sub(1);
+            if waited.timed_out() && state.queue.is_empty() {
+                state.workers = state.workers.saturating_sub(1);
+                break;
+            }
+        }
+    }
+
+    async fn run<T: Send + 'static>(
+        self: &Arc<Self>,
+        work: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        let (send, receive) = futures_channel::oneshot::channel();
+        self.submit(Box::new(move || {
+            let _ = send.send(work());
+        }))?;
+        receive.await.map_err(|_| io::Error::other("the request worker stopped"))?
+    }
+}
+
 async fn on_thread<T: Send + 'static>(work: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T> {
-    let (send, receive) = futures_channel::oneshot::channel();
-    std::thread::Builder::new().name("tinyclient-ipc".into()).spawn(move || {
-        let _ = send.send(work());
-    })?;
-    receive.await.map_err(|_| io::Error::other("the request worker stopped"))?
+    IpcPool::shared().run(work).await
 }
 
 /// The socket is not there or nobody holds it: chatd is not running and may be started.
@@ -323,5 +425,67 @@ mod tests {
         assert_eq!(failure_class(&io::Error::new(io::ErrorKind::InvalidData, "body")), "invalid");
         assert_eq!(failure_class(&io::Error::new(io::ErrorKind::PermissionDenied, "no")), "refused");
         assert_eq!(failure_class(&io::Error::new(io::ErrorKind::Other, "os error 61")), "other");
+    }
+
+    #[test]
+    fn ipc_pool_bounds_workers_and_rejects_excess_backlog() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = IpcPool::new(2, 2, Duration::from_secs(1));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let entered_tx = entered_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            pool.submit(Box::new(move || {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(2));
+                active.fetch_sub(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            }))
+            .expect("worker slot available");
+            handles.push(done_rx);
+        }
+
+        // Wait for both workers to be occupied.
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Fill the bounded queue (2 slots) while both workers are busy.
+        for _ in 0..2 {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            pool.submit(Box::new(move || {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                active.fetch_sub(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            }))
+            .expect("queue slot available");
+            handles.push(done_rx);
+        }
+
+        // A 5th submission exceeds max_queued and fails fast with WouldBlock.
+        let overflow = pool.submit(Box::new(|| {})).unwrap_err();
+        assert_eq!(overflow.kind(), io::ErrorKind::WouldBlock);
+
+        // Release both blocked workers; all 4 accepted jobs complete and peak concurrency never exceeded 2.
+        let _ = release_tx.send(());
+        let _ = release_tx.send(());
+        for done_rx in handles {
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2);
     }
 }

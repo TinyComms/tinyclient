@@ -95,6 +95,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's core E2EE/security driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("core-e2ee-security") {
+        if let Err(err) = chatd::adapters::tiny::prove_core_e2ee_security() {
+            eprintln!("core-e2ee-security: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-core-e2ee-security:0");
+        return Ok(());
+    }
     // The lab's linkify driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("linkify") {
         if let Err(err) = chatd::adapters::tiny::prove_linkify() {
@@ -1182,6 +1191,15 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-telegram-wave15c:0");
+        return Ok(());
+    }
+    // The lab's fast-send-pipeline driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("fast-send-pipeline") {
+        if let Err(err) = chatd::adapters::prove_fast_send_pipeline() {
+            eprintln!("fast-send-pipeline: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-fast-send-pipeline:0");
         return Ok(());
     }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());

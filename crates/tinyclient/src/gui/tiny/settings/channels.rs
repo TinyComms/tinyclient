@@ -440,6 +440,7 @@ pub(in crate::gui::tiny) fn channels(shell: &Shell, facts: &Facts, window: &mut 
         );
     }
     page = page.child(tools);
+    let stacked = crate::gui::phone::active() || f32::from(window.viewport_size().width) < 900.;
     let editor = match &draft.sel {
         Some(Sel::Room(_)) => shell.tiny_channels_room().map(|room| room_editor(shell, facts, &room, window, cx).into_any_element()),
         Some(Sel::Channel(_)) => shell.tiny_channels_text().map(|ch| channel_editor(shell, facts, &ch, window, cx).into_any_element()),
@@ -447,7 +448,13 @@ pub(in crate::gui::tiny) fn channels(shell: &Shell, facts: &Facts, window: &mut 
         None => None,
     }
     .unwrap_or_else(|| kit::empty("icons/volume-2.svg", "Pick a channel or a category to edit it.").into_any_element());
-    page.child(div().flex().items_start().gap(px(24.)).child(tree(facts, draft, cx)).child(div().flex_1().min_w_0().child(editor))).into_any_element()
+    let list_el = tree(facts, draft, stacked, cx);
+    let body = if stacked {
+        div().flex().flex_col().gap(px(20.)).child(list_el).child(div().w_full().min_w_0().child(editor))
+    } else {
+        div().flex().items_start().gap(px(24.)).child(list_el).child(div().flex_1().min_w_0().child(editor))
+    };
+    page.child(body).into_any_element()
 }
 
 fn channel_tree_row(facts: &Facts, draft: &Draft, ch: &TinyChannel, cx: &mut Context<Shell>) -> Stateful {
@@ -482,9 +489,13 @@ fn channel_tree_row(facts: &Facts, draft: &Draft, ch: &TinyChannel, cx: &mut Con
 
 /// The categories, text channels and voice rooms, in order, each a drag handle and a drop target
 /// where the layout may change.
-fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
+fn tree(facts: &Facts, draft: &Draft, stacked: bool, cx: &mut Context<Shell>) -> Div {
     let community = facts.community;
-    let mut tree = div().w(px(232.)).flex_none().flex().flex_col().gap(px(1.));
+    let mut tree = if stacked {
+        div().w_full().flex_none().flex().flex_col().gap(px(1.))
+    } else {
+        div().w(px(232.)).flex_none().flex().flex_col().gap(px(1.))
+    };
     let empty = HashSet::new();
     let lines = model::lines(community, &empty, None, &empty);
     let headed_loose = !community.categories.is_empty() && lines.iter().any(|line| matches!(line, Line::Category { id: None, .. }));
@@ -734,9 +745,9 @@ fn room_editor(shell: &Shell, facts: &Facts, room: &TinyRoom, window: &mut Windo
                         switch_row("tiny-channels-video", "Video", "People may turn their camera on here.", video, edits)
                             .when(edits, |row| row.on_click(cx.listener(move |this, _, _, cx| this.tiny_channels_draft(cx, |draft| draft.video = Some(!video))))),
                     )
+                    .child(kit::rule())
                     .child(
                         switch_row("tiny-channels-ptt", "Push to talk required", "Everyone here holds a key to talk, whatever their voice activity permission.", ptt, edits)
-                            .border_b_0()
                             .when(edits, |row| row.on_click(cx.listener(move |this, _, _, cx| this.tiny_channels_draft(cx, |draft| draft.ptt = Some(!ptt))))),
                     ),
             ),
@@ -754,7 +765,6 @@ fn room_editor(shell: &Shell, facts: &Facts, room: &TinyRoom, window: &mut Windo
                             e2ee,
                             edits,
                         )
-                        .border_b_0()
                         .when(edits, |row| row.on_click(cx.listener(move |this, _, _, cx| this.tiny_channels_draft(cx, |draft| draft.e2ee = Some(!e2ee))))),
                     ),
                 ),

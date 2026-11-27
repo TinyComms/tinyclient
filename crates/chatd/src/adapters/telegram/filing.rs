@@ -40,6 +40,8 @@ pub(super) struct Facts {
     pub muted: bool,
     /// Nothing unread when it was last told.
     pub read: bool,
+    /// Dialog currently carries Telegram's manual `unread_mark` flag.
+    pub unread_mark: bool,
     /// When this chat's own mute ends, as Unix seconds. `None` is the kind's default.
     /// [`i32::MAX`] is muted until it is turned off.
     pub mute_until: Option<i64>,
@@ -506,6 +508,79 @@ pub(super) fn file(
     }
 
     Ok(())
+}
+
+/// Reorders pinned chats in the main list (`folder: None` or `"0"`), archive (`"1"` / `"archive"`),
+/// or a custom Telegram folder (`<folder_id>`).
+pub(super) fn reorder_pins(account: &Account, folder: Option<&str>, conversation_ids: &[String]) -> Result<(), Fault> {
+    let mut whos = Vec::with_capacity(conversation_ids.len());
+    for id in conversation_ids {
+        let Some((who, None)) = Who::parse(id) else {
+            return Err(Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None });
+        };
+        if !whos.contains(&who) {
+            whos.push(who);
+        }
+    }
+    let folder_key = folder.map(str::trim).filter(|s| !s.is_empty());
+    match folder_key {
+        None | Some("0") | Some("1") | Some("archive") => {
+            let folder_id = i32::from(matches!(folder_key, Some("1") | Some("archive")));
+            let mut order = Vec::with_capacity(whos.len());
+            for &who in &whos {
+                let peer = account.input(who)?;
+                order.push(tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer }));
+            }
+            account.ask(&tl::functions::messages::ReorderPinnedDialogs { force: true, folder_id, order })?;
+            let list = usize::from(folder_id == 1);
+            let before = std::mem::replace(&mut account.live().filed.pins[list], whos.clone());
+            refile(account, before.into_iter().chain(whos));
+            Ok(())
+        }
+        Some(custom) => {
+            let folder_id = parse_folder_id(custom)?;
+            let mut peers = Vec::with_capacity(whos.len());
+            for &who in &whos {
+                peers.push(account.input(who)?);
+            }
+            let tl::enums::messages::DialogFilters::Filters(found) = account.ask(&tl::functions::messages::GetDialogFilters {})?;
+            let mut updated = None;
+            let mut previous = Vec::new();
+            for filter in found.filters {
+                match filter {
+                    tl::enums::DialogFilter::Filter(mut f) if f.id == folder_id => {
+                        previous = f.pinned_peers.iter().filter_map(|p| input_who(p, account.me)).collect();
+                        f.pinned_peers = peers.clone();
+                        for &who in &whos {
+                            f.exclude_peers.retain(|p| input_who(p, account.me) != Some(who));
+                        }
+                        updated = Some(tl::enums::DialogFilter::Filter(f));
+                        break;
+                    }
+                    tl::enums::DialogFilter::Chatlist(mut c) if c.id == folder_id => {
+                        previous = c.pinned_peers.iter().filter_map(|p| input_who(p, account.me)).collect();
+                        c.pinned_peers = peers.clone();
+                        updated = Some(tl::enums::DialogFilter::Chatlist(c));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let Some(new_filter) = updated else {
+                return Err(Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None });
+            };
+            account.ask(&tl::functions::messages::UpdateDialogFilter { id: folder_id, filter: Some(new_filter.clone()) })?;
+            if let Some(new_rule) = rule(&new_filter, account.me) {
+                let mut live = account.live();
+                if let Some(slot) = live.filed.rules.iter_mut().find(|r| r.id == folder_id) {
+                    *slot = new_rule;
+                }
+            }
+            report(account);
+            refile(account, previous.into_iter().chain(whos));
+            Ok(())
+        }
+    }
 }
 
 fn resolve_peers(account: &Account, ids: &[String]) -> Result<Vec<tl::enums::InputPeer>, Fault> {

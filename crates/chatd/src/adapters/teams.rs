@@ -229,9 +229,8 @@ use protocol::Link;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::sleep;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Teams' own desktop client, the one registration third-party clients sign in as.
@@ -283,6 +282,10 @@ const GAP: Duration = Duration::from_millis(250);
 const PATIENCE: u64 = 30;
 /// A 429 that says no `Retry-After` is taken to mean this many seconds.
 const LIMITED_FOR: u64 = 30;
+/// Tight timeout for Teams' synchronous link-preview unfurl call before posting.
+pub(super) const URLPREVIEW_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Tight timeout for typing indicator POSTs so slow responses never back up.
+const TYPING_TIMEOUT: Duration = Duration::from_secs(5);
 /// A token this close to its end is replaced before it is used.
 const EARLY: Duration = Duration::from_secs(300);
 /// Typing is told at most this often per conversation, and shown this long when heard.
@@ -518,6 +521,37 @@ struct Answer {
     location: String,
 }
 
+/// Per-audience mint locks so a slow Graph/Substrate/Presence/Aggregator token mint never blocks
+/// `Spaces` sends, and two threads for the same audience still coalesce into one mint.
+#[derive(Default)]
+struct MintLocks {
+    spaces: Mutex<()>,
+    aggregator: Mutex<()>,
+    presence: Mutex<()>,
+    graph: Mutex<()>,
+    substrate: Mutex<()>,
+    pub(super) transcript: Mutex<()>,
+}
+
+impl MintLocks {
+    fn for_audience(&self, scope: Audience) -> &Mutex<()> {
+        match scope {
+            Audience::Spaces => &self.spaces,
+            Audience::Aggregator => &self.aggregator,
+            Audience::Presence => &self.presence,
+            Audience::Graph => &self.graph,
+            Audience::Substrate => &self.substrate,
+        }
+    }
+}
+
+/// Coalesced single-slot state for the `"teams-typing"` worker.
+#[derive(Default)]
+struct TypingSlot {
+    pending: Option<String>,
+    stopped: bool,
+}
+
 struct Teams {
     ctx: Context,
     agent: ureq::Agent,
@@ -534,11 +568,13 @@ struct Teams {
     /// A test moved the front door: the addresses it hands out are its own.
     moved: Option<String>,
     state: Mutex<State>,
-    /// Held while a token is minted, and while authz is asked, so two threads do not both ask.
-    minting: Mutex<()>,
+    /// Per-audience mutexes held while minting, and while authz is asked, so two threads do not
+    /// duplicate the same mint while independent audiences proceed concurrently.
+    minting: MintLocks,
     settling: Mutex<()>,
-    /// When anything was last asked.
-    asked: Mutex<Instant>,
+    /// Independent pace slots: background sync vs interactive sends.
+    asked: Mutex<Option<Instant>>,
+    send_asked: Mutex<Option<Instant>>,
 }
 
 fn tenants(session: &Value) -> &[Value] {
@@ -678,6 +714,9 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     let api = address("TINYCLIENT_TEAMS_API", ep.teams).trim_end_matches('/').to_owned();
     let agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
+        .max_idle_age(Duration::from_secs(30))
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(Duration::from_secs(20)))
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
         .max_redirects(0)
@@ -700,22 +739,44 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         api,
         session,
         state: Mutex::new(state),
-        minting: Mutex::new(()),
+        minting: MintLocks::default(),
         settling: Mutex::new(()),
-        asked: Mutex::new(Instant::now()),
+        asked: Mutex::new(None),
+        send_asked: Mutex::new(None),
     });
     let socket = teams.clone();
     std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
-    std::thread::spawn(move || {
-        serve_commands(
-            &teams.ctx,
-            inbox,
-            PACE,
-            |id| teams.report(teams.backfill(id).map_err(Failure::from)),
-            |command| teams.serve(command),
-        )
-    });
+    let _ = std::thread::Builder::new().name("teams".into()).spawn(move || teams.run_workers(inbox));
     Ok(())
+}
+
+/// Whether a `ureq` error indicates a stale pooled socket dropped under us.
+fn dropped_socket(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
+/// Methods safe to retry once on a dropped pooled socket: idempotent GETs and
+/// `clientmessageid`-keyed message POSTs.
+fn retryable_on_drop(method: &str, body: &Body) -> bool {
+    if method == "GET" {
+        return true;
+    }
+    if method == "POST" {
+        if let Body::Json(val) = body {
+            return val.get("clientmessageid").and_then(Value::as_str).is_some_and(|id| !id.is_empty());
+        }
+    }
+    false
 }
 
 /// A reply chain is a conversation of its own: its channel and the post that started it.
@@ -830,10 +891,8 @@ pub(super) fn iso_utc(unix_secs: i64) -> String {
 
 /// 16 bytes nobody can guess, as a version 4 UUID.
 fn uuid() -> String {
-    use std::io::Read;
     let mut bytes = [0u8; 16];
-    let read = std::fs::File::open("/dev/urandom").and_then(|mut source| source.read_exact(&mut bytes));
-    if read.is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         bytes = (u128::from(now_ms().unsigned_abs()) * 0x9E37_79B9_7F4A_7C15).to_be_bytes();
     }
     bytes[6] = bytes[6] & 0x0f | 0x40;
@@ -852,7 +911,144 @@ fn claim(token: &str, name: &str) -> Option<String> {
 
 impl Teams {
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap()
+        crate::hub::lock(&self.state)
+    }
+
+    /// Non-blocking front-end router decoupling sends, file uploads, cancels, typing, and
+    /// downloads from `serve_commands`.
+    fn run_workers(self: &Arc<Self>, inbox: Receiver<Command>) {
+        let (send_tx, send_rx) = std::sync::mpsc::channel::<Command>();
+        let (download_tx, download_rx) = std::sync::mpsc::channel::<Command>();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+        let typing_slot = Arc::new((Mutex::new(TypingSlot::default()), Condvar::new()));
+
+        let send_teams = self.clone();
+        let _ = std::thread::Builder::new().name("teams-send".into()).spawn(move || {
+            while !send_teams.ctx.stopped() {
+                let Ok(command) = send_rx.recv() else { break };
+                if matches!(command, Command::Stop) {
+                    break;
+                }
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
+                    Command::Send { conversation_id, client_id, text, reply_to } => {
+                        send_teams.post(&conversation_id, &client_id, &text, reply_to.as_deref());
+                    }
+                    Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                        send_teams.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+                    }
+                    _ => {}
+                }));
+                if outcome.is_err() {
+                    tracing::error!("chatd: Teams: send worker panicked");
+                }
+            }
+        });
+
+        let typing_teams = self.clone();
+        let typing_rx = typing_slot.clone();
+        let _ = std::thread::Builder::new().name("teams-typing".into()).spawn(move || {
+            let (lock, cvar) = &*typing_rx;
+            while !typing_teams.ctx.stopped() {
+                let conversation = {
+                    let mut guard = crate::hub::lock(lock);
+                    while !guard.stopped && guard.pending.is_none() && !typing_teams.ctx.stopped() {
+                        guard = cvar.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if guard.stopped || typing_teams.ctx.stopped() {
+                        break;
+                    }
+                    guard.pending.take()
+                };
+                if let Some(conversation) = conversation {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        typing_teams.typing(&conversation);
+                    }));
+                }
+            }
+        });
+
+        let dl_teams = self.clone();
+        let _ = std::thread::Builder::new().name("teams-download".into()).spawn(move || {
+            let refuse = |fault: Fault| Refusal::Refused(reason(fault));
+            while !dl_teams.ctx.stopped() {
+                let Ok(command) = download_rx.recv() else { break };
+                match command {
+                    Command::Stop => break,
+                    Command::Download { url, reply, .. } => {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _ = reply.send(dl_teams.download(url).map_err(refuse));
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let cmd_teams = self.clone();
+        let _ = std::thread::Builder::new().name("teams-cmd".into()).spawn(move || {
+            serve_commands(
+                &cmd_teams.ctx,
+                cmd_rx,
+                PACE,
+                |id| cmd_teams.report(cmd_teams.backfill(id).map_err(Failure::from)),
+                |command| cmd_teams.serve(command),
+            );
+        });
+
+        self.route_inbox(inbox, send_tx, download_tx, cmd_tx, typing_slot);
+    }
+
+    fn route_inbox(
+        self: &Arc<Self>,
+        inbox: Receiver<Command>,
+        send_tx: Sender<Command>,
+        download_tx: Sender<Command>,
+        cmd_tx: Sender<Command>,
+        typing_slot: Arc<(Mutex<TypingSlot>, Condvar)>,
+    ) {
+        while !self.ctx.stopped() {
+            let Ok(command) = inbox.recv() else { break };
+            match command {
+                Command::Stop => {
+                    let _ = send_tx.send(Command::Stop);
+                    let _ = download_tx.send(Command::Stop);
+                    let _ = cmd_tx.send(Command::Stop);
+                    break;
+                }
+                cmd @ Command::Send { .. } => {
+                    let _ = send_tx.send(cmd);
+                }
+                Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                    if with.pick.is_none() && with.schedule.is_none() && with.poll.is_none() && !with.files.is_empty() {
+                        self.spawn_file_send(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+                    } else {
+                        let _ = send_tx.send(Command::SendWith { conversation_id, client_id, text, reply_to, with });
+                    }
+                }
+                Command::CancelSend { client_id, .. } => {
+                    self.cancel_send(&client_id);
+                }
+                Command::Typing { conversation_id, .. } => {
+                    let (lock, cvar) = &*typing_slot;
+                    crate::hub::lock(lock).pending = Some(conversation_id);
+                    cvar.notify_one();
+                }
+                cmd @ Command::Download { .. } => {
+                    let _ = download_tx.send(cmd);
+                }
+                other => {
+                    let _ = cmd_tx.send(other);
+                }
+            }
+        }
+        {
+            let (lock, cvar) = &*typing_slot;
+            crate::hub::lock(lock).stopped = true;
+            cvar.notify_all();
+        }
+        drop(send_tx);
+        drop(download_tx);
+        drop(cmd_tx);
     }
 
     fn me(&self) -> String {
@@ -891,14 +1087,34 @@ impl Teams {
         self.moved.as_ref().is_some_and(|base| url.starts_with(base.as_str())) || https_host(url).is_some_and(media)
     }
 
-    /// Waits until the last call is [`GAP`] behind.
-    fn pace(&self) {
-        let mut asked = self.asked.lock().unwrap();
-        let since = asked.elapsed();
-        if since < GAP {
-            sleep(GAP - since);
+    /// Reserves the next paced slot without holding the mutex across the sleep, using
+    /// `ctx.pause` so shutdown interrupts immediately. Returns `true` if stopped.
+    fn pace_slot(&self, slot: &Mutex<Option<Instant>>, gap: Duration) -> bool {
+        let wait = {
+            let mut last = crate::hub::lock(slot);
+            let now = Instant::now();
+            let next = match *last {
+                Some(prev) if prev + gap > now => prev + gap,
+                _ => now,
+            };
+            *last = Some(next);
+            next.saturating_duration_since(now)
+        };
+        if wait.is_zero() {
+            false
+        } else {
+            self.ctx.pause(wait)
         }
-        *asked = Instant::now();
+    }
+
+    /// Waits until the last background call is [`GAP`] behind. True if stopped while waiting.
+    fn pace(&self) -> bool {
+        self.pace_slot(&self.asked, GAP)
+    }
+
+    /// Independent pace slot for interactive sends so background sync never stalls sends.
+    fn pace_send(&self) -> bool {
+        self.pace_slot(&self.send_asked, GAP)
     }
 
     // Tokens.
@@ -906,7 +1122,10 @@ impl Teams {
     /// An access token for one audience, minted from the refresh token when the one held is
     /// missing or near its end. Microsoft answers with the next refresh token, which is saved.
     fn token(&self, scope: Audience) -> Result<String, Fault> {
-        let _one = self.minting.lock().unwrap();
+        if let Some(token) = self.state().access.get(&scope).filter(|token| token.fresh()) {
+            return Ok(token.value.clone());
+        }
+        let _one = crate::hub::lock(self.minting.for_audience(scope));
         if let Some(token) = self.state().access.get(&scope).filter(|token| token.fresh()) {
             return Ok(token.value.clone());
         }
@@ -920,7 +1139,10 @@ impl Teams {
             ("refresh_token", refresh.as_str()),
             ("scope", scopes.as_str()),
         ];
-        self.pace();
+        let stopped = if scope == Audience::Spaces { self.pace_send() } else { self.pace() };
+        if stopped {
+            return Err(Fault::Net("token: stopped".to_owned()));
+        }
         let mut response = self.agent.post(&url).send_form(form).map_err(|err| Fault::Net(format!("token: {err}")))?;
         let status = response.status().as_u16();
         let body: Value = response.body_mut().read_json().unwrap_or(Value::Null);
@@ -975,7 +1197,7 @@ impl Teams {
         if let Some(held) = held() {
             return Ok(held);
         }
-        let _one = self.settling.lock().unwrap();
+        let _one = crate::hub::lock(&self.settling);
         if let Some(held) = held() {
             return Ok(held);
         }
@@ -987,7 +1209,9 @@ impl Teams {
         let mut refused = None;
         for _ in 0..2 {
             let bearer = self.token(Audience::Spaces)?;
-            self.pace();
+            if self.pace_send() {
+                return Err(Fault::Net("authz: stopped".to_owned()));
+            }
             let sent = self
                 .agent
                 .post(&url)
@@ -1084,12 +1308,28 @@ impl Teams {
         })
     }
 
-    fn send(&self, method: &str, url: &str, headers: &[(&'static str, String)], body: &Body) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&'static str, String)],
+        body: &Body,
+        timeout: Option<Duration>,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let origin = self.cloud.endpoints().teams;
         let referer = format!("{origin}/");
         macro_rules! dressed {
             ($request:expr) => {{
-                let mut request = $request
+                let req = match timeout {
+                    Some(limit) => $request
+                        .config()
+                        .timeout_global(Some(limit))
+                        .timeout_connect(Some(limit.min(Duration::from_secs(10))))
+                        .timeout_recv_response(Some(limit))
+                        .build(),
+                    None => $request,
+                };
+                let mut request = req
                     .header("Accept", "application/json")
                     .header("BehaviorOverride", "redirectAs404")
                     .header("Origin", origin)
@@ -1117,6 +1357,18 @@ impl Teams {
     /// One call to a Teams service. A token the service refuses is minted again once; a short
     /// rate limit is waited out when `patient`, and a send is not: the user is told instead.
     fn call(&self, method: &str, url: &str, auth: Auth, body: Body, patient: bool) -> Result<Answer, Fault> {
+        self.call_with_timeout(method, url, auth, body, patient, None)
+    }
+
+    fn call_with_timeout(
+        &self,
+        method: &str,
+        url: &str,
+        auth: Auth,
+        body: Body,
+        patient: bool,
+        timeout: Option<Duration>,
+    ) -> Result<Answer, Fault> {
         if let Some(why) = self.state().expired.clone() {
             return Err(Fault::Auth(why));
         }
@@ -1127,16 +1379,28 @@ impl Teams {
         if !allowed {
             return Err(Fault::Net(format!("{} is not a Teams address", bare(url))));
         }
-        let (mut renewed, mut limited, mut wait) = (false, false, 0);
-        for _ in 0..3 {
+        let retryable = retryable_on_drop(method, &body);
+        let (mut renewed, mut limited, mut retried_socket, mut wait) = (false, false, false, 0);
+        for _ in 0..4 {
             let headers = self.headers(auth)?;
-            self.pace();
+            let stopped = if patient { self.pace() } else { self.pace_send() };
+            if stopped {
+                return Err(Fault::Net(format!("{}: stopped", bare(url))));
+            }
             // The library's word for a bad address repeats the address, which may be signed.
             let failed = |err: ureq::Error| match err {
                 ureq::Error::BadUri(_) => Fault::Net(format!("{}: not an address", bare(url))),
                 err => Fault::Net(format!("{}: {err}", bare(url))),
             };
-            let mut response = self.send(method, url, &headers, &body).map_err(failed)?;
+            let mut response = match self.send(method, url, &headers, &body, timeout) {
+                Ok(response) => response,
+                Err(err) if !retried_socket && retryable && dropped_socket(&err) => {
+                    retried_socket = true;
+                    tracing::debug!(url = bare(url), "chatd: Teams: pooled connection dropped; retrying once");
+                    continue;
+                }
+                Err(err) => return Err(failed(err)),
+            };
             let status = response.status().as_u16();
             let header = |name: &str| response.headers().get(name).and_then(|value| value.to_str().ok()).unwrap_or("").to_owned();
             let (retry, location) = (header("retry-after").parse::<u64>().ok(), header("location"));
@@ -1155,7 +1419,9 @@ impl Teams {
                         break;
                     }
                     limited = true;
-                    sleep(Duration::from_secs(wait));
+                    if self.ctx.pause(Duration::from_secs(wait)) {
+                        return Err(Fault::Net(format!("{}: stopped", bare(url))));
+                    }
                 }
                 _ => {
                     let message = [&body["message"], &body["errorCode"], &body["standardizedError"]["errorDescription"]];
@@ -1168,6 +1434,22 @@ impl Teams {
             }
         }
         Err(Fault::Limited(wait))
+    }
+
+    /// Single-attempt tight-timeout POST with no 401 token-refresh retry, no 429 sleep, and no
+    /// pacing wait — used for opportunistic link unfurling so slow `urlpreview` never stalls sends.
+    pub(super) fn call_fast_post(&self, url: &str, auth: Auth, body: &Value, timeout: Duration) -> Option<Value> {
+        if self.state().expired.is_some() || !self.ours(url) {
+            return None;
+        }
+        let headers = self.headers(auth).ok()?;
+        let mut response = self.send("POST", url, &headers, &Body::Json(body), Some(timeout)).ok()?;
+        let status = response.status().as_u16();
+        if !(200..=299).contains(&status) {
+            return None;
+        }
+        let text = response.body_mut().read_to_string().ok()?;
+        serde_json::from_str(&text).ok()
     }
 
     /// A call to the chat service, under its own address.
@@ -1489,9 +1771,10 @@ impl Teams {
             }
             state.typed = Some((conversation.to_owned(), Instant::now()));
         }
+        let Ok(place) = self.place() else { return };
         let body = json!({"content": "", "contenttype": "Application/Message", "messagetype": "Control/Typing"});
-        let path = format!("/v1/users/ME/conversations/{}/messages", escaped(conversation));
-        if let Err(Fault::Auth(why)) = self.chat("POST", &path, Body::Json(&body), false) {
+        let url = format!("{}/v1/users/ME/conversations/{}/messages", place.chat, escaped(conversation));
+        if let Err(Fault::Auth(why)) = self.call_with_timeout("POST", &url, Auth::Skype, Body::Json(&body), false, Some(TYPING_TIMEOUT)) {
             self.state().expired.get_or_insert(why);
         }
     }
@@ -1673,9 +1956,10 @@ mod tests {
             moved: None,
             session: per_tenant,
             state: Mutex::new(State { refresh: "rt-gov".to_owned(), ..State::default() }),
-            minting: Mutex::new(()),
+            minting: MintLocks::default(),
             settling: Mutex::new(()),
-            asked: Mutex::new(Instant::now()),
+            asked: Mutex::new(None),
+            send_asked: Mutex::new(None),
         };
 
         // GCC High accepts only GCC High hosts and refuses worldwide, DoD, and China hosts.
@@ -1703,5 +1987,168 @@ mod tests {
         assert!(matches!(refused, Err(Fault::Net(msg)) if msg.contains("is not a Teams address")));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_teams(tag: &str, base: &str) -> (Arc<Teams>, super::super::Adapter, std::path::PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("tiny-teams-{tag}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = crate::store::Store::open(&dir.join("chat.sqlite")).unwrap();
+        let hub = Arc::new(crate::hub::Hub::new(store));
+        let acct = protocol::AccountKey { network: protocol::Network::Teams, account: format!("tenant-{tag}") };
+        let (adapter, ctx, _rx) = super::super::local(acct, hub);
+        let agent = ureq::Agent::config_builder()
+            .max_idle_age(Duration::from_secs(30))
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(Duration::from_secs(20)))
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .build()
+            .into();
+        let mut state = State {
+            refresh: "rt-test".to_owned(),
+            me: "8:orgid:me-test".to_owned(),
+            skype: Some(Token {
+                value: "skype-fresh".to_owned(),
+                until: Instant::now() + Duration::from_secs(3600),
+            }),
+            place: Some(Arc::new(Place {
+                chat: format!("{base}/chat"),
+                middle: format!("{base}/middle"),
+                presence: format!("{base}/presence"),
+                urlp: None,
+                search: None,
+                ams: Some(format!("{base}/ams")),
+            })),
+            ..State::default()
+        };
+        state.access.insert(
+            Audience::Spaces,
+            Token {
+                value: "spaces-fresh".to_owned(),
+                until: Instant::now() + Duration::from_secs(3600),
+            },
+        );
+        let teams = Arc::new(Teams {
+            ctx,
+            agent,
+            cloud: TeamsCloud::Worldwide,
+            login: format!("{base}/login"),
+            api: base.to_owned(),
+            graph: format!("{base}/graph"),
+            trouter: format!("{base}/trouter"),
+            moved: Some(base.to_owned()),
+            session: Session {
+                tenant: format!("tenant-{tag}"),
+                name: "Test".to_owned(),
+                refresh_token: "rt-test".to_owned(),
+                client_id: CLIENT.to_owned(),
+                user_agent: "Test/1".to_owned(),
+                oid: "me-test".to_owned(),
+                user: "Test User".to_owned(),
+                cloud: String::new(),
+                personal: false,
+            },
+            state: Mutex::new(state),
+            minting: MintLocks::default(),
+            settling: Mutex::new(()),
+            asked: Mutex::new(None),
+            send_asked: Mutex::new(None),
+        });
+        (teams, adapter, dir)
+    }
+
+    #[test]
+    fn unfurl_link_slow_response_does_not_stall_sending() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let done_rx = Arc::new(Mutex::new(done_rx));
+        let server_done = done_rx.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let done_rx = server_done.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+                    if path.starts_with("/middle/v1/urlpreview") {
+                        // Simulate an unresponsive/slow urlpreview (>4s).
+                        let _ = crate::hub::lock(&done_rx).recv_timeout(Duration::from_secs(5));
+                        let body = r#"{"title":"Too Late"}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if path.contains("/messages") {
+                        let body = r#"{"OriginalArrivalTime":1760005000100}"#;
+                        let resp = format!(
+                            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                });
+            }
+        });
+
+        let (teams, _adapter, dir) = test_teams("slow-unfurl", &base);
+        let started = Instant::now();
+        let sent = teams
+            .posted_with(
+                "19:chat@unq.gbl.spaces",
+                "77001",
+                "see https://example.com/slow",
+                None,
+                &protocol::Outgoing::default(),
+                None,
+            )
+            .expect("send should succeed even when urlpreview stalls");
+        let elapsed = started.elapsed();
+        let _ = done_tx.send(());
+
+        assert_eq!(sent.id, "1760005000100");
+        assert!(sent.previews.is_empty(), "timed-out urlpreview should be skipped cleanly");
+        assert!(
+            elapsed < Duration::from_millis(3500),
+            "slow urlpreview stalled send for {elapsed:?} (expected bounded by 1.5s timeout)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_returns_fresh_cached_audience_without_waiting_on_other_mint_lock() {
+        let (teams, _adapter, dir) = test_teams("token-cache", "http://127.0.0.1:9");
+        // Hold another audience's mint lock (and even Spaces's own lock) while Spaces has a fresh token.
+        let _graph_lock = crate::hub::lock(teams.minting.for_audience(Audience::Graph));
+        let _spaces_lock = crate::hub::lock(teams.minting.for_audience(Audience::Spaces));
+        let started = Instant::now();
+        let tok = teams.token(Audience::Spaces).expect("fresh cached Spaces token");
+        assert_eq!(tok, "spaces-fresh");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn original_arrival_time_parses_both_casings() {
+        assert_eq!(message::arrival_time_id(&json!({"OriginalArrivalTime": 1_760_005_000_100u64})), "1760005000100");
+        assert_eq!(message::arrival_time_id(&json!({"OriginalArrivalTime": "1760005000100"})), "1760005000100");
+        assert_eq!(message::arrival_time_id(&json!({"originalarrivaltime": 1_760_005_000_200u64})), "1760005000200");
+        assert_eq!(message::arrival_time_id(&json!({"originalarrivaltime": "1760005000200"})), "1760005000200");
+        assert_eq!(message::arrival_time_id(&json!({"originalArrivalTime": 1_760_005_000_300u64})), "1760005000300");
+        assert_eq!(message::arrival_time_id(&json!({})), "");
     }
 }

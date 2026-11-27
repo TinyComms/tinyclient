@@ -26,10 +26,11 @@
 //! lock into a warning.
 
 use super::{in_call, Menu};
+use crate::gui::components::place::{anchor, placed, Layer, Place as OverlayPlace};
 use crate::gui::components::{glyph, tip};
 use crate::gui::state::Shell;
-use crate::gui::theme;
-use gpui::{deferred, div, prelude::*, px, AnyElement, Context, Div, FontWeight, MouseButton, Rgba, Stateful};
+use crate::gui::theme::{self, Type};
+use gpui::{canvas, deferred, div, prelude::*, px, AnyElement, Context, Div, FontWeight, MouseButton, Rgba, Stateful, Window};
 use protocol::{Call, CallSecurity, Request, SecureMember, SecurityMode, Trust};
 
 /// Where the indicator is drawn: the panel it opens is placed by it.
@@ -268,24 +269,20 @@ const SERVER_SEES: [&str; 4] = [
 
 fn label(text: &str) -> Div {
     div()
-        .text_size(px(11.))
-        .line_height(px(15.))
-        .font_weight(FontWeight::MEDIUM)
+        .type_micro()
         .text_color(theme::text_faint())
         .child(text.to_owned())
 }
 
 fn words(text: String, color: Rgba) -> Div {
-    div().text_size(px(11.5)).line_height(px(16.)).text_color(color).child(text)
+    div().type_small().text_color(color).child(text)
 }
 
 fn digits(lines: Vec<String>) -> Div {
     div()
         .flex()
         .flex_col()
-        .font_family(theme::MONO)
-        .text_size(px(13.))
-        .line_height(px(18.))
+        .type_code()
         .text_color(theme::text())
         .children(lines.into_iter().map(|line| div().child(line)))
 }
@@ -294,14 +291,33 @@ impl Shell {
     /// The call header's security indicator at `place`, or nothing for a call that says nothing
     /// about its protection. 24 × 24, as the call health bars beside it.
     pub(in crate::gui) fn call_security(&self, call: &Call, place: Place, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.call_security_in(call, place, None, cx)
+    }
+
+    /// Same as [`Self::call_security`], placing the popover through `placed(..., Layer::Popover, window, ...)`
+    /// anchored to captured indicator bounds when `window` is provided.
+    pub(in crate::gui) fn call_security_in(
+        &self,
+        call: &Call,
+        place: Place,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let security = call.security.as_ref()?;
         let shown = badge(security, call.participants.is_empty());
         let (icon, color) = badge_look(shown);
         let open = self.call_security_open(place);
         let tg_emojis = telegram_header_emojis(call);
+        let bounds_cell = self.call_state.security_bounds[place as usize].clone();
+        let tracker = canvas(move |bounds, _, _| bounds_cell.set(Some(bounds)), |_, _, _, _| {})
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full();
         let mut indicator = if let Some(emojis) = tg_emojis {
             div()
                 .id(("call-security", place as usize))
+                .relative()
                 .flex_none()
                 .h(px(24.))
                 .px(px(6.))
@@ -314,8 +330,9 @@ impl Shell {
                 .when(open, |el| el.bg(theme::selected()))
                 .hover(|style| style.bg(theme::hover()))
                 .focus_visible(|style| style.shadow(theme::focus_ring()))
-                .text_size(px(13.))
+                .type_ui()
                 .child(emojis)
+                .child(tracker)
                 .tooltip(tip("End-to-end encrypted · compare these four emoji", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -326,6 +343,7 @@ impl Shell {
         } else {
             div()
                 .id(("call-security", place as usize))
+                .relative()
                 .flex_none()
                 .size(px(24.))
                 .rounded(px(theme::R_CONTROL))
@@ -338,6 +356,7 @@ impl Shell {
                 .hover(|style| style.bg(theme::hover()))
                 .focus_visible(|style| style.shadow(theme::focus_ring()))
                 .child(glyph(icon, 14., color))
+                .child(tracker)
                 .tooltip(tip(badge_words(shown), None))
                 // Stop the dock title's click (open conversation) on press, not only on click: a
                 // parent that sees mouse_down first steals the gesture and the lock looks dead.
@@ -348,28 +367,64 @@ impl Shell {
                     this.call_menu_toggle(Menu::Security, cx);
                 }))
         };
-        // The dock's card places its own popovers; the other two hang the panel off the
-        // indicator, over the content beside the column: up from the compact bar at the bottom
-        // of the column, down from the top bar.
+        // The dock's card places its own popovers; the other two place the panel relative to the
+        // captured indicator bounds through `placed(..., Layer::Popover, window, ...)`.
         if open && place != Place::Dock {
-            let panel = div()
-                .id(("call-security-popover", place as usize))
-                .absolute()
-                .w(px(320.))
-                .rounded(px(12.))
-                .bg(theme::overlay())
-                .border_1()
-                .border_color(theme::border())
-                .shadow(theme::shadow_popover())
-                .occlude()
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
-                .child(self.call_security_panel(call, cx));
-            let panel = if place == Place::TopBar {
-                panel.top(px(30.)).right(px(-4.))
+            if let Some(window) = window {
+                let viewport = window.viewport_size();
+                let wide = f32::from(viewport.width);
+                let tall = f32::from(viewport.height);
+                let width = 320.0_f32.min((wide - 16.).max(200.));
+                let fallback = if place == Place::TopBar {
+                    anchor((wide - width - 16.).max(8.), 14., 24., 24.)
+                } else {
+                    anchor(crate::gui::layout::RAIL_WIDTH + 16., (tall - 96.).max(40.), 24., 24.)
+                };
+                let bounds = self.call_state.security_bounds[place as usize].get().unwrap_or(fallback);
+                let placement = if place == Place::TopBar {
+                    OverlayPlace::Below(bounds)
+                } else {
+                    OverlayPlace::Above(bounds)
+                };
+                let panel = div()
+                    .id(("call-security-popover", place as usize))
+                    .w(px(width))
+                    .max_w_full()
+                    .rounded(px(theme::R_FLOAT))
+                    .bg(theme::overlay())
+                    .border_1()
+                    .border_color(theme::border())
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
+                    .child(self.call_security_panel(call, cx));
+                indicator = indicator.child(placed(
+                    ("call-security-layer", place as usize),
+                    placement,
+                    Layer::Popover,
+                    window,
+                    panel,
+                ));
             } else {
-                panel.bottom(px(30.)).left(px(-4.))
-            };
-            indicator = indicator.relative().child(deferred(panel).priority(1));
+                let panel = div()
+                    .id(("call-security-popover", place as usize))
+                    .absolute()
+                    .w(px(320.))
+                    .max_w_full()
+                    .rounded(px(theme::R_FLOAT))
+                    .bg(theme::overlay())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow(theme::shadow_popover())
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
+                    .child(self.call_security_panel(call, cx));
+                let panel = if place == Place::TopBar {
+                    panel.top(px(30.)).right(px(-4.))
+                } else {
+                    panel.bottom(px(30.)).left(px(-4.))
+                };
+                indicator = indicator.child(deferred(panel).priority(Layer::Popover as usize));
+            }
         }
         Some(indicator.into_any_element())
     }
@@ -426,8 +481,7 @@ impl Shell {
                     .child(glyph(icon, 16., color))
                     .child(
                         div()
-                            .text_size(px(13.))
-                            .line_height(px(18.))
+                            .type_ui()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
                             .child(headline),
@@ -450,7 +504,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(12.))
+                    .type_small()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::warning())
                     .cursor_pointer()
@@ -481,7 +535,7 @@ impl Shell {
                         .children(lines.into_iter().map(|line| {
                             div()
                                 .font_family(theme::MONO)
-                                .text_size(px(12.))
+                                .type_small()
                                 .text_color(theme::text())
                                 .child(line)
                         })),
@@ -548,7 +602,7 @@ impl Shell {
                         .bg(theme::hover())
                         .flex()
                         .items_center()
-                        .text_size(px(11.5))
+                        .type_small()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme::text())
                         .cursor_pointer()
@@ -570,7 +624,7 @@ impl Shell {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(12.5))
+                                    .type_ui()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(if ghost { theme::warning() } else { theme::text() })
                                     .child(name),
@@ -584,7 +638,7 @@ impl Shell {
                                         .child(glyph("icons/badge-check.svg", 13., theme::positive()))
                                         .child(
                                             div()
-                                                .text_size(px(11.5))
+                                                .type_small()
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .text_color(theme::positive())
                                                 .child("Verified"),
@@ -618,7 +672,7 @@ impl Shell {
                 .cursor_pointer()
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .type_small()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme::text_faint())
                         .child(more_label),
@@ -654,7 +708,7 @@ impl Shell {
                 .gap(px(3.))
                 .child(
                     div()
-                        .text_size(px(12.5))
+                        .type_ui()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme::text())
                         .child(name),

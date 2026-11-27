@@ -391,6 +391,12 @@ impl Account {
         wire::patient(self.wire.as_ref(), &|time| self.ctx.pause(time), request)
     }
 
+    /// Interactive send request: caps flood-wait sleep at [`wire::SEND_PATIENCE`] so long waits
+    /// fail promptly with the duration instead of stalling the send timeout.
+    fn ask_send<R: tl::RemoteCall>(&self, request: &R) -> Result<R::Return, Fault> {
+        wire::patient_capped(self.wire.as_ref(), &|time| self.ctx.pause(time), request, wire::SEND_PATIENCE)
+    }
+
     /// Takes in the people and chats an answer or update named: the directory, the hashes kept
     /// for the next run, and the people's rows.
     fn learn(&self, users: &[tl::enums::User], chats: &[tl::enums::Chat]) {
@@ -718,13 +724,125 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         })
         .map_err(|err| err.to_string())?;
+
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+    let (send_tx, send_rx) = std::sync::mpsc::channel::<Command>();
+    let (preview_tx, preview_rx) = std::sync::mpsc::channel::<Vec<String>>();
+
+    // Dedicated FIFO send worker: handles `Command::Send` and non-file `Command::SendWith` so
+    // sends never wait behind `Previews`, `Backfill`, `EditMedia`, or general commands.
+    let (send_ctx, send_current) = (ctx.clone(), current.clone());
+    std::thread::Builder::new()
+        .name("telegram-send".into())
+        .spawn(move || {
+            let account = || send_current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+            while let Ok(command) = send_rx.recv() {
+                if send_ctx.stopped() {
+                    break;
+                }
+                match account() {
+                    Some(account) => match command {
+                        Command::Send { conversation_id, client_id, text, reply_to } => {
+                            let outcome = crate::sendtime::run(&client_id, || {
+                                send_text(&account, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default(), &[])
+                            });
+                            send_ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
+                        }
+                        Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                            send::send_with(&account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+                        }
+                        other => serve(&account, other),
+                    },
+                    None => offline(&send_ctx, command),
+                }
+            }
+        })
+        .map_err(|err| err.to_string())?;
+
+    // Dedicated low-priority preview worker: its 1 s × 20 loop never stalls sends or commands.
+    let (preview_ctx, preview_current) = (ctx.clone(), current.clone());
+    std::thread::Builder::new()
+        .name("telegram-previews".into())
+        .spawn(move || {
+            let account = || preview_current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+            while let Ok(ids) = preview_rx.recv() {
+                if preview_ctx.stopped() {
+                    break;
+                }
+                if let Some(account) = account() {
+                    sync::previews(&account, &ids);
+                }
+            }
+        })
+        .map_err(|err| err.to_string())?;
+
+    // Non-blocking router thread: dispatches sends, file uploads, cancels, previews, and media
+    // edits off `telegram-commands`.
+    let (router_ctx, router_current) = (ctx.clone(), current.clone());
+    std::thread::Builder::new()
+        .name("telegram-router".into())
+        .spawn(move || {
+            let account = || router_current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+            while let Ok(command) = inbox.recv() {
+                match command {
+                    command @ Command::Send { .. } => {
+                        let _ = send_tx.send(command);
+                    }
+                    Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                        if with.files.is_empty() {
+                            let _ = send_tx.send(Command::SendWith { conversation_id, client_id, text, reply_to, with });
+                        } else {
+                            match account() {
+                                Some(account) => send::send_with(&account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with),
+                                None => router_ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
+                            }
+                        }
+                    }
+                    Command::CancelSend { conversation_id, client_id } => {
+                        crate::blobs::upload::cancel(&router_ctx.account, &client_id);
+                        if let Some(account) = account() {
+                            let _ = std::thread::Builder::new()
+                                .name("telegram-cancel".into())
+                                .spawn(move || deliver_cancel(&account, &conversation_id));
+                        }
+                    }
+                    Command::Previews(ids) => {
+                        let _ = preview_tx.send(ids);
+                    }
+                    Command::EditMedia { conversation_id, message_id, file, text, spans, invert_media, reply } => {
+                        match account() {
+                            Some(account) => {
+                                let spawned = std::thread::Builder::new().name("telegram-edit-media".into()).spawn(move || {
+                                    let _ = reply.send(
+                                        edit_media(&account, &conversation_id, &message_id, &file, &text, &spans, invert_media)
+                                            .map_err(refused),
+                                    );
+                                });
+                                if let Err(err) = spawned {
+                                    tracing::warn!("chatd: Telegram: edit media worker: {err}");
+                                }
+                            }
+                            None => drop(reply.send(Err(Refusal::Refused("Telegram is offline.".to_owned())))),
+                        }
+                    }
+                    command => {
+                        let stop = matches!(&command, Command::Stop);
+                        if cmd_tx.send(command).is_err() || stop {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(|err| err.to_string())?;
+
     std::thread::Builder::new()
         .name("telegram-commands".into())
         .spawn(move || {
             let account = || current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
             serve_commands(
                 &ctx,
-                inbox,
+                cmd_rx,
                 PACE,
                 |id| match account() {
                     Some(account) => sync::backfill(&account, id),
@@ -773,7 +891,10 @@ fn connect(
         pending: pending.clone(),
         dialog_pages: Mutex::default(),
     });
-    // A long flood wait at sign-on is told on the account and waited out here, in full.
+    // Complete initial sign-on before announcing `Link::Connected`, so dialogs, contacts,
+    // blocked list, unread channel checks, stories, and recovered live locations are all in place
+    // when the account becomes connected; offload held backfills onto a background worker so live
+    // updates and interactive sends never stall behind them.
     let ready = loop {
         match sync::sign_on(&account) {
             Err(fault) => match fault.flood() {
@@ -801,18 +922,23 @@ fn connect(
     if ctx.stopped() {
         return Failure::Dropped("stopped".to_owned());
     }
-    ctx.link(Link::Connected);
     account.keep_session();
-    // The asks the link was down for go before anything else: the user's open stands, and
-    // the chats the sign-on read have the rows the ask refers to.
-    for id in held_take(&ctx.account.account) {
-        sync::backfill(&account, &id);
-    }
-    // Telegram fades an account to offline by itself, so being here is said on opening the
-    // connection and then on a cadence while it lives; `here` keeps it to one call per
-    // HERE_EVERY however often it is asked. The event loop is otherwise idle, so its wait is
-    // that cadence: a tick with nothing to read sends it. Nothing outlives the connection.
+    // Announce presence right as the connection opens, before any user commands run.
     account.here();
+    ctx.link(Link::Connected);
+    // Offload held backfills onto a background worker so live updates and sends are not blocked.
+    let held = held_take(&ctx.account.account);
+    if !held.is_empty() {
+        let bg_account = account.clone();
+        let _ = std::thread::Builder::new().name("telegram-sync".into()).spawn(move || {
+            for id in held {
+                if bg_account.ctx.stopped() {
+                    break;
+                }
+                sync::backfill(&bg_account, &id);
+            }
+        });
+    }
     let mut said = Instant::now();
     let ended = loop {
         if said.elapsed() >= HERE_EVERY {
@@ -933,6 +1059,7 @@ fn offline(ctx: &Context, command: Command) {
         | Command::SetDefaultDisappearing { reply, .. }
         | Command::Leave { reply, .. }
         | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::File { reply, .. } | Command::ReorderPinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(down()))),
         Command::FolderSave { reply, .. } => drop(reply.send(Err(down()))),
         Command::FolderDelete { reply, .. } | Command::FoldersReorder { reply, .. } => drop(reply.send(Err(down()))),
@@ -1105,8 +1232,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
         Command::MarkUnread { conversation_id, .. } => mark_dialog_unread(account, &conversation_id, true),
         Command::Send { conversation_id, client_id, text, reply_to } => {
-            account.here();
-            let outcome = send_text(account, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default(), &[]);
+            let outcome = crate::sendtime::run(&client_id, || {
+                send_text(account, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default(), &[])
+            });
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -1333,6 +1461,9 @@ fn serve(account: &Arc<Account>, command: Command) {
                 filing::file(account, &conversation_id, pinned, archived, folder_add.as_deref(), folder_remove.as_deref())
                     .map_err(refused),
             );
+        }
+        Command::ReorderPinned { folder, conversation_ids, reply } => {
+            let _ = reply.send(filing::reorder_pins(account, folder.as_deref(), &conversation_ids).map_err(refused));
         }
         Command::FolderSave { folder, reply } => {
             let _ = reply.send(filing::save_folder(account, &folder).map_err(refused));
@@ -1819,9 +1950,16 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
     if read && topic.is_none() {
         sync::viewed(account, conversation, who, max_id);
     }
-    // Reading does not clear a manual unread mark. Telegram's own apps send both.
+    // Reading does not clear a manual unread mark. Only send `messages.markDialogUnread(false)`
+    // when the dialog actually carries a manual unread mark (avoiding an extra RPC on every read).
     if topic.is_none() {
-        mark_dialog_unread(account, conversation, false);
+        let needs_clear = match account.live().filed.facts.get(&who) {
+            Some(facts) => facts.unread_mark,
+            None => account.ctx.known(conversation).ok().flatten().is_some_and(|row| row.unread > 0),
+        };
+        if needs_clear {
+            mark_dialog_unread(account, conversation, false);
+        }
     }
     // The comments were read: the badge on the post they hang off goes with them.
     if let (true, who @ Who::Channel(_), Some(root)) = (read, who, topic) {
@@ -1892,7 +2030,10 @@ fn mark_dialog_unread(account: &Account, conversation: &str, unread: bool) {
     if let Err(fault) = account.ask(&request) {
         tracing::warn!("chatd: Telegram: unread mark: {fault}");
     }
-    filing::facts_changed(account, who, |facts| facts.read = !unread);
+    filing::facts_changed(account, who, |facts| {
+        facts.read = !unread;
+        facts.unread_mark = unread;
+    });
 }
 
 /// The nonce Telegram dedupes a send by, from the shell's client id.
@@ -1989,10 +2130,14 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         suggested_post: None,
         rich_message: None,
     };
-    let answer = account.ask(&request)?;
-    live::answered_scheduled(account, conversation, &plain, opts, &answer)
+    crate::sendtime::stage("prepare");
+    let answer = account.ask_send(&request)?;
+    crate::sendtime::stage("rpc");
+    let out = live::answered_scheduled(account, conversation, &plain, opts, &answer)
         .or_else(|| live::sent(account, conversation, who, &plain, reply, &answer))
-        .ok_or_else(|| Fault::Net("Telegram accepted the message but did not name it".to_owned()))
+        .ok_or_else(|| Fault::Net("Telegram accepted the message but did not name it".to_owned()));
+    crate::sendtime::stage("reconcile");
+    out
 }
 
 fn edit(account: &Account, conversation: &str, message: &str, text: &str, spans: &[protocol::Span]) -> Result<(), Fault> {
@@ -2034,7 +2179,7 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str, spans:
 }
 
 fn edit_media(
-    account: &Account,
+    account: &Arc<Account>,
     conversation: &str,
     message: &str,
     file: &protocol::OutgoingFile,
@@ -2144,9 +2289,32 @@ fn typing(account: &Account, conversation: &str, activity: protocol::Compose) {
     deliver(account, conversation, activity_action(activity, 0), Some(activity));
 }
 
-/// An upload's progress, 0 to 100. Not paced: each new percent is one signal.
-pub(super) fn show_upload(account: &Account, conversation: &str, activity: protocol::Compose, progress: i32) {
-    deliver(account, conversation, activity_action(activity, progress), None);
+/// An upload's progress, 0 to 100. Throttled to once every [`TYPING_EVERY`] (8 s) per
+/// conversation/activity and dispatched asynchronously so upload chunks never stall on
+/// `messages.SetTyping` RPCs.
+pub(super) fn show_upload(account: &Arc<Account>, conversation: &str, activity: protocol::Compose, progress: i32) {
+    let Some((who, topic)) = Who::parse(conversation) else {
+        return;
+    };
+    {
+        let mut live = account.live();
+        if live.typed.get(conversation).is_some_and(|(told, prev)| *prev == activity && told.elapsed() < TYPING_EVERY) {
+            return;
+        }
+        live.typed.retain(|_, (told, _)| told.elapsed() < TYPING_EVERY);
+        live.typed.insert(conversation.to_owned(), (Instant::now(), activity));
+    }
+    let Ok(peer) = account.input(who) else {
+        return;
+    };
+    let action = activity_action(activity, progress);
+    let account = account.clone();
+    let _ = std::thread::Builder::new()
+        .name("telegram-upload-typing".into())
+        .spawn(move || {
+            let request = tl::functions::messages::SetTyping { peer, top_msg_id: topic, action };
+            let _ = wire::call(account.wire.as_ref(), &request);
+        });
 }
 
 /// The other person should see that a recording or upload was abandoned.
@@ -2934,5 +3102,187 @@ mod call_rating_tests {
         assert_eq!(format_call_rating_comment(2, &reasons, "   "), "#echo #distorted_speech");
         assert_eq!(format_call_rating_comment(5, &reasons, "  Crystal clear  "), "Crystal clear");
         assert_eq!(format_call_rating_comment(5, &reasons, ""), "");
+    }
+
+    #[test]
+    fn previews_do_not_stall_send() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SlowPreviewWire {
+            preview_entered: Arc<AtomicBool>,
+        }
+        impl Wire for SlowPreviewWire {
+            fn invoke(&self, _dc: Option<i32>, body: Vec<u8>) -> Result<Vec<u8>, Fault> {
+                use tl::Identifiable;
+                let ctor = body.get(..4).and_then(|s| <[u8; 4]>::try_from(s).ok()).map(u32::from_le_bytes);
+                if ctor == Some(tl::functions::messages::GetHistory::CONSTRUCTOR_ID) {
+                    self.preview_entered.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_secs(2));
+                    let empty: tl::enums::messages::Messages = tl::types::messages::Messages {
+                        messages: Vec::new(),
+                        topics: Vec::new(),
+                        chats: Vec::new(),
+                        users: Vec::new(),
+                    }
+                    .into();
+                    return Ok(tl::Serializable::to_bytes(&empty));
+                }
+                if ctor == Some(tl::functions::messages::SendMessage::CONSTRUCTOR_ID) {
+                    let sent: tl::enums::Updates = tl::types::UpdateShortSentMessage {
+                        out: true,
+                        id: 77,
+                        pts: 1,
+                        pts_count: 1,
+                        date: 1_700_000_000,
+                        media: None,
+                        entities: None,
+                        ttl_period: None,
+                    }
+                    .into();
+                    return Ok(tl::Serializable::to_bytes(&sent));
+                }
+                Err(Fault::Net("unexpected rpc".into()))
+            }
+            fn events(&self) -> Option<Receiver<Event>> { None }
+            fn home(&self) -> i32 { 2 }
+            fn set_home(&self, _dc: i32) {}
+            fn signed_in(&self, _user: &tl::types::User) {}
+            fn session(&self, _user: i64, _name: &str) -> String { String::new() }
+            fn unsaved(&self) -> bool { false }
+            fn close(&self) {}
+        }
+
+        let db = std::env::temp_dir().join(format!("tinyclient-tg-previews-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = crate::store::Store::open(&db).unwrap();
+        let hub = Arc::new(crate::hub::Hub::new(store));
+        let account_key = protocol::AccountKey { network: protocol::Network::Telegram, account: "100".into() };
+        let (adapter, ctx, rx) = crate::adapters::local(account_key, hub);
+        let tx = ctx.commands.clone();
+        let row = crate::store::ConversationRow::new("u200", protocol::ConversationKind::Direct, "Alice");
+        ctx.conversation(&row).unwrap();
+
+        let preview_entered = Arc::new(AtomicBool::new(false));
+        let account = Arc::new(Account {
+            files: files::Files::start(&ctx),
+            ctx: ctx.clone(),
+            wire: Box::new(SlowPreviewWire { preview_entered: preview_entered.clone() }),
+            me: 100,
+            name: "Me".into(),
+            dir: Mutex::new(Directory::new(100)),
+            live: Mutex::default(),
+            pending: Arc::default(),
+            dialog_pages: Mutex::default(),
+        });
+        // Teach the directory about peer u200 so `account.input(Who::User(200))` succeeds.
+        let user: tl::enums::User = tl::types::User {
+            is_self: false,
+            contact: true,
+            mutual_contact: true,
+            deleted: false,
+            bot: false,
+            bot_chat_history: false,
+            bot_nochats: false,
+            verified: false,
+            restricted: false,
+            min: false,
+            bot_inline_geo: false,
+            support: false,
+            scam: false,
+            apply_min_photo: false,
+            fake: false,
+            bot_attach_menu: false,
+            premium: false,
+            attach_menu_enabled: false,
+            bot_can_edit: false,
+            close_friend: false,
+            stories_hidden: false,
+            stories_unavailable: false,
+            contact_require_premium: false,
+            bot_business: false,
+            bot_has_main_app: false,
+            bot_forum_view: false,
+            bot_forum_can_manage_topics: false,
+            bot_can_manage_bots: false,
+            bot_guard: false,
+            bot_guestchat: false,
+            id: 200,
+            access_hash: Some(12345),
+            first_name: Some("Alice".into()),
+            last_name: None,
+            username: None,
+            phone: None,
+            photo: None,
+            status: None,
+            bot_info_version: None,
+            restriction_reason: None,
+            bot_inline_placeholder: None,
+            lang_code: None,
+            emoji_status: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            bot_active_users: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+        }
+        .into();
+        account.learn(&[user], &[]);
+
+        // Mirror `start()` routing: Previews -> preview worker, Send -> send worker.
+        let (send_tx, send_rx) = std::sync::mpsc::channel::<Command>();
+        let (preview_tx, preview_rx) = std::sync::mpsc::channel::<Vec<String>>();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel::<Result<protocol::Message, Fault>>();
+
+        let send_acct = account.clone();
+        let send_worker = std::thread::spawn(move || {
+            while let Ok(Command::Send { conversation_id, client_id, text, reply_to }) = send_rx.recv() {
+                let res = send_text(&send_acct, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default(), &[]);
+                let _ = sent_tx.send(res);
+            }
+        });
+        let prev_acct = account.clone();
+        let prev_worker = std::thread::spawn(move || {
+            while let Ok(ids) = preview_rx.recv() {
+                sync::previews(&prev_acct, &ids);
+            }
+        });
+        let router = std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    cmd @ Command::Send { .. } => { let _ = send_tx.send(cmd); }
+                    Command::Previews(ids) => { let _ = preview_tx.send(ids); }
+                    Command::Stop => break,
+                    _ => {}
+                }
+            }
+        });
+
+        tx.send(Command::Previews(vec!["u200".into(), "u200".into()])).unwrap();
+        let wait_preview = Instant::now();
+        while !preview_entered.load(Ordering::SeqCst) && wait_preview.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(preview_entered.load(Ordering::SeqCst), "preview worker should be mid-fetch");
+
+        let began = Instant::now();
+        tx.send(Command::Send {
+            conversation_id: "u200".into(),
+            client_id: "tg-fast-1".into(),
+            text: "hi".into(),
+            reply_to: None,
+        })
+        .unwrap();
+        let msg = sent_rx.recv_timeout(Duration::from_millis(500)).expect("Send must not stall behind Previews").unwrap();
+        assert_eq!(msg.id, "77");
+        assert!(began.elapsed() < Duration::from_millis(500), "Send waited {:?}", began.elapsed());
+
+        drop(adapter);
+        let _ = tx.send(Command::Stop);
+        let _ = router.join();
+        let _ = send_worker.join();
+        let _ = prev_worker.join();
     }
 }

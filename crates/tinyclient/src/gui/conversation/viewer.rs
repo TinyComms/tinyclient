@@ -9,15 +9,16 @@ use super::tokens;
 use super::video::{self, Reel};
 use super::Pane;
 use crate::gui::anim::{self, Play};
-use crate::gui::components::{tip, Avatar};
+use crate::gui::components::place::{placed, Layer, Place};
+use crate::gui::components::{menu, menu_item, menu_separator, tip, Avatar};
 use crate::gui::chrome;
-use crate::gui::layout::TOP_BAR;
+use crate::gui::layout::{drags_window, TOP_BAR};
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::now;
 use gpui::{
-    anchored, canvas, deferred, div, point, prelude::*, px, AnyElement, ClipboardItem, Context, Div, ElementId, Image,
-    ImageFormat, KeyDownEvent, MouseButton, ObjectFit, Pixels, Point, Stateful, Window,
+    anchored, canvas, deferred, div, point, prelude::*, px, relative, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId,
+    Image, ImageFormat, KeyDownEvent, MouseButton, ObjectFit, Pixels, Point, Stateful, Window,
 };
 use std::cell::Cell;
 use protocol::{Attachment, Message};
@@ -108,6 +109,9 @@ pub struct Viewer {
     spanned: Option<(u64, u64)>,
     /// Selected alternative quality file id (`Attachment::variants`), or `None` for the original.
     quality: Option<String>,
+    /// Overflow `…` menu open on narrow desktop viewports.
+    menu: bool,
+    menu_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 /// Full-screen text/code viewer opened from "Expand" on an inline text attachment preview (#385).
@@ -166,8 +170,8 @@ fn bar_button(id: impl Into<ElementId>, which: Icon) -> Stateful<Div> {
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .hover(|style| style.bg(gpui::rgba(0xffffff1a)))
-        .active(|style| style.bg(gpui::rgba(0xffffff29)))
+        .hover(|style| style.bg(theme::media_hover()))
+        .active(|style| style.bg(theme::media_pressed()))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(icon(which, 16., theme::on_media()))
 }
@@ -236,6 +240,8 @@ impl Pane {
             reel: None,
             spanned: None,
             quality: None,
+            menu: false,
+            menu_anchor: Rc::new(Cell::new(None)),
         });
         self.hover = None;
         window.focus(&self.focus, cx);
@@ -540,7 +546,7 @@ impl Pane {
             .unwrap_or_else(|| (protocol::MediaFile::new("", protocol::MediaKind::Video), Vec::new()));
         let chosen_quality = self.viewer.as_ref().and_then(|v| v.quality.clone());
         let quality_row = (!variants.1.is_empty()).then(|| {
-            let mut row = div().flex().items_center().gap(px(4.));
+            let mut row = div().flex().flex_wrap().items_center().gap(px(4.));
             let orig_label = if variants.0.height > 0 { format!("{}p", variants.0.height) } else { "Original".to_owned() };
             let orig_active = chosen_quality.is_none();
             row = row.child(
@@ -600,7 +606,8 @@ impl Pane {
         };
         let scrub = div()
             .id("viewer-scrub")
-            .w(px(160.))
+            .flex_1()
+            .min_w(px(60.))
             .h(px(28.))
             .flex()
             .items_center()
@@ -622,7 +629,7 @@ impl Pane {
             .child(
                 div()
                     .relative()
-                    .w(px(160.))
+                    .w_full()
                     .h(px(4.))
                     .rounded_full()
                     .bg(theme::hover())
@@ -633,12 +640,12 @@ impl Pane {
                                 .left_0()
                                 .top_0()
                                 .h(px(4.))
-                                .w(px((160. * buffered_fraction).clamp(0., 160.)))
+                                .w(relative(buffered_fraction.clamp(0., 1.)))
                                 .rounded_full()
                                 .bg(theme::accent_soft()),
                         )
                     })
-                    .child(div().absolute().left_0().top_0().h(px(4.)).w(px((160. * fraction).clamp(0., 160.))).rounded_full().bg(theme::accent()))
+                    .child(div().absolute().left_0().top_0().h(px(4.)).w(relative(fraction.clamp(0., 1.))).rounded_full().bg(theme::accent()))
                     .child(canvas(
                         move |bounds, _, _| remembered.set((f32::from(bounds.origin.x), f32::from(bounds.size.width).max(1.))),
                         |_, _, _, _| {},
@@ -655,17 +662,19 @@ impl Pane {
             .bg(theme::overlay())
             .flex()
             .flex_col()
-            .gap(px(2.))
+            .gap(px(4.))
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .gap(px(8.))
+                    .gap_x(px(8.))
+                    .gap_y(px(4.))
                     .child(play)
-                    .child(div().type_micro().text_color(theme::text()).child(format!("{at} / {length}")))
+                    .child(div().flex_none().whitespace_nowrap().type_micro().text_color(theme::text()).child(format!("{at} / {length}")))
                     .child(scrub)
                     .child(sound)
-                    .child(div().type_micro().text_color(theme::text_soft()).child(volume))
+                    .child(div().flex_none().whitespace_nowrap().type_micro().text_color(theme::text_soft()).child(volume))
                     .children(quality_row),
             )
             .child(div().type_micro().text_color(theme::text_faint()).child(status_line))
@@ -923,7 +932,7 @@ impl Pane {
                 div().max_w_full().when(!phone, |line| line.truncate()).when(phone, |line| line.line_clamp(2).text_center()).text_color(theme::on_media()).child(said)
             }))
             .children(note.map(|note| {
-                let line = div().id("viewer-note").text_color(theme::accent_text());
+                let line = div().id("viewer-note").text_color(theme::accent_on_media());
                 match saved.clone() {
                     Some(path) => line
                         .cursor_pointer()
@@ -945,7 +954,7 @@ impl Pane {
             .flex()
             .flex_col()
             // A phone's viewer is the whole screen, black, as its own photos are.
-            .bg(if phone { gpui::rgb(0x000000) } else { tokens::scrim() })
+            .bg(if phone { theme::media_stage() } else { tokens::scrim() })
             .font_family(theme::FONT)
             .text_color(theme::on_media())
             .occlude()
@@ -976,20 +985,92 @@ impl Pane {
             }))
             .child(bar)
             .child(stage)
-            .child(footer);
+            .child(footer)
+            .children(self.viewer_more_menu(fit, window, cx));
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(layer)).priority(2).into_any_element())
+    }
+
+    fn viewer_more_menu(&self, fit: f32, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let viewer = self.viewer.as_ref().filter(|v| v.menu)?;
+        let anchor = viewer.menu_anchor.get()?;
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(180.);
+        let items = menu()
+            .w(px(220.0_f32.min(max_w)))
+            .child(menu_item("viewer-menu-zoom-out", Some("icons/minus.svg"), "Zoom out", Some("−")).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    if let Some(v) = this.viewer.as_mut() {
+                        v.menu = false;
+                    }
+                    this.zoom_step(false, fit, cx);
+                },
+            )))
+            .child(menu_item("viewer-menu-fit", Some("icons/maximize.svg"), "Fit to window", Some("⌘0")).on_click(cx.listener(
+                |this, _, _, cx| {
+                    if let Some(v) = this.viewer.as_mut() {
+                        v.menu = false;
+                    }
+                    this.zoom(None, cx);
+                },
+            )))
+            .child(menu_item("viewer-menu-actual", None, "Actual size (1:1)", Some("⌘1")).on_click(cx.listener(
+                |this, _, _, cx| {
+                    if let Some(v) = this.viewer.as_mut() {
+                        v.menu = false;
+                    }
+                    this.zoom(Some(1.), cx);
+                },
+            )))
+            .child(menu_separator())
+            .child(menu_item("viewer-menu-save-as", Some("icons/download.svg"), "Save as…", Some("⇧⌘S")).on_click(cx.listener(
+                |this, _, _, cx| {
+                    if let Some(v) = this.viewer.as_mut() {
+                        v.menu = false;
+                    }
+                    this.save_viewed_as(cx);
+                },
+            )))
+            .child(menu_item("viewer-menu-look", Some("icons/image.svg"), crate::host::QUICK_LOOK, Some("Space")).on_click(
+                cx.listener(|this, _, _, cx| {
+                    if let Some(v) = this.viewer.as_mut() {
+                        v.menu = false;
+                    }
+                    this.open_viewed(false, cx);
+                }),
+            ))
+            .child(menu_item("viewer-menu-preview", Some("icons/external-link.svg"), crate::host::OPEN_PICTURE, None).on_click(
+                cx.listener(|this, _, _, cx| {
+                    if let Some(v) = this.viewer.as_mut() {
+                        v.menu = false;
+                    }
+                    this.open_viewed(true, cx);
+                }),
+            ))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if let Some(v) = this.viewer.as_mut() {
+                    v.menu = false;
+                    cx.notify();
+                }
+            }));
+        Some(placed("viewer-more-menu", Place::Below(anchor), Layer::Menu, window, items))
     }
 
     /// The desktop's bar: who sent it, then zoom, copy, save, Quick Look, Preview and close.
     #[allow(clippy::too_many_arguments)]
     fn desktop_bar(&self, message: &Rc<Message>, sender: &str, facts: &[String], asked: Option<f32>, zoom: f32, fit: f32, window: &Window, cx: &mut Context<Self>) -> Div {
         let sender = sender.to_owned();
+        let corner = chrome::corner_pad(window, 12.);
+        let wide = f32::from(window.viewport_size().width);
+        let compact = wide - corner < 600.;
+        let menu_anchor = self.viewer.as_ref().map(|v| v.menu_anchor.clone());
+        let menu_open = self.viewer.as_ref().is_some_and(|v| v.menu);
         div()
             .h(px(TOP_BAR))
             .flex_none()
+            .overflow_hidden()
             // Clear of the traffic lights on macOS; standard edge padding on Windows/Linux.
             .pl(px(if cfg!(target_os = "macos") { 84. } else { 16. }))
-            .pr(px(chrome::corner_pad(window, 12.)))
+            .pr(px(corner))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -1003,11 +1084,13 @@ impl Pane {
                     .child(div().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::on_media()).child(sender.clone()))
                     .child(div().truncate().type_micro().font_weight(theme::REGULAR).text_color(theme::on_media_soft()).child(facts.join(" · "))),
             )
-            .child(
-                bar_button("zoom-out", Icon::ZoomOut)
-                    .tooltip(tip("Zoom out", Some("−")))
-                    .on_click(cx.listener(move |this, _, _, cx| this.zoom_step(false, fit, cx))),
-            )
+            .when(!compact, |bar| {
+                bar.child(
+                    bar_button("zoom-out", Icon::ZoomOut)
+                        .tooltip(tip("Zoom out", Some("−")))
+                        .on_click(cx.listener(move |this, _, _, cx| this.zoom_step(false, fit, cx))),
+                )
+            })
             .child(
                 div()
                     .id("zoom")
@@ -1021,7 +1104,7 @@ impl Pane {
                     .type_ui()
                     .text_color(theme::on_media())
                     .cursor_pointer()
-                    .hover(|style| style.bg(gpui::rgba(0xffffff1a)))
+                    .hover(|style| style.bg(theme::media_hover()))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .tooltip(tip(if asked.is_some() { "Fit to window" } else { "Actual size" }, Some(if asked.is_some() { "⌘0" } else { "⌘1" })))
                     .on_click(cx.listener(move |this, _, _, cx| this.zoom(if asked.is_some() { None } else { Some(1.) }, cx)))
@@ -1032,31 +1115,33 @@ impl Pane {
                     .tooltip(tip("Zoom in", Some("+")))
                     .on_click(cx.listener(move |this, _, _, cx| this.zoom_step(true, fit, cx))),
             )
-            .child(
-                bar_button("fit", Icon::Fit)
-                    .tooltip(tip("Fit to window", Some("⌘0")))
-                    .on_click(cx.listener(|this, _, _, cx| this.zoom(None, cx))),
-            )
-            .child(
-                div()
-                    .id("actual")
-                    .h(px(32.))
-                    .px(px(8.))
-                    .flex_none()
-                    .rounded(px(theme::R_CONTROL))
-                    .flex()
-                    .items_center()
-                    .type_small()
-                    .font_weight(theme::MEDIUM)
-                    .text_color(theme::on_media())
-                    .cursor_pointer()
-                    .hover(|style| style.bg(gpui::rgba(0xffffff1a)))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .tooltip(tip("Actual size", Some("⌘1")))
-                    .on_click(cx.listener(|this, _, _, cx| this.zoom(Some(1.), cx)))
-                    .child("1:1"),
-            )
-            .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).flex_none().bg(gpui::rgba(0xffffff24)))
+            .when(!compact, |bar| {
+                bar.child(
+                    bar_button("fit", Icon::Fit)
+                        .tooltip(tip("Fit to window", Some("⌘0")))
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom(None, cx))),
+                )
+                .child(
+                    div()
+                        .id("actual")
+                        .h(px(32.))
+                        .px(px(8.))
+                        .flex_none()
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .type_small()
+                        .font_weight(theme::MEDIUM)
+                        .text_color(theme::on_media())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::media_hover()))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .tooltip(tip("Actual size", Some("⌘1")))
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom(Some(1.), cx)))
+                        .child("1:1"),
+                )
+                .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).flex_none().bg(theme::media_hairline()))
+            })
             .child(
                 bar_button("copy", Icon::Copy)
                     .tooltip(tip("Copy image", Some("⌘C")))
@@ -1067,21 +1152,44 @@ impl Pane {
                     .tooltip(tip("Save to Downloads", Some("⌘S")))
                     .on_click(cx.listener(|this, _, _, cx| this.save_viewed(cx))),
             )
-            .child(
-                bar_button("save-as", Icon::Folder)
-                    .tooltip(tip("Save as…", Some("⇧⌘S")))
-                    .on_click(cx.listener(|this, _, _, cx| this.save_viewed_as(cx))),
-            )
-            .child(
-                bar_button("look", Icon::Eye)
-                    .tooltip(tip(crate::host::QUICK_LOOK, Some("Space")))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_viewed(false, cx))),
-            )
-            .child(
-                bar_button("preview", Icon::External)
-                    .tooltip(tip(crate::host::OPEN_PICTURE, None))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_viewed(true, cx))),
-            )
+            .when(!compact, |bar| {
+                bar.child(
+                    bar_button("save-as", Icon::Folder)
+                        .tooltip(tip("Save as…", Some("⇧⌘S")))
+                        .on_click(cx.listener(|this, _, _, cx| this.save_viewed_as(cx))),
+                )
+                .child(
+                    bar_button("look", Icon::Eye)
+                        .tooltip(tip(crate::host::QUICK_LOOK, Some("Space")))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_viewed(false, cx))),
+                )
+                .child(
+                    bar_button("preview", Icon::External)
+                        .tooltip(tip(crate::host::OPEN_PICTURE, None))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_viewed(true, cx))),
+                )
+            })
+            .when(compact, |bar| {
+                let more = bar_button("viewer-more", Icon::More)
+                    .relative()
+                    .when(menu_open, |b| b.bg(theme::media_pressed()))
+                    .tooltip(tip("More options", None))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(v) = this.viewer.as_mut() {
+                            v.menu = !v.menu;
+                            cx.notify();
+                        }
+                    }))
+                    .children(menu_anchor.map(|anchor| {
+                        canvas(move |bounds, _, _| anchor.set(Some(bounds)), |_, _, _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                    }));
+                bar.child(more)
+            })
             .child(
                 bar_button("close", Icon::Close)
                     .tooltip(tip("Close", Some("esc")))
@@ -1261,60 +1369,64 @@ impl Pane {
         let copied = viewer.copied;
         let download_att = viewer.attachment.clone();
         let text_body = viewer.text.clone();
-        let bar = div()
-            .flex_none()
-            .h(px(TOP_BAR))
-            .px(px(16.))
-            .border_b_1()
-            .border_color(theme::hairline())
-            .bg(theme::canvas())
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(10.))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(icon(media::file_icon(&viewer.attachment), 16., theme::text_soft()))
-                    .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(name))
-                    .when(!subtitle.is_empty(), |row| {
-                        row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child(subtitle))
-                    }),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(
-                        bar_button("tv-copy", if copied { Icon::Check } else { Icon::Copy })
-                            .tooltip(tip(if copied { "Copied" } else { "Copy text" }, Some("⌘C")))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
-                                if let Some(v) = this.text_viewer.as_mut() {
-                                    v.copied = true;
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .children(viewer.download.then(|| {
-                        bar_button("tv-download", Icon::Download)
-                            .tooltip(tip("Download", None))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.fetch_then(&download_att, super::Then::Open, cx);
-                            }))
-                    }))
-                    .child(
-                        bar_button("tv-close", Icon::Close)
-                            .tooltip(tip("Close", Some("Esc")))
-                            .on_click(cx.listener(|this, _, _, cx| this.close_text_viewer(cx))),
-                    ),
-            );
+        let bar = drags_window(
+            div()
+                .flex_none()
+                .h(px(TOP_BAR))
+                .overflow_hidden()
+                .pl(px(if cfg!(target_os = "macos") { 84. } else { 16. }))
+                .pr(px(chrome::corner_pad(window, 12.)))
+                .border_b_1()
+                .border_color(theme::hairline())
+                .bg(theme::canvas())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(icon(media::file_icon(&viewer.attachment), 16., theme::text_soft()))
+                        .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(name))
+                        .when(!subtitle.is_empty(), |row| {
+                            row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child(subtitle))
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(
+                            bar_button("tv-copy", if copied { Icon::Check } else { Icon::Copy })
+                                .tooltip(tip(if copied { "Copied" } else { "Copy text" }, Some("⌘C")))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                    if let Some(v) = this.text_viewer.as_mut() {
+                                        v.copied = true;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .children(viewer.download.then(|| {
+                            bar_button("tv-download", Icon::Download)
+                                .tooltip(tip("Download", None))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.fetch_then(&download_att, super::Then::Open, cx);
+                                }))
+                        }))
+                        .child(
+                            bar_button("tv-close", Icon::Close)
+                                .tooltip(tip("Close", Some("Esc")))
+                                .on_click(cx.listener(|this, _, _, cx| this.close_text_viewer(cx))),
+                        ),
+                ),
+        );
         let body = div()
             .id("text-viewer-body")
             .flex_1()

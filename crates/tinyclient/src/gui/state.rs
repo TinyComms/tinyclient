@@ -7,7 +7,7 @@ use super::autostart;
 use super::layout::{self, Slots};
 use super::sidebar::{self, pages::PAGE, Mode};
 use super::{call, composer, conversation, people};
-use crate::client::ask;
+use crate::client::{ask, ask_async};
 use gpui::{Context, FocusHandle, Subscription, Task, Window};
 use protocol::{
     AccountKey, AccountStatus, AppCommand, Call, Change, CommandKind, Conversation, ErrorCode, Group, Key, Link,
@@ -412,7 +412,7 @@ impl Shell {
         }
         let request = Request::Commands { conversation: conversation.clone(), query: String::new(), kind: Some(kind) };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let Ok(Response::Commands { commands }) = answer else {
                 // A refusal or a dropped answer must not stick, or the next Apps open never asks again.
                 let _ = this.update(cx, |this, _| match kind {
@@ -468,7 +468,7 @@ impl Shell {
             files: Vec::new(),
         };
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let answer = ask_async(request).await;
             let detail = match answer {
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Err(_) => Some("Couldn't run that command.".to_owned()),
@@ -498,7 +498,8 @@ impl Shell {
         .detach();
     }
 
-    /// Runs `work` off the main thread and hands its answer back to the shell.
+    /// Runs `work` on a dedicated worker thread (never occupying GPUI's background executor pool)
+    /// and hands its answer back to the shell.
     pub(super) fn off_thread<R: Send + 'static>(
         &self,
         cx: &mut Context<Self>,
@@ -506,7 +507,17 @@ impl Shell {
         then: impl FnOnce(&mut Shell, R, &mut Context<Shell>) + 'static,
     ) {
         cx.spawn(async move |this, cx| {
-            let answer = cx.background_executor().spawn(async move { work() }).await;
+            let (send, receive) = futures_channel::oneshot::channel();
+            let spawned = std::thread::Builder::new().name("tinyclient-ipc".into()).spawn(move || {
+                let _ = send.send(work());
+            });
+            if let Err(err) = spawned {
+                tracing::warn!("tinyclient: failed to spawn worker thread: {err}");
+                return;
+            }
+            let Ok(answer) = receive.await else {
+                return;
+            };
             let _ = this.update(cx, |this, cx| then(this, answer, cx));
         })
         .detach();

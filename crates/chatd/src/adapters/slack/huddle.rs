@@ -18,10 +18,10 @@
 //! not known yet, as any message's authors are.
 
 use super::people::User;
-use super::{message, Slack, State};
+use super::{message, Slack};
 use protocol::{Activity, ActivityKind, Occupant};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// The events, by `type`: someone joins a huddle, leaves it, or it changes.
 pub(super) const JOIN: &str = "sh_room_join";
@@ -206,47 +206,67 @@ impl Slack {
     /// now. Every row that listed one is emptied; Slack's next word, or the next page read,
     /// says what is running.
     pub(super) fn rooms_forgotten(&self) {
-        let mut state = self.state();
-        let (mut forgotten, mut moved): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
-        for (channel, room) in state.rooms.drain() {
-            moved.extend(room.people);
-            forgotten.push(channel);
-        }
+        let (forgotten, moved) = {
+            let mut state = self.state();
+            let (mut forgotten, mut moved): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+            for (channel, room) in state.rooms.drain() {
+                moved.extend(room.people);
+                forgotten.push(channel);
+            }
+            (forgotten, moved)
+        };
         for channel in &forgotten {
-            self.room_told(channel, &state);
+            self.room_told(channel);
         }
-        self.huddles_told(&moved, &state);
+        self.huddles_told(&moved);
     }
 
     /// "In a huddle" for someone: as their profile says, or because a huddle lists them. With the
     /// conversation it is in, and when it started, where a huddle does, so that "In a huddle" on
     /// them opens that conversation.
     pub(super) fn huddling(&self, id: &str, user: &User) -> Option<Activity> {
-        let state = self.state();
-        self.huddling_in(id, user, &state.rooms)
+        let sat_in = {
+            let state = self.state();
+            state
+                .rooms
+                .iter()
+                .find_map(|(channel, room)| room.people.iter().any(|who| who == id).then(|| (channel.clone(), room.started)))
+        };
+        self.build_huddle_activity(user.huddle, sat_in)
     }
 
-    fn huddling_in(&self, id: &str, user: &User, rooms: &HashMap<String, Room>) -> Option<Activity> {
-        let sat_in = rooms.iter().find_map(|(channel, room)| room.people.iter().any(|who| who == id).then_some((channel.as_str(), room.started)));
+    fn build_huddle_activity(&self, user_huddle: bool, sat_in: Option<(String, i64)>) -> Option<Activity> {
         let Some((channel, started)) = sat_in else {
-            return user.huddle.then(|| Activity::new(ActivityKind::Huddle, ""));
+            return user_huddle.then(|| Activity::new(ActivityKind::Huddle, ""));
         };
-        let mut activity = Activity::new(ActivityKind::Huddle, self.ctx.known(channel).ok().flatten().map_or_else(String::new, |row| row.title));
-        activity.conversation = Some(self.ctx.key(channel));
+        let title = self.ctx.known(&channel).ok().flatten().map_or_else(String::new, |row| row.title);
+        let mut activity = Activity::new(ActivityKind::Huddle, title);
+        activity.conversation = Some(self.ctx.key(&channel));
         // A start further back than a day is not believed: a huddle is not run that long.
         activity.started = (started > 0 && crate::hub::now().saturating_sub(started) <= DAY).then_some(started);
         Some(activity)
     }
 
     /// "In a huddle" said again for those who may have moved between a huddle and none.
-    fn huddles_told(&self, moved: &[String], state: &State) {
+    fn huddles_told(&self, moved: &[String]) {
         let mine = self.me.get().map(String::as_str);
-        for id in moved {
-            let Some(user) = state.users.get(id) else {
-                continue;
-            };
-            let owned = mine == Some(id.as_str()) || state.partners.contains_key(id);
-            self.ctx.activity(id, &user.emoji, self.huddling_in(id, user, &state.rooms), owned);
+        let updates: Vec<(String, String, bool, bool, Option<(String, i64)>)> = {
+            let state = self.state();
+            moved
+                .iter()
+                .filter_map(|id| {
+                    let user = state.users.get(id)?;
+                    let owned = mine == Some(id.as_str()) || state.partners.contains_key(id);
+                    let sat_in = state.rooms.iter().find_map(|(channel, room)| {
+                        room.people.iter().any(|who| who == id).then(|| (channel.clone(), room.started))
+                    });
+                    Some((id.clone(), user.emoji.clone(), owned, user.huddle, sat_in))
+                })
+                .collect()
+        };
+        for (id, emoji, owned, user_huddle, sat_in) in updates {
+            let activity = self.build_huddle_activity(user_huddle, sat_in);
+            self.ctx.activity(&id, &emoji, activity, owned);
         }
     }
 
@@ -310,50 +330,49 @@ impl Slack {
         drop(state);
         // Their names and faces for the row, asked of Slack as any message's authors are.
         self.users(&people);
-        let state = self.state();
-        self.room_told(channel, &state);
-        self.huddles_told(&moved, &state);
+        self.room_told(channel);
+        self.huddles_told(&moved);
     }
 
     /// A conversation the user is no longer in: the huddle that ran there is not known here any
     /// more, and nobody is said to be in it. Said while its row still stands, so the row is
     /// emptied before it goes.
     pub(super) fn room_forgotten(&self, channel: &str) {
-        let mut state = self.state();
-        let Some(room) = state.rooms.remove(channel) else { return };
-        drop(state);
-        let state = self.state();
-        self.room_told(channel, &state);
-        self.huddles_told(&room.people, &state);
+        let Some(room) = self.state().rooms.remove(channel) else { return };
+        self.room_told(channel);
+        self.huddles_told(&room.people);
     }
 
     /// Who is in the huddle in `channel`, for its row, as remembered now. Someone not yet named
     /// goes by their id, as the sender of a message does.
-    fn room_told(&self, channel: &str, state: &State) {
-        let people: Vec<Occupant> = state
-            .rooms
-            .get(channel)
-            .into_iter()
-            .flat_map(|room| &room.people)
-            .map(|id| {
-                let user = state.users.get(id);
-                Occupant {
-                    person: self.ctx.key(id),
-                    name: user.map_or(id.as_str(), |user| user.name.as_str()).to_owned(),
-                    avatar: user.and_then(User::avatar),
-                    muted: false,
-                    deafened: false,
-                    server_muted: false,
-                    server_deafened: false,
-                    suppressed: false,
-                    streaming: false,
-                    camera: false,
-                    speaking: false,
-                    hand_raised: false,
-                    is_channel: false,
-                }
-            })
-            .collect();
+    fn room_told(&self, channel: &str) {
+        let people: Vec<Occupant> = {
+            let state = self.state();
+            state
+                .rooms
+                .get(channel)
+                .into_iter()
+                .flat_map(|room| &room.people)
+                .map(|id| {
+                    let user = state.users.get(id);
+                    Occupant {
+                        person: self.ctx.key(id),
+                        name: user.map_or(id.as_str(), |user| user.name.as_str()).to_owned(),
+                        avatar: user.and_then(User::avatar),
+                        muted: false,
+                        deafened: false,
+                        server_muted: false,
+                        server_deafened: false,
+                        suppressed: false,
+                        streaming: false,
+                        camera: false,
+                        speaking: false,
+                        hand_raised: false,
+                        is_channel: false,
+                    }
+                })
+                .collect()
+        };
         let total = people.len() as u32;
         self.ctx.occupants(channel, people, total);
     }

@@ -2,7 +2,7 @@
 //! from every view and sends `Watch`; the presence and typing that come back are kept here,
 //! bounded, for the views to look up as they draw. Avatar files are asked for the same way.
 
-use crate::client::ask;
+use crate::client::ask_async;
 use crate::view::now;
 use gpui::App;
 use protocol::{
@@ -36,7 +36,7 @@ const VOICE_LIMIT: usize = 256;
 /// Runs one request off the main thread and hands the answer back on it.
 pub fn ask_later(cx: &mut App, request: Request, then: impl FnOnce(io::Result<Response>, &mut App) + 'static) {
     cx.spawn(async move |cx| {
-        let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+        let answer = ask_async(request).await;
         cx.update(|cx| then(answer, cx));
     })
     .detach();
@@ -462,7 +462,7 @@ impl Hub {
                     Due::Nothing => break,
                     Due::Send(watching) => {
                         let request = Request::Watch(watching);
-                        let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                        let answer = ask_async(request).await;
                         match answer {
                             Ok(Response::Watching { people, typists }) => {
                                 cx.update(|cx| hub.watching(people, typists, cx));

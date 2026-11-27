@@ -227,14 +227,22 @@ pub fn call_in<R: RemoteCall>(wire: &dyn Wire, dc: Option<i32>, request: &R) -> 
 /// Waits at most this long for one flood wait before the one retry. A longer wait is told to
 /// the user at once and nothing is retried; no wait is ever cut short.
 pub const PATIENCE: u64 = 60;
+/// Interactive send flood-wait cap: fails cleanly with the wait duration instead of sleeping
+/// 60 s into the send timeout.
+pub const SEND_PATIENCE: u64 = 8;
 
-/// A request with Telegram's flood waits honored: a wait up to [`PATIENCE`] is slept in full
-/// (`pause` is the adapter's interruptible wait and answers true when it was stopped) and the
-/// request made once more; a longer one is the answer.
-pub fn patient<R: RemoteCall>(wire: &dyn Wire, pause: &dyn Fn(Duration) -> bool, request: &R) -> Result<R::Return, Fault> {
+/// A request with Telegram's flood waits honored up to `max_wait` seconds: a wait `<= max_wait`
+/// is slept in full (`pause` is the adapter's interruptible wait and answers true when it was
+/// stopped) and the request made once more; a longer one is returned immediately without sleeping.
+pub fn patient_capped<R: RemoteCall>(
+    wire: &dyn Wire,
+    pause: &dyn Fn(Duration) -> bool,
+    request: &R,
+    max_wait: u64,
+) -> Result<R::Return, Fault> {
     match call(wire, request) {
         Err(fault) => match fault.flood() {
-            Some(seconds) if seconds <= PATIENCE => {
+            Some(seconds) if seconds <= max_wait => {
                 if pause(Duration::from_secs(seconds)) {
                     return Err(fault);
                 }
@@ -244,6 +252,13 @@ pub fn patient<R: RemoteCall>(wire: &dyn Wire, pause: &dyn Fn(Duration) -> bool,
         },
         answered => answered,
     }
+}
+
+/// A request with Telegram's flood waits honored: a wait up to [`PATIENCE`] is slept in full
+/// (`pause` is the adapter's interruptible wait and answers true when it was stopped) and the
+/// request made once more; a longer one is the answer.
+pub fn patient<R: RemoteCall>(wire: &dyn Wire, pause: &dyn Fn(Duration) -> bool, request: &R) -> Result<R::Return, Fault> {
+    patient_capped(wire, pause, request, PATIENCE)
 }
 
 #[cfg(test)]
@@ -312,5 +327,66 @@ mod tests {
         assert!(group.words().contains("aren't allowed in this group"), "{}", group.words());
         let round = Fault::Rpc { code: 403, name: "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN".into(), value: None };
         assert!(round.words().contains("aren't allowed in this group"), "{}", round.words());
+    }
+
+    #[test]
+    fn patient_capped_does_not_sleep_past_max_wait_on_flood_wait_45() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        struct FloodWire {
+            calls: AtomicUsize,
+            flood_secs: u32,
+        }
+        impl Wire for FloodWire {
+            fn invoke(&self, _dc: Option<i32>, _body: Vec<u8>) -> Result<Vec<u8>, Fault> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    return Err(Fault::Rpc { code: 420, name: "FLOOD_WAIT".into(), value: Some(self.flood_secs) });
+                }
+                Ok(tl::Serializable::to_bytes(&true))
+            }
+            fn events(&self) -> Option<Receiver<Event>> { None }
+            fn home(&self) -> i32 { 2 }
+            fn set_home(&self, _dc: i32) {}
+            fn signed_in(&self, _user: &tl::types::User) {}
+            fn session(&self, _user: i64, _name: &str) -> String { String::new() }
+            fn unsaved(&self) -> bool { false }
+            fn close(&self) {}
+        }
+
+        let req = tl::functions::account::UpdateStatus { offline: false };
+
+        // FLOOD_WAIT_45 exceeds SEND_PATIENCE (8s): must NOT call pause and must NOT retry.
+        let wire = FloodWire { calls: AtomicUsize::new(0), flood_secs: 45 };
+        let slept = Mutex::new(Vec::<Duration>::new());
+        let outcome = patient_capped(
+            &wire,
+            &|d| {
+                slept.lock().unwrap().push(d);
+                false
+            },
+            &req,
+            SEND_PATIENCE,
+        );
+        assert_eq!(outcome, Err(Fault::Rpc { code: 420, name: "FLOOD_WAIT".into(), value: Some(45) }));
+        assert_eq!(wire.calls.load(Ordering::SeqCst), 1, "must not retry past max_wait");
+        assert!(slept.lock().unwrap().is_empty(), "must not sleep past max_wait");
+
+        // FLOOD_WAIT_5 is within SEND_PATIENCE (8s): pauses once for 5s and retries.
+        let wire_ok = FloodWire { calls: AtomicUsize::new(0), flood_secs: 5 };
+        let slept_ok = Mutex::new(Vec::<Duration>::new());
+        let outcome_ok = patient_capped(
+            &wire_ok,
+            &|d| {
+                slept_ok.lock().unwrap().push(d);
+                false
+            },
+            &req,
+            SEND_PATIENCE,
+        );
+        assert_eq!(outcome_ok, Ok(true));
+        assert_eq!(wire_ok.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*slept_ok.lock().unwrap(), vec![Duration::from_secs(5)]);
     }
 }

@@ -382,6 +382,10 @@ pub struct State {
     menu: Option<Menu>,
     /// Which security indicator opened `Menu::Security`: the panel opens beside it.
     security_at: security::Place,
+    /// Captured window bounds for placing call popovers through `components::place::placed`.
+    pub(super) dock_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    pub(super) bar_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    pub(super) security_bounds: [Rc<std::cell::Cell<Option<Bounds<Pixels>>>>; 3],
     /// Whether the security panel's "More about this call" disclosure is open.
     security_more: bool,
     /// When a click outside closed the menu, so the same click on its button does not reopen it.
@@ -1143,14 +1147,14 @@ fn system_open(url: &str) -> Result<(), String> {
 }
 
 /// The dock, in the shape of the sidebar's slot (`layout::Slots::call_dock`).
-pub(super) fn dock(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> Option<AnyElement> {
+pub(super) fn dock(shell: &Shell, window: &mut Window, cx: &mut Context<Shell>) -> Option<AnyElement> {
     // A phone draws every state of a call full-screen, or as the bar over every screen
     // (`phone`), never as a card at the end of the list.
     if super::phone::active() {
         return None;
     }
     let snapshot = shell.snapshot.as_ref()?;
-    shell.call_dock(snapshot, cx).map(IntoElement::into_any_element)
+    shell.call_dock(snapshot, window, cx).map(IntoElement::into_any_element)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2936,7 +2940,7 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .gap(px(8.))
-                    .child(div().type_small().text_color(gpui::rgba(0xffffffb3)).child(format!(
+                    .child(div().type_small().text_color(theme::on_media_soft()).child(format!(
                         "{peer_name} is {}",
                         if peer_is_share { "sharing their screen" } else { "on camera" }
                     )))
@@ -3043,7 +3047,7 @@ impl Shell {
                 .overflow_hidden()
                 .border_1()
                 .border_color(theme::border())
-                .bg(gpui::rgb(0x0b0b0d))
+                .bg(theme::media_stage())
                 .child(gpui::img(frame).size_full().object_fit(gpui::ObjectFit::Contain))
         });
 
@@ -3053,7 +3057,7 @@ impl Shell {
             .h(px(height))
             .flex_none()
             .rounded(px(if compact { theme::R_CARD } else { 10. }))
-            .bg(gpui::rgb(0x0b0b0d))
+            .bg(theme::media_stage())
             .border_1()
             .border_color(theme::hairline())
             .overflow_hidden()
@@ -3844,6 +3848,12 @@ impl Shell {
 
     /// A small header pill while a call is live elsewhere, taking you back to it in one click.
     pub(super) fn call_live_hint(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        self.call_live_hint_sized(snapshot, false, cx)
+    }
+
+    /// Header live-call hint with a compact `28×28` icon-only mode for narrow conversation headers.
+    #[allow(dead_code)]
+    pub(super) fn call_live_hint_sized(&self, snapshot: &Snapshot, compact: bool, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         if super::phone::active() {
             return None;
         }
@@ -3856,22 +3866,22 @@ impl Shell {
                 .id("call-live-hint")
                 .flex_none()
                 .h(px(28.))
-                .px(px(10.))
+                .when(compact, |el| el.w(px(28.)).justify_center())
+                .when(!compact, |el| el.px(px(10.)).gap(px(6.)))
                 .rounded(px(theme::R_CONTROL))
                 .bg(theme::positive_soft())
                 .text_color(theme::positive())
                 .hover(|style| style.bg(theme::hover()))
                 .flex()
                 .items_center()
-                .gap(px(6.))
-                .text_size(px(12.))
+                .type_small()
                 .font_weight(FontWeight::MEDIUM)
                 .cursor_pointer()
-                .tooltip(tip("Open the call", Some("⌘⇧J")))
+                .tooltip(tip(format!("{label} — open call"), Some("⌘⇧J")))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.call_jump(cx)))
                 .child(glyph("icons/phone.svg", 13., theme::positive()))
-                .child(div().max_w(px(160.)).truncate().child(label)),
+                .when(!compact, |el| el.child(div().max_w(px(140.)).truncate().child(label))),
         )
     }
 

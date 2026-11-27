@@ -84,6 +84,7 @@ pub enum E2eeError {
     EpochRollback { expected_min: u64, got: u64 },
     UnknownSender(i64),
     EpochMismatch { expected: u64, got: u64 },
+    ReplayDetected,
     DecryptFailed,
 }
 
@@ -107,6 +108,7 @@ impl std::fmt::Display for E2eeError {
             E2eeError::EpochMismatch { expected, got } => {
                 write!(f, "media frame epoch mismatch: expected {expected}, got {got}")
             }
+            E2eeError::ReplayDetected => write!(f, "replayed or stale conference media frame"),
             E2eeError::DecryptFailed => write!(f, "conference frame AEAD authentication failed"),
         }
     }
@@ -237,6 +239,50 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
+/// 128-frame sliding anti-replay window per `(epoch, sender_key, kind)`.
+const REPLAY_WINDOW_SIZE: u64 = 128;
+
+#[derive(Debug, Clone, Copy)]
+struct ReplayWindow {
+    highest: u64,
+    /// Bit `i` (`0..128`) is set iff counter `highest - i` has been accepted.
+    bitmap: u128,
+}
+
+impl ReplayWindow {
+    fn new(counter: u64) -> Self {
+        Self { highest: counter, bitmap: 1 }
+    }
+
+    fn is_replay(&self, counter: u64) -> bool {
+        if counter > self.highest {
+            return false;
+        }
+        let diff = self.highest - counter;
+        if diff >= REPLAY_WINDOW_SIZE {
+            return true;
+        }
+        ((self.bitmap >> diff) & 1) != 0
+    }
+
+    fn record(&mut self, counter: u64) {
+        if counter > self.highest {
+            let shift = counter - self.highest;
+            if shift >= REPLAY_WINDOW_SIZE {
+                self.bitmap = 1;
+            } else {
+                self.bitmap = (self.bitmap << shift) | 1;
+            }
+            self.highest = counter;
+        } else {
+            let diff = self.highest - counter;
+            if diff < REPLAY_WINDOW_SIZE {
+                self.bitmap |= 1u128 << diff;
+            }
+        }
+    }
+}
+
 /// Stateful verifier and frame cipher for one Telegram encrypted conference call.
 pub struct ConferenceE2ee {
     my_user_id: i64,
@@ -251,6 +297,7 @@ pub struct ConferenceE2ee {
     epoch_key: Option<[u8; 32]>,
     prev_epoch: Option<(u64, [u8; 32])>,
     send_counter: u64,
+    replay_windows: BTreeMap<(u64, [u8; 32], u8), ReplayWindow>,
     blocked: bool,
 }
 
@@ -270,6 +317,7 @@ impl ConferenceE2ee {
             epoch_key: None,
             prev_epoch: None,
             send_counter: 0,
+            replay_windows: BTreeMap::new(),
             blocked: false,
         }
     }
@@ -305,6 +353,13 @@ impl ConferenceE2ee {
         self.blocked = true;
         self.epoch_key = None;
         self.prev_epoch = None;
+        self.replay_windows.clear();
+    }
+
+    fn prune_replay_windows(&mut self) {
+        let cur = self.epoch;
+        let prev = self.prev_epoch.map(|(ep, _)| ep);
+        self.replay_windows.retain(|(ep, _, _), _| *ep == cur || prev == Some(*ep));
     }
 
     /// Verifies and applies one raw chain block. Any verification failure fails closed permanently.
@@ -423,6 +478,7 @@ impl ConferenceE2ee {
                 self.participants = new_participants;
                 self.epoch = new_epoch;
                 self.epoch_key = Some(next_key);
+                self.prune_replay_windows();
                 Ok(())
             }
             SUB_CHAIN_BROADCAST => {
@@ -456,6 +512,7 @@ impl ConferenceE2ee {
                 self.broadcast_hash = block_hash;
                 self.epoch = block.epoch;
                 self.epoch_key = Some(next_key);
+                self.prune_replay_windows();
                 Ok(())
             }
             _ => Err(E2eeError::MalformedBlock("unknown sub_chain_id")),
@@ -499,8 +556,8 @@ impl ConferenceE2ee {
     }
 
     /// Decrypts and authenticates one incoming conference media frame.
-    /// Fails closed when blocked, unverified, sender not in verified set, or GCM tag invalid.
-    pub fn decrypt_frame(&self, packet: &[u8]) -> Result<(u8, i64, Vec<u8>), E2eeError> {
+    /// Fails closed when blocked, unverified, sender not in verified set, replayed/stale, or GCM tag invalid.
+    pub fn decrypt_frame(&mut self, packet: &[u8]) -> Result<(u8, i64, Vec<u8>), E2eeError> {
         if self.blocked {
             return Err(E2eeError::Blocked);
         }
@@ -535,6 +592,11 @@ impl ConferenceE2ee {
         };
 
         let sender_key = derive_sender_key(&epoch_key, sender_id);
+        let replay_key = (epoch, sender_key, kind);
+        if self.replay_windows.get(&replay_key).is_some_and(|w| w.is_replay(counter)) {
+            return Err(E2eeError::ReplayDetected);
+        }
+
         let nonce_bytes = derive_frame_nonce(&sender_key, kind, counter);
         let cipher = Aes256Gcm::new_from_slice(&sender_key).expect("256-bit key");
         let plaintext = cipher
@@ -543,6 +605,14 @@ impl ConferenceE2ee {
                 Payload { msg: &packet[HEADER_LEN..], aad: &packet[..HEADER_LEN] },
             )
             .map_err(|_| E2eeError::DecryptFailed)?;
+
+        // Update the anti-replay window only after AEAD authentication succeeds so forged
+        // frames with high counters cannot advance and DoS the window.
+        self.replay_windows
+            .entry(replay_key)
+            .and_modify(|w| w.record(counter))
+            .or_insert_with(|| ReplayWindow::new(counter));
+
         Ok((kind, sender_id, plaintext))
     }
 
@@ -764,5 +834,60 @@ mod tests {
         assert_eq!(err, E2eeError::UnauthorizedSigner(9999));
         assert!(e2ee.is_blocked());
         assert_eq!(e2ee.security().mode, SecurityMode::Blocked);
+    }
+
+    #[test]
+    fn decrypt_frame_rejects_replays_and_stale_counters_without_poisoning_window() {
+        let alice = mk_member(1001);
+        let bob = mk_member(1002);
+        let mut e2ee_a = ConferenceE2ee::new(alice.user_id, alice.public_key);
+        let mut e2ee_b = ConferenceE2ee::new(bob.user_id, bob.public_key);
+
+        let b0 = ChainBlock::build(
+            SUB_CHAIN_STATE,
+            0,
+            [0u8; 32],
+            55_004,
+            alice.user_id,
+            alice.public_key,
+            vec![alice.clone(), bob.clone()],
+            1,
+            [0x77; 32],
+        );
+        let b0_raw = b0.encode();
+        e2ee_a.apply_block_bytes(SUB_CHAIN_STATE, &b0_raw).unwrap();
+        e2ee_b.apply_block_bytes(SUB_CHAIN_STATE, &b0_raw).unwrap();
+
+        let f0 = e2ee_a.encrypt_frame(FRAME_KIND_AUDIO, b"frame-0").unwrap();
+        let f1 = e2ee_a.encrypt_frame(FRAME_KIND_AUDIO, b"frame-1").unwrap();
+        let f2 = e2ee_a.encrypt_frame(FRAME_KIND_AUDIO, b"frame-2").unwrap();
+
+        // First decryption of frame 0 succeeds; immediate replay is rejected.
+        assert_eq!(e2ee_b.decrypt_frame(&f0).unwrap().2, b"frame-0");
+        assert_eq!(e2ee_b.decrypt_frame(&f0), Err(E2eeError::ReplayDetected));
+
+        // Out-of-order delivery within the sliding window (2 before 1) succeeds once each.
+        assert_eq!(e2ee_b.decrypt_frame(&f2).unwrap().2, b"frame-2");
+        assert_eq!(e2ee_b.decrypt_frame(&f1).unwrap().2, b"frame-1");
+        assert_eq!(e2ee_b.decrypt_frame(&f1), Err(E2eeError::ReplayDetected));
+        assert_eq!(e2ee_b.decrypt_frame(&f2), Err(E2eeError::ReplayDetected));
+
+        // A forged packet claiming a huge counter must fail AEAD auth and NOT advance the window.
+        let mut forged = f2.clone();
+        forged[22..30].copy_from_slice(&9_999u64.to_le_bytes());
+        assert_eq!(e2ee_b.decrypt_frame(&forged), Err(E2eeError::DecryptFailed));
+
+        // Legitimate frame 3 is still accepted because the forged packet did not poison the window.
+        let f3 = e2ee_a.encrypt_frame(FRAME_KIND_AUDIO, b"frame-3").unwrap();
+        assert_eq!(e2ee_b.decrypt_frame(&f3).unwrap().2, b"frame-3");
+
+        // Advance well past the 128-frame window; an earlier unseen frame becomes stale.
+        let skipped = e2ee_a.encrypt_frame(FRAME_KIND_AUDIO, b"frame-4-skipped").unwrap();
+        for _ in 0..REPLAY_WINDOW_SIZE {
+            let _ = e2ee_a.encrypt_frame(FRAME_KIND_AUDIO, b"pad").unwrap();
+        }
+        let far = e2ee_a.encrypt_frame(FRAME_KIND_AUDIO, b"frame-far").unwrap();
+        assert_eq!(e2ee_b.decrypt_frame(&far).unwrap().2, b"frame-far");
+        assert_eq!(e2ee_b.decrypt_frame(&skipped), Err(E2eeError::ReplayDetected));
     }
 }

@@ -452,14 +452,20 @@ impl Pane {
             );
         }
 
-        // A phone's dialog keeps 16 pt of the window either side.
-        let room = f32::from(window.viewport_size().width) - 32.;
+        let size = window.viewport_size();
+        let max_w = (f32::from(size.width) - 32.).max(200.);
+        let max_h = (f32::from(size.height) - 32.).max(200.);
         let copy = target.clone();
         let panel = modal("Open this link?")
-            .w(px(if crate::gui::phone::active() { room.min(440.) } else { 440. }))
+            .id("link-ask-card")
+            .w(px(440.0_f32.min(max_w)))
+            .max_w_full()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .child(body)
             .child(
                 modal_buttons()
+                    .flex_wrap()
                     .child(button("link-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close_link_ask(cx))))
                     .child(button("link-copy", ButtonKind::Secondary, "Copy link").on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
@@ -469,11 +475,11 @@ impl Pane {
             )
             // A press on the panel is not a press on the scrim behind it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let size = window.viewport_size();
         let scrim = div()
             .id("link-ask")
             .w(size.width)
             .h(size.height)
+            .p(px(16.))
             .bg(theme::scrim())
             .occlude()
             .flex()
@@ -481,7 +487,11 @@ impl Pane {
             .justify_center()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_link_ask(cx)))
             .child(fade_in("link-ask-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(
+            deferred(anchored().position(point(px(0.), px(0.))).child(scrim))
+                .priority(crate::gui::components::place::Layer::Modal as usize)
+                .into_any_element(),
+        )
     }
 }
 

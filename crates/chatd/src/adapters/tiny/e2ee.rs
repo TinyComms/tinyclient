@@ -37,10 +37,11 @@ use protocol::{DeviceState, E2eeDevice, E2eePerson, E2eeStatus, Trust};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// The engine's snapshot under the store.
@@ -62,11 +63,10 @@ const REACTION_RECHECK_MAX: usize = 16;
 /// Maximum opened messages per conversation selected by the history exporter.
 /// Local durable history must keep saving beyond this transfer limit.
 const CACHED: usize = 20_000;
-/// How long a send waits for the people of a conversation to join its group. The server signs
-/// their Adds only after its commit batch (`e2ee_commit_batch_secs`, 30 s by default, counted from
-/// when the group started), and a message sent before then is for the devices already in it,
-/// which the others can never open. Past this the message goes to the group as it is.
-const JOIN_WAIT: Duration = Duration::from_secs(45);
+/// How long a send waits for the people of a conversation to join its group. Capped at 15 s
+/// (waking immediately on `e2ee.handshake` via condvar) so a send never stalls for 45 s polling.
+/// Past this the message goes to the group as it is.
+const JOIN_WAIT: Duration = Duration::from_secs(15);
 /// How often a waiting send asks again. Asking is what has the server sign the batch.
 fn join_poll() -> Duration {
     // Unit tests and the lab prove use a short poll so a held commit batch finishes quickly.
@@ -1260,6 +1260,70 @@ pub(crate) struct Device {
     /// list and this device's kept rows the first time a conversation's reactions are needed;
     /// never kept anywhere but here.
     folds: BTreeMap<String, Fold>,
+    /// Lock-free / RwLock sidecar state shared with fast send routing and live-socket wakeups.
+    pub(super) meta: Arc<FastMeta>,
+}
+
+/// Lock-free / RwLock sidecar state for one Tiny account's E2EE device so plaintext sends,
+/// `sealed_here` checks, handshake wakeups, and sibling deduplication never contend on `Mutex<Device>`.
+#[derive(Default)]
+pub(super) struct FastMeta {
+    encrypted: RwLock<HashMap<String, bool>>,
+    ready: AtomicBool,
+    starting: Mutex<bool>,
+    starting_cv: Condvar,
+    handshake_seq: Mutex<u64>,
+    handshake_cv: Condvar,
+    ws_connected: AtomicBool,
+    synced_convs: RwLock<HashSet<String>>,
+    pub(super) siblings_asking: AtomicBool,
+}
+
+impl FastMeta {
+    pub(super) fn note_encrypted(&self, conversation_id: &str, encrypted: bool) {
+        let mut map = self.encrypted.write().unwrap_or_else(|p| p.into_inner());
+        map.insert(conversation_id.to_owned(), encrypted);
+    }
+
+    fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Release);
+    }
+
+    fn mark_synced(&self, conversation_id: &str) {
+        self.synced_convs
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(conversation_id.to_owned());
+    }
+
+    fn unmark_synced(&self, conversation_id: &str) {
+        self.synced_convs
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(conversation_id);
+    }
+
+    fn is_synced(&self, conversation_id: &str) -> bool {
+        self.synced_convs
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(conversation_id)
+    }
+
+    fn clear_synced(&self) {
+        self.synced_convs
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    fn notify_handshake(&self, conversation_id: &str) {
+        self.unmark_synced(conversation_id);
+        let mut seq = lock(&self.handshake_seq);
+        *seq = seq.wrapping_add(1);
+        drop(seq);
+        self.handshake_cv.notify_all();
+    }
 }
 
 type Shared = Arc<Mutex<Device>>;
@@ -1267,6 +1331,104 @@ type Shared = Arc<Mutex<Device>>;
 fn devices() -> &'static Mutex<HashMap<(String, String), Shared>> {
     static DEVICES: OnceLock<Mutex<HashMap<(String, String), Shared>>> = OnceLock::new();
     DEVICES.get_or_init(Mutex::default)
+}
+
+fn fast_metas() -> &'static RwLock<HashMap<(String, String), Arc<FastMeta>>> {
+    static METAS: OnceLock<RwLock<HashMap<(String, String), Arc<FastMeta>>>> = OnceLock::new();
+    METAS.get_or_init(RwLock::default)
+}
+
+fn meta_get(saved: &Saved) -> Option<Arc<FastMeta>> {
+    fast_metas()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(saved.base_url.clone(), saved.user_id.clone()))
+        .cloned()
+}
+
+fn meta_or_insert(saved: &Saved) -> Arc<FastMeta> {
+    if let Some(found) = meta_get(saved) {
+        return found;
+    }
+    let key = (saved.base_url.clone(), saved.user_id.clone());
+    let mut map = fast_metas().write().unwrap_or_else(|p| p.into_inner());
+    map.entry(key)
+        .or_insert_with(|| Arc::new(FastMeta::default()))
+        .clone()
+}
+
+/// Marks `e2ee::begin` as in flight for this account before `tiny-router` starts accepting sends.
+pub(crate) fn mark_starting(saved: &Saved) {
+    let meta = meta_or_insert(saved);
+    *lock(&meta.starting) = true;
+}
+
+/// Waits for `e2ee::begin`'s local device initialization when a sealed send races startup.
+pub(crate) fn wait_begun(saved: &Saved) {
+    let Some(meta) = meta_get(saved) else {
+        return;
+    };
+    let deadline = Instant::now() + JOIN_WAIT;
+    let mut starting = lock(&meta.starting);
+    while *starting {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let (guard, _) = meta
+            .starting_cv
+            .wait_timeout(starting, left)
+            .unwrap_or_else(|p| p.into_inner());
+        starting = guard;
+    }
+}
+
+/// Lock-free / RwLock read of whether `conversation_id` is known encrypted (`Some(true)`),
+/// known plaintext (`Some(false)`), or not yet cached (`None`).
+pub(crate) fn known_encrypted_fast(saved: &Saved, conversation_id: &str) -> Option<bool> {
+    let meta = meta_get(saved)?;
+    let val = meta
+        .encrypted
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(conversation_id)
+        .copied();
+    val
+}
+
+/// Lock-free check of whether this account's E2EE device is currently ready.
+pub(crate) fn is_ready_fast(saved: &Saved) -> bool {
+    meta_get(saved).is_some_and(|meta| meta.ready.load(Ordering::Acquire))
+}
+
+/// Records a device's readiness into the lock-free `FastMeta` cache.
+pub(crate) fn set_ready_fast(saved: &Saved, ready: bool) {
+    let meta = meta_or_insert(saved);
+    meta.ready.store(ready, Ordering::Release);
+}
+
+/// Tracks whether the account's live WebSocket is connected. Disconnecting clears cached
+/// per-conversation sync state so the next send re-syncs cleanly.
+pub(crate) fn set_ws_connected(saved: &Saved, connected: bool) {
+    let meta = meta_or_insert(saved);
+    meta.ws_connected.store(connected, Ordering::Release);
+    if !connected {
+        meta.clear_synced();
+    }
+}
+
+/// Wakes any `e2ee::send` waiting for a pending join/commit on `conversation_id`.
+pub(crate) fn notify_handshake(saved: &Saved, conversation_id: &str) {
+    if let Some(meta) = meta_get(saved) {
+        meta.notify_handshake(conversation_id);
+    }
+}
+
+/// Invalidates the cached synced state for `conversation_id` as soon as a handshake arrives.
+pub(crate) fn invalidate_synced(saved: &Saved, conversation_id: &str) {
+    if let Some(meta) = meta_get(saved) {
+        meta.unmark_synced(conversation_id);
+    }
 }
 
 /// Keys made in a scratch directory, where nothing is written to the keychain: kept for the
@@ -1363,7 +1525,10 @@ pub(crate) fn device(saved: &Saved) -> Shared {
         lock(&found).saved.token.clone_from(&saved.token);
         return found;
     }
-    let made = Arc::new(Mutex::new(Device::new(saved)));
+    let meta = meta_or_insert(saved);
+    let mut dev = Device::new(saved);
+    dev.meta = meta;
+    let made = Arc::new(Mutex::new(dev));
     lock(devices()).entry(key).or_insert(made).clone()
 }
 
@@ -1459,10 +1624,37 @@ pub(crate) fn write_opened_row(
 /// `commands` is the adapter's own inbox: what this module took in by itself (a device link's
 /// history) is shown by asking the adapter to read those conversations again.
 pub(crate) fn begin(saved: &Saved, commands: std::sync::mpsc::Sender<crate::adapters::Command>) {
+    let meta = meta_or_insert(saved);
+    struct Finish(Arc<FastMeta>);
+    impl Drop for Finish {
+        fn drop(&mut self) {
+            *lock(&self.0.starting) = false;
+            self.0.starting_cv.notify_all();
+        }
+    }
+    let finish = Finish(meta);
     let shared = device(saved);
-    let mut device = lock(&shared);
-    device.commands = Some(commands);
-    device.enrol();
+    let ready = {
+        let mut device = lock(&shared);
+        device.commands = Some(commands);
+        device.enrol_core();
+        device.ready()
+    };
+    // Device is open & registered (or failed/off): wake any waiting sealed sends immediately
+    // before running heavy sibling catch-up in the background.
+    drop(finish);
+    if ready {
+        let bg = shared.clone();
+        let _ = std::thread::Builder::new()
+            .name("tiny-e2ee-catchup".into())
+            .spawn(move || {
+                let mut device = lock(&bg);
+                if device.ready() {
+                    let gained = device.catch_up().into_iter().collect();
+                    device.reload(&gained);
+                }
+            });
+    }
 }
 
 /// Live hints can be missed while offline (or before enrollment finished). Once the
@@ -1490,6 +1682,7 @@ pub(crate) fn sign_out(saved: &Saved) {
         }
     }
     lock(devices()).remove(&key);
+    fast_metas().write().unwrap_or_else(|p| p.into_inner()).remove(&key);
     lock(scratch_secrets()).remove(&key);
     start_over(&dir_of(saved));
 }
@@ -1499,6 +1692,7 @@ pub(crate) fn sign_out(saved: &Saved) {
 pub(crate) fn forget_local(saved: &Saved) {
     let key = (saved.base_url.clone(), saved.user_id.clone());
     lock(devices()).remove(&key);
+    fast_metas().write().unwrap_or_else(|p| p.into_inner()).remove(&key);
     lock(scratch_secrets()).remove(&key);
     erase_history(&saved.user_id);
 }
@@ -1740,6 +1934,7 @@ impl Device {
         self.state = DeviceState::Failed {
             why: "This device was removed. Saved messages are still available.".to_owned(),
         };
+        self.meta.set_ready(false);
         if changed { self.save_notes(); }
         changed
     }
@@ -1768,6 +1963,7 @@ impl Device {
             operation_deadline: None,
             siblings: siblings::Siblings::default(),
             folds: BTreeMap::new(),
+            meta: Arc::new(FastMeta::default()),
         }
     }
 
@@ -1850,7 +2046,7 @@ impl Device {
 
     /// Asks the server whether it speaks encrypted text, opens or makes the engine, registers the
     /// device and uploads key packages.
-    fn enrol(&mut self) {
+    fn enrol_core(&mut self) {
         match self.try_enrol() {
             Ok(state) => self.state = state,
             Err(why) => {
@@ -1858,6 +2054,11 @@ impl Device {
                 self.state = DeviceState::Failed { why };
             }
         }
+        self.meta.set_ready(self.ready());
+    }
+
+    fn enrol(&mut self) {
+        self.enrol_core();
         if self.ready() {
             // Startup can run while approval is still pending. Every successful enrollment,
             // including the one after linking, must initialize the hidden sibling group.
@@ -2110,7 +2311,10 @@ impl Device {
         if ConversationId::parse(conversation_id).is_ok() {
             // Durable cryptographic state wins over missing labels or an unavailable server.
             let active = self.active(conversation_id)?;
-            if active.head_hash.is_some() { return Ok(true); }
+            if active.head_hash.is_some() {
+                self.note_encrypted(conversation_id, true);
+                return Ok(true);
+            }
         }
         if let Some(known) = self.encrypted.get(conversation_id) { return Ok(*known); }
         let known = if self.generations {
@@ -2123,12 +2327,22 @@ impl Device {
                 _ => false,
             }
         };
-        self.encrypted.insert(conversation_id.to_owned(), known);
+        self.note_encrypted(conversation_id, known);
         Ok(known)
     }
 
     pub(crate) fn note_encrypted(&mut self, conversation_id: &str, encrypted: bool) {
         self.encrypted.insert(conversation_id.to_owned(), encrypted);
+        self.meta.note_encrypted(conversation_id, encrypted);
+    }
+
+    fn has_active_group(&mut self, conversation_id: &str) -> bool {
+        let Ok(active) = self.active(conversation_id) else {
+            return false;
+        };
+        self.engine
+            .as_ref()
+            .is_some_and(|engine| engine.has_group(active.group_id))
     }
 
     /// What the server lets new conversations be: `off`, `optional`, `new_required`; empty when
@@ -2308,6 +2522,11 @@ impl Device {
             }
         }
         let _ = self.engine()?.flush();
+        if settled && !self.joining.contains(conversation_id) && self.has_active_group(conversation_id) {
+            self.meta.mark_synced(conversation_id);
+        } else {
+            self.meta.unmark_synced(conversation_id);
+        }
         Ok(settled)
     }
 
@@ -2651,10 +2870,11 @@ impl Device {
         // One sync attempt per encryption group on this page. A blocked historical
         // generation must not spend the current group's Welcome attempt.
         let mut synced = BTreeSet::new();
+        let mut engine_touched = false;
         let mut ordered: Vec<&Row> = rows.iter().collect();
         ordered.sort_by_key(|row| (row.generation.unwrap_or(0), row.epoch));
         for row in ordered {
-            let read = self.read_one(conversation_id, conv, row, &mut synced);
+            let read = self.read_one(conversation_id, conv, row, &mut synced, &mut engine_touched);
             out.insert(row.id.to_owned(), read);
         }
         // An edit counts once its target is known, and only from the target's author.
@@ -2679,7 +2899,9 @@ impl Device {
             out.insert(target.clone(), Read::Opened(opened.clone()));
             self.remember(conversation_id, &target, opened);
         }
-        let _ = self.engine.as_mut().map(Engine::flush);
+        if engine_touched {
+            let _ = self.engine.as_mut().map(Engine::flush);
+        }
         // What did not open here may have on another device of the person.
         let missing: Vec<String> = rows
             .iter()
@@ -2700,6 +2922,7 @@ impl Device {
         _conv: ConversationId,
         row: &Row,
         synced: &mut BTreeSet<ConversationId>,
+        engine_touched: &mut bool,
     ) -> Read {
         let cached = self.cache(conversation_id).and_then(|cache| cache.rows.get(row.id).cloned());
         if let Some(opened) = &cached {
@@ -2732,6 +2955,7 @@ impl Device {
         let Some(mut engine) = self.engine.take() else {
             return fallback();
         };
+        *engine_touched = true;
         let mut opened = Self::receive_committed(
             &mut engine,
             self,
@@ -2920,7 +3144,10 @@ impl Device {
             let conv = active.group_id;
             let sealed = match self.engine()?.encrypt(conv, kind, target_id, envelope) {
                 Ok(sealed) => sealed,
-                Err(Error::PendingProposals | Error::PendingRemove | Error::CommitInFlight) => continue,
+                Err(Error::PendingProposals | Error::PendingRemove | Error::CommitInFlight) => {
+                    self.meta.unmark_synced(conversation_id);
+                    continue;
+                }
                 Err(err) => return Err(words(&err)),
             };
             opened.generation = Some(active.generation);
@@ -2964,7 +3191,10 @@ impl Device {
                     }
                     return Ok(answer);
                 }
-                409 if matches!(answer.get("error").and_then(Value::as_str), Some("proposals_changed" | "stale_epoch" | "generation_changed")) => continue,
+                409 if matches!(answer.get("error").and_then(Value::as_str), Some("proposals_changed" | "stale_epoch" | "generation_changed")) => {
+                    self.meta.unmark_synced(conversation_id);
+                    continue;
+                }
                 400 if answer.get("error").and_then(Value::as_str) == Some("e2ee_group_too_large") => {
                     return Err("This encrypted conversation has too many devices to send a message.".to_owned());
                 }
@@ -3218,6 +3448,37 @@ impl Device {
         })
     }
 
+    /// Every folded reaction currently standing on `message_id` in `conversation_id`, so a
+    /// reloaded message page keeps its encrypted reaction chips instead of overwriting them
+    /// with the server's empty plaintext list.
+    pub(crate) fn reactions_for(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Vec<ReactionLanded> {
+        let me = self.saved.user_id.clone();
+        let fold = self.fold(conversation_id);
+        let mut out = Vec::new();
+        for (key, who) in &fold.state.on {
+            if who.is_empty() {
+                continue;
+            }
+            let Some((msg, emoji)) = FoldState::split(key) else {
+                continue;
+            };
+            if msg != message_id {
+                continue;
+            }
+            out.push(ReactionLanded {
+                message: msg,
+                emoji,
+                count: who.len() as u32,
+                mine: who.contains(&me),
+            });
+        }
+        out
+    }
+
     /// Folds the server's reaction list from where the fold stands, and returns every
     /// (message, emoji) it changed. The list is folded oldest first, a page at a time; this
     /// device's own blobs fold from what it kept, in list order; blobs the server no longer
@@ -3390,7 +3651,7 @@ impl Device {
                         self.fold_resolved(conversation_id, seq, id);
                         return Folded::Passed;
                     };
-                    if !super::messages::unicode_emoji(&incoming.envelope.text) {
+                    if !super::messages::allowed_sealed_reaction(&incoming.envelope.text) {
                         tracing::debug!("chatd: Tiny e2ee: {conversation_id}: a reaction that is not an emoji is dropped");
                         self.fold_resolved(conversation_id, seq, id);
                         return Folded::Passed;
@@ -4138,22 +4399,42 @@ pub(crate) fn send(
 ) -> Result<Value, String> {
     let until = Instant::now() + JOIN_WAIT;
     let mut device = lock(shared);
-    // The lock stays held from the last sync to the encrypt, so what the sync settled on is what
-    // the post starts from and does not read the server again.
-    let settled = loop {
-        let settled = device.sync_settled(conversation_id)?;
-        if !device.joining.contains(conversation_id) {
-            break settled;
+    let meta = device.meta.clone();
+    // Fast path: when the live WebSocket is connected and this group is already synced with no
+    // pending join, encrypt and POST directly without 2+ redundant pre-send GETs. On a 409
+    // conflict (`proposals_changed` / `stale_epoch` / `generation_changed`), `post_after`
+    // invalidates the cache, runs `sync`, and retries cleanly.
+    let skip_sync = meta.ws_connected.load(Ordering::Acquire)
+        && meta.is_synced(conversation_id)
+        && !device.joining.contains(conversation_id)
+        && device.has_active_group(conversation_id);
+    let settled = if skip_sync {
+        true
+    } else {
+        // The lock stays held from the last sync to the encrypt, so what the sync settled on is what
+        // the post starts from and does not read the server again.
+        loop {
+            let settled = device.sync_settled(conversation_id)?;
+            if !device.joining.contains(conversation_id) {
+                break settled;
+            }
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    "chatd: Tiny e2ee: {conversation_id}: waited {}s for a joining member; sending to the current group",
+                    JOIN_WAIT.as_secs()
+                );
+                break settled;
+            }
+            let seq = *lock(&meta.handshake_seq);
+            drop(device);
+            let wait_for = join_poll().min(remaining);
+            let guard = lock(&meta.handshake_seq);
+            let _ = meta
+                .handshake_cv
+                .wait_timeout_while(guard, wait_for, |current| *current == seq);
+            device = lock(shared);
         }
-        if Instant::now() >= until {
-            tracing::warn!(
-                "chatd: Tiny e2ee: {conversation_id}: sent while someone is still joining"
-            );
-            break settled;
-        }
-        drop(device);
-        std::thread::sleep(join_poll());
-        device = lock(shared);
     };
     crate::sendtime::stage("sync");
     let sent = device.post_after(
@@ -4180,6 +4461,11 @@ pub fn prove_first_encrypted_message() -> Result<(), String> {
 /// Lab prove: see [`fake::prove_encrypted_reaction`].
 pub fn prove_encrypted_reaction() -> Result<(), String> {
     fake::prove_encrypted_reaction()
+}
+
+/// Lab prove: see [`fake::prove_core_e2ee_security`].
+pub fn prove_core_e2ee_security() -> Result<(), String> {
+    fake::prove_core_e2ee_security()
 }
 mod backup;
 mod linking;

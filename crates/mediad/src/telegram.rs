@@ -1210,7 +1210,6 @@ pub struct GroupOffer {
     offer_sdp: String,
     params_json: String,
     ssrc: u32,
-    video_ssrc: u32,
     mic_mid: Mid,
     recv_mids: Vec<Mid>,
     cam_mid: Mid,
@@ -1223,8 +1222,6 @@ pub struct GroupLink {
     udp: MioUdp,
     local_udp: SocketAddr,
     ssrc: u32,
-    #[allow(dead_code)]
-    video_ssrc: u32,
     mic_mid: Mid,
     recv_mids: Vec<Mid>,
     cam_mid: Mid,
@@ -1290,7 +1287,6 @@ impl GroupOffer {
             offer_sdp,
             params_json,
             ssrc,
-            video_ssrc,
             mic_mid,
             recv_mids,
             cam_mid,
@@ -1319,7 +1315,6 @@ impl GroupOffer {
             udp: self.udp,
             local_udp: self.local_udp,
             ssrc: self.ssrc,
-            video_ssrc: self.video_ssrc,
             mic_mid: self.mic_mid,
             recv_mids: self.recv_mids,
             cam_mid: self.cam_mid,
@@ -1345,7 +1340,7 @@ pub struct PresentationLink {
     rtc: Rtc,
     udp: MioUdp,
     local_udp: SocketAddr,
-    #[allow(dead_code)]
+    #[cfg(test)]
     ssrc: u32,
     share_mid: Mid,
     fake_loopback: bool,
@@ -1415,6 +1410,7 @@ impl PresentationOffer {
             rtc: self.rtc,
             udp: self.udp,
             local_udp: self.local_udp,
+            #[cfg(test)]
             ssrc: self.ssrc,
             share_mid: self.share_mid,
             fake_loopback,

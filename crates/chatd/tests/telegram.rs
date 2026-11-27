@@ -8327,3 +8327,66 @@ fn location_one_time_live_updates_stop_stop_all_and_restart_recovery() {
     };
     assert!(after_second_restart.is_empty());
 }
+
+#[test]
+fn pinned_chats_can_be_reordered_in_main_archive_and_folders() {
+    let world = World::signed_in();
+    world.connected();
+
+    let home = |shelf: Shelf| world.home(None, shelf);
+
+    // Pin Crew alongside Odalys so Crew is pin 0 and Odalys is pin 1.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key("g8001"),
+            pinned: Some(true),
+            archived: None,
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    world.until("Crew pinned first", || (world.conversation("g8001")?.pin == Some(0)).then_some(()));
+    assert_eq!(world.conversation("u7002").unwrap().pin, Some(1));
+
+    // Reorder pins in the main list so Odalys is back ahead of Crew.
+    assert_eq!(
+        world.ask(Request::ReorderPinned {
+            account: account(),
+            folder: None,
+            conversations: vec![key("u7002"), key("g8001")],
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("ReorderPinnedDialogs 0 u7002,g8001"), 1, "{:?}", world.calls());
+    let after_main = home(Shelf::Main);
+    assert_eq!(after_main[0].key.id, "u7002");
+    assert_eq!(after_main[0].pin, Some(0));
+    assert_eq!(after_main[1].key.id, "g8001");
+    assert_eq!(after_main[1].pin, Some(1));
+
+    // Reorder pins in the archive shelf (folder "archive" -> folder_id 1).
+    assert_eq!(
+        world.ask(Request::ReorderPinned {
+            account: account(),
+            folder: Some("archive".into()),
+            conversations: vec![key("u7003")],
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("ReorderPinnedDialogs 1 u7003"), 1, "{:?}", world.calls());
+
+    // Reorder pins in custom folder "2" (Work) via UpdateDialogFilter.
+    assert_eq!(
+        world.ask(Request::ReorderPinned {
+            account: account(),
+            folder: Some("2".into()),
+            conversations: vec![key("g8001"), key("u7002")],
+        }),
+        Response::Ok
+    );
+    assert!(world.called("UpdateDialogFilter 2 Work") >= 1, "{:?}", world.calls());
+    let work_rows = world.home(Some("2"), Shelf::Main);
+    assert_eq!(work_rows[0].key.id, "g8001");
+    assert_eq!(work_rows[1].key.id, "u7002");
+}

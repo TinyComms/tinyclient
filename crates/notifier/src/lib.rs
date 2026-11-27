@@ -217,7 +217,7 @@ pub fn copy_text(text: &str) -> Result<(), String> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 struct Unsupported;
 
 impl Sink for Unsupported {
@@ -274,7 +274,7 @@ impl Sink for Fake {
 }
 
 /// Text as XML character data or an attribute value.
-#[allow(dead_code)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -293,7 +293,7 @@ fn escape(text: &str) -> String {
 }
 
 /// A toast's XML: title, body, where, buttons, silent. Built here so it is tested anywhere.
-#[allow(dead_code)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn toast_xml(note: &Note) -> String {
     let id = escape(&note.id);
     let scenario = if matches!(note.kind, Kind::Call | Kind::CallOnPhone) { " scenario=\"incomingCall\"" } else { "" };
@@ -336,7 +336,7 @@ fn toast_xml(note: &Note) -> String {
 }
 
 /// A toast's `arguments` (or `launch`) back as what the user did.
-#[allow(dead_code)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn activation(arguments: &str, reply: Option<String>) -> Option<Activation> {
     let (verb, id) = arguments.split_once(':')?;
     let id = id.to_owned();

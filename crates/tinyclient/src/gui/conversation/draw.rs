@@ -21,7 +21,7 @@ use crate::gui::time;
 use crate::view::now;
 use crate::client::ask;
 use gpui::{
-    anchored, canvas, deferred, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
+    canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
     FontWeight, HighlightStyle, Hsla, MouseButton, ObjectFit, Pixels, Point, RenderImage, SharedString, Stateful, StyledText, Window,
 };
 use std::collections::hash_map::DefaultHasher;
@@ -221,7 +221,7 @@ fn named(path: &str, name: &str) -> std::path::PathBuf {
 /// Opens a cached file under its own name: in Quick Look, or in the system's app for it (a
 /// video in the system's player). Both are processes of their own; a thread waits for them so
 /// nothing of ours blocks, and makes the link off the main thread.
-pub fn open_file(path: &str, name: &str, then: Then, cx: &mut gpui::App) {
+pub(super) fn open_file(path: &str, name: &str, then: Then, cx: &mut gpui::App) {
     // A phone has no xdg-open: the file goes to GPUI's URL open, on this thread.
     if super::super::links_through_gpui() {
         let _ = then;
@@ -562,7 +562,7 @@ pub(super) fn badge(words: String) -> Div {
         .items_center()
         .type_micro()
         .font_weight(theme::SEMIBOLD)
-        .text_color(gpui::white())
+        .text_color(theme::on_media())
         .child(words)
 }
 
@@ -575,7 +575,7 @@ pub(super) fn play_disc() -> Div {
             .flex()
             .items_center()
             .justify_center()
-            .child(icon(Icon::Play, 18., gpui::white())),
+            .child(icon(Icon::Play, 18., theme::on_media())),
     )
 }
 
@@ -780,10 +780,10 @@ impl Pane {
             .flex_col()
             .gap(px(6.))
             .child(
-                div().flex().items_center().gap(px(6.))
+                div().min_w_0().flex().items_center().gap(px(6.))
                     .child(glyph(spec.icon, 16., ink))
-                    .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(if spec.missed { ink } else { theme::text() }).child(spec.label))
-                    .child(div().ml_auto().type_micro().text_color(theme::text_faint()).child(time::clock(message.sent))),
+                    .child(div().flex_1().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(if spec.missed { ink } else { theme::text() }).child(spec.label))
+                    .child(div().flex_none().whitespace_nowrap().ml_auto().type_micro().text_color(theme::text_faint()).child(time::clock(message.sent))),
             )
             .children((count > 0).then(|| {
                 faces.child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(
@@ -851,10 +851,10 @@ impl Pane {
                         .flex_none()
                         .h(px(24.))
                         .px(px(10.))
-                        .rounded_full()
-                        .bg(theme::quiet_fill())
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::hover())
                         .text_color(theme::text_soft())
-                        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+                        .hover(|style| style.bg(theme::selected()).text_color(theme::text()))
                         .flex()
                         .items_center()
                         .cursor_pointer()
@@ -881,7 +881,7 @@ impl Pane {
                     .flex_none()
                     .h(px(24.))
                     .px(px(10.))
-                    .rounded_full()
+                    .rounded(px(theme::R_CONTROL))
                     .bg(if spec.missed { theme::danger_soft() } else { theme::accent_soft() })
                     .text_color(if spec.missed { theme::danger() } else { theme::accent_text() })
                     .hover(|style| {
@@ -936,18 +936,22 @@ impl Pane {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .gap(px(8.))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .type_small()
                             .font_weight(if spec.missed { theme::SEMIBOLD } else { theme::REGULAR })
                             .text_color(label_fg)
                             .child(spec.label),
                     )
                     .children(faces)
-                    .child(div().type_micro().text_color(theme::text_faint()).child(time::clock(message.sent))),
+                    .child(div().flex_none().whitespace_nowrap().type_micro().text_color(theme::text_faint()).child(time::clock(message.sent))),
             )
             .children(rate_pill)
             .children(pill)
@@ -1224,8 +1228,10 @@ impl Pane {
         let ticked = selecting && self.multi_select.contains(&message.id);
         let bar = if editing || ticked {
             Some(theme::accent())
-        } else if message.importance != protocol::Importance::Normal {
+        } else if message.importance == protocol::Importance::Urgent {
             Some(theme::danger())
+        } else if message.importance == protocol::Importance::Important {
+            Some(theme::warning())
         } else {
             bar
         };
@@ -1319,6 +1325,48 @@ impl Pane {
                 }),
             ));
         } else {
+            sent = sent
+                .children(message.announcement.then(|| {
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .border_1()
+                                .border_color(theme::accent())
+                                .type_micro()
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(theme::accent_text())
+                                .child("Announcement"),
+                        )
+                }))
+                .children((message.importance != protocol::Importance::Normal).then(|| {
+                    let (label, color) = match message.importance {
+                        protocol::Importance::Urgent => ("Urgent", theme::danger()),
+                        protocol::Importance::Important => ("Important", theme::warning()),
+                        protocol::Importance::Normal => ("", theme::text_faint()),
+                    };
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .border_1()
+                                .border_color(color)
+                                .type_micro()
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(color)
+                                .child(label),
+                        )
+                }));
             let said = match &message.kind {
                 MessageKind::Unsupported { link } => vec![self.unsupported(message, link, cx).into_any_element()],
                 _ => self.content(message, window, cx),
@@ -1424,47 +1472,6 @@ impl Pane {
                 );
             }
             sent = sent
-                .children(message.announcement.then(|| {
-                    div()
-                        .pb(px(3.))
-                        .flex()
-                        .child(
-                            div()
-                                .px(px(6.))
-                                .py(px(1.))
-                                .rounded(px(theme::R_CONTROL))
-                                .bg(tokens::card())
-                                .border_1()
-                                .border_color(theme::accent())
-                                .type_micro()
-                                .font_weight(theme::SEMIBOLD)
-                                .text_color(theme::accent_text())
-                                .child("ANNOUNCEMENT"),
-                        )
-                }))
-                .children((message.importance != protocol::Importance::Normal).then(|| {
-                    let (label, color) = match message.importance {
-                        protocol::Importance::Urgent => ("URGENT", theme::danger()),
-                        protocol::Importance::Important => ("IMPORTANT", theme::danger()),
-                        protocol::Importance::Normal => ("", theme::text_faint()),
-                    };
-                    div()
-                        .pb(px(3.))
-                        .flex()
-                        .child(
-                            div()
-                                .px(px(6.))
-                                .py(px(1.))
-                                .rounded(px(theme::R_CONTROL))
-                                .bg(tokens::card())
-                                .border_1()
-                                .border_color(color)
-                                .type_micro()
-                                .font_weight(theme::SEMIBOLD)
-                                .text_color(color)
-                                .child(label),
-                        )
-                }))
                 .children(message.effect.as_ref().map(|effect| {
                     div()
                         .pb(px(3.))
@@ -1475,9 +1482,13 @@ impl Pane {
                                 .py(px(1.))
                                 .rounded(px(theme::R_CONTROL))
                                 .bg(tokens::card())
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
                                 .type_micro()
                                 .text_color(theme::accent_text())
-                                .child(if effect.is_empty() { "✨".to_owned() } else { format!("✨ {effect}") }),
+                                .child(glyph("icons/star.svg", 11., theme::accent_text()))
+                                .when(!effect.is_empty(), |chip| chip.child(effect.clone())),
                         )
                 }))
                 .children(message.sent_via.as_deref().map(|via| {
@@ -1621,7 +1632,7 @@ impl Pane {
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
-                                .when(ticked, |box_| box_.child(glyph("icons/check.svg", 12., gpui::rgb(0xffffff))))
+                                .when(ticked, |box_| box_.child(glyph("icons/check.svg", 12., theme::on_accent())))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                                     this.toggle_selected_row(&sel_id, event.modifiers().shift, cx);
@@ -1789,6 +1800,8 @@ impl Pane {
                 .child(words)
         };
         div()
+            .min_w_0()
+            .overflow_hidden()
             .h(if phone { px(tokens_phone::scaled(20.)) } else { theme::line(20.) })
             .flex()
             .items_center()
@@ -1851,9 +1864,9 @@ impl Pane {
                             .child(label)
                     })),
             )
-            .children(message.sender.bot.then(|| tag("APP")))
-            .children(message.saved_history.then(|| tag("SAVED")))
-            .children(message.published.then(|| tag("PUBLISHED")))
+            .children(message.sender.bot.then(|| tag("App")))
+            .children(message.saved_history.then(|| tag("Saved")))
+            .children(message.published.then(|| tag("Published")))
             .children((!message.crosspost_source.is_empty()).then(|| {
                 div()
                     .flex_none()
@@ -2273,12 +2286,13 @@ impl Pane {
 
     /// Renders the Teams `@Tag` members popover with a "Start group chat" action and
     /// "Manage tags in Teams" external link.
-    pub(super) fn tag_popover_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn tag_popover_layer(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let pop = self.tag_popover.as_ref()?;
         let heading = format!("@{}", pop.label);
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(180.);
         let mut card = div()
             .id("tag-popover")
-            .w(px(260.))
+            .w(px(260.0_f32.min(max_w)))
             .p(px(10.))
             .rounded(px(theme::R_FLOAT))
             .bg(theme::overlay())
@@ -2382,7 +2396,13 @@ impl Pane {
             this.tag_popover = None;
             cx.notify();
         }));
-        Some(deferred(anchored().position(pop.at).snap_to_window_with_margin(px(8.)).child(card)).into_any_element())
+        Some(crate::gui::components::place::placed(
+            "tag-popover-scroll",
+            crate::gui::components::place::Place::Pointer(pop.at),
+            crate::gui::components::place::Layer::Popover,
+            window,
+            card,
+        ))
     }
 
     /// The decoded picture of a file on disk, `edge` pixels on its longer side. Asking queues
@@ -3088,13 +3108,13 @@ impl Pane {
                     .right(px(4.))
                     .size(px(24.))
                     .rounded(px(theme::R_CONTROL))
-                    .bg(gpui::rgba(0x00000099))
+                    .bg(theme::media_dim())
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
                     .tooltip(tip("Favourite GIF", None))
-                    .child(glyph("icons/star.svg", 14., gpui::white()))
+                    .child(glyph("icons/star.svg", 14., theme::on_media()))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -3109,12 +3129,12 @@ impl Pane {
                 .absolute()
                 .inset_0()
                 .rounded(px(theme::R_CARD))
-                .bg(gpui::rgba(0x00000099))
+                .bg(theme::media_dim())
                 .flex()
                 .items_center()
                 .justify_center()
                 .type_headline()
-                .text_color(gpui::white())
+                .text_color(theme::on_media())
                 .child(format!("+{more}"))
         }));
         tile.into_any_element()
@@ -4695,25 +4715,48 @@ impl Pane {
                         .child(div().type_ui().truncate().text_color(theme::text()).child(choice.text.clone())),
                 )
                 .when(show_results, |el| {
-                    el.child(
-                        div()
-                            .relative()
-                            .flex_none()
-                            .type_small()
-                            .text_color(if picked { theme::accent_text() } else { theme::text_faint() })
-                            .child(format!("{} ({pct}%)", choice.count)),
-                    )
+                    let count_text = format!("{} ({pct}%)", choice.count);
+                    if choice.answer_id.is_some() && choice.count > 0 {
+                        let id = message.id.clone();
+                        el.child(
+                            div()
+                                .id(name_id(&format!("poll-voters-choice-{idx}"), &message.id))
+                                .role(gpui::Role::Button)
+                                .aria_label(format!("View voters for {}", choice.text))
+                                .tab_index(0)
+                                .focus_visible(|style| style.shadow(theme::focus_ring()))
+                                .relative()
+                                .flex_none()
+                                .px(px(4.))
+                                .rounded(px(theme::R_CONTROL))
+                                .type_small()
+                                .text_color(if picked { theme::accent_text() } else { theme::text_soft() })
+                                .cursor_pointer()
+                                .hover(|style| style.underline().text_color(theme::text()))
+                                .tooltip(tip("View voters", None))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_poll_voters(id.clone(), idx_u32, cx);
+                                }))
+                                .child(count_text),
+                        )
+                    } else {
+                        el.child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .type_small()
+                                .text_color(if picked { theme::accent_text() } else { theme::text_faint() })
+                                .child(count_text),
+                        )
+                    }
                 });
             rows = rows.child(row);
-            if show_results && choice.answer_id.is_some() && choice.count > 0 {
-                let id = message.id.clone();
-                rows = rows.child(button(("poll-voters-choice", idx), ButtonKind::Ghost, "View voters")
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_poll_voters(id.clone(), idx_u32, cx))));
-            }
             if let Some(list) = self.poll_voters.as_ref().filter(|list| list.message_id == message.id && list.choice == idx_u32) {
                 let mut voters = div().p(px(8.)).bg(theme::overlay()).rounded(px(theme::R_CONTROL)).flex().flex_col().gap(px(3.))
                     .child(div().type_small().font_weight(theme::SEMIBOLD).child(format!("Voters · {}", choice.text)))
-                    .child(div().id(("poll-voters-list", idx)).max_h(px(180.)).overflow_y_scroll().children(
+                    .child(div().id(name_id(&format!("poll-voters-list-{idx}"), &message.id)).max_h(px(180.)).overflow_y_scroll().children(
                         list.voters.iter().map(|voter| div().type_small().child(voter.name.clone())),
                     ));
                 if list.loading {
@@ -4724,7 +4767,7 @@ impl Pane {
                     voters = voters.child(div().type_small().child("No votes"));
                 }
                 if !list.loading && (list.more || list.error.is_some()) {
-                    voters = voters.child(button(("poll-more-voters", idx), ButtonKind::Secondary, if list.error.is_some() { "Retry" } else { "Load more" })
+                    voters = voters.child(button(name_id(&format!("poll-more-voters-{idx}"), &message.id), ButtonKind::Secondary, if list.error.is_some() { "Retry" } else { "Load more" })
                         .on_click(cx.listener(|this, _, _, cx| this.load_poll_voters(cx))));
                 }
                 rows = rows.child(voters);
@@ -4858,7 +4901,8 @@ impl Pane {
                 sized(div().truncate().type_micro(), 12., 16.).text_color(theme::text_faint()).child("Opens in browser")
             }));
         let url = preview.url.clone();
-        let dismiss = can_suppress.then(|| {
+        let show_dismiss = can_suppress && !phone;
+        let dismiss = show_dismiss.then(|| {
             let msg_id = message_id.to_owned();
             div()
                 .id(SharedString::from(format!("suppress-preview-{message_id}-{index}")))
@@ -4886,17 +4930,17 @@ impl Pane {
         // A phone's card is exactly the column's width: wrapped words then measure against it,
         // not against the desktop's 440, and never run past its edge.
         let card_w = if phone { self.media_width() } else { self.media_width().min(440.) };
-        let right_pad = if can_suppress { 30. } else { 12. };
+        let right_pad = if show_dismiss { 30. } else { 12. };
         let inner_w = (card_w - 12. - right_pad - 2.).max(1.);
         let card = div()
-            .id(("card", index))
+            .id(name_id(&format!("card-{index}"), message_id))
             .group("link-card")
             .relative()
             .w(px(card_w))
             .max_w_full()
             .overflow_hidden()
             .px(px(12.))
-            .when(can_suppress, |c| c.pr(px(30.)))
+            .when(show_dismiss, |c| c.pr(px(30.)))
             .py(px(10.))
             .rounded(px(theme::R_FLOAT))
             .bg(tokens::card())
@@ -4906,8 +4950,9 @@ impl Pane {
             .cursor_pointer()
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)))
             .children(dismiss);
-        let holder = |id: &'static str, wide: f32, tall: f32, radius: f32| {
-            div().id(id).relative().w(px(wide)).h(px(tall)).flex_none().rounded(px(radius)).bg(theme::hover()).overflow_hidden()
+        let preview_id = name_id(&format!("preview-{index}"), message_id);
+        let holder = |wide: f32, tall: f32, radius: f32| {
+            div().id(preview_id.clone()).relative().w(px(wide)).h(px(tall)).flex_none().rounded(px(radius)).bg(theme::hover()).overflow_hidden()
         };
         let dress = |picture: Stateful<Div>| match preview.opens_in_browser {
             true => {
@@ -4920,7 +4965,7 @@ impl Pane {
             if !preview.opens_in_browser {
                 return card.child(words).into_any_element();
             }
-            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(holder("preview", inner_w, 180., 8.))).into_any_element();
+            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(holder(inner_w, 180., 8.))).into_any_element();
         };
         let shown = |image, radius: f32| anim::picture(image, ObjectFit::Cover, radius, Play::Inline);
         if large {
@@ -4928,25 +4973,25 @@ impl Pane {
             let tall = (wide * image.height as f32 / image.width.max(1) as f32).round().min(210.);
             let edge = media::decode_edge((image.width, image.height), wide, tall, Fit::Cover, scale);
             if self.held_back(&image) {
-                let picture = self.load_box(holder("preview", wide, tall, 8.), &image, "Preview", image.bytes, true, cx);
+                let picture = self.load_box(holder(wide, tall, 8.), &image, "Preview", image.bytes, true, cx);
                 return card.flex().flex_col().gap(px(8.)).child(words).child(dress(picture)).into_any_element();
             }
             let picture = match self.still(&image, edge, edge, None, cx) {
-                Picture::Ready(decoded) => holder("preview", wide, tall, 8.).child(shown(decoded, 8.)),
-                Picture::Loading => holder("preview", wide, tall, 8.).child(in_box(Icon::Image, None)),
-                Picture::Failed => self.failed_box(holder("preview", wide, tall, 8.), &image, false, cx),
+                Picture::Ready(decoded) => holder(wide, tall, 8.).child(shown(decoded, 8.)),
+                Picture::Loading => holder(wide, tall, 8.).child(in_box(Icon::Image, None)),
+                Picture::Failed => self.failed_box(holder(wide, tall, 8.), &image, false, cx),
             };
             return card.flex().flex_col().gap(px(8.)).child(words).child(dress(picture)).into_any_element();
         }
         let edge = media::decode_edge((image.width, image.height), 72., 72., Fit::Cover, scale);
         if self.held_back(&image) {
-            let picture = self.load_box(holder("preview", 72., 72., 6.), &image, "Preview", 0, false, cx);
+            let picture = self.load_box(holder(72., 72., 6.), &image, "Preview", 0, false, cx);
             return card.flex().gap(px(12.)).child(words).child(picture).into_any_element();
         }
         let picture = match self.still(&image, edge, edge, None, cx) {
-            Picture::Ready(decoded) => holder("preview", 72., 72., 6.).child(shown(decoded, 6.)),
-            Picture::Loading => holder("preview", 72., 72., 6.).child(in_box(Icon::Image, None)),
-            Picture::Failed => self.failed_box(holder("preview", 72., 72., 6.), &image, false, cx),
+            Picture::Ready(decoded) => holder(72., 72., 6.).child(shown(decoded, 6.)),
+            Picture::Loading => holder(72., 72., 6.).child(in_box(Icon::Image, None)),
+            Picture::Failed => self.failed_box(holder(72., 72., 6.), &image, false, cx),
         };
         card.flex().gap(px(12.)).child(words).child(picture).into_any_element()
     }
@@ -5059,68 +5104,42 @@ impl Pane {
                 InviteState::Joined => {
                     let target_space = space_id.clone();
                     Some(
-                        div()
-                            .id(name_id(&format!("invite-open-{ix}"), &message.id))
-                            .flex_none()
-                            .h(px(30.))
-                            .px(px(12.))
-                            .rounded(px(theme::R_CONTROL))
-                            .bg(theme::raised())
-                            .border_1()
-                            .border_color(theme::border())
-                            .hover(|s| s.bg(theme::selected()))
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .type_small()
-                            .font_weight(theme::MEDIUM)
-                            .text_color(theme::text())
+                        button(name_id(&format!("invite-open-{ix}"), &message.id), ButtonKind::Secondary, "Open")
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .when_some(target_space, |btn, gid| {
                                 btn.on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.open_invite_space(gid.clone(), cx);
                                 }))
                             })
-                            .child("Joined")
                             .into_any_element(),
                     )
                 }
                 InviteState::Valid => {
-                    let label = if handoff {
-                        "Open in Discord"
-                    } else if joining {
-                        "Joining…"
+                    if joining {
+                        Some(crate::gui::components::button_disabled("Joining…").into_any_element())
                     } else {
-                        "Join"
-                    };
-                    Some(
-                        div()
-                            .id(name_id(&format!("invite-join-{ix}"), &message.id))
-                            .flex_none()
-                            .h(px(30.))
-                            .px(px(14.))
-                            .rounded(px(theme::R_CONTROL))
-                            .bg(theme::accent())
-                            .text_color(theme::on_accent())
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .type_small()
-                            .font_weight(theme::SEMIBOLD)
-                            .when(handoff && valid_url, |btn| {
-                                let url = url.clone();
-                                btn.on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_external_link(&url, window, cx);
-                                }))
-                            })
-                            .when(!handoff && !joining, |btn| {
-                                let code = code.clone();
-                                btn.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.join_invite(code.clone(), cx);
-                                }))
-                            })
-                            .child(label)
-                            .into_any_element(),
-                    )
+                        let label = if handoff { "Open in Discord" } else { "Join" };
+                        Some(
+                            button(name_id(&format!("invite-join-{ix}"), &message.id), ButtonKind::Primary, label)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .when(handoff && valid_url, |btn| {
+                                    let url = url.clone();
+                                    btn.on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.open_external_link(&url, window, cx);
+                                    }))
+                                })
+                                .when(!handoff, |btn| {
+                                    let code = code.clone();
+                                    btn.on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.join_invite(code.clone(), cx);
+                                    }))
+                                })
+                                .into_any_element(),
+                        )
+                    }
                 }
                 InviteState::Invalid | InviteState::Unresolved => None,
             };
@@ -5194,28 +5213,33 @@ impl Pane {
                         .children(meta_line.map(|m| div().truncate().type_micro().text_color(theme::text_soft()).child(m))),
                 );
             if can_interest {
-                ev_box = ev_box.child(
-                    div()
-                        .id(name_id(&format!("event-interest-{ix}"), &message.id))
-                        .flex_none()
-                        .h(px(28.))
-                        .px(px(10.))
-                        .rounded(px(theme::R_CONTROL))
-                        .border_1()
-                        .when(ev.interested, |b| b.bg(theme::accent_soft()).border_color(theme::accent()).text_color(theme::accent_text()))
-                        .when(!ev.interested, |b| b.bg(theme::raised()).border_color(theme::border()).text_color(theme::text()))
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .type_small()
-                        .font_weight(theme::MEDIUM)
-                        .when(!toggling, |b| {
-                            b.on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_event_interest(ev_guild.clone(), ev_id.clone(), next_interested, cx);
-                            }))
-                        })
-                        .child(if ev.interested { "✓ Interested" } else { "Interested" }),
-                );
+                let btn: AnyElement = if toggling {
+                    crate::gui::components::button_disabled("Interested").into_any_element()
+                } else if ev.interested {
+                    crate::gui::components::button_with_icon(
+                        name_id(&format!("event-interest-{ix}"), &message.id),
+                        ButtonKind::Secondary,
+                        "icons/check.svg",
+                        "Interested",
+                    )
+                    .border_color(theme::accent())
+                    .text_color(theme::accent_text())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_event_interest(ev_guild.clone(), ev_id.clone(), next_interested, cx);
+                    }))
+                    .into_any_element()
+                } else {
+                    button(name_id(&format!("event-interest-{ix}"), &message.id), ButtonKind::Secondary, "Interested")
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_event_interest(ev_guild.clone(), ev_id.clone(), next_interested, cx);
+                        }))
+                        .into_any_element()
+                };
+                ev_box = ev_box.child(btn);
             }
             card = card.child(ev_box);
         }
@@ -5266,7 +5290,7 @@ impl Pane {
                 .and_then(|hex| u32::from_str_radix(hex, 16).ok());
             let base = parsed.unwrap_or(0x8b5cf6);
             let accent = theme::role_color(base);
-            let fill = gpui::rgba((base << 8) | if mine { if theme::is_light() { 0x33 } else { 0x42 } } else if theme::is_light() { 0x1a } else { 0x24 });
+            let fill = theme::tinted_chip(base, mine);
             let edge_color = if mine { accent } else { gpui::Rgba { alpha: 0.5, ..accent } };
             (
                 div()

@@ -1545,13 +1545,54 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         })
         .map_err(|err| err.to_string())?;
+    let (send_tx, send_rx) = std::sync::mpsc::channel::<Command>();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+    let router_ctx = ctx.clone();
+    std::thread::Builder::new()
+        .name("signal-router".into())
+        .spawn(move || {
+            for command in inbox {
+                match command {
+                    Command::CancelSend { client_id, .. } => {
+                        upload::cancel(&router_ctx.account, &client_id);
+                    }
+                    cmd @ (Command::Send { .. } | Command::SendWith { .. }) => {
+                        if send_tx.send(cmd).is_err() {
+                            break;
+                        }
+                    }
+                    other => {
+                        if cmd_tx.send(other).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(|err| err.to_string())?;
+    let (send_ctx, send_current) = (ctx.clone(), current.clone());
+    std::thread::Builder::new()
+        .name("signal-send".into())
+        .spawn(move || {
+            for command in send_rx {
+                let account = send_current
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                match (account, command) {
+                    (Some(account), command) => serve_send(&account, command),
+                    (None, command) => offline(&send_ctx, command),
+                }
+            }
+        })
+        .map_err(|err| err.to_string())?;
     std::thread::Builder::new()
         .name("signal-commands".into())
         .spawn(move || {
             let account = || current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
             serve_commands(
                 &ctx,
-                inbox,
+                cmd_rx,
                 PACE,
                 // Signal keeps no history on its servers: what is stored is all there is.
                 |_| {},
@@ -3991,7 +4032,15 @@ fn group_call_join(account: &Account, conversation_id: &str, group_id: &str) {
 
     // Distribute frame-encryption sender key ONLY to verified group members via 1:1 `CallMessage.opaque`.
     let mut sender_key = [0u8; 32];
-    let _ = getrandom::fill(&mut sender_key);
+    if let Err(err) = getrandom::fill(&mut sender_key) {
+        let _ = account.wire.group_call_leave(group_id, &roster.era_id);
+        account.ctx.call_failed(
+            conversation_id,
+            CallFailure::Encryption,
+            &format!("OS random generator failed: {err}"),
+        );
+        return;
+    }
     let key_opaque = encode_group_call_signal(&GroupCallSignal::SenderKey {
         group_id: group_id.to_owned(),
         era_id: roster.era_id.clone(),
@@ -4687,6 +4736,50 @@ fn capabilities(link_previews: bool) -> protocol::Capabilities {
     }
 }
 
+/// Dedicated fast-path send handler running on `"signal-send"` so sends never wait behind
+/// `MarkRead`, `patch_group`, `person_profile`, or `CallIce` on `"signal-commands"`.
+fn serve_send(account: &Arc<Account>, command: Command) {
+    let ctx = &account.ctx;
+    match command {
+        Command::Send { conversation_id, client_id, text, reply_to } => {
+            let _ = crate::sendtime::run(&client_id, || {
+                let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref(), &[], false);
+                let ok = outcome.is_ok();
+                ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
+                crate::sendtime::stage("store");
+                if ok { Ok(()) } else { Err(()) }
+            });
+        }
+        Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+            if let Some(draft) = with.poll.clone() {
+                if !with.files.is_empty() {
+                    ctx.sent(&conversation_id, &client_id, Err("A poll can't carry a file.".to_owned()));
+                } else {
+                    let _ = crate::sendtime::run(&client_id, || {
+                        let outcome = send_poll(account, &conversation_id, &draft, reply_to.as_deref());
+                        let ok = outcome.is_ok();
+                        ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
+                        crate::sendtime::stage("store");
+                        if ok { Ok(()) } else { Err(()) }
+                    });
+                }
+            } else if let Some(contact) = with.contact.clone() {
+                let _ = crate::sendtime::run(&client_id, || {
+                    let outcome = send_contact(account, &conversation_id, contact);
+                    let ok = outcome.is_ok();
+                    ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
+                    crate::sendtime::stage("store");
+                    if ok { Ok(()) } else { Err(()) }
+                });
+            } else {
+                send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+            }
+        }
+        Command::CancelSend { client_id, .. } => upload::cancel(&account.ctx.account, &client_id),
+        other => serve(account, other),
+    }
+}
+
 fn serve(account: &Arc<Account>, command: Command) {
     let ctx = &account.ctx;
     match command {
@@ -4776,24 +4869,8 @@ fn serve(account: &Arc<Account>, command: Command) {
             })();
             let _ = reply.send(outcome);
         }
-        Command::Send { conversation_id, client_id, text, reply_to } => {
-            let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref(), &[], false);
-            ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
-        }
-        Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
-            if let Some(draft) = with.poll.clone() {
-                if !with.files.is_empty() {
-                    ctx.sent(&conversation_id, &client_id, Err("A poll can't carry a file.".to_owned()));
-                } else {
-                    let outcome = send_poll(account, &conversation_id, &draft, reply_to.as_deref());
-                    ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
-                }
-            } else if let Some(contact) = with.contact.clone() {
-                let outcome = send_contact(account, &conversation_id, contact);
-                ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
-            } else {
-                send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
-            }
+        Command::Send { .. } | Command::SendWith { .. } => {
+            serve_send(account, command);
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&account.ctx.account, &client_id),
         Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
@@ -6509,6 +6586,7 @@ fn send_text(
                     previews.push(fetched);
                 }
             }
+            crate::sendtime::stage("preview");
         }
     }
     let sent = account.wire.send(&to, Body::Text {
@@ -6518,6 +6596,7 @@ fn send_text(
         timer,
         previews: previews.clone(),
     })?;
+    crate::sendtime::stage("wire");
     account.live().sent(sent, conversation);
     let words = Text {
         author: account.me.clone(),
@@ -6561,17 +6640,21 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
         return;
     }
     if with.files.is_empty() {
-        if let Some(pick) = with.pick {
-            let outcome = match pick.kind {
-                CatalogKind::Gifs => send_gif(account, conversation, client_id, text, reply_to, &pick.id).map_err(|fault| fault.words()),
-                CatalogKind::Stickers => send_sticker(account, conversation, client_id, reply_to, &pick.id).map_err(|fault| fault.words()),
-                _ => Err("Signal can't send that item from here.".to_owned()),
+        let _ = crate::sendtime::run(client_id, || {
+            let outcome = if let Some(pick) = with.pick {
+                match pick.kind {
+                    CatalogKind::Gifs => send_gif(account, conversation, client_id, text, reply_to, &pick.id).map_err(|fault| fault.words()),
+                    CatalogKind::Stickers => send_sticker(account, conversation, client_id, reply_to, &pick.id).map_err(|fault| fault.words()),
+                    _ => Err("Signal can't send that item from here.".to_owned()),
+                }
+            } else {
+                send_text(account, conversation, text, reply_to, &with.spans, with.suppress_embeds).map_err(|fault| fault.words())
             };
+            let ok = outcome.is_ok();
             account.ctx.sent(conversation, client_id, outcome);
-            return;
-        }
-        let outcome = send_text(account, conversation, text, reply_to, &with.spans, with.suppress_embeds).map_err(|fault| fault.words());
-        account.ctx.sent(conversation, client_id, outcome);
+            crate::sendtime::stage("store");
+            if ok { Ok(()) } else { Err(()) }
+        });
         return;
     }
     let account = Arc::clone(account);
@@ -6583,7 +6666,9 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
     let ctx = account.ctx.clone();
     let conversation_id = conversation.clone();
     upload::spawn(&ctx, &conversation_id, client_id, &with.files, move |upload| {
-        send_files(&account, &conversation, &client_id_owned, &text, reply_to.as_deref(), voice, upload)
+        crate::sendtime::run(&client_id_owned, || {
+            send_files(&account, &conversation, &client_id_owned, &text, reply_to.as_deref(), voice, upload)
+        })
     });
 }
 
@@ -6637,7 +6722,10 @@ fn send_files(
     let timer = account.live().timer_of(conversation);
     let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, &[]);
     let sent = match account.wire.send(&to, Body::Files { text: wire_body, quote: quote.clone(), ranges, files: prepared, timer }) {
-        Ok(sent) => sent,
+        Ok(sent) => {
+            crate::sendtime::stage("wire");
+            sent
+        }
         Err(fault) => {
             forget_landed(&attachments);
             return Err(fault.words());

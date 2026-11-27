@@ -6,57 +6,25 @@ use gpui::{rgb, rgba, Rgba};
 
 /// Links, mentions and "N replies": the accent adjusted for body-text contrast.
 pub fn link() -> Rgba { theme::accent_text() }
-pub fn row_hover() -> Rgba {
-    if theme::is_high_contrast() {
-        if theme::is_light() { rgba(0x00000014) } else { rgba(0xffffff18) }
-    } else if theme::is_light() {
-        rgba(0x0000000a)
-    } else {
-        rgba(0xffffff0c)
-    }
-}
+pub fn row_hover() -> Rgba { theme::hover() }
 /// A mention of me inside the text.
-pub fn mention_me() -> Rgba {
-    if theme::is_high_contrast() {
-        if theme::is_light() { rgba(0x1d5bd638) } else { rgba(0x2f6feb66) }
-    } else if theme::is_light() {
-        rgba(0x1d5bd62e)
-    } else {
-        rgba(0x2f6feb52)
-    }
-}
+pub fn mention_me() -> Rgba { theme::mention_me() }
 pub fn border_strong() -> Rgba { theme::border_strong() }
-pub fn code_inline() -> Rgba {
-    if theme::is_high_contrast() {
-        if theme::is_light() { rgba(0x00000018) } else { rgba(0xffffff20) }
-    } else if theme::is_light() {
-        rgba(0x0000000f)
-    } else {
-        rgba(0xffffff14)
-    }
-}
+pub fn code_inline() -> Rgba { theme::code_inline() }
 /// Opaque, so a picture's box hides the row tint behind it.
 pub fn media_fill() -> Rgba { theme::raised() }
 pub fn card() -> Rgba { theme::raised() }
 pub fn code_bg() -> Rgba { theme::raised() }
-pub fn code_keyword() -> Rgba { if theme::is_light() { rgb(0x7c3aed) } else { rgb(0xc792ea) } }
-pub fn code_string() -> Rgba { if theme::is_light() { rgb(0x1e7e34) } else { rgb(0xc3e88d) } }
-pub fn code_comment() -> Rgba {
-    if theme::is_high_contrast() {
-        if theme::is_light() { rgb(0x3f4450) } else { rgb(0xa3b0bc) }
-    } else if theme::is_light() {
-        rgb(0x5b606d)
-    } else {
-        rgb(0x7f8c98)
-    }
-}
-pub fn code_number() -> Rgba { if theme::is_light() { rgb(0xb84314) } else { rgb(0xf78c6c) } }
-pub fn code_type() -> Rgba { if theme::is_light() { rgb(0x9a5b00) } else { rgb(0xffcb6b) } }
-pub fn code_function() -> Rgba { if theme::is_light() { rgb(0x1852c9) } else { rgb(0x82aaff) } }
-pub fn code_added() -> Rgba { if theme::is_light() { rgb(0x1a7f49) } else { rgb(0x7ee787) } }
-pub fn code_added_bg() -> Rgba { if theme::is_light() { rgba(0x1a7f4924) } else { rgba(0x3fb95033) } }
-pub fn code_removed() -> Rgba { if theme::is_light() { rgb(0xc92a2a) } else { rgb(0xff7b72) } }
-pub fn code_removed_bg() -> Rgba { if theme::is_light() { rgba(0xc92a2a24) } else { rgba(0xf8514933) } }
+pub fn code_keyword() -> Rgba { rgb(theme::syntax().keyword) }
+pub fn code_string() -> Rgba { rgb(theme::syntax().string) }
+pub fn code_comment() -> Rgba { rgb(theme::syntax().comment) }
+pub fn code_number() -> Rgba { rgb(theme::syntax().number) }
+pub fn code_type() -> Rgba { rgb(theme::syntax().type_) }
+pub fn code_function() -> Rgba { rgb(theme::syntax().function) }
+pub fn code_added() -> Rgba { rgb(theme::syntax().added) }
+pub fn code_added_bg() -> Rgba { theme::tinted_chip(theme::syntax().added, true) }
+pub fn code_removed() -> Rgba { rgb(theme::syntax().removed) }
+pub fn code_removed_bg() -> Rgba { theme::tinted_chip(theme::syntax().removed, true) }
 
 /// ANSI SGR colours. `0` is the default, so it has no paint of its own.
 pub fn code_ansi(code: u8) -> Option<Rgba> {
@@ -67,19 +35,24 @@ pub fn code_ansi(code: u8) -> Option<Rgba> {
         100..=107 => (code - 100, true),
         _ => return None,
     };
-    if theme::is_light() {
-        const DIM: [u32; 8] = [0x141518, 0xc92a2a, 0x1a7f49, 0x9a6200, 0x1852c9, 0x7c3aed, 0x0e7490, 0x5b606d];
-        const BRIGHT: [u32; 8] = [0x454954, 0xd93838, 0x1e8f53, 0xb07200, 0x2563eb, 0x9333ea, 0x0891b2, 0x6b7280];
-        return Some(rgb(if bright { BRIGHT[index as usize] } else { DIM[index as usize] }));
-    }
-    const DIM: [u32; 8] = [0x4a4a4a, 0xf07178, 0xc3e88d, 0xffcb6b, 0x82aaff, 0xc792ea, 0x89ddff, 0xeeffff];
-    const BRIGHT: [u32; 8] = [0x6b6b6b, 0xff8b92, 0xd0f0a0, 0xffe082, 0x9cc4ff, 0xd4b0ff, 0xb3e5ff, 0xffffff];
-    Some(rgb(if bright { BRIGHT[index as usize] } else { DIM[index as usize] }))
+    let s = theme::syntax();
+    let cyan = theme::accent_ramp_for(theme::Accent::Teal, theme::is_light(), theme::is_high_contrast()).accent_text;
+    let color = match index {
+        0 => if theme::is_light() { if bright { theme::text_soft() } else { theme::text() } } else { if bright { theme::text_faint() } else { theme::text_disabled() } },
+        1 => rgb(s.removed),
+        2 => rgb(s.string),
+        3 => rgb(s.type_),
+        4 => rgb(s.function),
+        5 => rgb(s.keyword),
+        6 => rgb(cyan),
+        _ => if theme::is_light() { theme::text_faint() } else { theme::text() },
+    };
+    Some(color)
 }
-pub fn float_hover() -> Rgba { if theme::is_light() { rgb(0xe4e6eb) } else { rgb(0x303136) } }
-pub fn spoiler() -> Rgba { if theme::is_light() { rgb(0xd0d4dc) } else { rgb(0x3a3b42) } }
+pub fn float_hover() -> Rgba { theme::float_hover() }
+pub fn spoiler() -> Rgba { theme::spoiler() }
 /// Labels over media.
-pub fn badge() -> Rgba { rgba(0x000000a6) }
+pub fn badge() -> Rgba { theme::media_dim() }
 pub fn scrim() -> Rgba { if theme::is_light() { rgba(0x000000c0) } else { rgba(0x0b0b0df0) } }
 pub fn selection() -> Rgba { theme::selection() }
 

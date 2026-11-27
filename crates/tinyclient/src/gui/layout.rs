@@ -13,8 +13,8 @@ use super::phone::tokens::PhoneType;
 use super::state::{Shell, Snapshot};
 use super::theme::{self, Type};
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point, Rgba,
-    SharedString, Window, WindowControlArea,
+    canvas, deferred, div, prelude::*, px, AnyElement, App, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point,
+    Rgba, SharedString, Window, WindowControlArea,
 };
 use protocol::{CallState, Conversation, Key, Link, Network, Notify, Presence};
 use std::rc::Rc;
@@ -168,6 +168,10 @@ pub struct State {
     pub update_alert: bool,
     /// Shell-level external link confirmation when no conversation pane is mounted.
     link_ask: Option<super::conversation::links::LinkAsk>,
+    /// Last observed viewport `(width, height)` for dismissing transient overlays on resize.
+    pub last_viewport: std::cell::Cell<Option<(f32, f32)>>,
+    /// Measured top Y of `main_row` in window coordinates (nonzero when `live_location_bar` is shown).
+    main_top: Rc<std::cell::Cell<f32>>,
 }
 
 impl Default for State {
@@ -187,6 +191,8 @@ impl Default for State {
             toasts: 0,
             update_alert: false,
             link_ask: None,
+            last_viewport: std::cell::Cell::new(None),
+            main_top: Rc::new(std::cell::Cell::new(0.)),
         }
     }
 }
@@ -417,16 +423,40 @@ impl Shell {
         }
     }
 
-    /// Closes the top layer: switcher, menu, floating sidebar, right pane. False when there was
-    /// none, so the key can mean something else.
+    /// Dismisses transient pointer- or anchor-pinned menus and floating cards when the viewport
+    /// size changes or a pane divider drag starts. Leaves modals open.
+    pub(in crate::gui) fn dismiss_transient_overlays(&mut self, cx: &mut Context<Self>) {
+        let mut changed = self.layout_state.menu.take().is_some();
+        if self.close_slack_menu(cx) {
+            changed = true;
+        }
+        self.tiny_close_float(cx);
+        self.call_menu_close(cx);
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Closes the top layer: top-level modals, switcher, menu, floating sidebar, right pane.
+    /// False when there was none, so the key can mean something else.
     pub(super) fn close_top(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // On a phone Escape is back: one pushed page, sheet or switcher at a time.
         if super::phone::active() {
             return self.phone_back(Some(window), cx);
         }
-        // The invite dialog is painted above the switcher, so Escape closes it first.
-        if self.sidebar_state.create_invite.is_some() {
-            self.sidebar_state.create_invite = None;
+        if self.story_state.viewer.is_some() {
+            self.close_story_viewer(cx);
+            return true;
+        }
+        if self.meeting_form.is_some() {
+            self.close_meeting(window, cx);
+            return true;
+        }
+        if self.discord_settings.open.is_some() {
+            self.close_discord_settings(cx);
+            return true;
+        }
+        if self.discord_admin.modal.take().is_some() {
             cx.notify();
             return true;
         }
@@ -434,22 +464,15 @@ impl Shell {
             cx.notify();
             return true;
         }
+        if self.close_sidebar_modal(cx) {
+            return true;
+        }
         if self.sidebar_state.switcher.is_some() {
             self.close_switcher(window, cx);
         } else if self.close_discord_admin(cx) {
             return true;
-        } else if self.sidebar_state.delete_channel.is_some() {
-            self.sidebar_state.delete_channel = None;
-        } else if self.sidebar_state.move_channels.is_some() {
-            self.sidebar_state.move_channels = None;
-        } else if self.sidebar_state.edit_channel.is_some() {
-            self.sidebar_state.edit_channel = None;
-        } else if self.sidebar_state.create_category.is_some() {
-            self.sidebar_state.create_category = None;
-        } else if self.sidebar_state.create_channel.is_some() {
-            self.sidebar_state.create_channel = None;
-        } else if self.sidebar_state.browse_channels.is_some() {
-            self.sidebar_state.browse_channels = None;
+        } else if self.close_slack_menu(cx) {
+            return true;
         } else if self.layout_state.menu.is_some() {
             self.layout_state.menu = None;
         } else if self.call_unfull(window, cx) {
@@ -480,13 +503,21 @@ impl Shell {
             return;
         }
         let x = f32::from(event.position.x);
-        let overview = discord_overview_width(f32::from(window.viewport_size().width), self.layout_state.sidebar_width, self.layout_state.sidebar_hidden, self.layout_state.right.as_ref().filter(|_| !self.pane_tucked()).map(|_| self.layout_state.right_width), matches!(&self.sidebar_state.mode, super::sidebar::Mode::Space(space) if space.network == Network::Discord));
+        let viewport = f32::from(window.viewport_size().width);
+        let right_open = self.layout_state.right.as_ref().filter(|_| !self.pane_tucked()).map(|_| self.layout_state.right_width);
+        let overview = discord_overview_width(viewport, self.layout_state.sidebar_width, self.layout_state.sidebar_hidden, right_open, matches!(&self.sidebar_state.mode, super::sidebar::Mode::Space(space) if space.network == Network::Discord));
+        let current_plan = plan(viewport - overview, self.layout_state.sidebar_width, self.layout_state.sidebar_hidden, right_open);
+        let right_in_row = current_plan.right.filter(|&(_, replaces)| !replaces).map(|(w, _)| w).unwrap_or(0.);
+        let sidebar_in_row = current_plan.sidebar.unwrap_or(0.);
         let state = &mut self.layout_state;
         match edge {
-            Edge::Sidebar => state.sidebar_width = (x - RAIL_WIDTH - overview).round().clamp(SIDEBAR_RANGE.0, SIDEBAR_RANGE.1),
+            Edge::Sidebar => {
+                let max_w = (viewport - RAIL_WIDTH - overview - right_in_row - CONVERSATION_MIN).clamp(SIDEBAR_RANGE.0, SIDEBAR_RANGE.1);
+                state.sidebar_width = (x - RAIL_WIDTH - overview).round().clamp(SIDEBAR_RANGE.0, max_w);
+            }
             Edge::Right => {
-                let window = f32::from(window.viewport_size().width);
-                state.right_width = (window - x).round().clamp(RIGHT_RANGE.0, RIGHT_RANGE.1);
+                let max_w = (viewport - RAIL_WIDTH - overview - sidebar_in_row - CONVERSATION_MIN).clamp(RIGHT_RANGE.0, RIGHT_RANGE.1);
+                state.right_width = (viewport - x).round().clamp(RIGHT_RANGE.0, max_w);
             }
         }
         cx.notify();
@@ -507,6 +538,7 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
+                    this.dismiss_transient_overlays(cx);
                     this.layout_state.resizing = Some(edge);
                     cx.stop_propagation();
                 }),
@@ -542,6 +574,7 @@ impl Shell {
         let title = div()
             .flex_1()
             .min_w_0()
+            .overflow_hidden()
             .flex()
             .items_baseline()
             .gap(px(8.))
@@ -563,6 +596,7 @@ impl Shell {
         });
         let row = div()
             .h_full()
+            .overflow_hidden()
             .pl(px(theme::PANE_PAD))
             .pr(px(chrome::end_pad(End::Right, 12.)))
             .flex()
@@ -597,6 +631,7 @@ impl Shell {
             .relative()
             .h(px(TOP_BAR))
             .flex_none()
+            .overflow_hidden()
             .border_b_1()
             .border_color(theme::hairline())
             .child(row);
@@ -705,6 +740,7 @@ impl Shell {
         let _ = snapshot;
         let mut card = div()
             .w(px(if super::phone::active() { 326. } else { 440. }))
+            .max_w_full()
             .rounded(px(theme::R_CARD))
             .bg(theme::raised())
             .border_1()
@@ -734,6 +770,7 @@ impl Shell {
                         div()
                             .w_full()
                             .min_h_full()
+                            .px(px(16.))
                             .pb(px(TOP_BAR))
                             .flex()
                             .flex_col()
@@ -785,14 +822,15 @@ impl Shell {
     }
 
     /// The open menu, over everything, with a catcher behind it that closes it.
-    fn menu_layer(&self, snapshot: &Snapshot, sidebar: f32, overview: f32, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+    fn menu_layer(&self, snapshot: &Snapshot, sidebar: f32, overview: f32, top_offset: f32, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let open = self.layout_state.menu.as_ref()?;
         let tall = f32::from(window.viewport_size().height);
         // The rail's add button and own avatar, anchored to the full rail width so popovers open outside the rail.
         let rail_button = |from_bottom: f32| place::anchor(0., tall - from_bottom - 40., RAIL_WIDTH, 40.);
         let strip_left = RAIL_WIDTH + if matches!(open, Menu::Space(_)) { overview } else { 0. };
         let strip_width = if overview > 0. && matches!(open, Menu::Network(_)) { overview } else { sidebar };
-        let strip_button = place::anchor(strip_left + strip_width - 12. - 28., 12., 28., 28.);
+        let strip_end = chrome::end_pad(End::List, 12.);
+        let strip_button = place::anchor(strip_left + strip_width - strip_end - 28., top_offset + 12., 28., 28.);
         // Discord, a multi-server Tiny title, and a server name are the buttons on the left.
         // The 28-point box at the strip's right is the ellipsis, and it sits under Unread.
         let named = match open {
@@ -802,7 +840,7 @@ impl Shell {
             _ => false,
         };
         let title_width = (strip_width * 0.55).clamp(140., 260.);
-        let title_anchor = place::anchor(strip_left + 8., 6., title_width, 32.);
+        let title_anchor = place::anchor(strip_left + 8., top_offset + 6., title_width, 32.);
         let menu_anchor = if named { title_anchor } else { strip_button };
         let placed: AnyElement = match open {
             Menu::Add => {
@@ -2268,7 +2306,7 @@ impl Render for Shell {
             let root = self.mount_shared_modals(root, window, cx);
             return root
                 .children(self.telegram_call_modal(window, cx))
-                .children(self.meeting_layer(cx))
+                .children(self.meeting_layer(window, cx))
                 .children(self.story_viewer_layer(window, cx))
                 .children(self.toast_layer(width, cx))
                 .children(super::settings::phone_page(window, cx))
@@ -2283,15 +2321,18 @@ impl Render for Shell {
         // Where a sign-in window should open: over this one.
         let origin = window.bounds().origin;
         self.window_at.set(Some((f32::from(origin.x) as i32, f32::from(origin.y) as i32)));
-        // Too narrow for the pane beside the conversation: sticky Details hides (07 §4).
-        self.note_room(narrow(width, state.sidebar_width, state.sidebar_hidden, state.right_width), None);
         let right_width = state.right.as_ref().filter(|_| !self.pane_tucked()).map(|_| state.right_width);
         let overview = discord_overview_width(width, state.sidebar_width, state.sidebar_hidden, right_width, matches!(&self.sidebar_state.mode, super::sidebar::Mode::Space(space) if space.network == Network::Discord));
-        let plan = plan(width - overview, state.sidebar_width, state.sidebar_hidden, right_width);
+        // Too narrow for the pane beside the conversation: sticky Details hides (07 §4).
+        self.note_room(narrow(width - overview, state.sidebar_width, state.sidebar_hidden, state.right_width), None);
+        let mut plan = plan(width - overview, state.sidebar_width, state.sidebar_hidden, right_width);
+        let call_view = self.call_view_active(snapshot);
+        if call_view && plan.right.is_some_and(|(_, replaces)| replaces) {
+            plan.right = None;
+        }
         self.note_room(self.pane_narrow(), Some(conversation_width(width - overview, &plan)));
         let floating = plan.sidebar.is_none() && state.floating;
         let replaced = plan.right.is_some_and(|(_, replaces)| replaces);
-        let call_view = self.call_view_active(snapshot);
         // With nothing open on a phone, the list is the whole screen: there is no sidebar
         // column to fall back to, and the conversation only exists when something is open.
         let list_alone = if call_view {
@@ -2310,11 +2351,35 @@ impl Render for Shell {
         chrome::set_end(end, window);
 
         let live_bar = self.live_location_bar(cx);
+        let has_live_bar = live_bar.is_some();
+        if !has_live_bar {
+            state.main_top.set(0.);
+        }
+        let main_top_cell = state.main_top.clone();
+        let floating_width = state.sidebar_width.min((width - RAIL_WIDTH).max(0.));
+        let actual_sidebar_width = if list_alone {
+            (width - RAIL_WIDTH).max(0.)
+        } else if floating {
+            floating_width
+        } else {
+            plan.sidebar.unwrap_or(state.sidebar_width)
+        };
         let main_row = div()
+            .relative()
             .flex_1()
             .min_h_0()
             .w_full()
             .flex()
+            .child(
+                canvas(
+                    move |bounds, _, _| {
+                        main_top_cell.set(f32::from(bounds.origin.y));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
             .child(self.rail(snapshot, window, cx))
             .when(overview > 0., |row| row.child(self.discord_overview(snapshot, overview, window, cx)))
             .children(plan.sidebar.map(|width| {
@@ -2339,35 +2404,42 @@ impl Render for Shell {
                 };
                 row.child(div().flex_1().min_w_0().h_full().child(pane))
             })
-            .children(plan.right.and_then(|(width, replaces)| self.right_pane(width, replaces, window, cx)));
+            .children(plan.right.and_then(|(width, replaces)| self.right_pane(width, replaces, window, cx)))
+            .when(floating, |row| {
+                row.child(
+                    deferred(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .child(
+                                scrim().left(px(RAIL_WIDTH)).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.layout_state.floating = false;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left(px(RAIL_WIDTH))
+                                    .h_full()
+                                    .shadow(theme::shadow_pane())
+                                    .occlude()
+                                    .child(self.sidebar(snapshot, floating_width, window, cx)),
+                            ),
+                    )
+                    .priority(Layer::Sidebar as usize),
+                )
+            });
 
         let desktop = root
             .flex_col()
             .children(live_bar.map(|bar| div().flex_none().w_full().pr(px(chrome::width(window))).child(bar)))
             .child(main_row)
             .children(self.banner_layer(plan.sidebar, cx))
-            .when(floating, |root| {
-                let width = state.sidebar_width.min(width - RAIL_WIDTH);
-                root.child(
-                    scrim().left(px(RAIL_WIDTH)).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.layout_state.floating = false;
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left(px(RAIL_WIDTH))
-                        .h_full()
-                        .shadow(theme::shadow_pane())
-                        .occlude()
-                        .child(self.sidebar(snapshot, width, window, cx)),
-                )
-            })
             .children(self.switcher(window, cx))
             .children(self.create_channel_modal(window, cx))
             .children(self.create_category_modal(window, cx))
@@ -2381,13 +2453,14 @@ impl Render for Shell {
             .children(self.forum_post_modal(window, cx))
             .children(self.browse_channels_modal(window, cx))
             .children(self.discord_admin_layer(window, cx));
+        let top_offset = if has_live_bar { self.layout_state.main_top.get() } else { 0. };
         let desktop = self.mount_shared_modals(desktop, window, cx)
             .children(self.call_full_stage(snapshot, cx))
             .children(self.telegram_call_modal(window, cx))
             // With no sidebar dock in view (collapsed, hidden, or narrow Tiny page), float incoming calls here.
             .children(self.call_incoming_overlay(snapshot, cx))
-            .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
-            .children(self.meeting_layer(cx))
+            .children(self.menu_layer(snapshot, actual_sidebar_width, overview, top_offset, window, cx))
+            .children(self.meeting_layer(window, cx))
             .children(self.story_viewer_layer(window, cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))
@@ -2401,13 +2474,13 @@ impl Render for Shell {
 impl Shell {
     /// Modals that can open on both desktop and phone roots.
     fn mount_shared_modals<E: ParentElement>(&self, root: E, window: &mut Window, cx: &mut Context<Self>) -> E {
-        root.children(self.create_invite_modal(cx))
+        root.children(self.create_invite_modal(window, cx))
             .children(self.join_server_modal(window, cx))
-            .children(self.conference_link_modal(cx))
+            .children(self.conference_link_modal(window, cx))
             .children(self.create_server_modal(window, cx))
-            .children(self.events_modal(cx))
+            .children(self.events_modal(window, cx))
             .children(self.server_gate_modal(window, cx))
-            .children(self.leave_space_modal(cx))
+            .children(self.leave_space_modal(window, cx))
             .children(self.discord_settings_layer(window, cx))
             .children(self.discord_admin_modal(window, cx))
             .children(self.link_ask_modal(window, cx))

@@ -47,6 +47,9 @@ const GAP: Duration = Duration::from_millis(200);
 /// The longest `Retry-After` that is waited out before the one retry. A longer one is told to
 /// the user at once and nothing is retried: the wait is never cut short.
 const PATIENCE: u64 = 60;
+/// Cap on 429 retry wait for interactive send methods so sends fail fast instead of stalling
+/// a user for a full minute.
+pub(super) const SEND_PATIENCE: u64 = 5;
 /// A search queued this long past the shell's ask is not sent: the pane has moved on.
 const SEARCH_PATIENCE: Duration = Duration::from_secs(25);
 /// A history this adapter fetched itself this recently is not fetched again when opened.
@@ -351,6 +354,9 @@ struct State {
     /// Conversations with a huddle running, and who is in it (`huddle`). Only what the socket
     /// sends and what a page read anyway says; nothing is asked of Slack to find them.
     rooms: HashMap<String, huddle::Room>,
+    /// Last written custom emoji note values (`name` -> stored note value), so `emoji.list`
+    /// skips unchanged entries instead of issuing thousands of redundant SQLite writes.
+    emoji_cache: HashMap<String, String>,
 }
 
 /// Remote draft metadata tracked so subsequent edits call `drafts.update` and clears call `drafts.delete`.
@@ -801,6 +807,9 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         let moved = api != session.url;
         let agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
             .tls_config(crate::tls::config())
+            .max_idle_age(Duration::from_secs(30))
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(Duration::from_secs(20)))
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
             .user_agent(&session.user_agent)
@@ -821,26 +830,54 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         });
         let socket = slack.clone();
         std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
-        // A send with files uploads on a thread of its own, and previews are fetched on one,
-        // paced: the commands behind either (a cancel among them) are not held up.
-        let other = |command| match command {
-            Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
-                if with.files.is_empty() && with.pick.is_none() && with.schedule.is_none() && parse_slash_command(&text).is_some() {
-                    slack.send(&conversation_id, &client_id, &text, reply_to.as_deref(), with.suppress_embeds);
-                } else {
-                    let sending = slack.clone();
-                    let (conversation, client) = (conversation_id.clone(), client_id.clone());
-                    crate::blobs::upload::spawn(&slack.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
-                        sending.send_with(&conversation, &client, &text, reply_to.as_deref(), &with, up)
-                    });
-                }
-            }
-            Command::Previews(ids) => slack.previews(ids),
-            command => slack.serve(command),
-        };
-        serve_commands(&slack.ctx, inbox, PACE, |id| slack.report(slack.fetch(id)), other)
+        slack.run_workers(inbox);
     });
     spawned.map(drop).map_err(|err| err.to_string())
+}
+
+/// Whether a `ureq` error indicates a stale pooled socket closed before or during a request.
+fn dropped_socket(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
+/// Methods safe to retry once on a dropped pooled socket: idempotent reads/marks and
+/// `chat.postMessage` when carrying `client_msg_id` for deduplication.
+fn retryable_on_drop(method: &str, params: &[(&str, &str)]) -> bool {
+    if method == "chat.postMessage" {
+        return params.iter().any(|(k, v)| *k == "client_msg_id" && !v.is_empty());
+    }
+    matches!(
+        method,
+        "auth.test"
+            | "rtm.connect"
+            | "client.counts"
+            | "team.info"
+            | "emoji.list"
+            | "bots.info"
+            | "commands.list"
+            | "dnd.info"
+            | "dnd.teamInfo"
+    ) || method.starts_with("search.")
+        || method.starts_with("gifs.")
+        || method.ends_with(".list")
+        || method.ends_with(".info")
+        || method.ends_with(".get")
+        || method.ends_with(".history")
+        || method.ends_with(".replies")
+        || method.ends_with(".members")
+        || method.ends_with(".mark")
+        || method.ends_with(".getView")
+        || method.ends_with(".getPermalink")
 }
 
 /// Seconds from a Slack timestamp such as `1700000000.000200`.
@@ -993,23 +1030,121 @@ impl Slack {
         Download { url, headers, sealed: None }
     }
 
-    /// Waits for the method's turn: [`GAP`] after the last call of any kind, and never more
-    /// often than half what Slack documents for the method, a few calls in a row allowed (a
-    /// tenth of a minute's worth) so that what the user clicks is not held back. True if the
-    /// adapter was stopped while waiting.
+    /// Non-blocking front-end router decoupling interactive sends, uploads, cancels, typing,
+    /// and downloads from `serve_commands`.
+    fn run_workers(self: &Arc<Self>, inbox: Receiver<Command>) {
+        let (send_tx, send_rx) = std::sync::mpsc::channel::<Command>();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+
+        let send_slack = self.clone();
+        let _ = std::thread::Builder::new().name("slack-send".into()).spawn(move || {
+            while !send_slack.ctx.stopped() {
+                let Ok(command) = send_rx.recv() else { break };
+                if matches!(command, Command::Stop) {
+                    break;
+                }
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
+                    Command::Send { conversation_id, client_id, text, reply_to } => {
+                        send_slack.send(&conversation_id, &client_id, &text, reply_to.as_deref(), false);
+                    }
+                    Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                        send_slack.send(&conversation_id, &client_id, &text, reply_to.as_deref(), with.suppress_embeds);
+                    }
+                    _ => {}
+                }));
+                if outcome.is_err() {
+                    tracing::error!("chatd: Slack: send worker panicked");
+                }
+            }
+        });
+
+        let cmd_slack = self.clone();
+        let _ = std::thread::Builder::new().name("slack-cmd".into()).spawn(move || {
+            let other = |command| match command {
+                Command::Previews(ids) => cmd_slack.previews(ids),
+                command => cmd_slack.serve(command),
+            };
+            serve_commands(&cmd_slack.ctx, cmd_rx, PACE, |id| cmd_slack.report(cmd_slack.fetch(id)), other);
+        });
+
+        self.route_inbox(inbox, send_tx, cmd_tx);
+    }
+
+    fn route_inbox(self: &Arc<Self>, inbox: Receiver<Command>, send_tx: Sender<Command>, cmd_tx: Sender<Command>) {
+        while !self.ctx.stopped() {
+            let Ok(command) = inbox.recv() else { break };
+            match command {
+                Command::Stop => {
+                    let _ = send_tx.send(Command::Stop);
+                    let _ = cmd_tx.send(Command::Stop);
+                    break;
+                }
+                cmd @ Command::Send { .. } => {
+                    let _ = send_tx.send(cmd);
+                }
+                Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                    if with.files.is_empty() && with.pick.is_none() && with.schedule.is_none() && parse_slash_command(&text).is_some() {
+                        let _ = send_tx.send(Command::SendWith { conversation_id, client_id, text, reply_to, with });
+                    } else {
+                        let sending = self.clone();
+                        let (conversation, client) = (conversation_id.clone(), client_id.clone());
+                        crate::blobs::upload::spawn(&self.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
+                            sending.send_with(&conversation, &client, &text, reply_to.as_deref(), &with, up)
+                        });
+                    }
+                }
+                Command::CancelSend { client_id, .. } => {
+                    crate::blobs::upload::cancel(&self.ctx.account, &client_id);
+                }
+                Command::Typing { conversation_id, .. } => {
+                    self.typing(&conversation_id);
+                }
+                Command::Download { url, reply, .. } => {
+                    let _ = reply.send(Ok(self.download(url)));
+                }
+                other => {
+                    let _ = cmd_tx.send(other);
+                }
+            }
+        }
+        drop(send_tx);
+        drop(cmd_tx);
+    }
+
+    /// Waits for the method's turn. Background reads observe the global [`GAP`] and half of
+    /// Slack's documented tier rate; interactive send methods bypass [`GAP`] so background
+    /// history/user/section traffic never throttles a user send, and `chat.postMessage` paces
+    /// at Slack's documented 60/min (1/sec). True if the adapter was stopped while waiting.
     fn pace(&self, method: &str) -> bool {
+        let interactive = matches!(
+            method,
+            "chat.postMessage"
+                | "chat.meMessage"
+                | "chat.scheduleMessage"
+                | "files.getUploadURLExternal"
+                | "files.completeUploadExternal"
+        );
+        let full_rate = method == "chat.postMessage";
         loop {
             let wait = {
                 let mut pacer = crate::hub::lock(&self.pacer);
                 let now = Instant::now();
-                let gap = pacer.last.map_or(Duration::ZERO, |last| GAP.saturating_sub(now.duration_since(last)));
-                let (a_second, most) = (per_minute(method) / 2. / 60., (per_minute(method) / 10.).max(2.));
+                let gap = if interactive {
+                    Duration::ZERO
+                } else {
+                    pacer.last.map_or(Duration::ZERO, |last| GAP.saturating_sub(now.duration_since(last)))
+                };
+                let rate = per_minute(method);
+                let a_second = if full_rate { rate / 60. } else { rate / 2. / 60. };
+                let most = (rate / 10.).max(2.);
                 let (left, at) = pacer.left.entry(method.to_owned()).or_insert((most, now));
                 *left = (*left + now.duration_since(*at).as_secs_f64() * a_second).min(most);
                 *at = now;
                 if *left >= 1. && gap.is_zero() {
                     *left -= 1.;
-                    pacer.last = Some(now);
+                    if !interactive {
+                        pacer.last = Some(now);
+                    }
                     return false;
                 }
                 let refill = if *left < 1. { Duration::from_secs_f64((1. - *left) / a_second) } else { Duration::ZERO };
@@ -1078,39 +1213,65 @@ impl Slack {
     // nowhere to say it was rate limited; `Context::attention` is for what only Slack's app can
     // do. It is logged, and the user sees the page not arriving.
     fn api(&self, method: &str, params: &[(&str, &str)]) -> Result<Value, Fault> {
+        self.api_with(method, params, PATIENCE)
+    }
+
+    pub(super) fn api_with(&self, method: &str, params: &[(&str, &str)], max_retry_wait: u64) -> Result<Value, Fault> {
         self.halted(method)?;
         let url = format!("{}api/{method}", self.api);
         let token = self.token();
         let mut form = vec![("token", token.as_str())];
         form.extend(params.iter().filter(|(_, value)| !value.is_empty()));
+        let retryable = retryable_on_drop(method, &form);
         let net = |err: ureq::Error| Fault::Net(format!("{method}: {err}"));
         let stopped = || Fault::Net(format!("{method}: stopped"));
-        let mut wait = 0;
-        for attempt in 0..2 {
+        let mut limited_once = false;
+        let mut retried_socket = false;
+        loop {
             if self.pace(method) {
                 return Err(stopped());
             }
             let sent = self.agent.post(&url).header("Cookie", self.cookie()).send_form(form.iter().copied());
-            let mut response = sent.map_err(net)?;
+            let mut response = match sent {
+                Ok(response) => response,
+                Err(err) if !retried_socket && retryable && dropped_socket(&err) => {
+                    retried_socket = true;
+                    tracing::debug!(method, "chatd: Slack: pooled connection dropped; retrying once");
+                    continue;
+                }
+                Err(err) => return Err(net(err)),
+            };
             self.reissued(response.headers());
             let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
             let limited = response.status().as_u16() == 429;
-            let body: Value = if limited { Value::Null } else { response.body_mut().read_json().map_err(net)? };
+            let body: Value = if limited {
+                Value::Null
+            } else {
+                match response.body_mut().read_json() {
+                    Ok(body) => body,
+                    Err(err) if !retried_socket && retryable && dropped_socket(&err) => {
+                        retried_socket = true;
+                        tracing::debug!(method, "chatd: Slack: response socket dropped; retrying once");
+                        continue;
+                    }
+                    Err(err) => return Err(net(err)),
+                }
+            };
             if !limited {
                 self.note_token(&body);
             }
             if !limited && body["error"] != "ratelimited" {
                 return self.checked(method, body);
             }
-            wait = retry.unwrap_or(5);
-            if attempt > 0 || wait > PATIENCE {
-                break;
+            let wait = retry.unwrap_or(5);
+            if limited_once || wait > max_retry_wait {
+                return Err(Fault::Limited(wait));
             }
+            limited_once = true;
             if self.ctx.pause(Duration::from_secs(wait)) {
                 return Err(stopped());
             }
         }
-        Err(Fault::Limited(wait))
     }
 
     /// Multipart form POST to a Slack web API method (used by `emoji.add`).
@@ -2283,28 +2444,40 @@ impl Slack {
     /// are intercepted before `chat.postMessage`. Unknown `/commands` are refused with the
     /// hand-off message and never posted as raw channel text.
     fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) {
-        if let Some((cmd, arg)) = parse_slash_command(text) {
-            match self.run_slash_command(conversation, client_id, cmd, arg, reply_to, suppress) {
-                SlashOutcome::Message(outcome) => self.ctx.sent(conversation, client_id, outcome),
-                SlashOutcome::Done(notice) => {
-                    let msg = notice.map(|body| {
-                        let mut m = Message::plain(
-                            format!("ephemeral:{client_id}"),
-                            "Slackbot",
-                            body,
-                            crate::hub::now(),
-                            false,
-                        );
-                        m.ephemeral = true;
-                        m
-                    });
-                    self.ctx.command_done(conversation, client_id, msg);
-                }
+        let _ = crate::sendtime::run(client_id, || -> Result<(), ()> {
+            if let Some((cmd, arg)) = parse_slash_command(text) {
+                let ok = match self.run_slash_command(conversation, client_id, cmd, arg, reply_to, suppress) {
+                    SlashOutcome::Message(outcome) => {
+                        let ok = outcome.is_ok();
+                        self.ctx.sent(conversation, client_id, outcome);
+                        crate::sendtime::stage("store");
+                        ok
+                    }
+                    SlashOutcome::Done(notice) => {
+                        let msg = notice.map(|body| {
+                            let mut m = Message::plain(
+                                format!("ephemeral:{client_id}"),
+                                "Slackbot",
+                                body,
+                                crate::hub::now(),
+                                false,
+                            );
+                            m.ephemeral = true;
+                            m
+                        });
+                        self.ctx.command_done(conversation, client_id, msg);
+                        crate::sendtime::stage("store");
+                        true
+                    }
+                };
+                return if ok { Ok(()) } else { Err(()) };
             }
-            return;
-        }
-        let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[], false);
-        self.ctx.sent(conversation, client_id, outcome);
+            let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[], false);
+            let ok = outcome.is_ok();
+            self.ctx.sent(conversation, client_id, outcome);
+            crate::sendtime::stage("store");
+            if ok { Ok(()) } else { Err(()) }
+        });
     }
 
     fn resolve_user_arg(&self, raw: &str) -> String {
@@ -2352,7 +2525,8 @@ impl Slack {
                     return SlashOutcome::Message(Err("Usage: /me <text>".to_owned()));
                 }
                 let escaped = escape(arg);
-                let posted = self.api("chat.meMessage", &[("channel", channel), ("text", escaped.as_str())]).map_err(reason);
+                let posted = self.api_with("chat.meMessage", &[("channel", channel), ("text", escaped.as_str())], SEND_PATIENCE).map_err(reason);
+                crate::sendtime::stage("post");
                 let outcome = posted.and_then(|resp| {
                     let ts = resp["ts"].as_str().unwrap_or("").to_owned();
                     let me = self.me.get().cloned().unwrap_or_default();
@@ -2363,9 +2537,10 @@ impl Slack {
                         "user": me,
                         "text": escaped,
                     });
-                    self.message(channel, &event)
+                    self.settled_message(channel, &event)
                         .ok_or_else(|| "Slack accepted /me but returned no message.".to_owned())
                 });
+                crate::sendtime::stage("parse");
                 SlashOutcome::Message(outcome)
             }
             "shrug" => {
@@ -2505,16 +2680,18 @@ impl Slack {
         if suppress {
             params.extend([("unfurl_links", "false"), ("unfurl_media", "false")]);
         }
-        let posted = self.api("chat.postMessage", &params).map_err(reason);
+        let posted = self.api_with("chat.postMessage", &params, SEND_PATIENCE).map_err(reason);
+        crate::sendtime::stage("post");
         let outcome = posted.and_then(|posted| {
             let mut event = posted["message"].clone();
             if event["ts"].is_null() {
                 event["ts"] = posted["ts"].clone();
             }
             let event = Self::with_blocks(event, text, spans);
-            let accepted = self.message(channel, &event);
+            let accepted = self.settled_message(channel, &event);
             accepted.ok_or_else(|| "Slack accepted it but sent nothing back.".to_owned())
         });
+        crate::sendtime::stage("parse");
         outcome.map(|mut message| {
             {
                 let mut state = self.state();
@@ -2689,18 +2866,6 @@ impl Slack {
                 Ok(())
             }
         }
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn reminders_list(&self) -> Result<Vec<Value>, Fault> {
-        let listed = self.api("reminders.list", &[])?;
-        Ok(listed["reminders"].as_array().cloned().unwrap_or_default())
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn reminder_complete(&self, reminder_id: &str) -> Result<(), Fault> {
-        self.api("reminders.complete", &[("reminder", reminder_id)])?;
-        Ok(())
     }
 
     pub(super) fn reminder_delete(&self, reminder_id: &str) -> Result<(), Fault> {
@@ -2994,7 +3159,7 @@ impl Slack {
             if let Some(root) = thread_ts {
                 params.push(("thread_ts", root));
             }
-            let res = self.api("chat.postMessage", &params);
+            let res = self.api_with("chat.postMessage", &params, SEND_PATIENCE);
             results.push((target.clone(), res.map(|_| ()).map_err(|e| reason(e))));
         }
         Ok(results)
@@ -3901,6 +4066,158 @@ pub(crate) fn prove_call_cards() -> Result<(), String> {
     message::prove_call_cards()
 }
 
+pub(crate) fn prove_fast_send_non_blocking() -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind mock server: {e}"))?;
+    let base = format!("http://{}", listener.local_addr().map_err(|e| format!("local_addr: {e}"))?);
+    let (hist_entered_tx, hist_entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let hist_finished = Arc::new(AtomicBool::new(false));
+
+    let server_release = release_rx.clone();
+    let server_finished = hist_finished.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let hist_tx = hist_entered_tx.clone();
+            let rel_rx = server_release.clone();
+            let finished = server_finished.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+                if path == "/api/conversations.history" {
+                    let _ = hist_tx.send(());
+                    let _ = crate::hub::lock(&rel_rx).recv_timeout(Duration::from_secs(4));
+                    finished.store(true, Ordering::Release);
+                    let body = r#"{"ok":true,"messages":[],"has_more":false}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if path == "/api/chat.postMessage" {
+                    let body = r#"{"ok":true,"ts":"1760003000.000100","message":{"type":"message","user":"U0ME","ts":"1760003000.000100","text":"fast slack send"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    let body = r#"{"ok":true}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+        }
+    });
+
+    let store = crate::store::Store::open(std::path::Path::new(":memory:"))
+        .map_err(|e| format!("open memory store: {e}"))?;
+    let hub = Arc::new(crate::hub::Hub::new(store));
+    let acct = protocol::AccountKey { network: protocol::Network::Slack, account: "T-prove".into() };
+    hub.store()
+        .upsert_conversation(&acct, &crate::store::ConversationRow::new("C0GEN", protocol::ConversationKind::Channel, "general"))
+        .map_err(|e| format!("upsert C0GEN: {e}"))?;
+    let (_adapter, ctx, rx) = super::local(acct, hub);
+    let tx = ctx.commands.clone();
+    let api = format!("{}/", base.trim_end_matches('/'));
+    let agent = ureq::Agent::config_builder()
+        .max_idle_age(Duration::from_secs(30))
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(Duration::from_secs(20)))
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let me = OnceLock::new();
+    let _ = me.set("U0ME".to_owned());
+    let slack = Arc::new(Slack {
+        ctx,
+        agent,
+        token: Mutex::new("xoxc-prove".to_owned()),
+        cookie: Mutex::new("d=xoxd-prove".to_owned()),
+        edge: format!("{api}cache/"),
+        api: api.clone(),
+        moved: true,
+        session: Session {
+            token: "xoxc-prove".to_owned(),
+            cookie: "d=xoxd-prove".to_owned(),
+            url: api,
+            team_id: "T-prove".to_owned(),
+            user_agent: "Prove/1".to_owned(),
+            workspaces: Vec::new(),
+            enterprise_id: String::new(),
+            enterprise_name: String::new(),
+        },
+        me,
+        state: Mutex::new(State::default()),
+        pacer: Mutex::new(Pacer::default()),
+    });
+
+    let worker_slack = slack.clone();
+    let handle = std::thread::spawn(move || worker_slack.run_workers(rx));
+
+    tx.send(Command::Backfill("C0GEN".to_owned()))
+        .map_err(|e| format!("send Backfill: {e}"))?;
+    hist_entered_rx
+        .recv_timeout(Duration::from_secs(3))
+        .map_err(|_| "Backfill did not reach conversations.history within 3s".to_owned())?;
+
+    let started = Instant::now();
+    tx.send(Command::Send {
+        conversation_id: "C0GEN".to_owned(),
+        client_id: "prove-fast-1".to_owned(),
+        text: "fast slack send".to_owned(),
+        reply_to: None,
+    })
+    .map_err(|e| format!("send Command::Send: {e}"))?;
+
+    let conv_key = slack.ctx.key("C0GEN");
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let settled = loop {
+        if let Ok(Some(msg)) = slack.ctx.hub.store().message(&conv_key, "1760003000.000100") {
+            break msg;
+        }
+        if Instant::now() >= deadline {
+            let _ = release_tx.send(());
+            let _ = tx.send(Command::Stop);
+            let _ = handle.join();
+            return Err("Command::Send did not settle within 1.5s while Backfill stalled".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let elapsed = started.elapsed();
+    let backfill_still_blocked = !hist_finished.load(Ordering::Acquire);
+
+    let _ = release_tx.send(());
+    let _ = tx.send(Command::Stop);
+    let _ = handle.join();
+
+    if settled.id != "1760003000.000100" {
+        return Err(format!("unexpected settled id: {}", settled.id));
+    }
+    if elapsed >= Duration::from_millis(1500) {
+        return Err(format!("Command::Send took {elapsed:?}, expected < 1.5s"));
+    }
+    if !backfill_still_blocked {
+        return Err("conversations.history finished before Command::Send settled".to_owned());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4250,5 +4567,269 @@ mod tests {
         assert_eq!(dnd_snooze_minutes(now, Some(now + 1800)), Some(30));
         assert_eq!(dnd_snooze_minutes(now, Some(now + 7200)), Some(120));
         assert_eq!(dnd_snooze_minutes(now, Some(now + 10 * 86_400)), Some(1440));
+    }
+
+    fn test_slack(tag: &str, api_base: &str) -> (Arc<Slack>, super::super::Adapter, Sender<Command>, Receiver<Command>, std::path::PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("tiny-slack-{tag}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = crate::store::Store::open(&dir.join("chat.sqlite")).unwrap();
+        let hub = Arc::new(crate::hub::Hub::new(store));
+        let acct = protocol::AccountKey { network: protocol::Network::Slack, account: format!("T-{tag}") };
+        let (adapter, ctx, rx) = super::super::local(acct, hub);
+        let tx = ctx.commands.clone();
+        let api = format!("{}/", api_base.trim_end_matches('/'));
+        let agent = ureq::Agent::config_builder()
+            .max_idle_age(Duration::from_secs(30))
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(Duration::from_secs(20)))
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let me = OnceLock::new();
+        let _ = me.set("U0ME".to_owned());
+        let slack = Arc::new(Slack {
+            ctx,
+            agent,
+            token: Mutex::new("xoxc-test".to_owned()),
+            cookie: Mutex::new("d=xoxd-test".to_owned()),
+            edge: format!("{api}cache/"),
+            api: api.clone(),
+            moved: true,
+            session: Session {
+                token: "xoxc-test".to_owned(),
+                cookie: "xoxd-test".to_owned(),
+                url: api,
+                team_id: format!("T-{tag}"),
+                user_agent: "Test/1".to_owned(),
+                workspaces: Vec::new(),
+                enterprise_id: String::new(),
+                enterprise_name: String::new(),
+            },
+            me,
+            state: Mutex::new(State::default()),
+            pacer: Mutex::new(Pacer::default()),
+        });
+        (slack, adapter, tx, rx, dir)
+    }
+
+    #[test]
+    fn command_send_completes_promptly_when_serve_commands_is_blocked() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (hist_entered_tx, hist_entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let extra_lookups = Arc::new(AtomicUsize::new(0));
+
+        let server_release = release_rx.clone();
+        let server_extra = extra_lookups.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let hist_tx = hist_entered_tx.clone();
+                let rel_rx = server_release.clone();
+                let extra = server_extra.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+                    if path == "/api/conversations.history" {
+                        let _ = hist_tx.send(());
+                        let _ = crate::hub::lock(&rel_rx).recv_timeout(Duration::from_secs(10));
+                        let body = r#"{"ok":true,"messages":[],"has_more":false}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if path == "/api/chat.postMessage" {
+                        // Include a custom emoji token and uncached user id to prove settled_message
+                        // does not synchronously block on emoji.list or users.info before ctx.sent().
+                        let body = r#"{"ok":true,"ts":"1760003000.000100","message":{"type":"message","user":"U0ME","ts":"1760003000.000100","text":"hello :partyparrot: fast"}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else {
+                        if path == "/api/emoji.list" || path == "/api/users.info" {
+                            extra.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let body = r#"{"ok":true}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                });
+            }
+        });
+
+        let (slack, _adapter, tx, rx, dir) = test_slack("send-unblocked", &base);
+        let worker_slack = slack.clone();
+        let handle = std::thread::spawn(move || worker_slack.run_workers(rx));
+
+        // Block serve_commands inside conversations.history.
+        tx.send(Command::History {
+            conversation_id: "C0GEN".to_owned(),
+            before: "1760000100.000000".to_owned(),
+        })
+        .unwrap();
+        hist_entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("serve_commands should enter conversations.history");
+
+        // Send a message while serve_commands is blocked.
+        let started = Instant::now();
+        tx.send(Command::Send {
+            conversation_id: "C0GEN".to_owned(),
+            client_id: "99001".to_owned(),
+            text: "hello :partyparrot: fast".to_owned(),
+            reply_to: None,
+        })
+        .unwrap();
+
+        let conv_key = slack.ctx.key("C0GEN");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let settled = loop {
+            if let Ok(Some(msg)) = slack.ctx.hub.store().message(&conv_key, "1760003000.000100") {
+                break msg;
+            }
+            assert!(Instant::now() < deadline, "Command::Send timed out behind blocked serve_commands");
+            std::thread::sleep(Duration::from_millis(15));
+        };
+        let elapsed = started.elapsed();
+
+        let _ = release_tx.send(());
+        let _ = tx.send(Command::Stop);
+        let _ = handle.join();
+
+        assert_eq!(settled.id, "1760003000.000100");
+        assert!(settled.text.contains("hello"), "unexpected settled text: {}", settled.text);
+        assert!(elapsed < Duration::from_secs(2), "send took too long behind blocked serve_commands: {elapsed:?}");
+        assert_eq!(extra_lookups.load(Ordering::Relaxed), 0, "post() must not trigger emoji.list or users.info");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn send_with_settles_immediately_from_complete_upload_shares_ts() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let base_for_server = base.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let base_url = base_for_server.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = json!({
+                        "ok": true,
+                        "files": [{
+                            "id": "F0FAST",
+                            "name": "note.txt",
+                            "title": "note.txt",
+                            "mimetype": "text/plain",
+                            "size": 5,
+                            "url_private": format!("{base_url}/files/F0FAST"),
+                            "shares": {
+                                "public": {
+                                    "C0GEN": [{"ts": "1760004000.000200"}]
+                                }
+                            }
+                        }]
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                });
+            }
+        });
+
+        let (slack, _adapter, _tx, _rx, dir) = test_slack("shares-ts", &base);
+        let started = Instant::now();
+        let msg = slack
+            .complete_and_settle(
+                "C0GEN",
+                "C0GEN",
+                None,
+                false,
+                "attached note",
+                &protocol::Outgoing::default(),
+                None,
+                &["F0FAST".to_owned()],
+                vec![json!({"id": "F0FAST", "title": "note.txt"})],
+            )
+            .expect("complete_and_settle should settle immediately from shares ts");
+        let elapsed = started.elapsed();
+
+        assert_eq!(msg.id, "1760004000.000200");
+        assert_eq!(msg.attachments.len(), 1);
+        assert!(slack.state().shares.is_empty(), "share waiter should be removed immediately");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected immediate 0ms settle from shares ts (not 4s/20s socket wait), got {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_post_message_caps_429_retry_wait_to_send_patience() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let count = server_attempts.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    count.fetch_add(1, Ordering::Relaxed);
+                    let resp = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 45\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes());
+                });
+            }
+        });
+
+        let (slack, _adapter, _tx, _rx, dir) = test_slack("rate-cap", &base);
+        let started = Instant::now();
+        let err = slack
+            .post("C0GEN", "99003", "hello rate limit", None, false, &[], false)
+            .expect_err("45s Retry-After should fail fast instead of sleeping");
+        let elapsed = started.elapsed();
+
+        assert!(err.contains("45 s"), "unexpected rate-limit error message: {err}");
+        assert_eq!(attempts.load(Ordering::Relaxed), 1, "should not retry when Retry-After exceeds SEND_PATIENCE");
+        assert!(elapsed < Duration::from_secs(2), "post slept instead of failing fast: {elapsed:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

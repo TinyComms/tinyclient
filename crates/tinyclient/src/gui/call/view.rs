@@ -7,6 +7,7 @@ use super::security::Place;
 use super::stage::{self, sending, sending_now, CallPeople, Focus, People, Seat, Stage, Stream};
 use super::{watching, Menu, Subject};
 use crate::gui::chrome::{self, End};
+use crate::gui::components::place::{anchor, placed, Layer, Place as OverlayPlace};
 use crate::gui::components::{
     button, button_with_icon, glyph, icon_button, tip, Avatar, ButtonKind,
 };
@@ -15,7 +16,7 @@ use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme::{self, Type};
 use crate::gui::tiny::Float;
 use gpui::{
-    deferred, div, img, prelude::*, px, relative, AnyElement, Context, Div, MouseButton,
+    canvas, div, img, prelude::*, px, AnyElement, Context, Div, MouseButton,
     MouseDownEvent, ObjectFit, SharedString, Stateful, Window,
 };
 use protocol::{
@@ -96,6 +97,20 @@ impl Size {
     pub(in crate::gui) fn stream(self) -> (f32, f32) {
         let (_, h, _) = self.person();
         (h * 16. / 9., h)
+    }
+
+    /// A stream's tile clamped to `avail_w` (minus stage padding) so narrow call stages never overflow.
+    pub(in crate::gui) fn stream_fit(self, avail_w: f32) -> (f32, f32) {
+        let (w, h) = self.stream();
+        if self == Size::Strip {
+            return (w, h);
+        }
+        let max_w = (avail_w - 2. * STAGE_PAD).max(160.);
+        if w <= max_w {
+            (w.round(), h.round())
+        } else {
+            (max_w.round(), (max_w * 9. / 16.).round())
+        }
     }
 
     fn grid(avail_w: f32, seat_count: usize, has_streams: bool) -> Self {
@@ -490,17 +505,19 @@ impl Shell {
         let title_row = div()
             .flex_1()
             .min_w_0()
+            .overflow_hidden()
             .flex()
             .items_center()
             .gap(px(8.))
-            .child(glyph(
+            .child(div().flex_none().child(glyph(
                 title_icon,
                 16.,
                 if call.state == CallState::Joined { theme::positive() } else { theme::text_soft() },
-            ))
+            )))
             .child(
                 div()
-                    .min_w_0()
+                    .flex_initial()
+                    .min_w(px(64.))
                     .max_w(px(260.))
                     .truncate()
                     .type_title()
@@ -508,7 +525,7 @@ impl Shell {
                     .child(subject.title.clone()),
             )
             .children(place_chip.filter(|_| roomy))
-            .children(voice_status.map(|status| self.voice_status_line(&call.conversation, &status, cx)))
+            .children(voice_status.filter(|_| roomy).map(|status| self.voice_status_line(&call.conversation, &status, cx)))
             .when(roomy, |row| row.child(chip(count_label, theme::text_soft(), theme::hover())))
             .children(
                 call.record_start_date
@@ -521,26 +538,32 @@ impl Shell {
             .children(self.call_stage_clock(&call, cx).map(|clock| {
                 div().flex_none().type_small().text_color(theme::text_soft()).child(clock)
             }))
-            .children(self.call_security(&call, Place::TopBar, cx));
+            .children(self.call_security_in(&call, Place::TopBar, Some(window), cx));
         let add_people = can_add_people.then(|| {
-            button_with_icon(
-                "call-view-add-people",
-                ButtonKind::Secondary,
-                "icons/user-plus.svg",
-                "Add people",
-            )
-            .h(px(28.))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener({
-                let picker = picker;
-                move |this, _, window, cx| {
-                    if picker {
-                        this.open_call_people(window, cx);
-                    } else {
-                        this.call_menu_toggle(Menu::AddPeople, cx);
+            let btn = if roomy {
+                button_with_icon(
+                    "call-view-add-people",
+                    ButtonKind::Secondary,
+                    "icons/user-plus.svg",
+                    "Add people",
+                )
+                .h(px(28.))
+            } else {
+                icon_button("call-view-add-people", "icons/user-plus.svg", false)
+                    .tooltip(tip("Add people", None))
+            };
+            btn.flex_none()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener({
+                    let picker = picker;
+                    move |this, _, window, cx| {
+                        if picker {
+                            this.open_call_people(window, cx);
+                        } else {
+                            this.call_menu_toggle(Menu::AddPeople, cx);
+                        }
                     }
-                }
-            }))
+                }))
         });
         let streams = stage::streams(&stage, &me_id, sending_now(Some(&call)));
         let auto_peer_video = self.call_state.grid_choice_for.as_ref() != Some(&call.conversation);
@@ -594,6 +617,7 @@ impl Shell {
         let bar = drags_window(div())
             .h(px(TOP_BAR))
             .flex_none()
+            .overflow_hidden()
             .pl(px(theme::PANE_PAD))
             .pr(px(end_pad))
             .border_b_1()
@@ -627,7 +651,7 @@ impl Shell {
         };
         let banner = self.call_view_banner_inner(&subject.title, &call, false, cx);
         let stage_el = self.call_stage_inner(&stage, &people, Some(&call), false, cx);
-        let controls = self.call_view_bar(
+        let controls = self.call_view_bar_in(
             Some(&call),
             &ViewBar {
                 held,
@@ -638,6 +662,7 @@ impl Shell {
                 no_sound: false,
                 audio_up: true,
             },
+            Some(window),
             cx,
         );
         div().size_full().child(
@@ -900,7 +925,7 @@ impl Shell {
                             .overflow_hidden()
                             .border_1()
                             .border_color(theme::border())
-                            .bg(gpui::rgb(0x0b0b0d))
+                            .bg(theme::media_stage())
                             .shadow(theme::shadow_popover())
                             .child(img(frame).size_full().object_fit(ObjectFit::Contain))
                     });
@@ -1324,7 +1349,7 @@ impl Shell {
                     body.child(glyph(
                         if stream.share { "icons/monitor-up.svg" } else { "icons/video.svg" },
                         if small { 18. } else { 36. },
-                        theme::on_accent(),
+                        theme::on_media(),
                     ))
                 })
                 .when(!small, |body| {
@@ -1334,7 +1359,7 @@ impl Shell {
                             .whitespace_normal()
                             .type_ui()
                             .font_weight(theme::SEMIBOLD)
-                            .text_color(theme::on_accent())
+                            .text_color(theme::on_media())
                             .child(words),
                     )
                 })
@@ -1345,12 +1370,12 @@ impl Shell {
                             .text_center()
                             .whitespace_normal()
                             .type_small()
-                            .text_color(gpui::rgba(0xffffffb3))
+                            .text_color(theme::on_media_soft())
                             .child(line),
                     )
                 })
                 .when_some(stream.share.then(|| call.and_then(|call| stage::viewer_line(&call.viewers))).flatten(), |body, line| {
-                    body.child(div().text_center().whitespace_normal().type_small().text_color(gpui::rgba(0xffffffb3)).child(line))
+                    body.child(div().text_center().whitespace_normal().type_small().text_color(theme::on_media_soft()).child(line))
                 })
                 .when(!small, |body| {
                     body.child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))
@@ -1367,7 +1392,7 @@ impl Shell {
                             .build(),
                     )
                 })
-                .child(div().type_small().text_color(gpui::rgba(0xffffffb3)).child("Camera on"))
+                .child(div().type_small().text_color(theme::on_media_soft()).child("Camera on"))
                 .into_any_element();
         }
         let since = self
@@ -1426,7 +1451,7 @@ impl Shell {
                         .text_center()
                         .whitespace_normal()
                         .type_small()
-                        .text_color(gpui::rgba(0xffffffb3))
+                        .text_color(theme::on_media_soft())
                         .child(words),
                 )
                 .children(retry)
@@ -1475,7 +1500,11 @@ impl Shell {
         size: Size,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (w, h) = size.stream();
+        let avail_w = {
+            let room = self.conversation_room();
+            if room > 0. { room } else { 760. }
+        };
+        let (w, h) = size.stream_fit(avail_w);
         let small = size == Size::Strip;
         let name = people.name(&stream.user_id);
         let what = if stream.share { "screen" } else { "camera" };
@@ -1495,7 +1524,7 @@ impl Shell {
             .w(px(w))
             .h(px(h))
             .rounded(px(theme::R_CARD + 4.))
-            .bg(gpui::rgb(0x0b0b0d))
+            .bg(theme::media_stage())
             .border_2()
             .border_color(if live { theme::border_strong() } else { theme::hairline() })
             .overflow_hidden()
@@ -1667,7 +1696,7 @@ impl Shell {
             .w_full()
             .when(full, |view| view.size_full())
             .when(!full, |view| view.rounded(px(12.)).border_1().border_color(theme::hairline()))
-            .bg(if popped_out { theme::raised() } else { gpui::rgb(0x000000) })
+            .bg(if popped_out { theme::raised() } else { theme::media_stage() })
             .overflow_hidden()
             .when(!full, |view| {
                 view.cursor_pointer()
@@ -1773,7 +1802,7 @@ impl Shell {
             .top_0()
             .left_0()
             .size_full()
-            .bg(if has_stream { gpui::rgb(0x000000) } else { theme::raised() })
+            .bg(if has_stream { theme::media_stage() } else { theme::raised() })
             .occlude()
             .flex()
             .child(inside)
@@ -1983,7 +2012,7 @@ impl Shell {
             .w(px(w))
             .h(px(h))
             .rounded(px(theme::R_CARD + 4.))
-            .bg(if camera_frame.is_some() { gpui::rgb(0x0b0b0d) } else { theme::raised() })
+            .bg(if camera_frame.is_some() { theme::media_stage() } else { theme::raised() })
             .overflow_hidden()
             .border_2()
             .border_color(ring)
@@ -2229,6 +2258,62 @@ impl Shell {
 
     /// The in-call control bar under the stage: mute, deafen, share, camera, devices, health, Leave.
     pub(in crate::gui) fn call_view_bar(&self, call: Option<&Call>, opts: &ViewBar, cx: &mut Context<Self>) -> Div {
+        self.call_view_bar_in(call, opts, None, cx)
+    }
+
+    /// The call-view popover layer placed above the control bar through `components::place::placed`.
+    pub(in crate::gui) fn call_view_popover_layer(
+        &self,
+        call: &Call,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let open = self.call_menu()?;
+        let (width, body) = if let Some(body) = self.call_device_popover_body(call, &open, cx) {
+            body
+        } else {
+            match &open {
+                Menu::AddPeople => (280., self.call_add_people_menu(call, cx).p(px(6.))),
+                Menu::Soundboard => (320., self.call_soundboard_body(call, cx).p(px(8.))),
+                Menu::Person { account, user_id, name } => {
+                    (260., self.call_person_menu(account.clone(), user_id, name, cx).p(px(6.)))
+                }
+                _ => return None,
+            }
+        };
+        let viewport = window.viewport_size();
+        let wide = f32::from(viewport.width);
+        let tall = f32::from(viewport.height);
+        let width = width.min((wide - 16.).max(200.));
+        let fallback = anchor(((wide - width) / 2.).max(8.), (tall - 80.).max(40.), width, 56.);
+        let bounds = self.call_state.bar_bounds.get().unwrap_or(fallback);
+        let panel = div()
+            .id("call-view-popover")
+            .w(px(width))
+            .max_w_full()
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::border())
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
+            .child(body);
+        Some(placed(
+            "call-view-popover-layer",
+            OverlayPlace::Above(bounds),
+            Layer::Popover,
+            window,
+            panel,
+        ))
+    }
+
+    fn call_view_bar_in(
+        &self,
+        call: Option<&Call>,
+        opts: &ViewBar,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let bar = div().w_full().flex_none().pb(px(20.)).pt(px(8.)).flex().flex_col().items_center().gap(px(8.));
         let (muted, deafened) = if opts.room_context {
             self.tiny_quiet()
@@ -2604,20 +2689,10 @@ impl Shell {
                 this.call_soundboard_toggle(key.clone(), cx);
             }))
         });
-        let bar_popover = call.and_then(|call| {
-            let open = menu.as_ref()?;
-            if let Some(body) = self.call_device_popover_body(call, open, cx) {
-                return Some(body);
-            }
-            match open {
-                Menu::AddPeople => Some((280., self.call_add_people_menu(call, cx).p(px(6.)))),
-                Menu::Soundboard => Some((320., self.call_soundboard_body(call, cx).p(px(8.)))),
-                Menu::Person { account, user_id, name } => {
-                    Some((260., self.call_person_menu(account.clone(), user_id, name, cx).p(px(6.))))
-                }
-                _ => None,
-            }
-        });
+        let bar_popover = window
+            .zip(call)
+            .and_then(|(window, call)| self.call_view_popover_layer(call, window, cx));
+        let bar_bounds = self.call_state.bar_bounds.clone();
         let device_notice_click = self.call_refused().is_none()
             && call.and_then(|c| c.device_notice.as_deref()).is_some();
         let call_error = room_context.then(|| self.tiny_state.call_error.clone()).flatten();
@@ -2625,6 +2700,7 @@ impl Shell {
             .children(self.call_view_pills(opts.ptt_only, call, opts.held, opts.room_context, cx))
             .child(
                 div()
+                    .relative()
                     .max_w_full()
                     .p(px(6.))
                     .rounded(px(24.))
@@ -2647,7 +2723,14 @@ impl Shell {
                     .children(soundboard)
                     .child(devices)
                     .children(health)
-                    .child(leave),
+                    .child(leave)
+                    .child(
+                        canvas(move |bounds, _, _| bar_bounds.set(Some(bounds)), |_, _, _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                    ),
             )
             .when(opts.no_sound, |bar| {
                 bar.child(
@@ -2683,32 +2766,7 @@ impl Shell {
             .children(call_error.map(|detail| {
                 div().type_small().text_color(theme::danger()).child(detail)
             }))
-            .children(bar_popover.map(|(width, body)| {
-                deferred(
-                    div()
-                        .id("call-view-popover")
-                        .absolute()
-                        .bottom(relative(1.))
-                        .left_0()
-                        .right_0()
-                        .pb(px(8.))
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(px(width))
-                                .rounded(px(12.))
-                                .bg(theme::overlay())
-                                .border_1()
-                                .border_color(theme::border())
-                                .shadow(theme::shadow_popover())
-                                .occlude()
-                                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
-                                .child(body),
-                        ),
-                )
-                .priority(1)
-            }))
+            .children(bar_popover)
     }
 
     /// Activity tile, stage topic, and stage controls between the banner and the seats.
@@ -2761,6 +2819,7 @@ impl Shell {
         let topic = (!call.stage_topic.is_empty()).then(|| call.stage_topic.clone());
         Some(
             div()
+                .flex_none()
                 .w_full()
                 .px(px(theme::PANE_PAD))
                 .pt(px(8.))

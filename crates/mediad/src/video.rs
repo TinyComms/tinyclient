@@ -15,7 +15,7 @@
 use crate::picture::{
     self, camera_fps, camera_high_bps, share_quality, Ask, Encoded, Incoming, Outgoing, Painted, Tag, CAMERA_LOW_BPS,
 };
-use crate::session::Controls;
+use crate::session::{lock, wait as cv_wait, wait_timeout as cv_wait_timeout, Controls};
 use crate::{out, rt};
 use protocol::{MediaResponse, PictureKind, WatchSize, WatchSource};
 use std::collections::{HashSet, VecDeque};
@@ -569,7 +569,7 @@ impl<S: Source> Capture<S> {
             return true;
         };
         if let Some(name) = self.source.encoder_backend(track) {
-            self.controls.video_stats.lock().unwrap().encoded_with(name);
+            lock(&self.controls.video_stats).encoded_with(name);
         }
         if coded.key {
             tracing::debug!(?track, wanted_key, bytes = coded.bytes.len(), "keyframe handed to the tick");
@@ -669,7 +669,7 @@ fn wait(
     schedule: &mut Schedule,
     gates: &mut [KeyGate; 3],
 ) -> Option<(Wants, bool)> {
-    let mut order = orders.order.lock().unwrap();
+    let mut order = lock(&orders.order);
     loop {
         if order.stop {
             return None;
@@ -683,18 +683,14 @@ fn wait(
             return Some((order.wants, false));
         }
         if !order.wants.any() {
-            order = orders.changed.wait(order).unwrap();
+            order = cv_wait(&orders.changed, order);
             continue;
         }
         let now = Instant::now();
         if now >= schedule.next {
             return Some((order.wants, true));
         }
-        order = orders
-            .changed
-            .wait_timeout(order, schedule.next - now)
-            .unwrap()
-            .0;
+        order = cv_wait_timeout(&orders.changed, order, schedule.next - now).0;
     }
 }
 
@@ -818,7 +814,7 @@ struct Inbox {
 impl Inbox {
     /// False when the queue overflowed. It starts again from a keyframe.
     fn put(&self, frame: Received) -> bool {
-        let mut queue = self.queue.lock().unwrap();
+        let mut queue = lock(&self.queue);
         let fits = queue.frames.len() < RECEIVED;
         if fits {
             queue.frames.push_back(In::Frame(frame));
@@ -832,13 +828,13 @@ impl Inbox {
 
     /// Goes ahead of every frame: those belong to what this replaces.
     fn replace(&self, word: In) {
-        self.queue.lock().unwrap().replace(word);
+        lock(&self.queue).replace(word);
         self.arrived.notify_one();
     }
 
     /// The next thing in, waiting up to `wait` for one.
     fn take(&self, wait: Duration) -> Take {
-        let mut queue = self.queue.lock().unwrap();
+        let mut queue = lock(&self.queue);
         let deadline = Instant::now() + wait;
         loop {
             if queue.stop {
@@ -851,7 +847,7 @@ impl Inbox {
             if now >= deadline {
                 return Take::Nothing;
             }
-            queue = self.arrived.wait_timeout(queue, deadline - now).unwrap().0;
+            queue = cv_wait_timeout(&self.arrived, queue, deadline - now).0;
         }
     }
 }
@@ -955,7 +951,8 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
     fn lost(&mut self, reason: &'static str, frame: &Received) {
         tracing::debug!(reason, key = frame.key, contiguous = frame.contiguous, bytes = frame.data.len(), "a received frame was not painted");
         static NOT_PAINTED: std::sync::Mutex<Option<(Instant, u64)>> = std::sync::Mutex::new(None);
-        if let Ok(mut guard) = NOT_PAINTED.lock() {
+        {
+            let mut guard = lock(&NOT_PAINTED);
             let now = Instant::now();
             let entry = guard.get_or_insert((now, 0));
             entry.1 += 1;
@@ -998,7 +995,7 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
         let began = Instant::now();
         let decoded = self.screen.decode(frame.codec, &opened, paint);
         if let Some(name) = self.screen.decoder_backend() {
-            self.controls.video_stats.lock().unwrap().decoded_with(name);
+            lock(&self.controls.video_stats).decoded_with(name);
         }
         self.cost.note(began, Instant::now(), painting && decoded.is_ok());
         match decoded {
@@ -1015,10 +1012,7 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
     /// Every picture painted since last asked goes to the window.
     fn flush(&mut self) {
         for (tag, painted) in self.screen.painted() {
-            self.controls
-                .video_stats
-                .lock()
-                .unwrap()
+            lock(&self.controls.video_stats)
                 .rendered_slot(painted.width, painted.height, !self.small, Instant::now());
             (self.show)(MediaResponse::Picture {
                 path: painted.path.display().to_string(),
@@ -1057,7 +1051,7 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
                 }
                 Take::Next(In::Clear) => {
                     if !self.small {
-                        self.controls.video_stats.lock().unwrap().clear();
+                        lock(&self.controls.video_stats).clear();
                     }
                     self.screen.reset();
                     self.screen.forget();
@@ -1074,7 +1068,7 @@ impl<P: Screen, F: FnMut(MediaResponse)> Decode<P, F> {
                 }
                 Take::Next(In::ClearSource { user_id, kind }) => {
                     if !self.small {
-                        self.controls.video_stats.lock().unwrap().clear();
+                        lock(&self.controls.video_stats).clear();
                     }
                     self.screen.reset();
                     self.screen.forget();
@@ -1230,7 +1224,7 @@ impl Video {
             self.start(started);
         }
         if let Some(sender) = &self.sender {
-            sender.orders.order.lock().unwrap().wants = wants;
+            lock(&sender.orders.order).wants = wants;
             sender.orders.changed.notify_all();
         }
     }
@@ -1238,7 +1232,7 @@ impl Video {
     /// The server asked this track for a keyframe.
     pub fn ask_key(&self, track: Track) {
         if let Some(sender) = &self.sender {
-            sender.orders.order.lock().unwrap().keys[track as usize] = true;
+            lock(&sender.orders.order).keys[track as usize] = true;
             sender.orders.changed.notify_all();
         }
     }
@@ -1361,7 +1355,7 @@ impl Video {
     /// The call is over: every thread finishes what it holds and ends.
     pub fn stop(self) {
         let sender = self.sender.map(|sender| {
-            sender.orders.order.lock().unwrap().stop = true;
+            lock(&sender.orders.order).stop = true;
             sender.orders.changed.notify_all();
             // A thread waiting for room to hand a frame over is let go.
             drop(sender.words);
@@ -1372,7 +1366,7 @@ impl Video {
             .into_iter()
             .flatten()
             .map(|watcher| {
-                watcher.inbox.queue.lock().unwrap().stop = true;
+                lock(&watcher.inbox.queue).stop = true;
                 watcher.inbox.arrived.notify_all();
                 watcher.done
             })
@@ -1795,7 +1789,7 @@ mod tests {
         }
         let sender = start_capture(|| Viewing(Fake { painting: true, ..Fake::default() }), Arc::default()).unwrap();
         let tell = |wants: Wants| {
-            sender.orders.order.lock().unwrap().wants = wants;
+            lock(&sender.orders.order).wants = wants;
             sender.orders.changed.notify_all();
         };
         tell(wanting(true, false));
@@ -1812,7 +1806,7 @@ mod tests {
             cleared |= matches!(word, Word::SelfView { share: true, painted: None });
         }
         assert!(cleared, "the tile is told my share is gone");
-        sender.orders.order.lock().unwrap().stop = true;
+        lock(&sender.orders.order).stop = true;
         sender.orders.changed.notify_all();
     }
 
@@ -1845,14 +1839,14 @@ mod tests {
                 required: false,
             }),
         );
-        *controls.tiny_e2ee.lock().unwrap() = waiting;
+        *lock(&controls.tiny_e2ee) = waiting;
         capture.round(&wants, start + KEY_EVERY, 15.);
         assert_eq!(
             words.try_iter().count(),
             0,
             "nothing without keys, never in clear"
         );
-        *controls.tiny_e2ee.lock().unwrap() = E2ee::default();
+        *lock(&controls.tiny_e2ee) = E2ee::default();
         capture.round(&wants, start + KEY_EVERY * 2, 15.);
         assert_eq!(
             capture.source.share.last().map(|ask| ask.key),
@@ -1937,14 +1931,14 @@ mod tests {
                 self.0.camera(high, low)
             }
             fn close_camera(&mut self) {
-                *self.1.lock().unwrap() += 1;
+                *lock(&self.1) += 1;
             }
         }
         let closed = shared.clone();
         let sender =
             start_capture(move || Counted(Fake::default(), closed), Arc::default()).unwrap();
         let tell = |wants: Wants| {
-            sender.orders.order.lock().unwrap().wants = wants;
+            lock(&sender.orders.order).wants = wants;
             sender.orders.changed.notify_all();
         };
         tell(wanting(false, true));
@@ -1966,8 +1960,8 @@ mod tests {
             .recv_timeout(Duration::from_millis(200))
             .is_ok()
         {}
-        assert_eq!(*shared.lock().unwrap(), 1, "the camera was closed");
-        sender.orders.order.lock().unwrap().stop = true;
+        assert_eq!(*lock(&shared), 1, "the camera was closed");
+        lock(&sender.orders.order).stop = true;
         sender.orders.changed.notify_all();
         assert_eq!(
             sender.done.recv_timeout(Duration::from_secs(5)),
@@ -1980,7 +1974,7 @@ mod tests {
     fn a_camera_waiting_on_a_renegotiation_stays_open() {
         let (mut work, _words) = work(Arc::default());
         let orders = Orders::default();
-        orders.order.lock().unwrap().wants = Wants {
+        lock(&orders.order).wants = Wants {
             keep_camera: true,
             ..Wants::default()
         };
@@ -2032,7 +2026,7 @@ mod tests {
 
     impl Screen for Glass {
         fn decode(&mut self, _codec: VideoCodec, annex_b: &[u8], paint: Option<Tag>) -> Result<(), ()> {
-            self.decoded.lock().unwrap().push((annex_b[0], paint.is_some()));
+            lock(&self.decoded).push((annex_b[0], paint.is_some()));
             if self.fails.contains(&annex_b[0]) {
                 return Err(());
             }
@@ -2048,11 +2042,11 @@ mod tests {
         }
 
         fn reset(&mut self) {
-            *self.resets.lock().unwrap() += 1;
+            *lock(&self.resets) += 1;
         }
 
         fn forget(&mut self) {
-            *self.forgotten.lock().unwrap() += 1;
+            *lock(&self.forgotten) += 1;
         }
     }
 
@@ -2080,7 +2074,7 @@ mod tests {
             screen: glass,
             controls: Arc::default(),
             inbox: Arc::default(),
-            show: move |frame| sink.lock().unwrap().push(frame),
+            show: move |frame| lock(&sink).push(frame),
             small: false,
             wait_key: true,
             painted: None,
@@ -2105,7 +2099,7 @@ mod tests {
         watcher.inbox.want_key.store(false, Ordering::Relaxed);
         std::thread::sleep(KEY_EVERY + PAINT_EVERY * 3);
         assert!(!watcher.inbox.want_key.load(Ordering::Relaxed), "stopping watching must stop the retries");
-        watcher.inbox.queue.lock().unwrap().stop = true;
+        lock(&watcher.inbox.queue).stop = true;
         watcher.inbox.arrived.notify_all();
         ended(&watcher.done);
         assert!(retried, "a lost or premature initial PLI must be retried even without arriving frames");
@@ -2119,7 +2113,7 @@ mod tests {
         let mut key = frame(7, true);
         key.contiguous = false;
         decode.frame(key);
-        assert_eq!(decoded.lock().unwrap().len(), 1, "a keyframe needs no preceding frame");
+        assert_eq!(lock(&decoded).len(), 1, "a keyframe needs no preceding frame");
         assert!(!decode.wait_key);
     }
 
@@ -2132,11 +2126,11 @@ mod tests {
         decode.frame(frame(2, false));
         decode.frame(frame(3, false));
         assert_eq!(
-            *decoded.lock().unwrap(),
+            *lock(&decoded),
             [(1, true), (2, false), (3, false)],
             "frames inside the gate still decode"
         );
-        assert_eq!(shown.lock().unwrap().len(), 1);
+        assert_eq!(lock(&shown).len(), 1);
         assert!(
             !decode.inbox.want_key.load(Ordering::Relaxed),
             "and nobody asked for a keyframe"
@@ -2160,7 +2154,7 @@ mod tests {
         let decoded = glass.decoded.clone();
         let (mut decode, _) = decode(glass);
         decode.frame(frame(1, false));
-        assert!(decoded.lock().unwrap().is_empty(), "wait_key holds it back");
+        assert!(lock(&decoded).is_empty(), "wait_key holds it back");
         assert!(
             decode.inbox.want_key.swap(false, Ordering::Relaxed),
             "and asks"
@@ -2174,14 +2168,14 @@ mod tests {
         assert!(decode.inbox.want_key.swap(false, Ordering::Relaxed));
         decode.frame(frame(4, false));
         assert_eq!(
-            decoded.lock().unwrap().len(),
+            lock(&decoded).len(),
             2,
             "the next P-frame is not tried"
         );
         let mut gap = frame(5, false);
         gap.contiguous = false;
         decode.frame(gap);
-        assert_eq!(decoded.lock().unwrap().len(), 2, "a gap is a loss");
+        assert_eq!(lock(&decoded).len(), 2, "a gap is a loss");
     }
 
     #[test]
@@ -2192,7 +2186,7 @@ mod tests {
         }
         assert!(!inbox.put(frame(0, false)), "the tick is told");
         assert_eq!(inbox.take(Duration::ZERO), Take::Next(In::Reset), "what was queued is gone");
-        inbox.queue.lock().unwrap().stop = true;
+        lock(&inbox.queue).stop = true;
         assert_eq!(inbox.take(Duration::ZERO), Take::Stop);
     }
 
@@ -2223,7 +2217,7 @@ mod tests {
         inbox.replace(In::Clear);
         inbox.replace(In::Clear);
         assert_eq!(inbox.take(Duration::ZERO), Take::Next(In::Clear));
-        assert_eq!(inbox.queue.lock().unwrap().frames.len(), 0);
+        assert_eq!(lock(&inbox.queue).frames.len(), 0);
     }
 
     #[test]
@@ -2252,9 +2246,9 @@ mod tests {
             matches!(word, MediaResponse::Picture { ref path, .. } if path.is_empty()),
             "{word:?}"
         );
-        assert_eq!(*forgotten.lock().unwrap(), 1);
-        assert!(*resets.lock().unwrap() >= 1);
-        watcher.inbox.queue.lock().unwrap().stop = true;
+        assert_eq!(*lock(&forgotten), 1);
+        assert!(*lock(&resets) >= 1);
+        lock(&watcher.inbox.queue).stop = true;
         watcher.inbox.arrived.notify_all();
         assert_eq!(
             watcher.done.recv_timeout(Duration::from_secs(5)),
@@ -2262,7 +2256,7 @@ mod tests {
             "the thread ended"
         );
         assert_eq!(
-            *forgotten.lock().unwrap(),
+            *lock(&forgotten),
             2,
             "and took its last file with it"
         );
@@ -2399,7 +2393,7 @@ mod tests {
             .map(|watcher| Arc::clone(&watcher.inbox))
             .unwrap();
         video.stop();
-        assert!(done.queue.lock().unwrap().stop);
+        assert!(lock(&done.queue).stop);
         assert_eq!(
             Arc::strong_count(&done),
             1,
@@ -2438,7 +2432,7 @@ mod tests {
         video.watch_slot(1, true);
         assert_eq!(video.watchers.len(), 2);
         video.reset_slot(1);
-        let slot0 = video.watchers[0].as_ref().unwrap().inbox.queue.lock().unwrap().frames.len();
+        let slot0 = lock(&video.watchers[0].as_ref().unwrap().inbox.queue).frames.len();
         assert_eq!(slot0, 0);
         video.clear_slot(1, "bea".into(), PictureKind::Camera);
         video.stop();

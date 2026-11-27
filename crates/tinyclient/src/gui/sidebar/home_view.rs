@@ -381,10 +381,16 @@ impl Shell {
             .iter()
             .filter(|c| c.kind != ConversationKind::Thread && !c.hidden && !c.archived && c.unread > 0 && (!c.muted || c.mentions > 0))
             .collect();
+        // Follow canonical `badge_look` rules: 1:1 DMs count as unread messages, not @mentions.
+        let mentions: u32 = unreads
+            .iter()
+            .filter(|c| c.mentions > 0 && (c.kind != ConversationKind::Direct || c.muted))
+            .map(|c| c.mentions)
+            .sum();
         Some(super::tree::Row::Unreads {
             space: space.clone(),
-            count: unreads.len() as u32,
-            mention: unreads.iter().any(|c| c.mentions > 0),
+            count: if mentions > 0 { mentions } else { unreads.len() as u32 },
+            mention: mentions > 0,
         })
     }
 
@@ -392,7 +398,12 @@ impl Shell {
     pub(super) fn threads_row(&self, space: &Key) -> Option<super::tree::Row> {
         let tree = self.trees.get(space)?;
         let news: Vec<&Rc<Conversation>> = tree.conversations.iter().filter(|c| c.kind == ConversationKind::Thread && c.followed && c.unread > 0).collect();
-        Some(super::tree::Row::Threads { space: space.clone(), count: news.len() as u32, mention: news.iter().any(|c| c.mentions > 0) })
+        let mentions: u32 = news.iter().filter(|c| c.mentions > 0).map(|c| c.mentions).sum();
+        Some(super::tree::Row::Threads {
+            space: space.clone(),
+            count: if mentions > 0 { mentions } else { news.len() as u32 },
+            mention: mentions > 0,
+        })
     }
 
     /// The Slack workspace's Drafts row: shown when any conversation in the workspace has a draft.
@@ -409,11 +420,12 @@ impl Shell {
             (Mode::Network(_), Some(Drill::Unreads(_))) => {
                 let mut out = Vec::new();
                 if !state.home.unreads.is_empty() {
+                    let (_, _, summary) = unreads_summary(&state.home.unreads);
                     out.push(Item::Action {
                         act: Act::MarkAllUnreadsRead,
                         icon: "icons/check-check.svg",
                         words: "Mark all as read".into(),
-                        after: format!("{} unread", state.home.unreads.len()),
+                        after: summary,
                         dot: None,
                     });
                 }
@@ -1094,20 +1106,19 @@ impl Shell {
                 } else {
                     conv.title.clone()
                 };
-                let count = group.total_unread;
-                let has_mention = conv.mentions > 0;
+                let count = group.total_unread.max(group.messages.len() as u32);
+                let first_group = self
+                    .sidebar_state
+                    .home
+                    .unreads
+                    .first()
+                    .is_some_and(|first| first.conversation.key == conv.key);
                 let mark_key = conv.key.clone();
                 let mark_through = group.messages.last().map(|m| m.id.clone()).unwrap_or_default();
-                let mark_btn = div()
-                    .id(("unread-group-mark", ix))
-                    .flex_none()
-                    .px(px(6.))
-                    .py(px(2.))
-                    .rounded(px(theme::R_CONTROL))
+                let mark_btn = button(("unread-group-mark", ix), ButtonKind::Secondary, "Mark read")
+                    .h(px(22.))
+                    .px(px(8.))
                     .type_micro()
-                    .text_color(theme::text_faint())
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let key = mark_key.clone();
@@ -1115,35 +1126,69 @@ impl Shell {
                         this.sidebar_state.home.unreads.retain(|g| g.conversation.key != key);
                         this.rebuild_home(cx);
                         this.off_thread(cx, move || ask(&Request::MarkRead { conversation: key, message_id }), |_, _, _| {});
-                    }))
-                    .child("Mark read");
-                let badge = if has_mention {
-                    crate::gui::components::badge_mention(conv.mentions)
-                } else {
-                    crate::gui::components::badge_count_unread(count)
-                };
+                    }));
+                let badge = crate::gui::components::badge_for(unread_group_badge(conv, count));
                 let content = div()
                     .gap(px(6.))
                     .child(div().flex_1().min_w_0().truncate().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(label))
-                    .child(badge)
+                    .children(badge)
                     .child(mark_btn);
-                click(list_row(("unread-group", ix), theme::row_height(32.), false, focused, content), cx).into_any_element()
+                let row = click(list_row(("unread-group", ix), theme::row_height(32.), false, focused, content), cx);
+                row.when(!first_group, |row| row.mt(px(8.))).into_any_element()
             }
-            Item::UnreadMessage { message, .. } => {
+            Item::UnreadMessage { conversation, message, .. } => {
+                let is_direct = self
+                    .sidebar_state
+                    .home
+                    .unreads
+                    .iter()
+                    .find(|g| g.conversation.key == conversation)
+                    .is_some_and(|g| g.conversation.kind == ConversationKind::Direct);
                 let sender = if message.sender.name.is_empty() { "Someone".to_owned() } else { message.sender.name.clone() };
                 let snippet = if message.text.trim().is_empty() {
                     if !message.attachments.is_empty() { "[attachment]".to_owned() } else { "New message".to_owned() }
                 } else {
                     message.text.replace('\n', " ")
                 };
-                let content = div()
-                    .pl(px(8.))
-                    .flex()
-                    .flex_col()
-                    .min_w_0()
-                    .flex_1()
-                    .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).truncate().child(sender))
-                    .child(div().type_small().text_color(theme::text_soft()).truncate().child(snippet));
+                let stamp = super::chat::row_time(now(), message.sent);
+                let content = if is_direct {
+                    div()
+                        .w_full()
+                        .flex_1()
+                        .min_w_0()
+                        .pl(px(8.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(snippet))
+                        .when(!stamp.is_empty(), |row| {
+                            row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child(stamp))
+                        })
+                } else {
+                    div()
+                        .w_full()
+                        .flex_1()
+                        .min_w_0()
+                        .pl(px(8.))
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .justify_center()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(div().flex_1().min_w_0().truncate().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(sender))
+                                .when(!stamp.is_empty(), |row| {
+                                    row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child(stamp))
+                                }),
+                        )
+                        .child(div().w_full().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(snippet))
+                };
                 click(list_row(("unread-msg", ix), theme::row_height(44.), false, focused, content), cx).into_any_element()
             }
         }
@@ -1245,6 +1290,7 @@ impl Shell {
         let join = joins_from_list(c) && !ours;
         let faint = if selected { theme::text_soft() } else { theme::text_faint() };
         let content = div()
+            .relative()
             .gap(px(10.))
             .child(faces)
             .child(
@@ -1260,13 +1306,12 @@ impl Shell {
                             .items_center()
                             .gap(px(6.))
                             .child(glyph(glyph_name, 14., theme::accent_text()))
-                            .child(div().flex_none().max_w(px(150.)).truncate().type_ui().text_color(theme::text()).child(title))
+                            .child(div().flex_initial().min_w_0().max_w(px(160.)).truncate().type_ui().text_color(theme::text()).child(title))
                             .children((!c.space_title.is_empty()).then(|| div().flex_1().min_w_0().truncate().type_ui().text_color(faint).child(c.space_title.clone()))),
                     )
                     .child(div().h(theme::line(16.)).truncate().type_small().text_color(theme::text_soft()).child(who)),
             )
-            .children(join.then(|| self.join_pill(c, cx)))
-            .when(join, |row| row.group("voice"));
+            .children(join.then(|| self.join_pill(c, selected, cx)));
         let picked = c.clone();
         list_row(super::row_id("voice", &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
             .map(|row| {
@@ -1453,6 +1498,29 @@ fn faint_words(words: String) -> Div {
     div().flex_none().max_w(px(140.)).truncate().type_small().text_color(theme::text_faint()).child(words)
 }
 
+/// Total unread messages, conversations count, and summary string for the All Unreads view.
+pub(in crate::gui) fn unreads_summary(groups: &[Rc<protocol::UnreadGroup>]) -> (u32, usize, String) {
+    let msgs: u32 = groups.iter().map(|g| g.total_unread.max(g.messages.len() as u32)).sum();
+    let chats = groups.len();
+    let msg_word = if msgs == 1 { "message" } else { "messages" };
+    let chat_word = if chats == 1 { "chat" } else { "chats" };
+    (msgs, chats, format!("{msgs} {msg_word} · {chats} {chat_word}"))
+}
+
+/// Canonical badge look for an All Unreads group header: follows `components::badge_look` so 1:1
+/// DMs render an outlined count rather than an accent @mention pill.
+pub(in crate::gui) fn unread_group_badge(conv: &Conversation, count: u32) -> crate::gui::components::BadgeLook {
+    use crate::gui::components::BadgeLook;
+    let pill = conv.mentions > 0 && (conv.kind != ConversationKind::Direct || conv.muted);
+    if pill {
+        BadgeLook::Mention(conv.mentions)
+    } else if count > 0 {
+        BadgeLook::Count(count)
+    } else {
+        BadgeLook::None
+    }
+}
+
 fn format_call_log_duration(seconds: u32) -> String {
     if seconds >= 3600 {
         let h = seconds / 3600;
@@ -1467,7 +1535,10 @@ fn format_call_log_duration(seconds: u32) -> String {
 
 #[cfg(test)]
 mod call_duration_tests {
-    use super::format_call_log_duration;
+    use super::{format_call_log_duration, unread_group_badge, unreads_summary};
+    use crate::gui::components::BadgeLook;
+    use protocol::{Conversation, ConversationKind, Key, Network, UnreadGroup};
+    use std::rc::Rc;
 
     #[test]
     fn call_log_duration_formats_seconds_minutes_and_hours() {
@@ -1475,5 +1546,36 @@ mod call_duration_tests {
         assert_eq!(format_call_log_duration(720), "12 min");
         assert_eq!(format_call_log_duration(3600), "1 hr");
         assert_eq!(format_call_log_duration(3900), "1 hr 5 min");
+    }
+
+    #[test]
+    fn all_unreads_counts_messages_and_uses_canonical_dm_vs_channel_badges() {
+        let mut dm = Conversation::new(
+            Key { network: Network::Slack, account: "a".into(), id: "dm1".into() },
+            ConversationKind::Direct,
+            "Geekbot",
+        );
+        dm.unread = 2;
+        dm.mentions = 2;
+        assert_eq!(unread_group_badge(&dm, 2), BadgeLook::Count(2));
+
+        let mut ch = Conversation::new(
+            Key { network: Network::Slack, account: "a".into(), id: "c1".into() },
+            ConversationKind::Channel,
+            "standup",
+        );
+        ch.unread = 1;
+        assert_eq!(unread_group_badge(&ch, 1), BadgeLook::Count(1));
+
+        let mut mentioned = ch.clone();
+        mentioned.unread = 4;
+        mentioned.mentions = 1;
+        assert_eq!(unread_group_badge(&mentioned, 4), BadgeLook::Mention(1));
+
+        let groups = vec![
+            Rc::new(UnreadGroup { conversation: dm, messages: Vec::new(), total_unread: 2 }),
+            Rc::new(UnreadGroup { conversation: ch, messages: Vec::new(), total_unread: 1 }),
+        ];
+        assert_eq!(unreads_summary(&groups), (3, 2, "3 messages · 2 chats".to_owned()));
     }
 }

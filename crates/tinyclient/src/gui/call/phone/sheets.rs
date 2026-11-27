@@ -52,7 +52,7 @@ fn switch(on: bool) -> AnyElement {
         .bg(if on { theme::positive() } else { theme::selected() })
         .flex()
         .when(on, |track| track.justify_end())
-        .child(div().size(px(22.)).rounded_full().bg(gpui::rgb(0xffffff)))
+        .child(div().size(px(22.)).rounded_full().bg(if on { theme::on_accent() } else { theme::switch_knob() }).border_1().border_color(theme::border()))
         .into_any_element()
 }
 

@@ -1055,6 +1055,7 @@ impl Demo {
             Command::DismissMention { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MoveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetFolder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReorderPinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReadBy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

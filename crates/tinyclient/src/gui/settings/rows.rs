@@ -66,6 +66,8 @@ pub const ROWS: &[Row] = &[
     row("S13", Sounds, "Your sounds", "Add a sound…", &[], &["custom", "custom sound", "custom sounds", "sound file", "import", "add", "my sound", "audio"]),
     row("S14", Sounds, "Calls", "Ring back while I'm calling someone", &[], &["ringback", "ring back", "calling", "dial", "tone"]),
     row("A1", Appearance, "", "Appearance", &["System", "Light", "Dark"], &["theme", "light", "dark", "dark mode", "light mode", "system", "colour", "color"]),
+    row("AT", Appearance, "", "Theme", &["Graphite", "Midnight", "Nord", "Catppuccin Mocha", "Dusk", "Forest", "Paper", "Warm Stone"], &["theme", "palette", "oled", "mocha", "rose pine", "sepia", "colour", "color"]),
+    row("AC", Appearance, "", "Accent color", &["Theme default", "Blue", "Indigo", "Violet", "Emerald", "Amber", "Rose", "Teal", "Graphite"], &["accent", "colour", "color", "highlight", "tint", "swatch"]),
     row("A2", Appearance, "", "Text size", &["13 pt", "14 pt", "15 pt", "16 pt", "17 pt"], &["font", "bigger", "smaller", "zoom", "large"]),
     row("A3", Appearance, "", "Density", &["Comfortable", "Compact"], &["rows", "dense", "spacing", "compact"]),
     row("A4", Appearance, "", "Show message previews in the list", &[], &["preview", "screen sharing", "privacy", "list"]),
@@ -147,7 +149,6 @@ pub const ROWS: &[Row] = &[
 /// Words for what tinyclient does not have yet, or will not have, so a search for one gets an
 /// honest line rather than nothing.
 pub const NOT_YET: &[(&str, &str)] = &[
-    ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
     ("language", crate::host::FOLLOWS_LANGUAGE),
     ("sync", crate::host::SETTINGS_STAY),
@@ -401,8 +402,12 @@ mod tests {
         assert!(search("socks").iter().any(|row| row.id == "GN1"));
         assert_eq!(not_yet("proxy"), None);
         assert_eq!(not_yet("socks"), None);
-        // Accent is intentionally not customizable yet.
-        assert_eq!(not_yet("accent"), Some("tinyclient keeps one accent colour."));
+        // Curated themes and accents are built now.
+        assert!(search("accent").iter().any(|row| row.id == "AC"));
+        assert_eq!(not_yet("accent"), None);
+        assert!(search("mocha").iter().any(|row| row.id == "AT"));
+        assert!(search("nord").iter().any(|row| row.id == "AT"));
+        assert!(search("warm stone").iter().any(|row| row.id == "AT"));
         // Reactions, thread replies and keywords are built now.
         assert!(search("reactions").iter().any(|row| row.id == "NR"));
         assert!(search("threads").iter().any(|row| row.id == "NF"));

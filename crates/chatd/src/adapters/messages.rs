@@ -120,7 +120,9 @@ pub enum Event {
 trait Drive: Send + Sync {
     fn events(&self) -> Option<std::sync::mpsc::Receiver<Event>>;
     fn me(&self) -> (String, String);
+    fn activate(&self) -> Result<(), String>;
     fn refresh(&self) -> Result<(), String>;
+    fn refresh_lists(&self) -> Result<(), String>;
     /// `before` is the last message already shown, and its time in milliseconds. `None` is the
     /// newest page. Bugle has no forward cursor: older pages are the only ones it can ask for.
     fn history(&self, conversation: &str, before: Option<(&str, i64)>) -> Result<Vec<bugle::Note>, String>;
@@ -188,8 +190,14 @@ impl Drive for LiveDrive {
     fn me(&self) -> (String, String) {
         self.inner.me()
     }
+    fn activate(&self) -> Result<(), String> {
+        self.inner.activate()
+    }
     fn refresh(&self) -> Result<(), String> {
         self.inner.refresh()
+    }
+    fn refresh_lists(&self) -> Result<(), String> {
+        self.inner.refresh_lists()
     }
     fn history(&self, conversation: &str, before: Option<(&str, i64)>) -> Result<Vec<bugle::Note>, String> {
         let cursor = before.map(|(id, millis)| bugle::Cursor { id: id.to_owned(), millis });
@@ -602,6 +610,19 @@ struct Phone {
     pictures: Vec<(String, String)>,
 }
 
+enum SendWork {
+    Command(Command),
+    Drain,
+}
+
+enum BgWork {
+    Wanted(Vec<String>),
+    CatchUp,
+}
+
+/// How often `messages-schedule` probes/drains a queued phone outbox on quiet chats.
+const PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
 struct Account {
     ctx: Context,
     drive: Box<dyn Drive>,
@@ -628,6 +649,20 @@ struct Account {
     scheduled: Arc<Mutex<Vec<ScheduledSend>>>,
     /// SIM cards reported by the phone's settings update for this session.
     sims: Mutex<Vec<bugle::SimCard>>,
+    /// Dedicated FIFO send worker wakeup channel.
+    send_tx: std::sync::mpsc::Sender<SendWork>,
+    /// Dedicated low-priority background crawl / media fetch worker channel.
+    bg_tx: std::sync::mpsc::Sender<BgWork>,
+}
+
+impl Account {
+    fn wake_send(&self) {
+        let _ = self.send_tx.send(SendWork::Drain);
+    }
+
+    fn wake_bg(&self) {
+        let _ = self.bg_tx.send(BgWork::CatchUp);
+    }
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -637,20 +672,207 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     }
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
     let scheduled: Arc<Mutex<Vec<ScheduledSend>>> = Arc::default();
-    let (socket_ctx, held, socket_saved, socket_scheduled) =
-        (ctx.clone(), current.clone(), saved.clone(), scheduled.clone());
+    let (send_tx, send_rx) = std::sync::mpsc::channel::<SendWork>();
+    let (bg_tx, bg_rx) = std::sync::mpsc::channel::<BgWork>();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+
+    let (socket_ctx, held, socket_saved, socket_scheduled, link_send_tx, link_bg_tx) = (
+        ctx.clone(),
+        current.clone(),
+        saved.clone(),
+        scheduled.clone(),
+        send_tx.clone(),
+        bg_tx.clone(),
+    );
     std::thread::Builder::new()
         .name("messages-link".into())
         .spawn(move || {
             let mut gate = bugle::Gate::default();
             keep_connected(&socket_ctx, || {
-                connect(&socket_ctx, &socket_saved, &held, &socket_scheduled, &mut gate)
+                connect(
+                    &socket_ctx,
+                    &socket_saved,
+                    &held,
+                    &socket_scheduled,
+                    &link_send_tx,
+                    &link_bg_tx,
+                    &mut gate,
+                )
             });
             held.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
         })
         .map_err(|err| err.to_string())?;
+
+    let (router_ctx, router_current, router_scheduled, router_send_tx, router_bg_tx) = (
+        ctx.clone(),
+        current.clone(),
+        scheduled.clone(),
+        send_tx.clone(),
+        bg_tx.clone(),
+    );
+    std::thread::Builder::new()
+        .name("messages-router".into())
+        .spawn(move || {
+            for command in inbox {
+                match command {
+                    Command::CancelSend {
+                        conversation_id,
+                        client_id,
+                    } => {
+                        upload::cancel(&router_ctx.account, &client_id);
+                        let mut queued = {
+                            let mut sched = router_scheduled
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            let before = sched.len();
+                            sched.retain(|item| {
+                                item.conversation != conversation_id || item.client_id != client_id
+                            });
+                            sched.len() != before
+                        };
+                        if let Some(account) = router_current
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone()
+                        {
+                            phone(&account).queue.retain(|held| {
+                                let drop = held.conversation == conversation_id
+                                    && held.client_id == client_id;
+                                queued |= drop;
+                                !drop
+                            });
+                        }
+                        if queued {
+                            router_ctx.sent(
+                                &conversation_id,
+                                &client_id,
+                                Err("Cancelled".into()),
+                            );
+                        } else {
+                            // Forward to `messages-commands` so a CancelSend racing a queued
+                            // scheduled send still cancels it in FIFO order after it registers.
+                            let _ = cmd_tx.send(Command::CancelSend {
+                                conversation_id,
+                                client_id,
+                            });
+                        }
+                    }
+                    Command::SendWith {
+                        conversation_id,
+                        client_id,
+                        text,
+                        reply_to,
+                        with,
+                    } => {
+                        if with.schedule.is_some() {
+                            if cmd_tx
+                                .send(Command::SendWith {
+                                    conversation_id,
+                                    client_id,
+                                    text,
+                                    reply_to,
+                                    with,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if !with.files.is_empty() {
+                            let account = router_current
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone();
+                            match account {
+                                Some(account) => {
+                                    spawn_file_send(&account, conversation_id, client_id, text, reply_to, *with);
+                                }
+                                None => offline(
+                                    &router_ctx,
+                                    Command::SendWith {
+                                        conversation_id,
+                                        client_id,
+                                        text,
+                                        reply_to,
+                                        with,
+                                    },
+                                ),
+                            }
+                        } else if router_send_tx
+                            .send(SendWork::Command(Command::SendWith {
+                                conversation_id,
+                                client_id,
+                                text,
+                                reply_to,
+                                with,
+                            }))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    cmd @ Command::Send { .. } => {
+                        if router_send_tx.send(SendWork::Command(cmd)).is_err() {
+                            break;
+                        }
+                    }
+                    Command::Wanted(ids) => {
+                        let _ = router_bg_tx.send(BgWork::Wanted(ids));
+                    }
+                    Command::OpenHome => {
+                        let _ = router_send_tx.send(SendWork::Drain);
+                        let _ = router_bg_tx.send(BgWork::CatchUp);
+                    }
+                    other => {
+                        if cmd_tx.send(other).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(|err| err.to_string())?;
+
+    let (send_ctx, send_current) = (ctx.clone(), current.clone());
+    std::thread::Builder::new()
+        .name("messages-send".into())
+        .spawn(move || {
+            for work in send_rx {
+                let account = send_current
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                match (account, work) {
+                    (Some(account), SendWork::Command(cmd)) => serve_send(&account, cmd),
+                    (Some(account), SendWork::Drain) => drain_sends(&account),
+                    (None, SendWork::Command(cmd)) => offline(&send_ctx, cmd),
+                    (None, SendWork::Drain) => {}
+                }
+            }
+        })
+        .map_err(|err| err.to_string())?;
+
+    let bg_current = current.clone();
+    std::thread::Builder::new()
+        .name("messages-bg".into())
+        .spawn(move || {
+            for work in bg_rx {
+                let Some(account) = bg_current
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                else {
+                    continue;
+                };
+                match work {
+                    BgWork::Wanted(ids) => wanted(&account, &ids),
+                    BgWork::CatchUp => catch_up_bg(&account),
+                }
+            }
+        })
+        .map_err(|err| err.to_string())?;
+
     std::thread::Builder::new()
         .name("messages-commands".into())
         .spawn(move || {
@@ -662,7 +884,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             };
             serve_commands(
                 &ctx,
-                inbox,
+                cmd_rx,
                 PACE,
                 |id| {
                     if let Some(account) = account() {
@@ -700,6 +922,8 @@ fn connect(
     saved: &Saved,
     current: &Mutex<Option<Arc<Account>>>,
     scheduled: &Arc<Mutex<Vec<ScheduledSend>>>,
+    send_tx: &std::sync::mpsc::Sender<SendWork>,
+    bg_tx: &std::sync::mpsc::Sender<BgWork>,
     gate: &mut bugle::Gate,
 ) -> Failure {
     let drive = match open(saved) {
@@ -727,6 +951,8 @@ fn connect(
         contacts_loaded: std::sync::atomic::AtomicBool::new(false),
         scheduled: scheduled.clone(),
         sims: Mutex::default(),
+        send_tx: send_tx.clone(),
+        bg_tx: bg_tx.clone(),
     });
     ctx.capabilities(capability_ceiling());
     let _ = ctx.describe(
@@ -744,11 +970,11 @@ fn connect(
         account.drive.close();
         return Failure::Dropped("stopped".to_owned());
     }
-    ctx.link(protocol::Link::Connected);
     let sched_account = Arc::downgrade(&account);
     let _ = std::thread::Builder::new()
         .name("messages-schedule".into())
         .spawn(move || {
+            let mut last_probe = std::time::Instant::now();
             while let Some(acc) = sched_account.upgrade() {
                 if acc.ctx.stopped() {
                     break;
@@ -761,8 +987,17 @@ fn connect(
                         .iter()
                         .any(|item| now >= item.at)
                 };
-                if due {
-                    let _ = acc.ctx.commands.send(Command::OpenHome);
+                let probe_due = if last_probe.elapsed() >= PROBE_EVERY {
+                    let p = phone(&acc);
+                    p.down || !p.queue.is_empty()
+                } else {
+                    false
+                };
+                if due || probe_due {
+                    if probe_due {
+                        last_probe = std::time::Instant::now();
+                    }
+                    acc.wake_send();
                 }
                 drop(acc);
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -771,13 +1006,16 @@ fn connect(
     let ended = loop {
         match events.recv() {
             Ok(Event::Ready) => {
-                if let Err(why) = account.drive.refresh() {
+                if let Err(why) = account.drive.activate() {
                     break gate.fail(&why);
                 }
-                // Further inbox pages run on the command thread. This loop has to stay free to
-                // read the phone.
+                ctx.link(protocol::Link::Connected);
+                if let Err(why) = account.drive.refresh_lists() {
+                    break gate.fail(&why);
+                }
+                // Further inbox pages run on the low-priority background worker.
                 if account.drive.inbox_continues() {
-                    let _ = account.ctx.commands.send(Command::OpenHome);
+                    account.wake_bg();
                 }
             }
             Ok(Event::Closed(why)) => break gate.fail(&why),
@@ -1160,7 +1398,8 @@ fn apply(account: &Account, event: Event) {
             nudge(account);
         }
         Event::PhoneBack => {
-            let _ = account.ctx.commands.send(Command::OpenHome);
+            account.wake_send();
+            account.wake_bg();
         }
         Event::Ready | Event::Closed(_) | Event::Ended(_) => {}
     }
@@ -1287,25 +1526,45 @@ fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
         return;
     }
     let mut shown = message(account, note, page);
-    if note.outgoing || note.author == account.me {
+    // Match the outbox unconditionally before gating on `note.outgoing || note.author == account.me`
+    // so early phone echoes missing those flags still reconcile onto the optimistic row.
+    let claimed = claim_with_prev(account, note);
+    if claimed.is_some() || note.outgoing || note.author == account.me {
+        let (claimed_id, prev_progress) = match claimed {
+            Some((id, prev)) => (Some(id), prev),
+            None => (None, None),
+        };
+        if claimed_id.is_some() {
+            shown.outgoing = true;
+        }
         shown.state = state_of(note);
         if note.scheduled {
             shown.waiting = true;
         }
-        if let Some(client_id) = claim(account, note) {
-            if shown.attachments.is_empty() || shown.text.is_empty() || shown.reply_to.is_none() {
-                if let Ok(Some(had)) = account.ctx.stored_message(&note.conversation, &client_id) {
-                    if shown.attachments.is_empty() {
-                        shown.attachments = had.attachments;
-                    }
-                    if shown.text.is_empty() {
-                        shown.text = had.text;
-                    }
-                    if shown.reply_to.is_none() {
-                        shown.reply_to = had.reply_to;
-                    }
+        let lookup_id = claimed_id.as_deref().unwrap_or(shown.id.as_str());
+        if let Ok(Some(had)) = account.ctx.stored_message(&note.conversation, lookup_id) {
+            // Never allow an out-of-order UpdateEvents status to regress a phone-confirmed
+            // (`SendState::Sent`) outgoing message back to `SendState::Pending`. (An initial
+            // status 4/5 before any phone confirmation has `prev_progress == None` and is allowed
+            // to show `Pending` while the phone transmits over SMS/RCS.)
+            let confirmed_sent =
+                prev_progress == Some(bugle::Progress::Sent) || (claimed_id.is_none() && had.state == SendState::Sent);
+            if confirmed_sent && shown.state == SendState::Pending {
+                shown.state = SendState::Sent;
+            }
+            if claimed_id.is_some() {
+                if shown.attachments.is_empty() {
+                    shown.attachments = had.attachments;
+                }
+                if shown.text.is_empty() {
+                    shown.text = had.text;
+                }
+                if shown.reply_to.is_none() {
+                    shown.reply_to = had.reply_to;
                 }
             }
+        }
+        if let Some(client_id) = claimed_id {
             shown.id = client_id.clone();
             shown.client_id = Some(client_id);
         }
@@ -2116,7 +2375,6 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
                         .filter_map(|(conv, peer)| conv.as_ref().map(|c| (c.clone(), peer.clone())))
                         .collect();
                     remember_pictures(&account, &retry_pairs);
-                    lost_phone(&account);
                 }
                 return tracing::warn!("chatd: Messages: pictures: {why}");
             }
@@ -2164,21 +2422,48 @@ fn offline(ctx: &Context, command: Command) {
     }
 }
 
-fn serve(account: &Arc<Account>, command: Command) {
+fn spawn_file_send(
+    account: &Arc<Account>,
+    conversation_id: String,
+    client_id: String,
+    text: String,
+    reply_to: Option<String>,
+    with: protocol::Outgoing,
+) {
+    let ctx = &account.ctx;
+    let sim = with.send_as.clone();
+    warn_mms(account, &conversation_id, &client_id, &with.files);
+    let reply = carried_reply(account, &conversation_id, reply_to);
+    let voice = with.voice.clone();
+    let account = Arc::clone(account);
+    let conversation = conversation_id.clone();
+    let cid = client_id.clone();
+    let caption = text;
+    upload::spawn(
+        ctx,
+        &conversation_id,
+        &client_id,
+        &with.files,
+        move |upload| {
+            crate::sendtime::run(&cid, || {
+                deliver_files(
+                    &account,
+                    upload,
+                    &conversation,
+                    &cid,
+                    &caption,
+                    reply.as_deref(),
+                    voice.as_ref(),
+                    sim.as_deref(),
+                )
+            })
+        },
+    );
+}
+
+fn serve_send(account: &Arc<Account>, command: Command) {
     let ctx = &account.ctx;
     match command {
-        Command::Backfill(id) | Command::Warm(id) => backfill(account, &id),
-        Command::History { conversation_id, before } => older(account, &conversation_id, &before),
-        Command::HistoryAfter { conversation_id, after } => later(account, &conversation_id, &after),
-        Command::HistoryAround { conversation_id, around } => surround(account, &conversation_id, &around),
-        Command::MarkRead {
-            conversation_id,
-            message_id,
-        } => {
-            if let Err(why) = account.drive.mark_read(&conversation_id, &message_id) {
-                tracing::warn!("chatd: Messages: {why}");
-            }
-        }
         Command::Send {
             conversation_id,
             client_id,
@@ -2210,34 +2495,35 @@ fn serve(account: &Arc<Account>, command: Command) {
             } else if with.files.is_empty() {
                 post_text(account, &conversation_id, &client_id, text, reply_to, sim);
             } else {
-                warn_mms(account, &conversation_id, &client_id, &with.files);
-                let reply = carried_reply(account, &conversation_id, reply_to);
-                let voice = with.voice.clone();
-                let account = Arc::clone(account);
-                let conversation = conversation_id.clone();
-                let cid = client_id.clone();
-                let caption = text;
-                upload::spawn(
-                    ctx,
-                    &conversation_id,
-                    &client_id,
-                    &with.files,
-                    move |upload| {
-                        deliver_files(
-                            &account,
-                            upload,
-                            &conversation,
-                            &cid,
-                            &caption,
-                            reply.as_deref(),
-                            voice.as_ref(),
-                            sim.as_deref(),
-                        )
-                    },
-                );
+                spawn_file_send(account, conversation_id, client_id, text, reply_to, *with);
             }
         }
-        Command::OpenHome => catch_up(account),
+        other => serve(account, other),
+    }
+}
+
+fn serve(account: &Arc<Account>, command: Command) {
+    let ctx = &account.ctx;
+    match command {
+        Command::Backfill(id) | Command::Warm(id) => backfill(account, &id),
+        Command::History { conversation_id, before } => older(account, &conversation_id, &before),
+        Command::HistoryAfter { conversation_id, after } => later(account, &conversation_id, &after),
+        Command::HistoryAround { conversation_id, around } => surround(account, &conversation_id, &around),
+        Command::MarkRead {
+            conversation_id,
+            message_id,
+        } => {
+            if let Err(why) = account.drive.mark_read(&conversation_id, &message_id) {
+                tracing::warn!("chatd: Messages: {why}");
+            }
+        }
+        Command::Send { .. } | Command::SendWith { .. } => {
+            serve_send(account, command);
+        }
+        Command::OpenHome => {
+            account.wake_send();
+            account.wake_bg();
+        }
         Command::CancelSend {
             conversation_id,
             client_id,
@@ -2712,18 +2998,22 @@ fn deliver_files(
             duration_secs: part.duration_secs,
         })
         .collect();
+    crate::sendtime::stage("upload");
     let sent = account
         .drive
         .send_media(conversation, caption, &parts, reply, sim, &mut |id| {
             keep_copy(account, client_id, id);
         });
-    if sent.is_err() {
+    crate::sendtime::stage("wire");
+    if let Err(ref why) = sent {
         for part in &prepared {
             if let Some(tmp) = &part.temp_path {
                 let _ = std::fs::remove_file(tmp);
             }
         }
-        forget(account, client_id);
+        if !phone_quiet(why) {
+            forget(account, client_id);
+        }
     }
     let id = sent?;
     let mut message = outgoing(account, client_id.to_owned(), caption.to_owned());
@@ -2836,7 +3126,7 @@ fn backfill(account: &Account, conversation: &str) {
         remember_due(account, due_of(conversation, None, None), false);
         return;
     }
-    fetch_back(account, conversation, None, None);
+    fetch_back(account, conversation, None, None, false);
 }
 
 /// One older page, when the cache has run out. Nothing, once this session has already read it
@@ -2849,7 +3139,7 @@ fn older(account: &Account, conversation: &str, before: &str) {
         remember_due(account, due_of(conversation, Some(before), None), false);
         return;
     }
-    fetch_back(account, conversation, Some(before.to_owned()), None);
+    fetch_back(account, conversation, Some(before.to_owned()), None, false);
 }
 
 /// Messages after `after`. The store already answers when it holds that page. Bugle can only
@@ -2863,7 +3153,7 @@ fn later(account: &Account, conversation: &str, after: &str) {
         remember_due(account, due_of(conversation, None, Some(after)), false);
         return;
     }
-    fetch_back(account, conversation, None, Some(after.to_owned()));
+    fetch_back(account, conversation, None, Some(after.to_owned()), false);
 }
 
 /// The page around one message. A cached window that already has older and newer rows is left
@@ -2888,7 +3178,7 @@ fn surround(account: &Account, conversation: &str, id: &str) {
     } else {
         resume_cursor(account, conversation)
     };
-    fetch_back(account, conversation, cursor, Some(id.to_owned()));
+    fetch_back(account, conversation, cursor, Some(id.to_owned()), false);
 }
 
 fn due_of(conversation: &str, before: Option<&str>, find: Option<&str>) -> Due {
@@ -2901,7 +3191,15 @@ fn due_of(conversation: &str, before: Option<&str>, find: Option<&str>) -> Due {
 
 /// Reads pages until `find` is on one of them, or one page when `find` is absent. A quiet phone
 /// keeps the cursor it had reached. The next try does not start again at the newest page.
-fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>, find: Option<String>) -> bool {
+/// When `background` is true (background crawl), a `PHONE_QUIET` does not lock out interactive
+/// user sends via `phone.down`.
+fn fetch_back(
+    account: &Account,
+    conversation: &str,
+    mut cursor: Option<String>,
+    find: Option<String>,
+    background: bool,
+) -> bool {
     loop {
         if account.ctx.stopped() {
             return false;
@@ -2932,8 +3230,12 @@ fn fetch_back(account: &Account, conversation: &str, mut cursor: Option<String>,
                 }
             }
             Err(why) if phone_quiet(&why) => {
-                remember_due(account, due_of(conversation, asked.as_deref(), find.as_deref()), true);
-                lost_phone(account);
+                if !background {
+                    remember_due(account, due_of(conversation, asked.as_deref(), find.as_deref()), true);
+                    lost_phone(account);
+                } else {
+                    tracing::debug!("chatd: Messages: background fill quiet for {conversation}");
+                }
                 return false;
             }
             Err(why) => {
@@ -3101,14 +3403,20 @@ fn lost_phone(account: &Account) {
     account.ctx.attention(CANT_REACH);
 }
 
-/// Ask the command thread to send what is waiting. The link thread must not call the phone itself.
+/// Ask the send/background workers to drain what is waiting without hijacking `Command::OpenHome`.
 fn nudge(account: &Account) {
-    let waiting = {
+    let (send_waiting, bg_waiting) = {
         let phone = phone(account);
-        phone.down || !phone.queue.is_empty() || !phone.history.is_empty() || !phone.pictures.is_empty()
+        (
+            phone.down || !phone.queue.is_empty(),
+            !phone.history.is_empty() || !phone.pictures.is_empty(),
+        )
     };
-    if waiting {
-        let _ = account.ctx.commands.send(Command::OpenHome);
+    if send_waiting {
+        account.wake_send();
+    }
+    if bg_waiting {
+        account.wake_bg();
     }
 }
 
@@ -3148,36 +3456,57 @@ fn carried_reply(account: &Account, conversation: &str, reply: Option<String>) -
 }
 
 fn post(account: &Account, item: WaitingSend) {
-    if phone(account).down {
+    // Only queue behind an existing waiting interactive send to keep FIFO order. A stale
+    // `phone.down` with an empty queue must never lock out a fresh interactive user send.
+    if {
+        let p = phone(account);
+        p.down && !p.queue.is_empty()
+    } {
         hold(account, item);
         return;
     }
-    match ask(account, &item) {
+    let client_id = item.client_id.clone();
+    let _ = crate::sendtime::run(&client_id, || match ask(account, &item) {
         Ok(message) => {
             mark_up(account);
             account.ctx.sent(&item.conversation, &item.client_id, Ok(message));
+            crate::sendtime::stage("store");
             nudge(account);
+            Ok(())
         }
         Err(why) if phone_quiet(&why) => {
             lost_phone(account);
             hold(account, item);
+            crate::sendtime::stage("store");
+            Err(())
         }
-        Err(why) => account.ctx.sent(&item.conversation, &item.client_id, Err(why)),
-    }
+        Err(why) => {
+            account.ctx.sent(&item.conversation, &item.client_id, Err(why));
+            crate::sendtime::stage("store");
+            Err(())
+        }
+    });
 }
 
 fn ask(account: &Account, item: &WaitingSend) -> Result<Message, String> {
     let reply = item.reply.as_deref();
     if let Some(copy) = phone_copy(account, &item.client_id) {
         mark_pending(account, &item.client_id);
-        account.drive.resend(&copy)?;
+        let res = account.drive.resend(&copy);
+        crate::sendtime::stage("wire");
+        res?;
         return Ok(finish(account, &item.client_id, carried(account, item)));
     }
     let sent = account.drive.send(&item.conversation, &item.text, reply, item.sim.as_deref(), &mut |id| {
         keep_copy(account, &item.client_id, id);
     });
-    if sent.is_err() {
-        forget(account, &item.client_id);
+    crate::sendtime::stage("wire");
+    // On PHONE_QUIET, keep the outbox mapping so a late phone echo reconciles cleanly instead of
+    // duplicating the row.
+    if let Err(ref why) = sent {
+        if !phone_quiet(why) {
+            forget(account, &item.client_id);
+        }
     }
     let message = sent.map(|_| carried(account, item))?;
     Ok(finish(account, &item.client_id, message))
@@ -3233,12 +3562,18 @@ fn forget(account: &Account, client_id: &str) {
 }
 
 fn phone_copy(account: &Account, client_id: &str) -> Option<String> {
-    outbox_mut(account).get(client_id).map(|attempt| {
-        if attempt.phone_id.is_empty() {
+    outbox_mut(account).get(client_id).and_then(|attempt| {
+        // Only resend a phone copy when the phone actually confirmed or failed that copy.
+        // A prior `PHONE_QUIET` timeout keeps the outbox mapping for echo reconciliation, but
+        // has no confirmed phone copy yet and should retry via `send`.
+        if attempt.progress.is_none() && attempt.phone_id == attempt.relay_id {
+            return None;
+        }
+        Some(if attempt.phone_id.is_empty() {
             attempt.relay_id.clone()
         } else {
             attempt.phone_id.clone()
-        }
+        })
     })
 }
 
@@ -3284,21 +3619,34 @@ fn hits(attempt: &Attempt, value: &str) -> bool {
     !value.is_empty() && (value == attempt.relay_id || value == attempt.phone_id)
 }
 
-/// The shell id of a text this computer sent, when the phone's note names that copy.
-fn claim(account: &Account, note: &bugle::Note) -> Option<String> {
-    claim_map(&mut outbox_mut(account), note)
+/// The shell id of a text this computer sent, when the phone's note names that copy, together with
+/// the attempt's previous phone-reported progress (if any).
+fn claim_with_prev(account: &Account, note: &bugle::Note) -> Option<(String, Option<bugle::Progress>)> {
+    claim_map_with_prev(&mut outbox_mut(account), note)
 }
 
+#[cfg(test)]
 fn claim_map(outbox: &mut HashMap<String, Attempt>, note: &bugle::Note) -> Option<String> {
+    claim_map_with_prev(outbox, note).map(|(id, _)| id)
+}
+
+fn claim_map_with_prev(
+    outbox: &mut HashMap<String, Attempt>,
+    note: &bugle::Note,
+) -> Option<(String, Option<bugle::Progress>)> {
     let (client_id, attempt) = outbox
         .iter_mut()
         .find(|(_, attempt)| hits(attempt, &note.tmp) || hits(attempt, &note.id))?;
+    let prev = attempt.progress;
     if !note.id.is_empty() {
         attempt.phone_id = note.id.clone();
     }
-    attempt.progress = Some(bugle::progress(note.status));
-    attempt.detail = note.detail.clone();
-    Some(client_id.clone())
+    let next = bugle::progress(note.status);
+    if !(prev == Some(bugle::Progress::Sent) && next == bugle::Progress::Pending) {
+        attempt.progress = Some(next);
+        attempt.detail = note.detail.clone();
+    }
+    Some((client_id.clone(), prev))
 }
 
 fn settle_map(outbox: &mut HashMap<String, Attempt>, client_id: &str, status: u64) {
@@ -3379,7 +3727,7 @@ fn remember_pictures(account: &Account, wanted: &[(String, String)]) {
 
 /// True when this read still has to wait. One try: a phone that is still quiet stops the queue.
 fn retry_due(account: &Account, due: Due) -> bool {
-    fetch_back(account, &due.conversation, due.before, due.find);
+    fetch_back(account, &due.conversation, due.before, due.find, false);
     phone(account).down
 }
 
@@ -3411,6 +3759,9 @@ fn schedule_text(
     if let Some(id) = reply.as_deref() {
         pending.reply_to = Some(quoted(account, conversation, id, &[]));
     }
+    // Store the pending row BEFORE publishing into `account.scheduled` so a concurrent
+    // `CancelSend` on `messages-router` that sees and removes the entry can never have its
+    // `Err("Cancelled")` overwritten by this `ctx.message` call.
     let _ = account.ctx.message(conversation, &pending);
     let mut sched = account
         .scheduled
@@ -3480,7 +3831,7 @@ fn drain_scheduled(account: &Account) {
     }
 }
 
-fn catch_up(account: &Arc<Account>) {
+fn drain_sends(account: &Arc<Account>) {
     drain_scheduled(account);
     loop {
         let next = {
@@ -3494,6 +3845,9 @@ fn catch_up(account: &Arc<Account>) {
             return;
         }
     }
+}
+
+fn catch_up_bg(account: &Arc<Account>) {
     loop {
         let next = {
             let mut phone = phone(account);
@@ -3550,7 +3904,7 @@ fn fill_older(account: &Arc<Account>) {
         return;
     };
     let cursor = resume_cursor(account, &conversation);
-    let ok = fetch_back(account, &conversation, cursor, None);
+    let ok = fetch_back(account, &conversation, cursor, None, true);
     if phone(account).down || account.ctx.stopped() {
         return;
     }
@@ -3565,11 +3919,11 @@ fn fill_older(account: &Arc<Account>) {
         .cloned()
         .collect();
     if ids.iter().any(|id| needs_fill(account, id)) && !account.ctx.pause(PACE) {
-        let _ = account.ctx.commands.send(Command::OpenHome);
+        account.wake_bg();
     }
 }
 
-/// The command thread reads chats the user has not opened. Nothing, once each has reached its start.
+/// The background worker reads chats the user has not opened. Nothing, once each has reached its start.
 fn ask_fill(account: &Account) {
     let ids: Vec<String> = account
         .chats
@@ -3579,7 +3933,7 @@ fn ask_fill(account: &Account) {
         .cloned()
         .collect();
     if ids.iter().any(|id| needs_fill(account, id)) {
-        let _ = account.ctx.commands.send(Command::OpenHome);
+        account.wake_bg();
     }
 }
 
@@ -3985,8 +4339,8 @@ fn shared(
     }
 }
 
-/// One more inbox page, on the command thread. A quiet phone waits for the next home open.
-/// Asking again here would spin while it is still down.
+/// One more inbox page, on the low-priority background worker. A quiet phone does not lock out
+/// interactive user sends (`phone.down`).
 fn continue_inbox(account: &Arc<Account>) {
     if phone(account).down || !account.drive.inbox_continues() {
         return;
@@ -3994,10 +4348,12 @@ fn continue_inbox(account: &Arc<Account>) {
     match account.drive.older_chats() {
         Ok(_) => {
             if account.drive.inbox_continues() && !account.ctx.pause(PACE) {
-                let _ = account.ctx.commands.send(Command::OpenHome);
+                account.wake_bg();
             }
         }
-        Err(why) if phone_quiet(&why) => lost_phone(account),
+        Err(why) if phone_quiet(&why) => {
+            tracing::debug!("chatd: Messages: background inbox pagination quiet");
+        }
         Err(why) => tracing::warn!("chatd: Messages: {why}"),
     }
 }
@@ -4118,5 +4474,114 @@ mod tests {
         assert!(card.fields[0].1.contains("42"));
         assert!(!card.fields[0].1.contains("555"), "phone number must be masked");
         assert_eq!(card.fields[1], ("Email".to_owned(), "linnea@harbor.example".to_owned()));
+    }
+
+    struct StubDrive;
+    impl Drive for StubDrive {
+        fn events(&self) -> Option<std::sync::mpsc::Receiver<Event>> { None }
+        fn me(&self) -> (String, String) { ("me-1".into(), "Ada".into()) }
+        fn activate(&self) -> Result<(), String> { Ok(()) }
+        fn refresh(&self) -> Result<(), String> { Ok(()) }
+        fn refresh_lists(&self) -> Result<(), String> { Ok(()) }
+        fn history(&self, _: &str, _: Option<(&str, i64)>) -> Result<Vec<bugle::Note>, String> { Ok(Vec::new()) }
+        fn older_chats(&self) -> Result<Vec<Chat>, String> { Ok(Vec::new()) }
+        fn inbox_continues(&self) -> bool { false }
+        fn send(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &mut dyn FnMut(&str)) -> Result<String, String> { Ok(String::new()) }
+        fn upload_media(&self, _: &[u8], _: &str) -> Result<String, String> { Ok(String::new()) }
+        fn send_media(&self, _: &str, _: &str, _: &[bugle::MediaPart<'_>], _: Option<&str>, _: Option<&str>, _: &mut dyn FnMut(&str)) -> Result<String, String> { Ok(String::new()) }
+        fn resend(&self, _: &str) -> Result<(), String> { Ok(()) }
+        fn react(&self, _: &str, _: &str, _: bool) -> Result<(), String> { Ok(()) }
+        fn fetch(&self, _: &str, _: &[u8], _: &str, _: &str) -> Result<Vec<u8>, String> { Ok(Vec::new()) }
+        fn thumbnails(&self, _: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> { Ok(Vec::new()) }
+        fn contacts(&self) -> Result<Vec<bugle::ContactEntry>, String> { Ok(Vec::new()) }
+        fn get_or_create_conversation(&self, _: &[String], _: Option<&str>) -> Result<Chat, String> { Err("stub".into()) }
+        fn mark_read(&self, _: &str, _: &str) -> Result<(), String> { Ok(()) }
+        fn typing(&self, _: &str) -> Result<(), String> { Ok(()) }
+        fn delete_message(&self, _: &str) -> Result<(), String> { Ok(()) }
+        fn edit_message(&self, _: &str, _: &str, _: &str) -> Result<(), String> { Ok(()) }
+        fn star_message(&self, _: &str, _: &str, _: bool) -> Result<(), String> { Ok(()) }
+        fn delete_conversation(&self, _: &str) -> Result<(), String> { Ok(()) }
+        fn unpair(&self) -> Result<(), String> { Ok(()) }
+        fn block(&self, _: &str) -> Result<(), String> { Ok(()) }
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn show_does_not_regress_sent_message_to_pending_and_claims_without_outgoing_flag() {
+        let hub = Arc::new(crate::hub::Hub::new(
+            crate::store::Store::open(std::path::Path::new(":memory:")).expect("memory store"),
+        ));
+        let account_key = protocol::AccountKey {
+            network: protocol::Network::Messages,
+            account: "phone-test".into(),
+        };
+        let (_adapter, ctx, _inbox) = crate::adapters::local(account_key, hub);
+        let conv = "conv-1";
+        let _ = ctx.conversation(&ConversationRow::new(conv, ConversationKind::Direct, "Grace"));
+        let (send_tx, _send_rx) = std::sync::mpsc::channel();
+        let (bg_tx, _bg_rx) = std::sync::mpsc::channel();
+        let account = Account {
+            ctx: ctx.clone(),
+            drive: Box::new(StubDrive),
+            me: "me-1".into(),
+            name: "Ada".into(),
+            held: Mutex::default(),
+            peers: Mutex::default(),
+            pictured: Mutex::default(),
+            chats: Mutex::default(),
+            span: Mutex::default(),
+            phone: Mutex::default(),
+            outbox: Mutex::default(),
+            newest: Mutex::default(),
+            contacts: Mutex::default(),
+            contacts_loaded: std::sync::atomic::AtomicBool::new(false),
+            scheduled: Arc::default(),
+            sims: Mutex::default(),
+            send_tx,
+            bg_tx,
+        };
+
+        // 1. Store an outgoing message tracked in outbox and confirm it with status 1 (OUTGOING_COMPLETE).
+        keep_copy(&account, "c-1", "relay-1");
+        let mut confirmed = Message::plain("c-1", "Ada", "Hello there", 1_700_000_000, true);
+        confirmed.state = SendState::Sent;
+        ctx.message(conv, &confirmed).unwrap();
+        let sent_ack = bugle::Note {
+            id: "phone-msg-1".into(),
+            conversation: conv.into(),
+            author: String::new(),
+            name: String::new(),
+            sent: 1_700_000_000,
+            text: "Hello there".into(),
+            outgoing: false,
+            status: 1, // OUTGOING_COMPLETE -> Progress::Sent
+            tmp: "relay-1".into(),
+            ..bugle::Note::default()
+        };
+        show(&account, &sent_ack, &[]);
+
+        // 2. An out-of-order UpdateEvents echo arrives with status 4 (Pending) AND outgoing=false, author="".
+        //    It must still claim "c-1" from the outbox AND must NOT regress SendState::Sent back to Pending.
+        let echo = bugle::Note {
+            id: "phone-msg-1".into(),
+            conversation: conv.into(),
+            author: String::new(),
+            name: String::new(),
+            sent: 1_700_000_001,
+            text: "Hello there".into(),
+            outgoing: false,
+            status: 4, // OUTGOING_SENDING -> Progress::Pending
+            tmp: "relay-1".into(),
+            ..bugle::Note::default()
+        };
+        show(&account, &echo, &[]);
+
+        let stored = ctx.stored_message(conv, "c-1").unwrap().expect("claimed message stored under client_id");
+        assert!(stored.outgoing, "claimed outbox message must remain outgoing");
+        assert_eq!(stored.state, SendState::Sent, "must not regress confirmed Sent state back to Pending");
+        assert!(
+            ctx.stored_message(conv, "phone-msg-1").unwrap().is_none(),
+            "echo must reconcile onto optimistic client_id instead of creating a duplicate row"
+        );
     }
 }

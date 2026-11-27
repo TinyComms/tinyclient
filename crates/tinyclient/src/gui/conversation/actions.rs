@@ -22,7 +22,6 @@ use protocol::{
     AppCommand, Capabilities, CommandKind, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, Network,
     ReactionRules, Request, Response, SendState,
 };
-use std::cell::Cell;
 use std::rc::Rc;
 
 /// Pending confirmation sheet for spending Telegram Stars on a paid reaction (#517).
@@ -2836,9 +2835,10 @@ impl Pane {
                     .type_micro()
                     .font_weight(theme::SEMIBOLD)
                     .when(active, |pill| {
-                        pill.bg(gpui::rgba(0x8b5cf62e))
-                            .border_color(gpui::rgb(0x8b5cf6))
-                            .text_color(gpui::rgb(0x8b5cf6))
+                        let super_color = theme::role_color(0x8b5cf6);
+                        pill.bg(theme::tinted_chip(0x8b5cf6, true))
+                            .border_color(super_color)
+                            .text_color(super_color)
                     })
                     .when(!active, |pill| {
                         pill.bg(theme::raised())
@@ -2994,20 +2994,25 @@ impl Pane {
                 this.delete_scoped(&target_all, protocol::DeleteScope::Everyone, cx);
             })));
         }
-        // A phone's dialog keeps 16 pt of the window either side.
-        let room = f32::from(window.viewport_size().width) - 32.;
+        let size = window.viewport_size();
+        let max_w = (f32::from(size.width) - 32.).max(200.);
+        let max_h = (f32::from(size.height) - 32.).max(200.);
         let panel = modal(heading)
-            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .id("confirm-card")
+            .w(px(400.0_f32.min(max_w)))
+            .max_w_full()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .child(modal_body(consequence))
             .child(quoted)
-            .child(buttons)
+            .child(buttons.flex_wrap())
             // A press on the panel is not a press on the scrim behind it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let size = window.viewport_size();
         let scrim = div()
             .id("confirm")
             .w(size.width)
             .h(size.height)
+            .p(px(16.))
             .bg(theme::scrim())
             .occlude()
             .flex()
@@ -3021,7 +3026,7 @@ impl Pane {
                 }),
             )
             .child(fade_in("confirm-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(Layer::Modal as usize).into_any_element())
     }
 
     /// Opens the Forward / Copy-to conversation picker, loading same-account conversations
@@ -3179,8 +3184,15 @@ impl Pane {
                 .when(picked, |d| d.child(div().type_micro().text_color(theme::accent_text()).child("Selected")))
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_forward_target(key.clone(), cx)))
         });
+        let size = window.viewport_size();
+        let max_w = (f32::from(size.width) - 32.).max(200.);
+        let max_h = (f32::from(size.height) - 32.).max(200.);
         let panel = modal(heading)
-            .w(px(400.))
+            .id("forward-card")
+            .w(px(400.0_f32.min(max_w)))
+            .max_w_full()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .child(modal_body(format!(
                 "Choose up to {} conversations on this account.",
                 protocol::FORWARD_LIMIT
@@ -3198,6 +3210,7 @@ impl Pane {
             )
             .child(
                 modal_buttons()
+                    .flex_wrap()
                     .child(button("forward-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
                         this.forward = None;
                         cx.notify();
@@ -3208,11 +3221,11 @@ impl Pane {
                     ),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let size = window.viewport_size();
         let scrim = div()
             .id("forward-scrim")
             .w(size.width)
             .h(size.height)
+            .p(px(16.))
             .bg(theme::scrim())
             .occlude()
             .flex()
@@ -3223,7 +3236,7 @@ impl Pane {
                 cx.notify();
             }))
             .child(fade_in("forward-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(Layer::Modal as usize).into_any_element())
     }
 
     /// Opens the Follow announcement channel picker, loading channels across the account's
@@ -3402,12 +3415,20 @@ impl Pane {
                 .into_any_element()
         };
         let can_confirm = follow.selected.is_some();
+        let size = window.viewport_size();
+        let max_w = (f32::from(size.width) - 32.).max(200.);
+        let max_h = (f32::from(size.height) - 32.).max(200.);
         let panel = modal(format!("Follow #{}", follow.source_title))
-            .w(px(420.))
+            .id("follow-card")
+            .w(px(420.0_f32.min(max_w)))
+            .max_w_full()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .child(modal_body(body))
             .child(list_el)
             .child(
                 modal_buttons()
+                    .flex_wrap()
                     .child(button("follow-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
                         this.follow = None;
                         cx.notify();
@@ -3419,11 +3440,11 @@ impl Pane {
                     ),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let size = window.viewport_size();
         let scrim = div()
             .id("follow-scrim")
             .w(size.width)
             .h(size.height)
+            .p(px(16.))
             .bg(theme::scrim())
             .occlude()
             .flex()
@@ -3437,13 +3458,14 @@ impl Pane {
                 }),
             )
             .child(fade_in("follow-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(Layer::Modal as usize).into_any_element())
     }
 
     fn select_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let open = self.open_select.as_ref()?;
         let multi = open.max_values > 1 || open.element_type.starts_with("multi_");
-        let mut list = menu().w(px(260.));
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(180.);
+        let mut list = menu().w(px(260.0_f32.min(max_w)));
         for (ix, opt) in open.options.iter().enumerate() {
             let active = if multi {
                 open.multi_selected.iter().any(|v| v == &opt.value)
@@ -3457,7 +3479,6 @@ impl Pane {
             let element_type = open.element_type.clone();
             let val = opt.value.clone();
             let confirm = open.confirm.clone();
-            let label = if active { format!("✓ {}", opt.label) } else { opt.label.clone() };
             let mut row = div()
                 .id(SharedString::from(format!("ctrl-opt-{ix}")))
                 .px(px(10.))
@@ -3469,7 +3490,18 @@ impl Pane {
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .child(div().type_small().text_color(theme::text()).child(label));
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(if active {
+                            crate::gui::components::glyph("icons/check.svg", 13., theme::accent_text()).into_any_element()
+                        } else {
+                            div().size(px(13.)).flex_none().into_any_element()
+                        })
+                        .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text()).child(opt.label.clone())),
+                );
             if !opt.description.is_empty() {
                 row = row.child(
                     div()
@@ -3573,7 +3605,6 @@ impl Pane {
         } else {
             active.modal.title.clone()
         };
-        let room = f32::from(window.viewport_size().width) - 32.;
         let mut fields_col = div().flex().flex_col().gap(px(10.)).pt(px(4.));
         for (field, input) in active.modal.fields.iter().zip(&active.inputs) {
             let label = if field.required {
@@ -3606,13 +3637,21 @@ impl Pane {
                 .text_color(theme::danger())
                 .child(err.clone())
         });
+        let size = window.viewport_size();
+        let max_w = (f32::from(size.width) - 32.).max(200.);
+        let max_h = (f32::from(size.height) - 32.).max(200.);
         let submitting = active.submitting;
         let panel = modal(title)
-            .w(px(if crate::gui::phone::active() { room.min(440.) } else { 440. }))
+            .id("interaction-modal-card")
+            .w(px(440.0_f32.min(max_w)))
+            .max_w_full()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .child(fields_col)
             .children(error_line)
             .child(
                 modal_buttons()
+                    .flex_wrap()
                     .child(button("interaction-modal-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
                         this.interaction_modal = None;
                         cx.notify();
@@ -3632,11 +3671,11 @@ impl Pane {
                     ),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let size = window.viewport_size();
         let scrim = div()
             .id("interaction-modal-scrim")
             .w(size.width)
             .h(size.height)
+            .p(px(16.))
             .bg(theme::scrim())
             .occlude()
             .flex()
@@ -3650,7 +3689,7 @@ impl Pane {
                 }),
             )
             .child(fade_in("interaction-modal-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(Layer::Modal as usize).into_any_element())
     }
 
     fn action_confirm_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3664,12 +3703,19 @@ impl Pane {
         let deny = if pending.confirm.deny.is_empty() { "Cancel".to_owned() } else { pending.confirm.deny.clone() };
         let ok = if pending.confirm.confirm.is_empty() { "Confirm".to_owned() } else { pending.confirm.confirm.clone() };
         let to_run = pending.clone();
-        let room = f32::from(window.viewport_size().width) - 32.;
+        let size = window.viewport_size();
+        let max_w = (f32::from(size.width) - 32.).max(200.);
+        let max_h = (f32::from(size.height) - 32.).max(200.);
         let panel = modal(title)
-            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .id("action-confirm-card")
+            .w(px(400.0_f32.min(max_w)))
+            .max_w_full()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .when(!body.is_empty(), |m| m.child(modal_body(body)))
             .child(
                 modal_buttons()
+                    .flex_wrap()
                     .child(button("ctrl-confirm-cancel", ButtonKind::Secondary, deny).on_click(cx.listener(|this, _, _, cx| {
                         this.action_confirm = None;
                         cx.notify();
@@ -3701,11 +3747,11 @@ impl Pane {
                     }))),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let size = window.viewport_size();
         let scrim = div()
             .id("action-confirm-scrim")
             .w(size.width)
             .h(size.height)
+            .p(px(16.))
             .bg(theme::scrim())
             .occlude()
             .flex()
@@ -3719,7 +3765,7 @@ impl Pane {
                 }),
             )
             .child(fade_in("action-confirm-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(Layer::Modal as usize).into_any_element())
     }
 
     fn paid_react_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3776,24 +3822,30 @@ impl Pane {
         buttons = buttons.child(button("paid-star-confirm", ButtonKind::Primary, send_label).on_click(cx.listener(|this, _, _, cx| {
             this.confirm_paid_react(cx);
         })));
-        let room = f32::from(window.viewport_size().width) - 32.;
+        let size = window.viewport_size();
+        let max_w = (f32::from(size.width) - 32.).max(200.);
+        let max_h = (f32::from(size.height) - 32.).max(200.);
         let panel = modal("Send Star reaction?")
-            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .id("paid-star-card")
+            .w(px(400.0_f32.min(max_w)))
+            .max_w_full()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .child(modal_body(format!(
                 "This spends {} Telegram Star{} on this post. {}",
                 dialog.count,
                 if dialog.count == 1 { "" } else { "s" },
                 balance_line,
             )))
-            .child(preset_row)
+            .child(preset_row.flex_wrap())
             .child(anon_row)
-            .child(buttons)
+            .child(buttons.flex_wrap())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let size = window.viewport_size();
         let scrim = div()
             .id("paid-star-scrim")
             .w(size.width)
             .h(size.height)
+            .p(px(16.))
             .bg(theme::scrim())
             .occlude()
             .flex()
@@ -3807,7 +3859,7 @@ impl Pane {
                 }),
             )
             .child(fade_in("paid-star-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(Layer::Modal as usize).into_any_element())
     }
 
     fn action_result_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3819,7 +3871,9 @@ impl Pane {
         let url_label = if result.url_label.is_empty() { "Open".to_owned() } else { result.url_label.clone() };
         let follow = (!result.follow_action.is_empty()).then(|| (result.follow_action.clone(), result.follow_value.clone()));
         let origin = self.action_origin.clone();
-        let room = f32::from(window.viewport_size().width) - 32.;
+        let size = window.viewport_size();
+        let max_w = (f32::from(size.width) - 32.).max(200.);
+        let max_h = (f32::from(size.height) - 32.).max(200.);
         let field_rows = (!fields.is_empty()).then(|| {
             div().mt(px(8.)).flex().flex_col().gap(px(4.)).children(fields.into_iter().map(|(label, value)| {
                 div()
@@ -3831,11 +3885,16 @@ impl Pane {
         });
         let open = url.clone();
         let panel = modal(title)
-            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .id("action-result-card")
+            .w(px(400.0_f32.min(max_w)))
+            .max_w_full()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .when(!body.is_empty(), |m| m.child(modal_body(body)))
             .children(field_rows)
             .child(
                 modal_buttons()
+                    .flex_wrap()
                     .child(button("action-result-close", ButtonKind::Secondary, "Close").on_click(cx.listener(|this, _, _, cx| {
                         this.action_result = None;
                         this.action_origin = None;
@@ -3878,11 +3937,11 @@ impl Pane {
                     }),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let size = window.viewport_size();
         let scrim = div()
             .id("action-result-scrim")
             .w(size.width)
             .h(size.height)
+            .p(px(16.))
             .bg(theme::scrim())
             .occlude()
             .flex()
@@ -3897,7 +3956,7 @@ impl Pane {
                 }),
             )
             .child(fade_in("action-result-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(Layer::Modal as usize).into_any_element())
     }
 
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -4104,12 +4163,19 @@ impl Pane {
         if deletable == 0 {
             return None;
         }
-        let room = f32::from(window.viewport_size().width) - 32.;
+        let size = window.viewport_size();
+        let max_w = (f32::from(size.width) - 32.).max(200.);
+        let max_h = (f32::from(size.height) - 32.).max(200.);
         let panel = modal(format!("Delete {deletable} messages?"))
-            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .id("bulk-confirm-card")
+            .w(px(400.0_f32.min(max_w)))
+            .max_w_full()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .child(modal_body(format!("This removes {deletable} selected messages. This cannot be undone.")))
             .child(
                 modal_buttons()
+                    .flex_wrap()
                     .child(button("bulk-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
                         this.multi_select.confirm_delete = false;
                         cx.notify();
@@ -4119,11 +4185,11 @@ impl Pane {
                     }))),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        let size = window.viewport_size();
         let scrim = div()
             .id("bulk-confirm")
             .w(size.width)
             .h(size.height)
+            .p(px(16.))
             .bg(theme::scrim())
             .occlude()
             .flex()
@@ -4137,7 +4203,7 @@ impl Pane {
                 }),
             )
             .child(fade_in("bulk-confirm-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(Layer::Modal as usize).into_any_element())
     }
 
     /// Keys for whatever floats over the messages. True when the key was theirs.

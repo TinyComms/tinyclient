@@ -315,13 +315,14 @@ fn random_i32() -> i32 {
     i32::from_le_bytes(b) & 0x7fff_ffff
 }
 
-fn random_32() -> [u8; 32] {
+fn random_32() -> Result<[u8; 32], Fault> {
     let mut b = [0u8; 32];
-    let _ = getrandom::fill(&mut b);
+    getrandom::fill(&mut b)
+        .map_err(|err| Fault::Refused(format!("OS random generator failed: {err}")))?;
     if b == [0u8; 32] {
-        b[0] = 1;
+        return Err(Fault::Refused("OS random generator returned zero bytes.".to_owned()));
     }
-    b
+    Ok(b)
 }
 
 #[derive(Clone, Debug)]
@@ -754,11 +755,17 @@ fn join_resolved(
             Fault::Refused(detail)
         })?;
 
-    let my_public_key: [u8; 32] = pk_b64
+    let my_public_key: [u8; 32] = match pk_b64
         .as_deref()
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|v| v.try_into().ok())
-        .unwrap_or_else(random_32);
+    {
+        Some(pk) => pk,
+        None => random_32().map_err(|fault| {
+            account.ctx.call_failed(&conv_id, CallFailure::Encryption, &fault.words());
+            fault
+        })?,
+    };
 
     // Feed any pre-existing verified blocks into mediad so its E2EE verifier matches ours.
     if !existing_blocks.is_empty() {
@@ -785,6 +792,10 @@ fn join_resolved(
     if !members.iter().any(|m| m.user_id == account.me) {
         members.push(ChainMember { user_id: account.me, public_key: my_public_key });
     }
+    let epoch_seed = random_32().map_err(|fault| {
+        account.ctx.call_failed(&conv_id, CallFailure::Encryption, &fault.words());
+        fault
+    })?;
     let join_block = ChainBlock::build(
         SUB_CHAIN_STATE,
         verifier.next_state_height(),
@@ -794,7 +805,7 @@ fn join_resolved(
         my_public_key,
         members,
         verifier.epoch.saturating_add(1),
-        random_32(),
+        epoch_seed,
     )
     .encode();
 
@@ -852,6 +863,13 @@ fn join_resolved(
 }
 
 fn send_broadcast_block(account: &Account, call_id: i64, access_hash: i64) {
+    let epoch_seed = match random_32() {
+        Ok(seed) => seed,
+        Err(fault) => {
+            fail_closed_active(account, call_id, &fault.words());
+            return;
+        }
+    };
     let block_bytes = {
         let live = account.live();
         let Some(active) = live.conferences.active.as_ref().filter(|a| a.call_id == call_id) else {
@@ -875,7 +893,7 @@ fn send_broadcast_block(account: &Account, call_id: i64, access_hash: i64) {
             active.my_public_key,
             members,
             active.verifier.epoch,
-            random_32(),
+            epoch_seed,
         )
         .encode()
     };
@@ -909,20 +927,13 @@ fn apply_chain_blocks_internal(
     if blocks.is_empty() {
         return Ok(());
     }
-    let active_match = account
-        .live()
-        .conferences
-        .active
-        .as_ref()
-        .is_some_and(|a| a.call_id == call_id);
-    if !active_match {
-        return Ok(());
-    }
     let conv_id = conv_id_of(call_id);
 
     let verify_res: Result<CallSecurity, (String, i64, u32)> = {
         let mut live = account.live();
-        let active = live.conferences.active.as_mut().unwrap();
+        let Some(active) = live.conferences.active.as_mut().filter(|a| a.call_id == call_id) else {
+            return Ok(());
+        };
         let mut err_out = None;
         for raw in blocks {
             if let Err(why) = active.verifier.verify_block(sub_chain_id, raw) {
@@ -1172,6 +1183,7 @@ pub(super) fn remove_participants(account: &Account, people: &[String], kick: bo
             .filter(|(&uid, _)| !ids.contains(&uid))
             .map(|(&uid, &pk)| ChainMember { user_id: uid, public_key: pk })
             .collect();
+        let epoch_seed = random_32()?;
         let block = ChainBlock::build(
             SUB_CHAIN_STATE,
             active.verifier.next_state_height(),
@@ -1181,7 +1193,7 @@ pub(super) fn remove_participants(account: &Account, people: &[String], kick: bo
             active.my_public_key,
             remaining,
             active.verifier.epoch.saturating_add(1),
-            random_32(),
+            epoch_seed,
         )
         .encode();
         (active.call_id, active.access_hash, block)

@@ -1354,14 +1354,15 @@ impl Render for SettingsWindow {
         }
         let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, window, cx));
         let menu = self.picker.and_then(|picker| self.device_menu(picker, window, cx)).or_else(|| self.choice.and_then(|id| self.choice_menu(id, window, cx)));
+        let toast_w = super::components::place::toast_width(f32::from(window.viewport_size().width));
         let toast = self.log_note.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(4)).map(|(_, note)| {
             div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(
-                super::components::toast(Some(("icons/check.svg", theme::text_soft())), note.clone()).w(px(360.)),
+                super::components::toast(Some(("icons/check.svg", theme::text_soft())), note.clone()).w(px(toast_w)),
             )
         }).or_else(|| {
             self.copied.filter(|at| at.elapsed() < Duration::from_secs(4)).map(|_| {
                 div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(
-                    super::components::toast(Some(("icons/check.svg", theme::text_soft())), "Copied").w(px(200.)),
+                    super::components::toast(Some(("icons/check.svg", theme::text_soft())), "Copied").w(px(toast_w.min(200.))),
                 )
             })
         });

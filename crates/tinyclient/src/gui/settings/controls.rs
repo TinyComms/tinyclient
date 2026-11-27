@@ -12,8 +12,6 @@ use gpui::{div, prelude::*, px, Div, ElementId, Hsla, Rgba, SharedString, Statef
 pub const COLUMN: f32 = 480.;
 /// Every menu button. One width, so a short name and a long one share a column.
 pub const POPUP_WIDTH: f32 = 220.;
-/// About's action buttons. Wide enough for "Show in File Explorer".
-pub const ABOUT_ACTION: f32 = 168.;
 /// The space kept left of every control that has a default, for its reset button.
 pub const RESET_SLOT: f32 = 28.;
 pub const TRACK: f32 = 200.;
@@ -22,15 +20,7 @@ pub const SEGMENTS: usize = 20;
 
 /// A switch that is off, a slider's empty side, an unlit segment.
 pub fn switch_off() -> Rgba {
-    if theme::is_light() {
-        gpui::rgba(0x00000029)
-    } else {
-        gpui::rgba(0xffffff29)
-    }
-}
-
-fn knob() -> Rgba {
-    gpui::rgb(0xffffff)
+    theme::switch_off()
 }
 
 /// A row's side padding: 12 on the desktop, the phone's 16 gutter on a phone.
@@ -180,6 +170,7 @@ pub fn reset_button(id: impl Into<ElementId>, label: SharedString) -> Stateful<D
 pub fn switch(id: impl Into<ElementId>, label: &str, on: bool) -> Stateful<Div> {
     let track = if on { theme::accent() } else { switch_off() };
     let hover: Rgba = if on { theme::accent_hover() } else { theme::border_strong() };
+    let knob_fill = if on { theme::on_accent() } else { theme::switch_knob() };
     if phone::active() {
         // 48 × 28 under a thumb, the knob 24.
         return div()
@@ -196,7 +187,7 @@ pub fn switch(id: impl Into<ElementId>, label: &str, on: bool) -> Stateful<Div> 
             .role(gpui::Role::Switch)
             .aria_label(SharedString::from(label.to_owned()))
             .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
-            .child(div().size(px(24.)).rounded_full().bg(knob()));
+            .child(div().size(px(24.)).rounded_full().bg(knob_fill));
     }
     div()
         .id(id)
@@ -215,7 +206,7 @@ pub fn switch(id: impl Into<ElementId>, label: &str, on: bool) -> Stateful<Div> 
         .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
         .hover(move |style| style.bg(hover))
         .focus_visible(|style| style.shadow(theme::focus_ring_gap(theme::raised())))
-        .child(div().size(px(14.)).rounded_full().bg(knob()))
+        .child(div().size(px(14.)).rounded_full().bg(knob_fill))
 }
 
 /// Where `value` sits on a track `width` wide, from `min` to `max`.
@@ -269,11 +260,11 @@ pub fn slider_track(value: u32, range: (u32, u32), stops: Option<u32>, default: 
             .left(px(at - 8.))
             .size(px(16.))
             .rounded_full()
-            .bg(knob())
+            .bg(theme::slider_knob())
             .border_1()
-            .border_color(gpui::rgba(0x0000001f))
+            .border_color(theme::border_strong())
             .shadow(vec![gpui::BoxShadow {
-                color: gpui::hsla(0., 0., 0., 0.3).into(),
+                color: gpui::hsla(0., 0., 0., theme::shadow_alpha(0.3)).into(),
                 offset: gpui::point(px(0.), px(1.)),
                 blur_radius: px(3.),
                 spread_radius: px(0.),

@@ -1284,10 +1284,16 @@ impl Slack {
     }
 
     fn update_muted(&self, now: HashSet<String>) -> Result<(), Failure> {
+        let need_read = !self.state().mutes_read;
+        let stored = if need_read {
+            Some(self.ctx.note("muted").unwrap_or_default())
+        } else {
+            None
+        };
         let before: HashSet<String> = {
             let mut state = self.state();
             if !state.mutes_read {
-                let stored = self.ctx.note("muted").unwrap_or_default();
+                let stored = stored.unwrap_or_default();
                 state.muted = stored.split(',').filter(|id| !id.is_empty()).map(str::to_owned).collect();
                 state.mutes_read = true;
             }

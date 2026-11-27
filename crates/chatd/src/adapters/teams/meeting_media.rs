@@ -246,9 +246,11 @@ impl Teams {
             let url = graph_content(&self.graph, &source);
             let mut headers = self.headers(Auth::Bearer(Audience::Graph))?;
             headers.push(("Prefer", "redeemSharingLinkIfNecessary".to_owned()));
-            self.pace();
+            if self.pace() {
+                return Err(Fault::Net("transcript: stopped".to_owned()));
+            }
             let response = self
-                .send("GET", &url, &headers, &Body::None)
+                .send("GET", &url, &headers, &Body::None, None)
                 .map_err(|_| unavailable("The transcript could not be reached."))?;
             self.transcript_response(response)?
         };
@@ -315,7 +317,9 @@ impl Teams {
         let audience = format!("https://{host}");
         let access = self.transcript_access(&audience)?;
         let endpoint = format!("{site}/_api/v2.1/drives/{drive}/items/{item}?select=media/transcripts&$expand=media/transcripts");
-        self.pace();
+        if self.pace() {
+            return Err(Fault::Net("transcript: stopped".to_owned()));
+        }
         let mut metadata = self
             .agent
             .get(&endpoint)
@@ -348,7 +352,9 @@ impl Teams {
                 return self.transcript_response(response);
             }
         }
-        self.pace();
+        if self.pace() {
+            return Err(Fault::Net("transcript: stopped".to_owned()));
+        }
         let response = self
             .agent
             .get(source)
@@ -359,7 +365,12 @@ impl Teams {
     }
 
     fn transcript_access(&self, audience: &str) -> Result<String, Fault> {
-        let _one = self.minting.lock().unwrap();
+        if let Some((known, token)) = &self.state().transcript_token {
+            if known == audience && token.fresh() {
+                return Ok(token.value.clone());
+            }
+        }
+        let _one = crate::hub::lock(&self.minting.transcript);
         if let Some((known, token)) = &self.state().transcript_token {
             if known == audience && token.fresh() {
                 return Ok(token.value.clone());
@@ -372,7 +383,9 @@ impl Teams {
             super::escaped(&self.session.tenant)
         );
         let scopes = format!("{audience}/.default openid profile offline_access");
-        self.pace();
+        if self.pace() {
+            return Err(Fault::Net("transcript token: stopped".to_owned()));
+        }
         let mut answer = self
             .agent
             .post(&url)

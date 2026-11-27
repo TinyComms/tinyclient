@@ -5,14 +5,16 @@
 //! Privacy rule: `Request::ReadStory` is sent ONLY when the user explicitly opens a story or
 //! navigates to it in the viewer — never during ring loading or prefetching.
 
-use super::components::{button, glyph, icon_button, scrim, ButtonKind};
+use super::components::{button, glyph, icon_button, modal_layer, ButtonKind};
 use super::input::TextInput;
 use super::state::Shell;
 use super::theme::{self, Type};
-use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, Entity, Focusable, MouseButton, Task, Window};
+use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton, Task, Window};
 use protocol::{AccountKey, Key, PeerStoryRing, Request, Response, Story, StoryMediaKind};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// Quick reaction choices offered in the story viewer footer.
@@ -40,11 +42,15 @@ pub(super) struct Viewer {
     pub error: Option<String>,
     pub reply_input: Entity<TextInput>,
     pub reply_sending: bool,
-    pub reply_status: Option<String>,
+    /// `(message, is_error)` so errors paint in `theme::danger()` and success in `theme::positive()`.
+    pub reply_status: Option<(String, bool)>,
     pub started_at: Instant,
     /// Story IDs for which we already sent `Request::ReadStory` in this viewer session.
     pub marked_read: HashSet<String>,
     pub timer: Option<Task<()>>,
+    pub focus: FocusHandle,
+    pub hovered: Rc<Cell<bool>>,
+    pub reply_focused: Rc<Cell<bool>>,
 }
 
 impl Viewer {
@@ -215,6 +221,7 @@ impl Shell {
             .or_else(|| self.people_state.hub().person(&peer).map(|p| p.name))
             .unwrap_or_else(|| peer.id.clone());
         let reply_input = cx.new(|cx| TextInput::new("Reply to story…", cx));
+        let focus = cx.focus_handle();
         self.story_state.viewer = Some(Viewer {
             account: account.clone(),
             peer: peer.clone(),
@@ -229,6 +236,9 @@ impl Shell {
             started_at: Instant::now(),
             marked_read: HashSet::new(),
             timer: None,
+            focus,
+            hovered: Rc::new(Cell::new(false)),
+            reply_focused: Rc::new(Cell::new(false)),
         });
         cx.notify();
 
@@ -352,9 +362,12 @@ impl Shell {
                         let Some(viewer) = shell.story_state.viewer.as_mut() else {
                             return false;
                         };
-                        // Pause auto-advance while the user is typing a reply.
-                        let typing = !viewer.reply_input.read(cx).text().trim().is_empty() || viewer.reply_sending;
-                        if typing {
+                        // Pause auto-advance while the user is hovering the story, focusing the reply field, or typing/sending.
+                        let paused = viewer.hovered.get()
+                            || viewer.reply_focused.get()
+                            || !viewer.reply_input.read(cx).text().trim().is_empty()
+                            || viewer.reply_sending;
+                        if paused {
                             viewer.started_at = Instant::now();
                             return true;
                         }
@@ -500,10 +513,10 @@ impl Shell {
                 if let Some(viewer) = shell.story_state.viewer.as_mut() {
                     viewer.reply_sending = false;
                     viewer.reply_status = match answer {
-                        Ok(Response::StoryReplied { .. }) => Some("Reply sent".to_owned()),
-                        Ok(Response::Error { detail, .. }) => Some(detail),
-                        Err(err) => Some(err.to_string()),
-                        _ => Some("Reply failed".to_owned()),
+                        Ok(Response::StoryReplied { .. }) => Some(("Reply sent".to_owned(), false)),
+                        Ok(Response::Error { detail, .. }) => Some((detail, true)),
+                        Err(err) => Some((err.to_string(), true)),
+                        _ => Some(("Reply failed".to_owned(), true)),
                     };
                 }
                 cx.notify();
@@ -636,7 +649,7 @@ impl Shell {
             .filter(|c| !c.is_empty());
         let active_reaction = cur.and_then(|s| s.my_reaction.clone());
 
-        let reactions = div().flex().items_center().gap(px(4.)).children(
+        let reactions = div().flex().flex_wrap().items_center().gap(px(4.)).children(
             QUICK_REACTIONS.iter().enumerate().map(|(ix, &emoji)| {
                 let selected = active_reaction.as_deref() == Some(emoji);
                 let chosen = emoji.to_owned();
@@ -662,8 +675,12 @@ impl Shell {
             }),
         );
 
+        let reply_focused = viewer.reply_input.focus_handle(cx).is_focused(window);
+        viewer.reply_focused.set(reply_focused);
+        if !reply_focused && !viewer.focus.contains_focused(window, cx) {
+            window.focus(&viewer.focus, cx);
+        }
         let reply_row = cur.is_some_and(|s| !s.own).then(|| {
-            let reply_focused = viewer.reply_input.focus_handle(cx).is_focused(window);
             div()
                 .flex()
                 .items_center()
@@ -680,11 +697,13 @@ impl Shell {
                 )
         });
 
+        let hovered_cell = viewer.hovered.clone();
         let card = div()
             .id("story-viewer-modal")
-            .w_full()
-            .max_w(px(420.))
-            .max_h(px(660.))
+            .track_focus(&viewer.focus)
+            .w(px(420.))
+            .max_w_full()
+            .max_h_full()
             .overflow_hidden()
             .p(px(14.))
             .rounded(px(theme::R_MODAL))
@@ -695,7 +714,30 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(10.))
+            .on_hover(move |&hovered, _, _| hovered_cell.set(hovered))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let typing = this
+                    .story_state
+                    .viewer
+                    .as_ref()
+                    .is_some_and(|v| v.reply_input.focus_handle(cx).is_focused(window));
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        cx.stop_propagation();
+                        this.close_story_viewer(cx);
+                    }
+                    "left" if !typing => {
+                        cx.stop_propagation();
+                        this.story_prev(cx);
+                    }
+                    "right" if !typing => {
+                        cx.stop_propagation();
+                        this.story_next(cx);
+                    }
+                    _ => {}
+                }
+            }))
             // Top segmented progress bar
             .child(div().flex().items_center().gap(px(4.)).children(bars))
             // Header: author, time/views, prev/next, close
@@ -760,26 +802,19 @@ impl Shell {
             }))
             .child(reactions)
             .children(reply_row)
-            .children(
-                viewer
-                    .reply_status
-                    .as_ref()
-                    .map(|status| div().type_small().text_color(theme::text_soft()).child(status.clone())),
-            );
+            .children(viewer.reply_status.as_ref().map(|(status, is_error)| {
+                div()
+                    .type_small()
+                    .text_color(if *is_error { theme::danger() } else { theme::positive() })
+                    .child(status.clone())
+            }));
 
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .p(px(16.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .occlude()
-                .child(scrim().on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_story_viewer(cx))))
-                .child(card)
-                .into_any_element(),
-        )
+        Some(modal_layer(
+            "story-viewer-backdrop",
+            window,
+            card,
+            cx.listener(|this, _, _, cx| this.close_story_viewer(cx)),
+        ))
     }
 }
 

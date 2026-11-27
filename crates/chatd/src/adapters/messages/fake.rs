@@ -1111,9 +1111,15 @@ impl Drive for Fake {
     fn me(&self) -> (String, String) {
         (ME.into(), "Ada Quill".into())
     }
+    fn activate(&self) -> Result<(), String> {
+        Ok(())
+    }
     fn refresh(&self) -> Result<(), String> {
         record("list");
         Ok(())
+    }
+    fn refresh_lists(&self) -> Result<(), String> {
+        self.refresh()
     }
     fn history(&self, conversation: &str, before: Option<(&str, i64)>) -> Result<Vec<Note>, String> {
         self.unanswered()?;

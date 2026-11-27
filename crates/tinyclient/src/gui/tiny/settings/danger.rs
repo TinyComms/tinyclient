@@ -4,13 +4,16 @@
 
 use super::kit::{self, card, check_box};
 use super::{page_head, section};
+use crate::gui::components::place::{anchor, placed, Layer, Place};
 use crate::gui::components::{button, menu, menu_item_check, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::tiny::model;
 use crate::gui::tiny::{Modal, Page as Facts};
-use gpui::{anchored, deferred, div, prelude::*, px, AnyElement, Context, Div, Window};
+use gpui::{canvas, div, prelude::*, px, AnyElement, Bounds, Context, Div, Pixels, Window};
 use protocol::{Request, TinyCommunity, TinyMember};
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// Who ownership goes to, and whether this account stops being an owner after.
 #[derive(Default)]
@@ -18,6 +21,7 @@ pub(in crate::gui) struct Draft {
     pub heir: Option<String>,
     pub picking: bool,
     pub step_down: bool,
+    pub heir_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 /// Who ownership can go to: members who are not owners already, by name.
@@ -94,7 +98,6 @@ fn zone(title: &'static str, words: &'static str, action: impl IntoElement) -> D
 }
 
 pub(in crate::gui::tiny) fn danger(shell: &Shell, facts: &Facts, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
-    let _ = window;
     let community = facts.community;
     let Some(overlay) = shell.tiny_state.settings.as_ref() else {
         return div().into_any_element();
@@ -104,12 +107,22 @@ pub(in crate::gui::tiny) fn danger(shell: &Shell, facts: &Facts, window: &mut Wi
 
     // Transfer ownership.
     let heir_name = draft.heir.as_ref().map(|id| model::name_by_id(community, id));
+    let heir_bounds = draft.heir_bounds.clone();
     let mut picker = div().flex().flex_col().child(
         kit::picker("tiny-danger-heir", "icons/user.svg", heir_name.clone().unwrap_or_else(|| "Choose a member".to_owned()), draft.picking, 260.)
+            .relative()
+            .child(
+                canvas(move |bounds, _, _| heir_bounds.set(Some(bounds)), |_, _, _, _| {})
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+            )
             .on_click(cx.listener(|this, _, _, cx| this.tiny_danger_draft(cx, |draft| draft.picking = !draft.picking))),
     );
     if draft.picking {
-        let mut list = menu().id("tiny-danger-heirs").overflow_y_scroll().max_h(px(320.)).w(px(260.));
+        let max_w = (f32::from(window.viewport_size().width) - 16.).max(180.);
+        let mut list = menu().id("tiny-danger-heirs").overflow_y_scroll().max_h(px(320.)).w(px(260.)).max_w(px(max_w));
         for (ix, member) in heirs(community).into_iter().enumerate() {
             let id = member.user_id.clone();
             list = list.child(menu_item_check(("tiny-danger-heir-item", ix), draft.heir.as_deref() == Some(member.user_id.as_str()), model::name_of(member), None).on_click(cx.listener(
@@ -123,7 +136,8 @@ pub(in crate::gui::tiny) fn danger(shell: &Shell, facts: &Facts, window: &mut Wi
             )));
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_danger_draft(cx, |draft| draft.picking = false)));
-        picker = picker.child(deferred(anchored().snap_to_window().child(div().mt(px(4.)).child(list))).priority(2));
+        let at = draft.heir_bounds.get().unwrap_or_else(|| anchor(16., 200., 260., 32.));
+        picker = picker.child(placed("tiny-danger-heirs-menu", Place::Below(at), Layer::Menu, window, list));
     }
     let step_down = draft.step_down;
     let transfer_button = match &draft.heir {

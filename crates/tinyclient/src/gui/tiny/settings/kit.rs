@@ -133,6 +133,11 @@ pub(in crate::gui::tiny) fn cell(width: f32, words: impl Into<SharedString>, ton
     div().flex_none().w(px(width)).min_w_0().truncate().type_small().text_color(tone).child(words.into())
 }
 
+/// A subtle 1 pt divider between rows inside a [`card`].
+pub(in crate::gui::tiny) fn rule() -> Div {
+    div().w_full().flex_none().h(px(1.)).bg(theme::hairline())
+}
+
 /// A role as a chip: its colour's dot, then its name.
 pub(in crate::gui::tiny) fn role_chip(name: impl Into<SharedString>, color: Option<u32>) -> Div {
     div()
@@ -146,14 +151,22 @@ pub(in crate::gui::tiny) fn role_chip(name: impl Into<SharedString>, color: Opti
         .flex()
         .items_center()
         .gap(px(6.))
-        .child(div().size(px(8.)).rounded_full().bg(color.map(gpui::rgb).unwrap_or(theme::text_faint())))
+        .child(div().size(px(8.)).rounded_full().bg(color.map(theme::role_color).unwrap_or(theme::text_faint())))
         .child(div().type_small().text_color(theme::text()).child(name.into()))
 }
 
 /// A colour to pick: a round swatch, ringed when chosen. `None` is no colour, struck through.
 pub(in crate::gui::tiny) fn swatch(id: impl Into<ElementId>, color: Option<u32>, on: bool) -> Stateful<Div> {
+    let label = match color {
+        Some(c) => format!("Color #{c:06X}"),
+        None => "No color".to_owned(),
+    };
     let ring = div()
         .id(id)
+        .role(gpui::Role::RadioButton)
+        .aria_label(label)
+        .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
+        .tab_index(0)
         .flex_none()
         .size(px(28.))
         .rounded_full()
@@ -161,7 +174,8 @@ pub(in crate::gui::tiny) fn swatch(id: impl Into<ElementId>, color: Option<u32>,
         .border_2()
         .border_color(if on { theme::text() } else { gpui::rgba(0x00000000) })
         .cursor_pointer()
-        .hover(|style| style.border_color(theme::border_strong()));
+        .hover(|style| style.border_color(theme::border_strong()))
+        .focus_visible(|style| style.shadow(theme::focus_ring()));
     let inner = div().size_full().rounded_full();
     ring.child(match color {
         Some(color) => inner.bg(gpui::rgb(color)),
@@ -172,8 +186,15 @@ pub(in crate::gui::tiny) fn swatch(id: impl Into<ElementId>, color: Option<u32>,
 /// A check box, 16 square. `None` is mixed (some of a selection).
 pub(in crate::gui::tiny) fn check_box(id: impl Into<ElementId>, on: Option<bool>, enabled: bool) -> Stateful<Div> {
     let filled = on != Some(false);
+    let toggled = match on {
+        Some(true) => gpui::Toggled::True,
+        Some(false) => gpui::Toggled::False,
+        None => gpui::Toggled::Mixed,
+    };
     div()
         .id(id)
+        .role(gpui::Role::CheckBox)
+        .aria_toggled(toggled)
         .flex_none()
         .size(px(16.))
         .rounded(px(theme::R_CHIP))
@@ -183,8 +204,13 @@ pub(in crate::gui::tiny) fn check_box(id: impl Into<ElementId>, on: Option<bool>
         .flex()
         .items_center()
         .justify_center()
-        .when(enabled, |check| check.cursor_pointer())
-        .when(!enabled, |check| check.opacity(0.35))
+        .when(enabled, |check| {
+            check
+                .cursor_pointer()
+                .tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
+        })
+        .when(!enabled, |check| check.opacity(0.35).aria_disabled(true))
         .children(match on {
             Some(true) => Some(glyph("icons/check.svg", 12., theme::on_accent())),
             None => Some(glyph("icons/minus.svg", 12., theme::on_accent())),
@@ -193,7 +219,7 @@ pub(in crate::gui::tiny) fn check_box(id: impl Into<ElementId>, on: Option<bool>
 }
 
 /// A setting's row: its name and one line of help, the control at the right. A row that can't
-/// be changed is drawn faint and takes no clicks.
+/// be changed is drawn faint and takes no clicks. Callers place [`rule()`] between adjacent rows.
 pub(in crate::gui::tiny) fn switch_row(id: impl Into<ElementId>, label: &'static str, help: &'static str, on: bool, enabled: bool) -> Stateful<Div> {
     let id: ElementId = id.into();
     div()
@@ -204,8 +230,6 @@ pub(in crate::gui::tiny) fn switch_row(id: impl Into<ElementId>, label: &'static
         .flex()
         .items_center()
         .gap(px(16.))
-        .border_b_1()
-        .border_color(theme::hairline())
         .when(enabled, |row| row.cursor_pointer().hover(|style| style.bg(theme::hover())))
         .when(!enabled, |row| row.opacity(0.5))
         .child(
@@ -232,28 +256,41 @@ pub(in crate::gui) enum Tri {
 /// One cell of the allow / inherit / deny control: a cross, a slash or a check, lit in red, grey
 /// or green when it is the state.
 pub(in crate::gui::tiny) fn tri_cell(id: impl Into<ElementId>, tri: Tri, on: bool, enabled: bool) -> Stateful<Div> {
-    let (icon, tone, fill) = match tri {
-        Tri::Deny => ("icons/x.svg", theme::danger(), theme::danger_soft()),
-        Tri::Inherit => ("icons/minus.svg", theme::text(), theme::selected()),
-        Tri::Allow => ("icons/check.svg", theme::positive(), theme::positive_soft()),
+    let (icon, tone, fill, word) = match tri {
+        Tri::Deny => ("icons/x.svg", theme::danger(), theme::danger_soft(), "Deny"),
+        Tri::Inherit => ("icons/minus.svg", theme::text(), theme::selected(), "Inherit"),
+        Tri::Allow => ("icons/check.svg", theme::positive(), theme::positive_soft(), "Allow"),
     };
     div()
         .id(id)
+        .role(gpui::Role::RadioButton)
+        .aria_label(word)
+        .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
         .size(px(28.))
         .rounded(px(theme::R_CHIP))
         .flex()
         .items_center()
         .justify_center()
         .when(on, |cell| cell.bg(fill))
+        .when(enabled, |cell| {
+            cell.tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
+        })
+        .when(!enabled, |cell| cell.aria_disabled(true))
         .when(enabled && !on, |cell| cell.cursor_pointer().hover(|style| style.bg(theme::hover())))
         .child(glyph(icon, 14., if on { tone } else { theme::text_faint() }))
 }
 
 /// A picker's closed face: a glyph, what is chosen, a chevron.
 pub(in crate::gui::tiny) fn picker(id: impl Into<ElementId>, icon: &'static str, words: impl Into<SharedString>, open: bool, width: f32) -> Stateful<Div> {
+    let words: SharedString = words.into();
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(words.clone())
+        .tab_index(0)
         .w(px(width))
+        .max_w_full()
         .h(px(32.))
         .px(px(10.))
         .rounded(px(theme::R_CONTROL))
@@ -261,12 +298,13 @@ pub(in crate::gui::tiny) fn picker(id: impl Into<ElementId>, icon: &'static str,
         .border_1()
         .border_color(if open { theme::focus() } else { theme::border() })
         .hover(|style| style.border_color(theme::border_strong()))
+        .focus_visible(|style| style.shadow(theme::focus_ring()))
         .flex()
         .items_center()
         .gap(px(8.))
         .cursor_pointer()
         .child(glyph(icon, 14., theme::text_faint()))
-        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(words.into()))
+        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(words))
         .child(glyph("icons/chevron-down.svg", 14., theme::text_faint()))
 }
 

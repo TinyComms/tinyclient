@@ -638,7 +638,7 @@ fn header(title: &str) -> Div {
         .items_end()
         .type_micro()
         .text_color(theme::text_faint())
-        .child(div().truncate().child(title.to_owned()))
+        .child(div().flex_1().min_w_0().truncate().child(title.to_owned()))
 }
 
 /// A row inside the visible range that has not arrived: its final geometry, standing still.

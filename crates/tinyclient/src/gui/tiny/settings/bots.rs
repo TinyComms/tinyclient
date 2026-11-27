@@ -229,9 +229,11 @@ pub(in crate::gui::tiny) fn bots(shell: &Shell, _facts: &Facts, window: &mut Win
     let mut grants = kit::card();
     for (ix, (scope, help)) in GRANTS.into_iter().enumerate() {
         let on = grant_on(draft, scope);
+        if ix > 0 {
+            grants = grants.child(kit::rule());
+        }
         grants = grants.child(
             kit::switch_row(("tiny-bots-grant", ix), help, scope, on, !draft.loading)
-                .when(ix + 1 == GRANTS.len(), |row| row.border_b_0())
                 .on_click(cx.listener(move |this, _, _, cx| this.tiny_bot_grant(scope, cx))),
         );
     }

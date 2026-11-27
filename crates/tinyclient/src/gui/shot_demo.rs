@@ -501,7 +501,6 @@ fn build() -> Fixture {
             .map(|id| Occupant { person: Key::new(&d, id), name: who(id).map_or(id, |w| w.name).into(), avatar: None, muted: id == "ines", deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: id == "yusuf", hand_raised: false, is_channel: false })
             .collect(),
         total: 2,
-        ..Default::default()
         ..Occupants::default()
     });
     let mut random = in_space(row(&s, "c-random", ConversationKind::Channel, "random", on_day(1, 12, 0)), harbor, "Harbor Labs", "eng", "Engineering", 1);
@@ -1032,6 +1031,20 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         hand_raised: false,
         reaction: None,
         invite_link: None,
+        title: String::new(),
+        join_muted: false,
+        can_change_join_muted: false,
+        participants_count: 0,
+        joined_as: None,
+        record_start_date: None,
+        record_video_active: false,
+        can_start_video: true,
+        unmuted_video_count: 0,
+        unmuted_video_limit: 0,
+        rtmp_stream: false,
+        rtmp_state: None,
+        rtmp_quality: None,
+        rtmp_qualities: Vec::new(),
     }
 }
 

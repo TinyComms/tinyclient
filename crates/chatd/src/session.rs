@@ -115,10 +115,10 @@ fn keep(entry: &Entry, session: &str) -> keyring::Result<()> {
 /// `SERVICE` the first time it is read, so the rename signs nobody out.
 const RENAMED_FROM: &str = "tinychat";
 
-/// False when `TINYCLIENT_DIR` points chatd at a scratch directory. Tests and the demo never touch
-/// the keychain and never sign in.
+/// False in unit tests or when `TINYCLIENT_DIR` points chatd at a scratch directory.
+/// Tests and the demo never touch the keychain and never sign in.
 pub fn enabled() -> bool {
-    std::env::var_os("TINYCLIENT_DIR").is_none()
+    !cfg!(test) && std::env::var_os("TINYCLIENT_DIR").is_none()
 }
 
 /// The store sign-ins are kept in, named the way this system names it.
@@ -633,5 +633,10 @@ mod tests {
             // Credential Manager puts up no prompt to wait on.
             assert_eq!(STORE_WAITING, "Still reading your sign-in from Credential Manager.");
         }
+    }
+
+    #[test]
+    fn unit_tests_never_touch_the_system_credential_store() {
+        assert!(!super::enabled());
     }
 }

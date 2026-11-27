@@ -10,11 +10,12 @@ use super::{
     ensure_daemon, ensure_keys, handoff_label, icon as glyph_in, in_call, open, Confirm, Ended,
     Menu, Subject,
 };
+use crate::gui::components::place::{anchor, placed, Layer, Place as OverlayPlace};
 use crate::gui::components::{glyph, network_icon, tip, Avatar};
 use crate::gui::state::{Shell, Snapshot};
-use crate::gui::theme;
+use crate::gui::theme::{self, Type};
 use gpui::{
-    deferred, div, prelude::*, px, relative, AnyElement, Context, Div, FontWeight, MouseButton, Rgba, Stateful,
+    canvas, deferred, div, prelude::*, px, AnyElement, Context, Div, FontWeight, MouseButton, Rgba, Stateful, Window,
 };
 use protocol::{
     Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, Network, Request,
@@ -173,7 +174,7 @@ fn worded(id: &'static str, icon: Option<&'static str>, word: impl Into<gpui::Sh
         .items_center()
         .justify_center()
         .gap(px(7.))
-        .text_size(px(12.5))
+        .type_ui()
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .children(icon.map(|icon| glyph_in(icon, 14., color, lit)))
@@ -198,7 +199,7 @@ fn plain(id: &'static str) -> Stateful<Div> {
         .items_center()
         .justify_center()
         .gap(px(6.))
-        .text_size(px(12.5))
+        .type_ui()
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme::text())
         .cursor_pointer()
@@ -223,7 +224,7 @@ fn outlined(id: &'static str, network: Network) -> Stateful<Div> {
         .items_center()
         .justify_center()
         .gap(px(6.))
-        .text_size(px(12.5))
+        .type_ui()
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme::text_soft())
         .cursor_pointer()
@@ -451,6 +452,21 @@ pub(super) fn dock_mode(in_tiny_room: bool, tiny_column_has: bool, stage_bar_vis
     }
 }
 
+/// Clamps a dock popover's width to the sidebar dock and viewport so it never bleeds across
+/// the sidebar hairline or off a narrow window.
+pub(in crate::gui) fn dock_popover_width(requested: f32, dock_w: f32, viewport_w: f32) -> f32 {
+    let viewport_cap = (viewport_w - 16.).max(200.);
+    let sidebar_cap = if dock_w > 0. { dock_w.max(200.) } else { requested };
+    requested.min(sidebar_cap).min(viewport_cap)
+}
+
+/// Width and top offset of the floating incoming call overlay when the sidebar dock is hidden.
+pub(in crate::gui) fn incoming_overlay_frame(viewport_w: f32, live_bar: bool) -> (f32, f32) {
+    let w = (viewport_w - 32.).max(200.).min(320.);
+    let top = if live_bar { 56. + theme::BANNER } else { 56. };
+    (w, top)
+}
+
 impl Shell {
     /// The dock, for the end of the sidebar column as a flex-none child: full width, as tall as
     /// its rows. The narrowest sidebar still shows the server name on its own line. `None` when
@@ -458,6 +474,7 @@ impl Shell {
     pub(in crate::gui) fn call_dock(
         &self,
         snapshot: &Snapshot,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
         ensure_keys(cx);
@@ -476,7 +493,7 @@ impl Shell {
                         self.call_failed(&call, &subject, *reason, detail, cx)
                     }
                     (CallState::RingingIn { from }, _) => {
-                        self.call_incoming(&call, &subject, from, cx)
+                        self.call_incoming(&call, &subject, from, window, cx)
                     }
                     (_, Some(confirm)) => {
                         self.call_question(&question(confirm, &subject.title), cx)
@@ -486,9 +503,9 @@ impl Shell {
                         self.tiny_column_has(&call.conversation),
                         self.call_stage_bar_visible(snapshot),
                     ) {
-                        DockMode::CompactTiny => div().child(self.call_compact(&call, &subject, cx)),
-                        DockMode::CompactStage => div().child(self.call_compact_stage(&call, &subject, cx)),
-                        DockMode::Full => div().child(self.call_bar(&call, &subject, cx)),
+                        DockMode::CompactTiny => div().child(self.call_compact(&call, &subject, window, cx)),
+                        DockMode::CompactStage => div().child(self.call_compact_stage(&call, &subject, window, cx)),
+                        DockMode::Full => div().child(self.call_bar(&call, &subject, window, cx)),
                     },
                 }
             }
@@ -500,6 +517,7 @@ impl Shell {
         let dock_picture = self
             .call_shown(snapshot)
             .and_then(|call| self.call_dock_picture(snapshot, &call, cx));
+        let dock_bounds = self.call_state.dock_bounds.clone();
         Some(
             div()
                 .w_full()
@@ -511,7 +529,21 @@ impl Shell {
                 .border_t_1()
                 .border_color(theme::hairline())
                 .children(dock_picture)
-                .child(div().id("call-controls").role(gpui::Role::Group).aria_label("Call controls").child(card)),
+                .child(
+                    div()
+                        .id("call-controls")
+                        .relative()
+                        .role(gpui::Role::Group)
+                        .aria_label("Call controls")
+                        .child(card)
+                        .child(
+                            canvas(move |bounds, _, _| dock_bounds.set(Some(bounds)), |_, _, _, _| {})
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                        ),
+                ),
         )
     }
 
@@ -585,6 +617,15 @@ impl Shell {
                 })
             })
         };
+        let support = self
+            .sidebar_state
+            .find(&self.trees, &ringing.conversation)
+            .map(|c| c.call)
+            .unwrap_or(protocol::CallSupport::Native);
+        let accept_label = incoming_accept_label(&ringing, support);
+        let accept_icon = if video || ringing.incoming_video { "icons/video.svg" } else { "icons/phone.svg" };
+        let conv_key = ringing.conversation.clone();
+        let handoff = support == protocol::CallSupport::Handoff;
         let decline = worded("call-overlay-decline", Some("icons/phone-off.svg"), "Decline", theme::danger_soft(), theme::danger())
             .flex_1()
             .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
@@ -593,57 +634,68 @@ impl Shell {
                 cx.stop_propagation();
                 this.call_decline(cx);
             }));
-        let accept = worded("call-overlay-accept", Some("icons/phone.svg"), "Accept", theme::positive(), theme::on_accent())
+        let accept = worded("call-overlay-accept", Some(accept_icon), accept_label, theme::positive(), theme::on_accent())
             .flex_1()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.call_accept(cx);
+                if handoff {
+                    this.call_handoff(conv_key.clone(), cx);
+                } else {
+                    this.call_accept(cx);
+                }
             }));
+        let viewport_w = self.frame.get().map_or(1120., |(_, _, w, _)| w);
+        let live_bar = !self.live_location_state.all_shares().is_empty();
+        let (card_w, top) = incoming_overlay_frame(viewport_w, live_bar);
         Some(
-            div()
-                .id("call-incoming-overlay")
-                .occlude()
-                .absolute()
-                .top(px(56.))
-                .right(px(16.))
-                .w(px(320.))
-                .p(px(12.))
-                .rounded(px(12.))
-                .flex()
-                .flex_col()
-                .gap(px(10.))
-                .bg(theme::overlay())
-                .border_1()
-                .border_color(theme::overlay_edge())
-                .shadow(theme::shadow_popover())
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .child(Avatar::new(&ringing.conversation, &name, 40.).image_at(picture).build())
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap(px(1.))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(14.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme::text())
-                                        .child(name),
-                                )
-                                .child(div().text_size(px(12.)).text_color(theme::text_soft()).child(line)),
-                        ),
-                )
-                .child(div().flex().gap(px(8.)).child(decline).child(accept))
-                .into_any_element(),
+            deferred(
+                div()
+                    .id("call-incoming-overlay")
+                    .occlude()
+                    .absolute()
+                    .top(px(top))
+                    .right(px(16.))
+                    .w(px(card_w))
+                    .max_w_full()
+                    .p(px(12.))
+                    .rounded(px(theme::R_MODAL))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .bg(theme::overlay())
+                    .border_1()
+                    .border_color(theme::overlay_edge())
+                    .shadow(theme::shadow_popover())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(Avatar::new(&ringing.conversation, &name, 40.).image_at(picture).build())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .type_body()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::text())
+                                            .child(name),
+                                    )
+                                    .child(div().type_small().text_color(theme::text_soft()).child(line)),
+                            ),
+                    )
+                    .child(div().flex().gap(px(8.)).child(decline).child(accept)),
+            )
+            .priority(Layer::Popover as usize)
+            .into_any_element(),
         )
     }
 
@@ -674,7 +726,7 @@ impl Shell {
             .bg(theme::hover())
             .flex()
             .items_center()
-            .text_size(px(12.5))
+            .type_ui()
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme::text())
             .cursor_pointer()
@@ -697,8 +749,7 @@ impl Shell {
                     .child(
                         div()
                             .line_clamp(2)
-                            .text_size(px(13.))
-                            .line_height(px(18.))
+                            .type_ui()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
                             .child(subject.title.clone()),
@@ -709,8 +760,7 @@ impl Shell {
                             .flex_wrap()
                             .items_center()
                             .gap(px(4.))
-                            .text_size(px(11.5))
-                            .line_height(px(15.))
+                            .type_small()
                             .text_color(theme::text_soft())
                             .child(network_icon(network, 11.))
                             .child(div().line_clamp(2).child(format!("Call ended · {}", clock(ended.seconds)))),
@@ -731,16 +781,14 @@ impl Shell {
             .gap(px(1.))
             .child(
                 div()
-                    .text_size(px(13.))
-                    .line_height(px(18.))
+                    .type_ui()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text())
                     .child("Rate call quality"),
             )
             .child(
                 div()
-                    .text_size(px(11.5))
-                    .line_height(px(15.))
+                    .type_small()
                     .text_color(theme::text_soft())
                     .child(subtitle),
             );
@@ -750,6 +798,8 @@ impl Shell {
             stars_row = stars_row.child(
                 div()
                     .id(gpui::SharedString::from(format!("call-rate-star-{n}")))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("Rate {n} of 5 stars"))
                     .size(px(26.))
                     .rounded(px(6.))
                     .bg(if filled { theme::accent_soft() } else { theme::hover() })
@@ -757,11 +807,11 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .text_size(px(14.))
-                    .text_color(if filled { theme::accent() } else { theme::text_faint() })
+                    .tab_index(0)
+                    .focus_visible(|s| s.shadow(theme::focus_ring()))
                     .hover(|s| s.bg(theme::selected()))
                     .on_click(cx.listener(move |this, _, _, cx| this.call_rating_star(n, cx)))
-                    .child(if filled { "★" } else { "☆" }),
+                    .child(glyph("icons/star.svg", 14., if filled { theme::accent() } else { theme::text_faint() })),
             );
         }
         let reasons = (rating.stars > 0 && rating.stars < 5).then(|| {
@@ -775,7 +825,7 @@ impl Shell {
                         .py(px(3.))
                         .rounded(px(6.))
                         .bg(if picked { theme::accent_soft() } else { theme::hover() })
-                        .text_size(px(11.))
+                        .type_micro()
                         .text_color(if picked { theme::accent_text() } else { theme::text_soft() })
                         .cursor_pointer()
                         .hover(|s| s.bg(theme::selected()))
@@ -794,13 +844,13 @@ impl Shell {
                 .bg(theme::raised())
                 .border_1()
                 .border_color(theme::hairline())
-                .text_size(px(12.))
+                .type_small()
                 .text_color(theme::text())
                 .child(rating.comment_input.clone())
         });
         let error = rating.error.as_ref().map(|msg| {
             div()
-                .text_size(px(11.))
+                .type_micro()
                 .text_color(theme::danger())
                 .child(msg.clone())
         });
@@ -813,7 +863,7 @@ impl Shell {
             .bg(theme::hover())
             .flex()
             .items_center()
-            .text_size(px(12.))
+            .type_small()
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme::text())
             .cursor_pointer()
@@ -828,7 +878,7 @@ impl Shell {
             .bg(if can_send { theme::accent() } else { theme::hover() })
             .flex()
             .items_center()
-            .text_size(px(12.))
+            .type_small()
             .font_weight(FontWeight::MEDIUM)
             .text_color(if can_send { theme::on_accent() } else { theme::text_faint() })
             .when(can_send, |d| d.cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.call_rating_send(cx))))
@@ -857,7 +907,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.5))
+                .type_ui()
                 .font_weight(FontWeight::MEDIUM)
                 .cursor_pointer()
                 .child(div().line_clamp(2).child(word))
@@ -880,16 +930,14 @@ impl Shell {
                     .child(
                         div()
                             .line_clamp(3)
-                            .text_size(px(13.))
-                            .line_height(px(18.))
+                            .type_ui()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
                             .child(question.title.clone()),
                     )
                     .child(
                         div()
-                            .text_size(px(11.5))
-                            .line_height(px(16.))
+                            .type_small()
                             .text_color(theme::text_soft())
                             .child("You can be in one call at a time."),
                     ),
@@ -953,13 +1001,13 @@ impl Shell {
             .gap(px(8.))
             .border_b_1()
             .border_color(theme::hairline())
-            .text_size(px(12.))
+            .type_small()
             .text_color(theme::text_soft())
             .child(Avatar::named(from, 20.).build())
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(120.))
+                    .min_w_0()
                     .flex()
                     .flex_wrap()
                     .items_center()
@@ -1028,7 +1076,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .text_size(px(12.))
+                .type_small()
                 .text_color(theme::text())
                 .child(glyph("icons/monitor-up.svg", 13., theme::accent()))
                 .child(
@@ -1048,7 +1096,7 @@ impl Shell {
                         .bg(theme::accent())
                         .hover(|s| s.bg(theme::accent_hover()))
                         .text_color(theme::on_accent())
-                        .text_size(px(11.5))
+                        .type_small()
                         .font_weight(FontWeight::MEDIUM)
                         .flex()
                         .items_center()
@@ -1157,7 +1205,7 @@ impl Shell {
 
     /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,
     /// deafen and the voice settings are in the user panel right under it.
-    fn call_compact(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn call_compact(&self, call: &Call, subject: &Subject, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let (state, color) = match call.state {
             CallState::Joined if super::securing(call) => ("Securing…", theme::warning()),
             CallState::Joined if self.call_muted_talking(call) => ("You're muted", theme::danger()),
@@ -1188,23 +1236,22 @@ impl Shell {
             .gap(px(1.))
             .child(
                 div()
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .gap(px(5.))
-                    .text_size(px(13.))
-                    .line_height(px(18.))
+                    .type_ui()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(color)
                     .when(self.call_muted_talking(call), |row| row.child(glyph("icons/mic-off.svg", 13., theme::danger())))
-                    .child(div().flex_none().child(state))
+                    .child(div().min_w_0().truncate().child(state))
                     .children(clock.map(|clock| div().flex_none().font_weight(FontWeight::NORMAL).text_color(theme::text_soft()).child(clock))),
             )
             .child(
                 div()
                     .whitespace_normal()
                     .line_clamp(4)
-                    .text_size(px(11.5))
-                    .line_height(px(15.))
+                    .type_small()
                     .text_color(if notice.is_some() { theme::warning() } else { theme::text_soft() })
                     .child(notice.unwrap_or(place)),
             );
@@ -1226,7 +1273,7 @@ impl Shell {
                 .cursor_pointer()
                 .tab_index(0)
                 .focus_visible(|style| style.shadow(theme::focus_ring()))
-                .text_size(px(11.5))
+                .type_small()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(fg)
                 .tooltip(tip("People in this call", None))
@@ -1265,19 +1312,19 @@ impl Shell {
                     .items_center()
                     .gap(px(8.))
                     .children(self.call_signal(call, cx))
-                    .children(self.call_security(call, Place::TinyBar, cx))
+                    .children(self.call_security_in(call, Place::TinyBar, Some(window), cx))
                     .children(people_chip)
                     .child(disconnect.ml_auto()),
             )
             .child(words)
-            .children(self.call_popover(call, subject, Place::TinyBar, cx))
+            .children(self.call_popover(call, subject, Place::TinyBar, window, cx))
     }
 
     /// Compact sidebar dock card shown while the main-pane call stage is open: keeps the call's
     /// identity, lock/signal/duration, any dock-only actions with no twin on the stage bar
     /// (Ring again, Copy call link, Telegram video-chat options), and Leave without duplicating
     /// mute, deafen, share, camera, call options, or the stage header's Show chat button.
-    fn call_compact_stage(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn call_compact_stage(&self, call: &Call, subject: &Subject, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let place = subject
             .space
             .as_deref()
@@ -1345,7 +1392,7 @@ impl Shell {
             .id("call-compact-stage-card")
             .children(waiting.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
             .children(share_strip)
-            .child(self.call_title(call, subject, words, cx))
+            .child(self.call_title(call, subject, words, window, cx))
             .child(
                 div()
                     .w_full()
@@ -1358,7 +1405,7 @@ impl Shell {
                     .children(tg_actions)
                     .child(end.ml_auto()),
             )
-            .children(self.call_popover(call, subject, Place::Dock, cx))
+            .children(self.call_popover(call, subject, Place::Dock, window, cx))
     }
 
     fn call_ring_again_button(
@@ -1443,6 +1490,7 @@ impl Shell {
         call: &Call,
         subject: &Subject,
         place: Place,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let joined = call.state == CallState::Joined;
@@ -1486,38 +1534,48 @@ impl Shell {
             }
             _ => return None,
         };
-        // Above the card, level with its left edge, on top of whatever the list shows.
-        // The card is as tall as its rows, so the popover hangs off the top of it.
-        Some(
-            deferred(
-                div()
-                    .absolute()
-                    .left(px(-1.))
-                    .bottom(relative(1.))
-                    .pb(px(6.))
-                    .child(
-                        div()
-                            .id("call-popover")
-                            .w(px(width))
-                            .rounded(px(12.))
-                            .bg(theme::overlay())
-                            .border_1()
-                            .border_color(theme::border())
-                            .shadow(theme::shadow_popover())
-                            .occlude()
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
-                            .child(body),
-                    ),
-            )
-            .priority(1)
-            .into_any_element(),
-        )
+        let viewport = window.viewport_size();
+        let wide = f32::from(viewport.width);
+        let tall = f32::from(viewport.height);
+        let captured = self.call_state.dock_bounds.get();
+        let live_sidebar = self.sidebar_state.width.get();
+        let sidebar = if live_sidebar > 0. { live_sidebar } else { self.layout_state.sidebar_width };
+        let dock_w = captured
+            .map(|b| f32::from(b.size.width))
+            .filter(|w| *w > 0.)
+            .unwrap_or_else(|| (sidebar - 16.).max(200.));
+        let width = dock_popover_width(width, dock_w, wide);
+        let fallback = anchor(
+            crate::gui::layout::RAIL_WIDTH + 8.,
+            (tall - 96.).max(40.),
+            dock_w.max(200.),
+            80.,
+        );
+        let bounds = captured.unwrap_or(fallback);
+        let panel = div()
+            .id("call-popover")
+            .w(px(width))
+            .max_w_full()
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::border())
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
+            .child(body);
+        Some(placed(
+            "call-popover-layer",
+            OverlayPlace::Above(bounds),
+            Layer::Popover,
+            window,
+            panel,
+        ))
     }
 
     /// Who or where, then the server or notice on its own line, then signal, lock and who else
     /// is there. Those icons used to share the name's row, which is what cut a server down to
     /// "Tiny C…" at the narrowest sidebar. A click opens the call's conversation.
-    fn call_title(&self, call: &Call, subject: &Subject, words: String, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn call_title(&self, call: &Call, subject: &Subject, words: String, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let network = call.conversation.network;
         let direct = subject.kind == ConversationKind::Direct;
         let live = in_call(call);
@@ -1590,8 +1648,7 @@ impl Shell {
             .flex_wrap()
             .items_center()
             .gap(px(4.))
-            .text_size(px(11.5))
-            .line_height(px(15.))
+            .type_small()
             .text_color(color)
             .child(div().flex_none().child(network_icon(network, 11.)))
             .child(
@@ -1625,7 +1682,7 @@ impl Shell {
             }
         };
         let signal = self.call_signal(call, cx);
-        let security = self.call_security(call, Place::Dock, cx);
+        let security = self.call_security_in(call, Place::Dock, Some(window), cx);
         let show_status = signal.is_some() || security.is_some() || right.is_some() || counter.is_some();
         div()
             .id("call-title")
@@ -1646,8 +1703,7 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .whitespace_normal()
-                            .text_size(px(13.))
-                            .line_height(px(18.))
+                            .type_ui()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
                             .child(super::telegram::call_header_display_title(call, &subject.title)),
@@ -1676,7 +1732,7 @@ impl Shell {
 
     /// Ringing out, connecting, joined and reconnecting. As tall as the name, the server line
     /// and the controls, which wrap when the sidebar is at its narrowest.
-    fn call_bar(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn call_bar(&self, call: &Call, subject: &Subject, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let place = subject
             .space
             .as_deref()
@@ -2063,14 +2119,14 @@ impl Shell {
             .on_click(cx.listener(move |this, _, _, cx| this.call_go(card_key.clone(), &card_title, cx)))
             .children(waiting.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
             .children(share_strip)
-            .child(self.call_title(call, subject, words, cx))
+            .child(self.call_title(call, subject, words, window, cx))
             .child(controls)
-            .children(self.call_popover(call, subject, Place::Dock, cx))
+            .children(self.call_popover(call, subject, Place::Dock, window, cx))
     }
 
     /// Someone is calling: the same card with a `positive` edge and two equal buttons. It holds
     /// nothing that can take keyboard focus.
-    fn call_incoming(&self, call: &Call, subject: &Subject, from: &str, cx: &mut Context<Self>) -> Div {
+    fn call_incoming(&self, call: &Call, subject: &Subject, from: &str, window: &Window, cx: &mut Context<Self>) -> Div {
         let words = incoming_subtitle(call, subject.kind, from, subject.occupied);
         let support = self
             .sidebar_state
@@ -2110,7 +2166,7 @@ impl Shell {
         }));
         card()
             .border_color(Rgba { alpha: 0.45, ..theme::positive() })
-            .child(self.call_title(call, subject, words, cx))
+            .child(self.call_title(call, subject, words, window, cx))
             .child(
                 div()
                     .min_h(px(32.))
@@ -2202,8 +2258,7 @@ impl Shell {
                                 div()
                                     .whitespace_normal()
                                     .line_clamp(2)
-                                    .text_size(px(13.))
-                                    .line_height(px(18.))
+                                    .type_ui()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::text())
                                     .child(title),
@@ -2212,8 +2267,7 @@ impl Shell {
                                 div()
                                     .whitespace_normal()
                                     .line_clamp(4)
-                                    .text_size(px(11.5))
-                                    .line_height(px(16.))
+                                    .type_small()
                                     .text_color(theme::text_soft())
                                     .child(reason_line),
                             ),

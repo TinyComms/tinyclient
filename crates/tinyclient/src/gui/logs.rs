@@ -459,9 +459,10 @@ impl Render for LogsWindow {
                 )
                 .into_any_element()
         };
+        let note_w = super::components::place::toast_width(f32::from(window.viewport_size().width));
         let note = self.note.as_ref().filter(|(at, _)| at.elapsed() < NOTE).map(|(_, words)| {
             div().absolute().bottom(px(56.)).left_0().right_0().flex().justify_center().child(
-                super::components::toast(Some(("icons/check.svg", theme::text_soft())), words.clone()).w(px(420.)),
+                super::components::toast(Some(("icons/check.svg", theme::text_soft())), words.clone()).w(px(note_w)).max_w_full(),
             )
         });
         let close = super::chrome::buttons(window, |_, window, _| window.remove_window());

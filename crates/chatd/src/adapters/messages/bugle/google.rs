@@ -56,7 +56,23 @@ pub(super) fn update_cookies(saved: &mut Saved, header: &str) {
     }
 }
 
-pub(super) fn acknowledge(values: &[serde_json::Value], live: &Mutex<Live>) {
+pub(super) fn extract_ack_ids(values: &[serde_json::Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|value| {
+            at(value, 2)
+                .and_then(|v| at(v, 1))
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+pub(super) fn acknowledge_ids(ids: &[String], live: &Mutex<Live>, http: &ureq::Agent) {
+    if ids.is_empty() {
+        return;
+    }
     let (body, cookies) = {
         let live = live.lock().unwrap_or_else(|p| p.into_inner());
         if live.saved.cookies.is_empty() {
@@ -67,19 +83,10 @@ pub(super) fn acknowledge(values: &[serde_json::Value], live: &Mutex<Live>) {
             live.saved.browser,
             "GDitto"
         ]);
-        let acks: Vec<_> = values
+        let acks: Vec<_> = ids
             .iter()
-            .filter_map(|value| {
-                at(value, 2)
-                    .and_then(|v| at(v, 1))
-                    .and_then(|v| v.as_str())
-                    .filter(|id| !id.is_empty())
-            })
             .map(|id| serde_json::json!([id, browser]))
             .collect();
-        if acks.is_empty() {
-            return;
-        }
         let mut auth = pblite_auth(&uuid(), &live.token);
         auth[2] = "GDitto".into();
         (
@@ -87,8 +94,9 @@ pub(super) fn acknowledge(values: &[serde_json::Value], live: &Mutex<Live>) {
             live.cookies.clone(),
         )
     };
-    if let Ok(response) = post(
-        &agent(Duration::from_secs(10)),
+    if let Ok(response) = post_with_timeout(
+        http,
+        Duration::from_secs(10),
         &format!("{RELAY}.Messaging/AckMessages"),
         "application/json+protobuf",
         &body,

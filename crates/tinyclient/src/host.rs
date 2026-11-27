@@ -38,6 +38,7 @@ pub fn here() -> &'static str {
 }
 
 /// The phone's own system, for the words that name it.
+#[allow(dead_code)]
 const PHONE_SYSTEM: &str = if cfg!(target_os = "ios") {
     "iOS"
 } else if cfg!(target_os = "android") {
@@ -56,6 +57,7 @@ pub fn keep_messages() -> &'static str {
 }
 
 /// Settings › About, under Copy diagnostics, for the form the window is in.
+#[allow(dead_code)]
 pub fn diagnostics() -> String {
     if phone() {
         format!("Version, {PHONE_SYSTEM}, memory and connection states. No messages, names or tokens.")
@@ -151,6 +153,7 @@ pub const KEEP_MESSAGES: &str = if cfg!(target_os = "macos") {
 };
 
 /// Settings › About, under Copy diagnostics.
+#[allow(dead_code)]
 pub const DIAGNOSTICS: &str = if cfg!(target_os = "macos") {
     "Version, macOS, memory and connection states. No messages, names, tokens, or log lines."
 } else if cfg!(windows) {
