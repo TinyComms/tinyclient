@@ -147,6 +147,8 @@ pub struct State {
     pub(super) activity_items: Vec<protocol::ActivityItem>,
     pub(super) activity_cursor: Option<(AccountKey, String)>,
     pub(super) activity_loading: bool,
+    /// Why the feed could not be read, shown when no account gave any rows.
+    pub(super) activity_error: Option<String>,
     /// Activity rows whose invite or sign-in code the user chose to reveal in Streamer mode.
     activity_revealed: HashSet<String>,
     activity_epoch: u64,
@@ -469,6 +471,7 @@ impl State {
             activity_items: Vec::new(),
             activity_cursor: None,
             activity_loading: false,
+            activity_error: None,
             activity_revealed: HashSet::new(),
             activity_epoch: 0,
             mentions_items: Vec::new(),
@@ -1441,6 +1444,7 @@ impl Shell {
         let epoch = self.sidebar_state.activity_epoch;
         self.sidebar_state.activity_items.clear();
         self.sidebar_state.activity_cursor = None;
+        self.sidebar_state.activity_error = None;
         if accounts.is_empty() {
             self.sidebar_state.activity_loading = false;
             return;
@@ -1448,24 +1452,30 @@ impl Shell {
         self.sidebar_state.activity_loading = true;
         let kind = self.sidebar_state.activity_filter;
         cx.spawn(async move |this, cx| {
-            let (merged, next_cursor) = cx
+            let (merged, next_cursor, errors) = cx
                 .background_executor()
                 .spawn(async move {
                     let mut merged = Vec::new();
                     let mut next_cursor = None;
+                    let mut errors = Vec::new();
                     for account in accounts {
                         let req = Request::ActivityFeed { account: account.clone(), kind, cursor: None, limit: 30 };
-                        if let Ok(Response::ActivityFeed { items, cursor }) = ask(&req) {
-                            merged.extend(items);
-                            if next_cursor.is_none() {
-                                if let Some(c) = cursor {
-                                    next_cursor = Some((account, c));
+                        match ask(&req) {
+                            Ok(Response::ActivityFeed { items, cursor }) => {
+                                merged.extend(items);
+                                if next_cursor.is_none() {
+                                    if let Some(c) = cursor {
+                                        next_cursor = Some((account, c));
+                                    }
                                 }
                             }
+                            Ok(Response::Error { detail, .. }) => errors.push(detail),
+                            Ok(_) => {}
+                            Err(err) => errors.push(err.to_string()),
                         }
                     }
                     merged.sort_by_key(|item| std::cmp::Reverse(item.time));
-                    (merged, next_cursor)
+                    (merged, next_cursor, errors)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -1473,6 +1483,7 @@ impl Shell {
                     return;
                 }
                 this.sidebar_state.activity_loading = false;
+                this.sidebar_state.activity_error = if merged.is_empty() { errors.into_iter().next() } else { None };
                 this.sidebar_state.activity_items = merged;
                 this.sidebar_state.activity_cursor = next_cursor;
                 cx.notify();

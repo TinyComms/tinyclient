@@ -531,6 +531,8 @@ impl Shell {
 
         let body: AnyElement = if state.activity_loading && state.activity_items.is_empty() {
             div().pt(px(4.)).children((0..5).map(Self::inbox_placeholder)).into_any_element()
+        } else if let Some(why) = state.activity_error.as_deref().filter(|_| state.activity_items.is_empty()) {
+            empty_state("icons/bell.svg", "Couldn't load activity", why).px(px(24.)).into_any_element()
         } else if state.activity_items.is_empty() && state.activity_cursor.is_none() {
             self.inbox_empty(cx)
         } else {
