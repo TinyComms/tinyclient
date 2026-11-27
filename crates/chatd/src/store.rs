@@ -349,7 +349,7 @@ const IN_INBOX: &str = "(NOT c.hidden AND c.special != 'request'
 const IS_UNREAD: &str = "(((c.unread > 0 AND NOT c.bot AND NOT c.archived) OR c.mentions > 0) AND NOT c.muted)";
 const IS_MENTION: &str = "(c.mentions > 0)";
 const IS_APP: &str = "(c.bot AND c.unread > 0)";
-const IS_ACTIVITY: &str = "(NOT c.muted AND (c.mentions > 0 OR (c.kind = 'thread' AND c.followed AND c.unread > 0) OR EXISTS (SELECT 1 FROM message m WHERE m.network = c.network AND m.account = c.account AND m.conversation = c.id AND json_extract(m.body, '$.outgoing') = 1 AND json_array_length(json_extract(m.body, '$.reactions')) > 0)))";
+const IS_ACTIVITY: &str = "(NOT c.muted AND (c.mentions > 0 OR (c.kind = 'thread' AND c.followed AND c.unread > 0) OR c.unread_reactions > 0))";
 
 const PERSON: &str = "
     SELECT p.network, p.account, p.id, p.name, p.handle, p.bot, p.relation, p.status, p.link,
