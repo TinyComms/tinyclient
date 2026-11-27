@@ -165,6 +165,11 @@ pub(crate) fn prove_offline_send_kept() -> Result<(), &'static str> {
     composer::prove_offline_send_kept()
 }
 
+/// The lab's slack-unreads-all driver. A Slack section's show-only-unreads setting does not hide channels under All.
+pub(crate) fn prove_slack_unreads_all() -> Result<(), &'static str> {
+    sidebar::tree::prove_slack_unreads_all()
+}
+
 /// The lab's telegram-mute-bell driver. A muted Telegram row draws the bell-off beside its quiet count.
 pub(crate) fn prove_telegram_mute_bell() -> Result<(), &'static str> {
     sidebar::chat::prove_telegram_mute_bell()
