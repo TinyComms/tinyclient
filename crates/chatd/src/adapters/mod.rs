@@ -4482,6 +4482,11 @@ pub fn prove_slack_call_cards() -> Result<(), String> {
     slack::prove_call_cards()
 }
 
+/// The lab's slack-reactors driver. See `slack::prove_reactors`.
+pub fn prove_slack_reactors() -> Result<(), String> {
+    slack::prove_reactors()
+}
+
 /// The lab's discord-thread-chip driver. A thread chip counts new replies and keeps the
 /// newest faces. A build without this returns to the server and stays up.
 pub fn prove_discord_thread_chip() -> Result<(), String> {

@@ -931,6 +931,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-poll:0");
         return Ok(());
     }
+    // The lab's slack-reactors driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-reactors") {
+        if let Err(err) = chatd::adapters::prove_slack_reactors() {
+            eprintln!("slack-reactors: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-slack-reactors:0");
+        return Ok(());
+    }
     // The lab's messages-unpaired driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-unpaired") {
         if let Err(err) = chatd::adapters::messages::prove_messages_unpaired() {

@@ -1,0 +1,12 @@
+{
+  "id": "slack-reactors",
+  "title": "Slack names who reacted via reactions.get, and every picker emoji has a Slack name",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same Slack names and reactions.get lookup are what a reaction maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same Slack names and reactions.get lookup are what a reaction maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
