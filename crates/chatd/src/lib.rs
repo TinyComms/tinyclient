@@ -1,6 +1,9 @@
 #[cfg(test)]
 #[path = "../tests/support/mediad.rs"]
 mod test_mediad;
+#[cfg(test)]
+#[path = "../build_support/telegram_env.rs"]
+mod telegram_env;
 
 pub mod adapters;
 pub mod leave_prove;
