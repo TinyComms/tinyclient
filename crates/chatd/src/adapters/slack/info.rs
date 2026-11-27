@@ -3,6 +3,7 @@
 //! threads the user follows, and the newest message of rows on screen. Each runs because the
 //! user opened or clicked something, or (previews) because the rows are on screen, paced.
 
+use super::text::Rich;
 use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
 use crate::adapters::{AccountFilesPage, ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage, SpaceAbout};
 use crate::store::Filing;
@@ -900,12 +901,62 @@ impl Slack {
             }
             items.push(mapped);
         }
+        self.fill_activity_text(&mut items);
         let next = feed["response_metadata"]["next_cursor"]
             .as_str()
             .or_else(|| feed["next_cursor"].as_str())
             .filter(|c| !c.is_empty())
             .map(str::to_owned);
         Ok(ActivityPage { items, cursor: next })
+    }
+
+    /// The feed names a message by channel and timestamp and carries no text. One
+    /// `messages.list`, as the web client sends it, fetches the whole page. A row whose
+    /// message does not come back keeps no preview.
+    fn fill_activity_text(&self, items: &mut [ActivityItem]) {
+        let mut wanted: Vec<(String, Vec<String>)> = Vec::new();
+        for item in items.iter().filter(|item| item.text.is_empty() && !item.message_id.is_empty()) {
+            let channel = item.conversation.id.as_str();
+            match wanted.iter_mut().find(|(known, _)| known == channel) {
+                Some((_, stamps)) => {
+                    if !stamps.contains(&item.message_id) {
+                        stamps.push(item.message_id.clone());
+                    }
+                }
+                None => wanted.push((channel.to_owned(), vec![item.message_id.clone()])),
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        let ids = Value::Array(
+            wanted.iter().map(|(channel, stamps)| json!({ "channel": channel, "timestamps": stamps })).collect(),
+        )
+        .to_string();
+        let params = [("message_ids", ids.as_str()), ("org_wide_aware", "true"), ("cached_latest_updates", "{}")];
+        let Ok(found) = self.api("messages.list", &params) else {
+            return;
+        };
+        for item in items.iter_mut().filter(|item| item.text.is_empty()) {
+            let Some(message) = found["messages_data"][item.conversation.id.as_str()]["messages"]
+                .as_array()
+                .and_then(|list| list.iter().find(|m| m["ts"].as_str() == Some(item.message_id.as_str())))
+            else {
+                continue;
+            };
+            let mut rich = Rich::new(self);
+            rich.mrkdwn(message["text"].as_str().unwrap_or(""));
+            rich.finish();
+            let flat = rich.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            // A message can run to tens of thousands of characters; a row shows a line.
+            item.text = flat.chars().take(300).collect();
+            if item.actor_id.is_empty() {
+                if let Some(user) = message["user"].as_str() {
+                    item.actor_id = user.to_owned();
+                    item.actor = self.user(user).name;
+                }
+            }
+        }
     }
 
     fn map_activity_item(&self, entry: &Value) -> Option<ActivityItem> {
