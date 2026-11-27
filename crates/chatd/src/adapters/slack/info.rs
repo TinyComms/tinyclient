@@ -854,18 +854,40 @@ impl Slack {
         if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
             params.push(("cursor", cursor));
         }
-        let types_filter = kind.and_then(|k| match k {
-            ActivityItemKind::Mention => Some("at_mention,broadcast,keyword,usergroup_mention"),
-            ActivityItemKind::ThreadReply => Some("thread_v2,thread"),
-            ActivityItemKind::Reaction => Some("reaction"),
-            ActivityItemKind::MissedCall => None,
-            ActivityItemKind::App => Some("app_mention,bot_dm,workflow"),
-            ActivityItemKind::Invite => Some("channel_invite"),
-            ActivityItemKind::Other => None,
-        });
-        if let Some(types) = types_filter {
-            params.push(("types", types));
+        // Mentions, Threads and All are the web client's own `types` values, captured from its
+        // Activity page. Reactions, Apps and Invites are picked out of the All list, unverified.
+        let types = match kind {
+            Some(ActivityItemKind::Mention) => {
+                "at_user,unjoined_channel_mention,at_user_group,at_channel,at_everyone,keyword"
+            }
+            Some(ActivityItemKind::ThreadReply) => "thread_v2",
+            Some(ActivityItemKind::Reaction) => "message_reaction",
+            Some(ActivityItemKind::App) => "bot_dm_bundle",
+            Some(ActivityItemKind::Invite) => {
+                "internal_channel_invite,external_channel_invite,external_dm_invite,quietly_added_to_channel"
+            }
+            Some(ActivityItemKind::MissedCall | ActivityItemKind::Other) | None => {
+                "at_user,at_user_group,at_channel,at_everyone,keyword,list_record_assigned,\
+                 list_user_mentioned,list_todo_notification,list_approval_request,\
+                 list_approval_reviewed,unjoined_channel_mention,thread_v2,message_reaction,\
+                 bot_dm_bundle,dm,prejoin_dm_welcome_party_alert,internal_channel_invite,\
+                 external_channel_invite,external_dm_invite,quietly_added_to_channel,channel,\
+                 saved_reminder,list_record_edited"
+            }
+        };
+        params.push(("types", types));
+        params.push(("mode", "chrono_v1"));
+        for flag in [
+            "archive_only",
+            "unread_only",
+            "priority_only",
+            "only_salesforce_channels",
+            "exclude_automations",
+            "automations_only",
+        ] {
+            params.push((flag, "false"));
         }
+        params.push(("is_activity_inbox", "true"));
         let feed = self.api("activity.feed", &params)?;
         let raw_items = feed["items"].as_array().map_or(&[][..], Vec::as_slice);
         let mut items = Vec::with_capacity(raw_items.len());
@@ -893,25 +915,30 @@ impl Slack {
             .or_else(|| entry["type"].as_str())
             .unwrap_or("");
         let kind = match raw_type {
-            "at_mention" | "mention" | "broadcast" | "keyword" | "at_channel" | "at_here" | "at_everyone" | "usergroup_mention" => {
-                ActivityItemKind::Mention
-            }
+            "at_mention" | "mention" | "broadcast" | "keyword" | "at_channel" | "at_here" | "at_everyone" | "usergroup_mention"
+            | "at_user" | "at_user_group" | "unjoined_channel_mention" => ActivityItemKind::Mention,
             "thread_v2" | "thread" | "thread_reply" => ActivityItemKind::ThreadReply,
-            "reaction" | "reaction_added" => ActivityItemKind::Reaction,
-            "app_mention" | "app_home" | "bot_dm" | "workflow" | "app" => ActivityItemKind::App,
-            "channel_invite" | "invite" => ActivityItemKind::Invite,
+            "reaction" | "reaction_added" | "message_reaction" => ActivityItemKind::Reaction,
+            "app_mention" | "app_home" | "bot_dm" | "workflow" | "app" | "bot_dm_bundle" => ActivityItemKind::App,
+            "channel_invite" | "invite" | "internal_channel_invite" | "external_channel_invite" | "external_dm_invite"
+            | "quietly_added_to_channel" => ActivityItemKind::Invite,
             _ => ActivityItemKind::Other,
         };
-        let msg = &inner["message"];
+        // Bundled items (threads, bot DMs) carry their coordinates under `bundle_info.payload`.
+        let payload = &inner["bundle_info"]["payload"];
+        let thread_entry = &payload["thread_entry"];
+        let msg = if inner["message"].is_object() { &inner["message"] } else { &payload["message"] };
         let react = &inner["reaction"];
         let channel = msg["channel"]
             .as_str()
+            .or_else(|| thread_entry["channel_id"].as_str())
             .or_else(|| react["channel"].as_str())
             .or_else(|| inner["channel"].as_str())
             .or_else(|| entry["channel"].as_str())
             .filter(|c| !c.is_empty())?;
         let message_id = msg["ts"]
             .as_str()
+            .or_else(|| thread_entry["latest_ts"].as_str())
             .or_else(|| react["item_ts"].as_str())
             .or_else(|| react["ts"].as_str())
             .or_else(|| inner["message_ts"].as_str())
@@ -921,6 +948,7 @@ impl Slack {
             .to_owned();
         let thread_ts = msg["thread_ts"]
             .as_str()
+            .or_else(|| thread_entry["thread_ts"].as_str())
             .or_else(|| inner["thread_ts"].as_str())
             .or_else(|| entry["thread_ts"].as_str())
             .filter(|t| !t.is_empty() && *t != message_id.as_str());
