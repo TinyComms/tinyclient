@@ -6114,6 +6114,33 @@ mod tests {
     }
 
     #[test]
+    fn the_activity_count_wants_an_unread_reaction_not_one_seen_long_ago() {
+        let (mut store, key) = store();
+        let account = key.account();
+        let direct = ConversationRow::new("dm", ConversationKind::Direct, "Mara");
+        store.upsert_conversation(&account, &direct).unwrap();
+        let dm = Key::new(&account, "dm");
+
+        // My own message, with a reaction on it that I have long since seen.
+        let mut mine = Message::plain("1", "me", "see you at six", crate::hub::now(), true);
+        mine.reactions.push(Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new(), ..Reaction::default() });
+        store.ingest(&dm, &mine, true).unwrap();
+        let activity = |store: &Store| store.inbox_counts(None, &[]).unwrap().activity;
+        assert_eq!(activity(&store), 0, "a reaction nobody has to read is not activity");
+
+        // The network says one is new, and the count follows it both ways.
+        store.set_unread_reactions(&dm, 1).unwrap();
+        assert_eq!(activity(&store), 1);
+        store.set_unread_reactions(&dm, 0).unwrap();
+        assert_eq!(activity(&store), 0);
+
+        // A muted conversation counts for nothing.
+        store.set_unread_reactions(&dm, 1).unwrap();
+        store.set_muted(&dm, true).unwrap();
+        assert_eq!(activity(&store), 0);
+    }
+
+    #[test]
     fn the_inbox_holds_what_needs_me_and_leaves_plain_channels_to_their_space() {
         let (mut store, key) = store();
         let account = key.account();
