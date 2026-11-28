@@ -185,6 +185,12 @@ pub(crate) fn prove_discord_format() -> Result<(), &'static str> {
     composer::format::prove()
 }
 
+/// The lab's composer-toolbars driver. Slack, Telegram and Teams drafts get a formatting bar that
+/// writes each network's own markers, and a setting hides it.
+pub(crate) fn prove_composer_toolbars() -> Result<(), &'static str> {
+    composer::format::prove_toolbars()
+}
+
 /// The lab's open-at-login driver. The row is there, off by default, and the switch writes and
 /// removes the entry the system reads at sign-in.
 pub(crate) fn prove_open_at_login() -> Result<(), &'static str> {

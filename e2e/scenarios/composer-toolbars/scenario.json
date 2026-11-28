@@ -1,0 +1,16 @@
+{
+  "id": "composer-toolbars",
+  "title": "Slack, Telegram and Teams drafts get a formatting bar that can be hidden in Settings",
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same composer is what a phone draft uses.",
+    "ios": "The phone proof build does not run the desktop window. The same composer is what a phone draft uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

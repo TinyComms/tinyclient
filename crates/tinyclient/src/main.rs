@@ -436,6 +436,15 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The lab's composer-toolbars driver. A build without this opens the window below and stays up.
+    #[cfg(feature = "gui")]
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("composer-toolbars") {
+        if let Err(err) = gui::prove_composer_toolbars() {
+            eprintln!("composer-toolbars: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     // The lab's open-at-login driver. A build without this opens the window below and stays up.
     #[cfg(feature = "gui")]
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("open-at-login") {

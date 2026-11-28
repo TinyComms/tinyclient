@@ -249,6 +249,41 @@ pub(in crate::gui) fn paint(text: &str) -> Vec<Look> {
     flatten(&hits, text.len())
 }
 
+/// The lab's toolbar driver. Slack, Telegram and Teams drafts get a formatting bar, each writing
+/// styles its own way, and the setting that hides the bar reads back. A build from before the
+/// bars never reaches it, so the window stays open and the scenario fails.
+pub(in crate::gui) fn prove_toolbars() -> Result<(), &'static str> {
+    use protocol::Network::{Signal, Slack, Teams, Telegram};
+    if !(Markup::of(Slack).on() && Markup::of(Telegram).on() && Markup::of(Teams).on()) {
+        return Err("a Slack, Telegram or Teams draft has no formatting bar");
+    }
+    if Markup::of(Signal).on() {
+        return Err("a network that cannot write styles got a bar");
+    }
+    if Markup::Teams.offers(Kind::Underline) || !Markup::Telegram.offers(Kind::Underline) {
+        return Err("the bar offers a style its network cannot write");
+    }
+    let (bold, inner) = Markup::Slack.apply("hi", 0..2, Kind::Bold);
+    if bold != "*hi*" || inner != (1..3) {
+        return Err("Slack bold is not wrapped in *");
+    }
+    let (text, spans) = Markup::Slack.fold("*hi* there".to_owned(), Vec::new());
+    if text != "hi there" || !spans.iter().any(|span| span.style == protocol::Style::Bold && (span.start, span.end) == (0, 2)) {
+        return Err("Slack bold did not become a style span on send");
+    }
+    let (text, spans) = Markup::Telegram.fold("**hi** there".to_owned(), Vec::new());
+    if text != "hi there" || !spans.iter().any(|span| span.style == protocol::Style::Bold) {
+        return Err("Telegram bold did not become an entity on send");
+    }
+    if !crate::gui::app::prefs::parse("").choices.format_bar {
+        return Err("the formatting bar is not on by default");
+    }
+    if crate::gui::app::prefs::parse("format_bar\toff\n").choices.format_bar {
+        return Err("the setting did not hide the formatting bar");
+    }
+    Ok(())
+}
+
 /// The lab driver. A build without these checks never reaches it, so the window stays open
 /// and the scenario fails.
 pub(in crate::gui) fn prove() -> Result<(), &'static str> {
@@ -1411,6 +1446,11 @@ mod tests {
         assert!(spans
             .iter()
             .any(|s| s.style == (protocol::Style::CodeBlock { language: "rs".into() })));
+    }
+
+    #[test]
+    fn the_lab_driver_passes() {
+        prove_toolbars().unwrap();
     }
 
     #[test]

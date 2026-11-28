@@ -249,7 +249,7 @@ attachment limits and permissions still apply through the staging tray.
 
 ## Deliberately absent
 
-Disabled or locked controls and upsells. A formatting bar. Uploading at staging. Locking the composer during upload.
+Disabled or locked controls and upsells. A formatting bar on a network that cannot write styles. Uploading at staging. Locking the composer during upload.
 Autoplaying GIF grids and animated stickers. Our own GIPHY key. GIFs on Slack and Teams. Teams importance, Loop and
 Urgent. Slash commands (`/` posts as text with the caption from `09`). Voice recording (P2). Image editing or crop.
 Inline images in the field. A sticker button on the card. Per-emoji skin-tone long-press. A send sound. Spinners.
