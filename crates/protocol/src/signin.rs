@@ -403,4 +403,29 @@ mod tests {
         );
         assert_eq!(serde_json::to_string(&SignInInput::Skip).unwrap(), r#"{"input":"skip"}"#);
     }
+
+    #[test]
+    fn sign_in_begin_is_backwards_compatible_with_and_without_account_hint() {
+        use crate::{Network, Request};
+
+        // Older wire format with only `network` still deserializes cleanly.
+        let legacy = r#"{"op":"sign_in_begin","network":"tiny"}"#;
+        let parsed: Request = serde_json::from_str(legacy).expect("legacy SignInBegin");
+        assert_eq!(
+            parsed,
+            Request::SignInBegin { network: Network::Tiny, account: None, server: None }
+        );
+        // None fields are omitted on the wire so older chatd never sees extra keys on fresh sign-in.
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), legacy);
+
+        // With account & server hints for 1-click Tiny re-authentication.
+        let reauth = Request::SignInBegin {
+            network: Network::Tiny,
+            account: Some(AccountKey { network: Network::Tiny, account: "u-1".into() }),
+            server: Some("chat.example".into()),
+        };
+        let encoded = serde_json::to_string(&reauth).unwrap();
+        assert!(encoded.contains(r#""account""#) && encoded.contains(r#""server":"chat.example""#));
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), reauth);
+    }
 }

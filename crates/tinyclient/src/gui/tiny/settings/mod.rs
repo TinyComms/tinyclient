@@ -364,6 +364,22 @@ impl Shell {
         cx.notify();
     }
 
+    /// Selects a connected Tiny server and opens its Server Settings › Sign-in page directly
+    /// (e.g. from Settings › Accounts › Sign-in & passkeys).
+    pub(in crate::gui) fn tiny_open_account_signin(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        self.go(crate::gui::sidebar::Mode::Network(protocol::Network::Tiny), cx);
+        self.prefer_tiny(account, cx);
+        self.tiny_state.float = None;
+        self.tiny_state.sub = None;
+        self.tiny_state.modal = None;
+        self.tiny_state.card = None;
+        self.tiny_state.settings = Some(Overlay::new(Page::SignIn, None));
+        self.tiny_settings_reset_all(cx);
+        self.tiny_settings_refreshed(cx);
+        self.tiny_settings_enter(Page::SignIn, cx);
+        cx.notify();
+    }
+
     /// A page comes on show: the audit reads its first page the first time.
     fn tiny_settings_enter(&mut self, page: Page, cx: &mut Context<Self>) {
         if page == Page::Audit && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.audit.asked) {

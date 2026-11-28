@@ -2397,7 +2397,7 @@ impl Shell {
                 let network = account.network;
                 match tone {
                 Tone::Danger => banner(tone, words).child(
-                    banner_action("sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx))),
+                    banner_action("sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in_account(account.clone(), cx))),
                 ),
                 Tone::Attention if slack_can_continue(network, &words) => {
                     let id = account.account.clone();

@@ -1220,6 +1220,25 @@ impl Shell {
         self.begin_sign_in(network, None, None, cx);
     }
 
+    /// Re-signs in an existing account (such as an expired Tiny server). For Tiny, passes the
+    /// account and its known server host so the sheet skips the invite/host prompt and launches
+    /// browser sign-in directly for that server.
+    pub(super) fn sign_in_account(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        let network = account.network;
+        if network == Network::Tiny {
+            let server = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.account(&account))
+                .map(|status| status.name.trim().to_owned())
+                .filter(|name| !name.is_empty());
+            if super::signin::open_account(account, server, cx) {
+                return;
+            }
+        }
+        self.begin_sign_in(network, None, None, cx);
+    }
+
     /// A personal Microsoft account (Teams free), not a work or school account.
     pub(super) fn sign_in_personal(&mut self, cx: &mut Context<Self>) {
         self.begin_sign_in(Network::Teams, None, Some("personal".to_owned()), cx);

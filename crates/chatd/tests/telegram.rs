@@ -309,7 +309,7 @@ impl World {
 
     fn sign_in(&self, input: Option<SignInInput>) -> SignInStep {
         let request = match input {
-            None => Request::SignInBegin { network: Network::Telegram },
+            None => Request::SignInBegin { network: Network::Telegram, account: None, server: None },
             Some(input) => Request::SignInAnswer { network: Network::Telegram, input },
         };
         match self.ask(request) {
@@ -2891,7 +2891,7 @@ fn cancelling_keeps_nothing_and_a_build_without_an_app_id_says_so() {
     // An answer with no sign-in to answer does not start one.
     assert!(matches!(world.sign_in(Some(SignInInput::UsePhone)), SignInStep::Failed { .. }));
     // A network that signs in through its own window has no steps.
-    let slack = world.ask(Request::SignInBegin { network: Network::Slack });
+    let slack = world.ask(Request::SignInBegin { network: Network::Slack, account: None, server: None });
     assert!(matches!(slack, Response::Error { code: ErrorCode::Unsupported, .. }), "{slack:?}");
 
     // Without the scripted wire this is chatd as it is built with no app id: Telegram is
@@ -2906,7 +2906,7 @@ fn cancelling_keeps_nothing_and_a_build_without_an_app_id_says_so() {
     let child = Command::new(env!("CARGO_BIN_EXE_chatd")).env("TINYCLIENT_DIR", &dir).env_remove("TINYCLIENT_TELEGRAM_FAKE").stderr(Stdio::null()).spawn().unwrap();
     let plain = World { child, dir };
     plain.until("the socket", || ChatStream::connect(&plain.dir.join("chat.sock")).ok().map(drop));
-    let answer = plain.ask(Request::SignInBegin { network: Network::Telegram });
+    let answer = plain.ask(Request::SignInBegin { network: Network::Telegram, account: None, server: None });
     let Response::Error { code: ErrorCode::Unsupported, detail } = answer else {
         panic!("{answer:?}");
     };

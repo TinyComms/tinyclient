@@ -206,8 +206,8 @@ impl Shell {
             let row = if sign_in {
                 // The same sign-in entry the desktop's banner uses for an expired or signed-out
                 // network: it opens that network's own window.
-                let network = open.key.network;
-                row.child(banner_action("phone-sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx))))
+                let account = open.key.account();
+                row.child(banner_action("phone-sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in_account(account.clone(), cx))))
             } else {
                 row
             };

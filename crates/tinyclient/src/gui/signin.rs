@@ -178,6 +178,8 @@ pub struct Sheet {
     shell: Option<WeakEntity<Shell>>,
     /// The next `open` of this network is the shell going on to its own sign-in: let it through.
     pass: Option<Network>,
+    /// When re-authenticating an existing Tiny server account, its account key and known host/origin.
+    reauth: Option<(AccountKey, Option<String>)>,
 }
 
 struct Holder(Entity<Sheet>);
@@ -196,6 +198,17 @@ fn holder(cx: &mut App) -> Entity<Sheet> {
 /// Opens the sheet for a network that signs in here. `false` for one that signs in through its
 /// own web page, so the caller goes on to the helper window.
 pub fn open(network: Network, cx: &mut Context<Shell>) -> bool {
+    open_target(network, None, cx)
+}
+
+/// Opens the sheet to re-authenticate an existing account (e.g. an expired Tiny server), skipping
+/// the invite/host prompt and launching the browser straight to that server's sign-in URL.
+pub fn open_account(account: AccountKey, server: Option<String>, cx: &mut Context<Shell>) -> bool {
+    let network = account.network;
+    open_target(network, Some((account, server)), cx)
+}
+
+fn open_target(network: Network, reauth: Option<(AccountKey, Option<String>)>, cx: &mut Context<Shell>) -> bool {
     let sheet = holder(cx);
     // The phone's own page for a web sign-in handed over: the shell goes on.
     if sheet.update(cx, |sheet, _| sheet.pass.take_if(|pass| *pass == network).is_some()) {
@@ -210,7 +223,7 @@ pub fn open(network: Network, cx: &mut Context<Shell>) -> bool {
     let shell = cx.entity().downgrade();
     sheet.update(cx, |sheet, cx| {
         sheet.shell = Some(shell);
-        sheet.open(network, cx);
+        sheet.open_with(network, reauth, cx);
     });
     cx.notify();
     true
@@ -394,9 +407,30 @@ fn messages_phone_note() -> &'static str {
     "Texts arrive only while tinyclient is open. Your Android phone has to stay online."
 }
 
-/// What the sheet draws before chatd has answered. Tiny starts on the code.
-fn waiting_for(network: Network) -> SignInStep {
-    waiting_for_mode(network, phone::active())
+/// What the sheet draws before chatd has answered. Tiny starts on the code unless re-signing in
+/// to an existing server, in which case it waits directly on the browser step.
+fn waiting_for_target(network: Network, phone_mode: bool, reauth_server: Option<&str>) -> SignInStep {
+    if network == Network::Tiny {
+        if let Some(server) = reauth_server {
+            return SignInStep::Browser {
+                server: server.to_owned(),
+                provider: String::new(),
+                waiting: false,
+                problem: None,
+            };
+        }
+    }
+    waiting_for_mode(network, phone_mode)
+}
+
+/// Validates a server host typed on the Server step before sending it to chatd.
+/// Empty or whitespace-only input produces an inline validation problem instead of failing silently.
+fn validate_server_url(raw: &str) -> Option<SignInProblem> {
+    if raw.trim().is_empty() {
+        Some(SignInProblem::UrlInvalid)
+    } else {
+        None
+    }
 }
 
 fn waiting_for_mode(network: Network, phone_mode: bool) -> SignInStep {
@@ -432,8 +466,8 @@ impl Sheet {
         let number = cx.new(|cx| TextInput::new("Phone number", cx));
         let digits = cx.new(|cx| TextInput::new("", cx));
         let password = cx.new(|cx| TextInput::new("", cx));
-        let url = cx.new(|cx| TextInput::new("tiny.example.com", cx));
-        let invite = cx.new(|cx| TextInput::new("Paste the code", cx));
+        let url = cx.new(|cx| TextInput::new("e.g. chat.example.com", cx));
+        let invite = cx.new(|cx| TextInput::new("Paste your invite link or code", cx));
         for input in [&country, &number] {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Submit => this.send_phone(cx),
@@ -509,6 +543,7 @@ impl Sheet {
             canned: false,
             shell: None,
             pass: None,
+            reauth: None,
         }
     }
 
@@ -547,10 +582,15 @@ impl Sheet {
     }
 
     fn open(&mut self, network: Network, cx: &mut Context<Sheet>) {
+        self.open_with(network, None, cx);
+    }
+
+    fn open_with(&mut self, network: Network, reauth: Option<(AccountKey, Option<String>)>, cx: &mut Context<Sheet>) {
         if self.face.is_some() {
             return;
         }
         self.network = network;
+        self.reauth = (network == Network::Tiny).then_some(reauth).flatten();
         self.local_servers = None;
         self.clear_fields(cx);
         if !matches!(network, Network::Telegram | Network::Signal | Network::Messages | Network::Tiny) {
@@ -559,11 +599,18 @@ impl Sheet {
             cx.notify();
             return;
         }
-        // The tile is up at once, saying a code is on its way.
-        self.face = Some(Face::Step(waiting_for(network)));
+        if let Some((_, Some(server))) = &self.reauth {
+            let shown = shown_host(server);
+            if !shown.is_empty() {
+                self.url.update(cx, |input, cx| input.set_text(&shown, cx));
+            }
+        }
+        // The tile is up at once, saying a code is on its way (or waiting on the browser for Tiny re-auth).
+        let reauth_hint = self.reauth.as_ref().map(|(_, s)| s.as_deref().unwrap_or(""));
+        self.face = Some(Face::Step(waiting_for_target(network, phone::active(), reauth_hint)));
         self.refocus = true;
         self.begin(cx);
-        if network == Network::Tiny {
+        if network == Network::Tiny && self.reauth.is_none() {
             let epoch = self.epoch;
             cx.spawn(async move |this, cx| {
                 let answer = cx.background_executor().spawn(async { crate::client::ask(&Request::TinyLocalServers) }).await;
@@ -593,6 +640,7 @@ impl Sheet {
         self.busy = false;
         self.local = None;
         self.code = None;
+        self.reauth = None;
         self.clear_fields(cx);
         if cancel && !self.canned {
             self.request_cancel(cx);
@@ -659,6 +707,10 @@ impl Sheet {
         // submit before SignInBegin has created the flow on a slow computer.
         self.busy = true;
         let (epoch, network) = (self.epoch, self.network);
+        let (reauth_account, reauth_server) = match &self.reauth {
+            Some((account, server)) => (Some(account.clone()), server.clone()),
+            None => (None, None),
+        };
         let cancelled = self.pending_cancel.clone();
         self.listener = Some(cx.spawn(async move |this, cx| {
             let background = cx.background_executor().clone();
@@ -672,7 +724,13 @@ impl Sheet {
                     _ => None,
                 }
             };
-            let begin = || ask_async(Request::SignInBegin { network });
+            let begin = || {
+                ask_async(Request::SignInBegin {
+                    network,
+                    account: reauth_account.clone(),
+                    server: reauth_server.clone(),
+                })
+            };
             let mut since = seq().await;
             if !this.update(cx, |this, _| this.epoch == epoch && this.face.is_some()).unwrap_or(false) { return; }
             let begun = begin().await;
@@ -845,7 +903,15 @@ impl Sheet {
         match &step {
             SignInStep::EmailSetup { .. } => self.url.update(cx, |input, _| input.set_placeholder("name@example.com")),
             SignInStep::SignUp { .. } => self.url.update(cx, |input, _| input.set_placeholder("First and last name")),
-            SignInStep::Server { .. } => self.url.update(cx, |input, _| input.set_placeholder("tiny.example.com")),
+            SignInStep::Server { .. } => self.url.update(cx, |input, _| input.set_placeholder("e.g. chat.example.com")),
+            SignInStep::Browser { server, .. } if self.network == Network::Tiny && !server.is_empty() => {
+                if self.url.read(cx).text().trim().is_empty() {
+                    let host = shown_host(server);
+                    if !host.is_empty() {
+                        self.url.update(cx, |input, cx| input.set_text(&host, cx));
+                    }
+                }
+            }
             _ => {}
         }
         if moved && matches!(step, SignInStep::EmailSetup { .. } | SignInStep::SignUp { .. }) {
@@ -864,7 +930,8 @@ impl Sheet {
         self.local = None;
         self.code = None;
         self.clear_typed(cx);
-        self.face = Some(Face::Step(waiting_for(self.network)));
+        let reauth_hint = self.reauth.as_ref().map(|(_, s)| s.as_deref().unwrap_or(""));
+        self.face = Some(Face::Step(waiting_for_target(self.network, phone::active(), reauth_hint)));
         self.refocus = true;
         // Bumped now, so an answer still on its way to the old sign-in is dropped.
         self.epoch += 1;
@@ -971,7 +1038,10 @@ impl Sheet {
             return;
         }
         let url = self.url.read(cx).text().to_owned();
-        if url.trim().is_empty() {
+        if let Some(problem) = validate_server_url(&url) {
+            self.local = Some(problem);
+            self.refocus = true;
+            cx.notify();
             return;
         }
         self.dismiss();
@@ -1487,14 +1557,14 @@ impl Sheet {
         div()
             .flex()
             .flex_col()
-            .child(self.header("Server", true, cx))
+            .child(self.header("Sign in to a server", true, cx))
             .child(
                 div()
                     .mt(px(6.))
                     .mb(px(16.))
                     .whitespace_normal()
                     .text_color(theme::text_soft())
-                    .child("A server you already have an account on. Type the host. Add a port when it is not the usual one."),
+                    .child("Enter the host address of a Tiny server you already belong to, like chat.example.com. Add :port if it uses a custom port."),
             )
             .child(input)
             .children(plain_http_note(self.url.read(cx).text()).map(note_line))
@@ -2336,4 +2406,27 @@ mod tests {
             assert!(terminal);
             assert!(body.contains("Reason.") && body.contains("device is linked"));
         }
+    }
+
+    #[test]
+    fn empty_server_host_shows_inline_validation_and_reauth_starts_on_browser_step() {
+        assert_eq!(validate_server_url(""), Some(SignInProblem::UrlInvalid));
+        assert_eq!(validate_server_url("   \t\n "), Some(SignInProblem::UrlInvalid));
+        assert_eq!(validate_server_url("chat.example.com"), None);
+
+        // Fresh Tiny sign-in starts on the invite prompt.
+        assert_eq!(
+            waiting_for_target(Network::Tiny, false, None),
+            SignInStep::Invite { server: String::new(), problem: None }
+        );
+        // Re-signing in to an existing/expired Tiny server skips directly to the browser step.
+        assert_eq!(
+            waiting_for_target(Network::Tiny, false, Some("chat.example")),
+            SignInStep::Browser {
+                server: "chat.example".into(),
+                provider: String::new(),
+                waiting: false,
+                problem: None,
+            }
+        );
     }

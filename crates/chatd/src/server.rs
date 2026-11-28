@@ -4051,17 +4051,65 @@ impl Chat {
         }
     }
 
+    /// Resolves a Tiny server target for 1-click re-authentication: prefers the exact saved
+    /// session origin (preserving scheme, port, and plain-HTTP confirmation), then falls back to
+    /// an explicit `server` hint or the stored account row's host name.
+    fn resolve_tiny_target(
+        &self,
+        account: Option<&AccountKey>,
+        server: Option<&str>,
+    ) -> Option<adapters::tiny::signin::Target> {
+        if let Some(account) = account.filter(|a| a.network == Network::Tiny) {
+            if let Some((base, plain_http_ok)) = adapters::tiny::saved_server(account) {
+                return Some(adapters::tiny::signin::Target {
+                    server: base,
+                    plain_http_ok,
+                });
+            }
+            if let Some(hint) = server.map(str::trim).filter(|s| !s.is_empty()) {
+                return Some(adapters::tiny::signin::Target {
+                    server: hint.to_owned(),
+                    plain_http_ok: false,
+                });
+            }
+            if let Ok(accounts) = self.hub.store().accounts() {
+                if let Some(row) = accounts
+                    .into_iter()
+                    .find(|row| row.key == *account && !row.name.trim().is_empty())
+                {
+                    return Some(adapters::tiny::signin::Target {
+                        server: row.name,
+                        plain_http_ok: false,
+                    });
+                }
+            }
+            return None;
+        }
+        server
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|hint| adapters::tiny::signin::Target {
+                server: hint.to_owned(),
+                plain_http_ok: false,
+            })
+    }
+
     /// A sign-in the shell draws itself: begins it, or passes on what the user did, and answers
     /// with the step to draw. Whenever it ends signed in, `adopt` keeps the session and starts
     /// the account; that may be long after this answered (a QR code scanned later).
-    fn sign_in_step(&self, network: Network, input: Option<protocol::SignInInput>) -> Response {
+    fn sign_in_step(
+        &self,
+        network: Network,
+        input: Option<protocol::SignInInput>,
+        target: Option<adapters::tiny::signin::Target>,
+    ) -> Response {
         let (hub, adapters) = (self.hub.clone(), self.adapters.clone());
         let adopt = move |session: &str| adopt(&hub, &adapters, network, session);
         let step = match network {
             Network::Telegram => adapters::telegram::signin::step(&self.hub, input, Box::new(adopt)),
             Network::Signal => adapters::signal::signin::step(&self.hub, input, Box::new(adopt)),
             Network::Messages => adapters::messages::signin::step(&self.hub, input, Box::new(adopt)),
-            Network::Tiny => adapters::tiny::signin::step(&self.hub, input, Box::new(adopt)),
+            Network::Tiny => adapters::tiny::signin::step_target(&self.hub, input, target, Box::new(adopt)),
             _ => Err(format!("{} signs in in its own window.", network.label())),
         };
         match step {
@@ -6565,8 +6613,15 @@ impl Chat {
             }
 
             Request::SignIn { network, at, resume, kind } => self.sign_in(network, at, resume, kind),
-            Request::SignInBegin { network } => self.sign_in_step(network, None),
-            Request::SignInAnswer { network, input } => self.sign_in_step(network, Some(input)),
+            Request::SignInBegin { network, account, server } => {
+                let target = if network == Network::Tiny {
+                    self.resolve_tiny_target(account.as_ref(), server.as_deref())
+                } else {
+                    None
+                };
+                self.sign_in_step(network, None, target)
+            }
+            Request::SignInAnswer { network, input } => self.sign_in_step(network, Some(input), None),
             Request::SignInCancel { network } => {
                 match network {
                     Network::Telegram => adapters::telegram::signin::cancel(),

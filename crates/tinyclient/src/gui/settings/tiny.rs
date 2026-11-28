@@ -14,13 +14,23 @@ use std::collections::HashMap;
 
 const NAME_SIZE: &str = "A name is 1 to 80 characters.";
 
+#[derive(Clone, Default)]
+struct TinyInfo {
+    display_name: String,
+    provider: String,
+}
+
 pub(super) struct TinyAccount {
     name: Entity<TextInput>,
     /// The account whose name field is open.
     naming: Option<AccountKey>,
-    /// Each connected server's display name for this account, once the server said. `None`
-    /// while it is being asked, empty when it did not say. Asked again when Accounts is opened.
-    names: HashMap<AccountKey, Option<String>>,
+    /// Each connected server's display name and sign-in provider for this account, once the
+    /// server said. `None` while it is being asked. Asked again when Accounts is opened.
+    info: HashMap<AccountKey, Option<TinyInfo>>,
+    /// Saved server origins for all local Tiny accounts (including expired ones), read once
+    /// when Accounts is opened so expired rows never lose their host name.
+    origins: HashMap<AccountKey, String>,
+    origins_asked: bool,
     busy: bool,
     /// Under the card: a failed rename or sign-out, or what just changed.
     line: Option<(String, bool)>,
@@ -44,13 +54,35 @@ impl TinyAccount {
                 }
             }),
         ];
-        let account = TinyAccount { name, naming: None, names: HashMap::new(), busy: false, line: None };
+        let account = TinyAccount {
+            name,
+            naming: None,
+            info: HashMap::new(),
+            origins: HashMap::new(),
+            origins_asked: false,
+            busy: false,
+            line: None,
+        };
         (account, subscriptions)
     }
 
     /// Forgets the names read, so opening Accounts asks each server again.
     pub(super) fn forget_names(&mut self) {
-        self.names.clear();
+        self.info.clear();
+        self.origins_asked = false;
+    }
+
+    /// Saved origin for a local Tiny account, if read.
+    pub(super) fn origin(&self, account: &AccountKey) -> Option<&str> {
+        self.origins.get(account).map(String::as_str)
+    }
+}
+
+/// Subtitle for the Sign-in & passkeys row in Settings › Accounts, naming the provider when known.
+fn passkeys_row_copy(provider: Option<&str>) -> String {
+    match provider.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("Manage passkeys, recovery codes, and sign-in with {name}."),
+        None => "Manage your passkeys, recovery codes, and server sign-in settings.".to_owned(),
     }
 }
 
@@ -58,7 +90,9 @@ impl SettingsWindow {
     /// One Tiny account's rows under its account row. `ix` keeps the ids apart.
     pub(super) fn tiny_rows(&mut self, account: &AccountStatus, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let busy = self.tiny.busy;
-        let known = self.tiny.names.get(&account.key).cloned().flatten().filter(|name| !name.is_empty());
+        let info = self.tiny.info.get(&account.key).cloned().flatten();
+        let known = info.as_ref().map(|i| i.display_name.clone()).filter(|name| !name.is_empty());
+        let provider = info.as_ref().map(|i| i.provider.as_str());
         let name_row = if self.tiny.naming.as_ref() == Some(&account.key) {
             let focused = self.tiny.name.focus_handle(cx).is_focused(window);
             let save = if busy {
@@ -99,6 +133,7 @@ impl SettingsWindow {
         };
         let avatar_key = account.key.clone();
         let remove_key = account.key.clone();
+        let passkeys_key = account.key.clone();
         let everywhere = Box::new(account.clone());
         let delete_account = Box::new(account.clone());
         div()
@@ -123,6 +158,14 @@ impl SettingsWindow {
             ))
             .child(rule())
             .child(row(
+                "Sign-in & passkeys",
+                Some(passkeys_row_copy(provider).into()),
+                super::controls::touch(button(("tiny-passkeys-manage", ix), ButtonKind::Secondary, "Manage…")).on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_tiny_signin_settings(passkeys_key.clone(), window, cx);
+                })),
+            ))
+            .child(rule())
+            .child(row(
                 "Sign out everywhere",
                 Some("Every device signed in as you, this one too.".into()),
                 super::controls::touch(button(("tiny-everywhere", ix), ButtonKind::Ghost, if crate::gui::phone::active() { "Sign out…" } else { "Sign out everywhere…" })).on_click(cx.listener(move |this, _, _, cx| {
@@ -143,15 +186,40 @@ impl SettingsWindow {
             ))
     }
 
-    /// Asks each connected Tiny server, once, for the name this account goes by there.
+    /// Jumps straight to this Tiny server's Server Settings › Sign-in page (passkeys & recovery codes).
+    fn open_tiny_signin_settings(&mut self, account: AccountKey, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.shell.update(cx, |shell, cx| shell.tiny_open_account_signin(account, cx));
+        if self.phone {
+            self.shown = false;
+            cx.refresh_windows();
+        } else {
+            self.stop_test(cx);
+            self.stop_recording(cx);
+            window.remove_window();
+            cx.activate(true);
+            cx.refresh_windows();
+        }
+    }
+
+    /// Asks each connected Tiny server, once, for the name and provider this account goes by there,
+    /// and reads saved local Tiny server origins so expired rows always show their host.
     pub(super) fn read_tiny_names(&mut self, cx: &mut Context<Self>) {
+        if !self.tiny.origins_asked {
+            self.tiny.origins_asked = true;
+            self.off_thread(cx, || crate::client::ask(&Request::TinyLocalServers), |this, answer, cx| {
+                if let Ok(Response::TinyLocalServers { servers }) = answer {
+                    this.tiny.origins = servers.into_iter().collect();
+                    cx.notify();
+                }
+            });
+        }
         let connected = self.tiny_accounts(cx);
-        self.tiny.names.retain(|key, _| connected.contains(key));
+        self.tiny.info.retain(|key, _| connected.contains(key));
         for account in connected {
-            if self.tiny.names.contains_key(&account) {
+            if self.tiny.info.contains_key(&account) {
                 continue;
             }
-            self.tiny.names.insert(account.clone(), None);
+            self.tiny.info.insert(account.clone(), None);
             self.read_tiny_name(account, cx);
         }
     }
@@ -159,14 +227,20 @@ impl SettingsWindow {
     fn read_tiny_name(&mut self, account: AccountKey, cx: &mut Context<Self>) {
         let request = Request::TinyCommunity { account: account.clone() };
         self.off_thread(cx, move || crate::client::ask(&request), move |this, answer, cx| {
-            let mine = match answer {
+            let info = match answer {
                 Ok(Response::TinyCommunity { community }) => {
-                    community.members.into_iter().find(|member| member.user_id == account.account).map(|member| member.display_name)
+                    let display_name = community
+                        .members
+                        .into_iter()
+                        .find(|member| member.user_id == account.account)
+                        .map(|member| member.display_name)
+                        .unwrap_or_default();
+                    TinyInfo { display_name, provider: community.provider }
                 }
-                _ => None,
+                _ => TinyInfo::default(),
             };
-            // An empty name is kept, so a server that did not answer is not asked on every redraw.
-            this.tiny.names.insert(account, Some(mine.unwrap_or_default()));
+            // An empty entry is kept, so a server that did not answer is not asked on every redraw.
+            this.tiny.info.insert(account, Some(info));
             cx.notify();
         });
     }
@@ -217,7 +291,9 @@ impl SettingsWindow {
             match answer {
                 Ok(Response::Ok) => {
                     this.tiny.naming = None;
-                    this.tiny.names.insert(account, Some(display_name));
+                    let mut entry = this.tiny.info.get(&account).cloned().flatten().unwrap_or_default();
+                    entry.display_name = display_name;
+                    this.tiny.info.insert(account, Some(entry));
                     this.tiny.line = Some(("Your name is changed.".to_owned(), false));
                 }
                 other => this.tiny.line = Some((failure(other), true)),
@@ -343,5 +419,26 @@ fn failure(answer: std::io::Result<Response>) -> String {
         Ok(Response::Error { detail, .. }) => detail,
         Ok(_) => crate::client::OTHER_ANSWER.to_owned(),
         Err(err) => crate::client::trouble_words("tiny", &err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passkeys_row_copy_names_provider_when_known() {
+        assert_eq!(
+            passkeys_row_copy(Some("Pocket ID")),
+            "Manage passkeys, recovery codes, and sign-in with Pocket ID."
+        );
+        assert_eq!(
+            passkeys_row_copy(Some("  ")),
+            "Manage your passkeys, recovery codes, and server sign-in settings."
+        );
+        assert_eq!(
+            passkeys_row_copy(None),
+            "Manage your passkeys, recovery codes, and server sign-in settings."
+        );
     }
 }

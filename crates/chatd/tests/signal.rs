@@ -235,7 +235,7 @@ impl World {
 
     fn sign_in(&self, input: Option<SignInInput>) -> SignInStep {
         let request = match input {
-            None => Request::SignInBegin { network: Network::Signal },
+            None => Request::SignInBegin { network: Network::Signal, account: None, server: None },
             Some(input) => Request::SignInAnswer { network: Network::Signal, input },
         };
         match self.ask(request) {
