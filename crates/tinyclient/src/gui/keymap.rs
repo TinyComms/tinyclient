@@ -1324,6 +1324,28 @@ pub(crate) fn run_of(id: &str) -> Option<CommandRun> {
         .or_else(|| find(id).map(|spec| CommandRun::Binding(spec.id)))
 }
 
+/// The lab's shortcut-no-key driver. A command can be left with no key, its old key is free for
+/// another command, and the saved file brings it back after a restart.
+pub(crate) fn prove_no_key() -> Result<(), &'static str> {
+    let mut map = Keymap::stock();
+    let stock = map.chord("quick-switcher");
+    map.unbind("quick-switcher").map_err(|_| "Quick Switcher could not be left with no key")?;
+    if !map.is_unbound("quick-switcher") || !map.keys("quick-switcher").is_empty() {
+        return Err("Quick Switcher still has a key");
+    }
+    if map.rebind("msg-edit", &stock).is_err() {
+        return Err("the key Quick Switcher gave up was not free");
+    }
+    if !Keymap::parse(&map.render()).is_unbound("quick-switcher") {
+        return Err("no key did not survive the saved file");
+    }
+    map.reset_one("quick-switcher");
+    if map.chord("quick-switcher") != stock {
+        return Err("Backspace did not restore the default key");
+    }
+    Ok(())
+}
+
 pub(crate) fn prove() -> Result<(), &'static str> {
     let mut map = Keymap::stock();
     let before = map.menu_label("Quick Switcher");
@@ -1371,6 +1393,11 @@ mod tests {
     #[test]
     fn rebinding_quick_switcher_moves_the_binding_and_the_menu_label() {
         prove().unwrap();
+    }
+
+    #[test]
+    fn the_no_key_lab_driver_passes() {
+        prove_no_key().unwrap();
     }
 
     #[test]
