@@ -1,0 +1,16 @@
+{
+  "id": "tiny-reauth-account-ux",
+  "title": "Expired Tiny server accounts re-authenticate in one click without re-entering the host",
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "not_applicable": {
+    "android": "This driver runs desktop chatd Tiny re-authentication proof; no native mobile runtime proof is claimed.",
+    "ios": "This driver runs desktop chatd Tiny re-authentication proof; no native mobile runtime proof is claimed."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

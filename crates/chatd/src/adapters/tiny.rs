@@ -110,6 +110,12 @@ pub fn prove_reauthenticated_history() -> Result<(), String> {
     e2ee::prove_reauthenticated_history()
 }
 
+/// The lab's Tiny re-auth & account UX proof: re-authenticating an expired Tiny account skips
+/// the invite/host prompts and launches browser sign-in directly for that server's saved origin.
+pub fn prove_tiny_reauth_account_ux() -> Result<(), String> {
+    signin::prove_reauth_account_ux()
+}
+
 /// The lab's keep-opened-sealed proof. See `messages::prove_keep_opened_sealed`.
 pub fn prove_keep_opened_sealed() -> Result<(), String> {
     messages::prove_keep_opened_sealed()
@@ -331,6 +337,31 @@ pub fn local_servers() -> Response {
         session::Stored::Absent => Response::TinyLocalServers { servers: Vec::new() },
         session::Stored::Unreadable(_) => error(ErrorCode::Internal, "The Tiny server session is unreadable.".to_owned()),
     }
+}
+
+/// Looks up one saved Tiny account's exact origin and plain-HTTP confirmation from a serialized
+/// Tiny session blob, without contacting any server or exposing bearer tokens.
+pub(crate) fn saved_server_in(session: &str, account: &str) -> Option<(String, bool)> {
+    if account.is_empty() {
+        return None;
+    }
+    saved_rows(session)
+        .ok()?
+        .into_iter()
+        .find(|saved| saved.user_id == account)
+        .map(|saved| (saved.base_url, saved.plain_http_ok))
+}
+
+/// Looks up the saved server origin (and plain-HTTP confirmation) for a locally stored Tiny
+/// account, including one whose session has expired (`Link::Expired`).
+pub(crate) fn saved_server(account: &AccountKey) -> Option<(String, bool)> {
+    if account.network != Network::Tiny || account.account.is_empty() {
+        return None;
+    }
+    let session::Stored::Found(session) = session::read(Network::Tiny) else {
+        return None;
+    };
+    saved_server_in(&session, &account.account)
 }
 
 /// Signing out of `account` with its encrypted history kept: each of its servers' cache keys moves

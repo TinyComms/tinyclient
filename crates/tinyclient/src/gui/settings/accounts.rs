@@ -33,9 +33,45 @@ fn dot(account: &AccountStatus) -> Div {
     let color = match account.link {
         Link::Connected => theme::positive(),
         Link::Offline => theme::warning(),
-        Link::Expired | Link::SignedOut => theme::text_faint(),
+        Link::Expired => theme::danger(),
+        Link::SignedOut => theme::text_faint(),
     };
     div().size(px(6.)).rounded_full().bg(color).flex_none()
+}
+
+/// Resolves a Tiny server account's human-readable host from `account.name` or a saved origin so
+/// expired rows always clearly show which server needs sign-in again.
+fn tiny_account_host(account: &AccountStatus, saved_origin: Option<&str>) -> Option<String> {
+    let from_name = account.name.trim();
+    if !from_name.is_empty() {
+        let host = protocol::join_host(from_name);
+        return Some(if host.is_empty() { from_name.to_owned() } else { host });
+    }
+    let origin = saved_origin?.trim();
+    if origin.is_empty() {
+        return None;
+    }
+    let host = protocol::join_host(origin);
+    Some(if host.is_empty() { origin.to_owned() } else { host })
+}
+
+/// Display title and status subtitle for one account row in Settings › Accounts.
+fn account_row_copy(account: &AccountStatus, saved_origin: Option<&str>) -> (String, String) {
+    let network = account.key.network;
+    let state = account_state(account);
+    let title = if network == Network::Tiny {
+        tiny_account_host(account, saved_origin).unwrap_or_else(|| network_name(network).to_owned())
+    } else if account.name.is_empty() {
+        network_name(network).to_owned()
+    } else {
+        account.name.clone()
+    };
+    let subtitle = if network == Network::Tiny && account.link == Link::Expired {
+        format!("{} · Session expired", network_name(network))
+    } else {
+        format!("{} · {}", network_name(network), state)
+    };
+    (title, subtitle)
 }
 
 fn account_row(network: Network, name: SharedString, line: SharedString, dot: Option<Div>, action: AnyElement) -> Div {
@@ -132,10 +168,10 @@ impl SettingsWindow {
                 group = group.child(account_row(network, network_name(network).into(), line.into(), None, action));
             }
             for (ix, account) in mine.iter().enumerate() {
-                let state = account_state(account);
                 let action = if account.link == Link::Expired {
+                    let acc_key = account.key.clone();
                     touch(button(("sign-in-again", ix + 10 * network as usize), ButtonKind::Primary, "Sign in again"))
-                        .on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx)))
+                        .on_click(cx.listener(move |this, _, _, cx| this.sign_in_account(acc_key.clone(), cx)))
                         .into_any_element()
                 } else {
                     let account = (*account).clone();
@@ -160,9 +196,9 @@ impl SettingsWindow {
                         }));
                     div().flex().items_center().gap(px(6.)).children(edit_btn).child(sign_out_btn).into_any_element()
                 };
-                let name: SharedString = if account.name.is_empty() { network_name(network).into() } else { account.name.clone().into() };
-                let line = format!("{} · {}", network_name(network), state);
-                group = group.when(ix > 0, |group| group.child(rule())).child(account_row(network, name, line.into(), Some(dot(account)), action));
+                let saved_origin = (network == Network::Tiny).then(|| self.tiny.origin(&account.key)).flatten();
+                let (name, line) = account_row_copy(account, saved_origin);
+                group = group.when(ix > 0, |group| group.child(rule())).child(account_row(network, name.into(), line.into(), Some(dot(account)), action));
                 if network == Network::Tiny && account.link == Link::Connected {
                     group = group.child(self.tiny_rows(account, ix, window, cx));
                 }
@@ -230,6 +266,13 @@ impl SettingsWindow {
 
     fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
+        cx.refresh_windows();
+        cx.notify();
+    }
+
+    fn sign_in_account(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        let _ = self.shell.update(cx, |shell, cx| shell.sign_in_account(account, cx));
+        cx.refresh_windows();
         cx.notify();
     }
 
@@ -1749,4 +1792,52 @@ fn accent_u32(text: &str) -> Option<u32> {
         return None;
     }
     u32::from_str_radix(text, 16).ok().map(|color| color & 0x00FF_FFFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{AccountKey, Capabilities};
+
+    fn tiny_status(name: &str, link: Link) -> AccountStatus {
+        AccountStatus {
+            key: AccountKey { network: Network::Tiny, account: "u-1".into() },
+            name: name.into(),
+            me: "u-1".into(),
+            link,
+            detail: String::new(),
+            reconnecting: false,
+            required: String::new(),
+            attention: 0,
+            unread: false,
+            avatar: None,
+            can: Capabilities::default(),
+            presence: protocol::Presence::default(),
+            status: String::new(),
+            status_emoji: String::new(),
+            status_until: None,
+            send_as: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn expired_tiny_row_clearly_shows_server_host_and_expired_state() {
+        let with_host = tiny_status("chat.example.com", Link::Expired);
+        assert_eq!(
+            account_row_copy(&with_host, None),
+            ("chat.example.com".into(), "Tiny server · Session expired".into())
+        );
+
+        let with_url = tiny_status("https://team.example:8443", Link::Expired);
+        assert_eq!(
+            account_row_copy(&with_url, None),
+            ("team.example:8443".into(), "Tiny server · Session expired".into())
+        );
+
+        let empty_name = tiny_status("", Link::Expired);
+        assert_eq!(
+            account_row_copy(&empty_name, Some("https://saved.example")),
+            ("saved.example".into(), "Tiny server · Session expired".into())
+        );
+    }
 }

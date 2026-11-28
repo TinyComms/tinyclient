@@ -168,56 +168,152 @@ const TIMED_OUT: &str = "Your browser didn't come back within 5 minutes. Try aga
 const NO_LISTEN: &str = "tinyclient couldn't listen for your browser on this computer.";
 const BAD_PAGE: &str = "The server sent the browser somewhere tinyclient won't open.";
 
+/// A known Tiny server to re-authenticate directly, skipping the invite and host prompts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub server: String,
+    pub plain_http_ok: bool,
+}
+
 /// Begins a sign-in, or with `input` answers the step on show.
 pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<SignInStep, String> {
-    step_with(hub, input, adopt, Browser::system)
+    step_with_target(hub, input, None, adopt, Browser::system)
+}
+
+/// Begins a sign-in with an optional pre-resolved `target` server (e.g. re-authenticating an
+/// expired Tiny server account), or with `input` answers the step on show.
+pub fn step_target(
+    hub: &Arc<Hub>,
+    input: Option<SignInInput>,
+    target: Option<Target>,
+    adopt: Adopt,
+) -> Result<SignInStep, String> {
+    step_with_target(hub, input, target, adopt, Browser::system)
 }
 
 /// `step`, with the browser a new sign-in will open.
+#[cfg(test)]
 pub(crate) fn step_with(
     hub: &Arc<Hub>,
     input: Option<SignInInput>,
     adopt: Adopt,
     browser: impl FnOnce() -> Browser,
 ) -> Result<SignInStep, String> {
+    step_with_target(hub, input, None, adopt, browser)
+}
+
+/// `step_target`, with the browser a new sign-in will open.
+pub(crate) fn step_with_target(
+    hub: &Arc<Hub>,
+    input: Option<SignInInput>,
+    target: Option<Target>,
+    adopt: Adopt,
+    browser: impl FnOnce() -> Browser,
+) -> Result<SignInStep, String> {
     let mut held = current();
-    let Some(input) = input else {
-        let flow = held.get_or_insert_with(|| Flow {
-            hub: hub.clone(),
-            server: String::new(),
-            code: String::new(),
-            address_first: false,
-            provider: String::new(),
-            step: SignInStep::Invite {
-                server: String::new(),
-                problem: None,
-            },
-            adopt: Arc::new(adopt),
-            browser: browser(),
-            warned: String::new(),
-            plain_http_ok: false,
-            out: None,
-        });
-        return Ok(flow.step.clone());
-    };
-    let Some(flow) = held.as_mut() else {
-        return Ok(SignInStep::Failed {
-            reason: OVER.to_owned(),
-        });
-    };
-    let next = flow.answer(input);
-    // Opening the system browser can block on a cold start. Never hold FLOW while
-    // doing it: the callback and cancellation must be able to finish meanwhile.
-    let opening = if matches!(next, SignInStep::Browser { waiting: true, .. }) {
-        flow.out.as_ref().map(|out| (flow.browser.open.clone(), out.authorize_url.clone(), out.stop.clone()))
-    } else {
-        None
-    };
-    if matches!(next, SignInStep::Done { .. } | SignInStep::Failed { .. }) {
-        if let Some(flow) = held.take() {
-            flow.stop();
+    let (next, opening) = match input {
+        None => {
+            if let Some(target) = target {
+                let normalized = base_url(&target.server);
+                // If the same target server is already mid-flow (e.g. Wait reset), keep it as-is.
+                if let Some(existing) = held.as_ref() {
+                    if normalized.as_deref() == Some(existing.server.as_str()) {
+                        return Ok(existing.step.clone());
+                    }
+                }
+                if let Some(old) = held.take() {
+                    old.stop();
+                }
+                let Some(origin) = normalized else {
+                    let flow = held.insert(Flow {
+                        hub: hub.clone(),
+                        server: String::new(),
+                        code: String::new(),
+                        address_first: true,
+                        provider: String::new(),
+                        step: SignInStep::Server {
+                            problem: Some(SignInProblem::UrlInvalid),
+                        },
+                        adopt: Arc::new(adopt),
+                        browser: browser(),
+                        warned: String::new(),
+                        plain_http_ok: false,
+                        out: None,
+                    });
+                    return Ok(flow.step.clone());
+                };
+                let mut flow = Flow {
+                    hub: hub.clone(),
+                    server: origin.clone(),
+                    code: String::new(),
+                    address_first: true,
+                    provider: String::new(),
+                    step: SignInStep::Server { problem: None },
+                    adopt: Arc::new(adopt),
+                    browser: browser(),
+                    warned: if target.plain_http_ok { origin } else { String::new() },
+                    plain_http_ok: false,
+                    out: None,
+                };
+                let next = flow.begin_browser();
+                flow.step = next.clone();
+                let opening = if matches!(next, SignInStep::Browser { waiting: true, .. }) {
+                    flow.out
+                        .as_ref()
+                        .map(|out| (flow.browser.open.clone(), out.authorize_url.clone(), out.stop.clone()))
+                } else {
+                    None
+                };
+                if matches!(next, SignInStep::Done { .. } | SignInStep::Failed { .. }) {
+                    flow.stop();
+                } else {
+                    *held = Some(flow);
+                }
+                (next, opening)
+            } else {
+                let flow = held.get_or_insert_with(|| Flow {
+                    hub: hub.clone(),
+                    server: String::new(),
+                    code: String::new(),
+                    address_first: false,
+                    provider: String::new(),
+                    step: SignInStep::Invite {
+                        server: String::new(),
+                        problem: None,
+                    },
+                    adopt: Arc::new(adopt),
+                    browser: browser(),
+                    warned: String::new(),
+                    plain_http_ok: false,
+                    out: None,
+                });
+                return Ok(flow.step.clone());
+            }
         }
-    }
+        Some(input) => {
+            let Some(flow) = held.as_mut() else {
+                return Ok(SignInStep::Failed {
+                    reason: OVER.to_owned(),
+                });
+            };
+            let next = flow.answer(input);
+            // Opening the system browser can block on a cold start. Never hold FLOW while
+            // doing it: the callback and cancellation must be able to finish meanwhile.
+            let opening = if matches!(next, SignInStep::Browser { waiting: true, .. }) {
+                flow.out
+                    .as_ref()
+                    .map(|out| (flow.browser.open.clone(), out.authorize_url.clone(), out.stop.clone()))
+            } else {
+                None
+            };
+            if matches!(next, SignInStep::Done { .. } | SignInStep::Failed { .. }) {
+                if let Some(flow) = held.take() {
+                    flow.stop();
+                }
+            }
+            (next, opening)
+        }
+    };
     drop(held);
     if let Some((open, url, stop)) = opening {
         let problem = open(&url).err().map(|reason| SignInProblem::Other { reason });
@@ -595,6 +691,230 @@ fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs() as i64)
+}
+
+/// Real daemon proof for `TINYCLIENT_PROVE=tiny-reauth-account-ux`.
+/// Exercises saved-session origin lookup, 1-click re-authentication skipping invite/host prompts,
+/// PKCE browser completion, fresh-join preservation, and protocol backwards compatibility.
+pub(crate) fn prove_reauth_account_ux() -> Result<(), String> {
+    use crate::store::Store;
+    use std::io::{Read, Write};
+
+    // 1. Protocol backwards compatibility for Request::SignInBegin.
+    let legacy_json = r#"{"op":"sign_in_begin","network":"tiny"}"#;
+    let legacy: protocol::Request =
+        serde_json::from_str(legacy_json).map_err(|e| format!("legacy SignInBegin parse: {e}"))?;
+    if legacy != (protocol::Request::SignInBegin { network: Network::Tiny, account: None, server: None }) {
+        return Err(format!("legacy SignInBegin mismatch: {legacy:?}"));
+    }
+    if serde_json::to_string(&legacy).map_err(|e| e.to_string())? != legacy_json {
+        return Err("SignInBegin with None fields must omit optional keys".into());
+    }
+
+    // 2. Spin up a real local HTTP server implementing /v1/auth/config, /v1/auth/start, /v1/auth/token.
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind mock server: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let origin = format!("http://127.0.0.1:{port}");
+    let user_id = "22222222-2222-2222-2222-222222222222";
+    let starts: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let challenge = Arc::new(Mutex::new(String::new()));
+    let server_stop = Arc::new(AtomicBool::new(false));
+    let server_starts = starts.clone();
+    let server_challenge = challenge.clone();
+    let stop_flag = server_stop.clone();
+    let _ = listener.set_nonblocking(true);
+    let server_thread = std::thread::spawn(move || {
+        while !stop_flag.load(Ordering::Relaxed) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_len = 0usize;
+            while let Ok(n) = stream.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let head = String::from_utf8_lossy(&buf[..pos]);
+                        for line in head.lines() {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.eq_ignore_ascii_case("content-length") {
+                                    content_len = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(end) = header_end {
+                    if buf.len() >= end + content_len {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&buf);
+            let first = req.lines().next().unwrap_or("");
+            let body: serde_json::Value = req
+                .split_once("\r\n\r\n")
+                .and_then(|(_, b)| serde_json::from_str(b).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let (status, json) = if first.starts_with("GET /v1/auth/config ") {
+                ("200 OK", r#"{"methods":["oidc"],"provider_name":"Pocket ID"}"#.to_owned())
+            } else if first.starts_with("POST /v1/auth/start ") {
+                let redirect = body["redirect_uri"].as_str().unwrap_or("").to_owned();
+                let state = body["state"].as_str().unwrap_or("").to_owned();
+                *server_challenge.lock().unwrap() = body["code_challenge"].as_str().unwrap_or("").to_owned();
+                server_starts.lock().unwrap().push((redirect, state));
+                (
+                    "200 OK",
+                    r#"{"authorize_url":"https://id.example/authorize?client_id=tiny&state=s1"}"#.to_owned(),
+                )
+            } else if first.starts_with("POST /v1/auth/token ") {
+                let verifier = body["code_verifier"].as_str().unwrap_or("");
+                if body["code"] == "reauth-code" && browser::challenge(verifier) == *server_challenge.lock().unwrap() {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"token":"tok_renewed","user_id":"{user_id}","email":"ada@example.com","display_name":"Ada","role":"member"}}"#
+                        ),
+                    )
+                } else {
+                    ("400 Bad Request", r#"{"error":"invalid_grant"}"#.to_owned())
+                }
+            } else {
+                ("404 Not Found", r#"{"error":"not_found"}"#.to_owned())
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                json.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    // 3. Saved session lookup resolves the expired account's exact origin & plain_http_ok.
+    let saved_blob = format!(
+        r#"{{"base_url":"{origin}","token":"tok_expired","user_id":"{user_id}","display_name":"Ada","role":"member"}}"#
+    );
+    let (resolved_origin, resolved_plain) = super::saved_server_in(&saved_blob, user_id)
+        .ok_or_else(|| "saved_server_in did not find expired account".to_owned())?;
+    if resolved_origin != origin || resolved_plain {
+        server_stop.store(true, Ordering::Relaxed);
+        let _ = server_thread.join();
+        return Err(format!("unexpected saved server: ({resolved_origin}, {resolved_plain})"));
+    }
+
+    // 4. 1-click re-auth skips Invite and Server and launches browser directly.
+    cancel();
+    let hub = Arc::new(Hub::new(
+        Store::open(std::path::Path::new(":memory:")).map_err(|e| e.to_string())?,
+    ));
+    let mut since = hub.seq();
+    let opened = Arc::new(Mutex::new(Vec::<String>::new()));
+    let adopted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let browser_opened = opened.clone();
+    let browser_starts = starts.clone();
+    let adopt_seen = adopted.clone();
+    let step = step_with_target(
+        &hub,
+        None,
+        Some(Target {
+            server: resolved_origin,
+            plain_http_ok: resolved_plain,
+        }),
+        Box::new(move |session| {
+            adopt_seen.lock().unwrap().push(session.to_owned());
+            Ok(vec![AccountKey {
+                network: Network::Tiny,
+                account: user_id.to_owned(),
+            }])
+        }),
+        || Browser {
+            open: Arc::new(move |url: &str| {
+                browser_opened.lock().unwrap().push(url.to_owned());
+                let (redirect, state) = browser_starts.lock().unwrap().last().cloned().unwrap_or_default();
+                std::thread::spawn(move || {
+                    let rest = redirect.strip_prefix("http://").unwrap_or(&redirect);
+                    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+                    if let Ok(mut stream) = std::net::TcpStream::connect(host) {
+                        let _ = write!(
+                            stream,
+                            "GET /{path}?code=reauth-code&state={state} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                        );
+                        let mut sink = String::new();
+                        let _ = stream.read_to_string(&mut sink);
+                    }
+                });
+                Ok(())
+            }),
+            patience: Duration::from_secs(5),
+        },
+    )?;
+
+    let expected_browser = SignInStep::Browser {
+        server: origin.clone(),
+        provider: "Pocket ID".into(),
+        waiting: true,
+        problem: None,
+    };
+    if step != expected_browser {
+        cancel();
+        server_stop.store(true, Ordering::Relaxed);
+        let _ = server_thread.join();
+        return Err(format!("re-auth did not jump directly to Browser step: got {step:?}"));
+    }
+    if opened.lock().unwrap().len() != 1 {
+        cancel();
+        server_stop.store(true, Ordering::Relaxed);
+        let _ = server_thread.join();
+        return Err(format!("expected 1 browser open, got {}", opened.lock().unwrap().len()));
+    }
+
+    // Wait for Change::SignIn Done.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut done = false;
+    while std::time::Instant::now() < deadline {
+        let (seq, _, changes) = hub.wait(since, Duration::from_millis(150));
+        since = seq;
+        for change in changes {
+            if let Change::SignIn {
+                network: Network::Tiny,
+                step: SignInStep::Done { account },
+            } = change
+            {
+                if account.as_ref().map(|a| a.account.as_str()) != Some(user_id) {
+                    return Err(format!("unexpected Done account: {account:?}"));
+                }
+                done = true;
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    if !done || adopted.lock().unwrap().len() != 1 {
+        cancel();
+        server_stop.store(true, Ordering::Relaxed);
+        let _ = server_thread.join();
+        return Err("re-auth did not finish with Done and adopt renewed session".into());
+    }
+
+    // 5. Fresh sign-in (no target) still starts at Invite.
+    let fresh = step_with_target(&hub, None, None, Box::new(|_| Ok(Vec::new())), Browser::system)?;
+    cancel();
+    server_stop.store(true, Ordering::Relaxed);
+    let _ = server_thread.join();
+    if fresh != (SignInStep::Invite { server: String::new(), problem: None }) {
+        return Err(format!("fresh sign-in did not start on Invite: {fresh:?}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1139,5 +1459,192 @@ mod tests {
             SignInStep::Invite { server: String::new(), problem: Some(SignInProblem::Other { reason: super::super::NO_BROWSER.into() }) }
         );
         cancel();
+    }
+
+    #[test]
+    fn reauth_target_skips_invite_and_server_and_launches_browser() {
+        let _one = one_sheet();
+        cancel();
+        let hub = hub();
+        let mut since = hub.seq();
+        let heard = Arc::new(Mutex::new(Heard::default()));
+        let base = server(heard.clone());
+        let pages = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::new(Mutex::new(Vec::<String>::new()));
+        let kept_in = kept.clone();
+        let browser = browser_that(heard.clone(), "code=one-time-code&state={state}", pages.clone());
+
+        let first = step_with_target(
+            &hub,
+            None,
+            Some(Target {
+                server: base.clone(),
+                plain_http_ok: false,
+            }),
+            Box::new(move |session| {
+                kept_in.lock().unwrap().push(session.to_owned());
+                Ok(vec![AccountKey { network: Network::Tiny, account: ADA.into() }])
+            }),
+            || browser,
+        )
+        .unwrap();
+
+        assert_eq!(
+            first,
+            SignInStep::Browser {
+                server: base.clone(),
+                provider: "Tinyauth".into(),
+                waiting: true,
+                problem: None,
+            }
+        );
+        assert_eq!(heard.lock().unwrap().opened.len(), 1);
+        assert_eq!(
+            next_step(&hub, &mut since),
+            SignInStep::Done {
+                account: Some(AccountKey { network: Network::Tiny, account: ADA.into() })
+            }
+        );
+        assert_eq!(kept.lock().unwrap().len(), 1);
+        assert!(first_page(&pages).contains("200 OK"));
+        cancel();
+    }
+
+    #[test]
+    fn reauth_target_unreachable_falls_back_to_server_step() {
+        let _one = one_sheet();
+        cancel();
+        let hub = hub();
+        let got = step_with_target(
+            &hub,
+            None,
+            Some(Target {
+                server: "http://127.0.0.1:9".into(),
+                plain_http_ok: false,
+            }),
+            adopt(),
+            Browser::system,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            SignInStep::Server {
+                problem: Some(SignInProblem::Unreachable)
+            }
+        );
+        cancel();
+    }
+
+    #[test]
+    fn reauth_target_keeps_same_server_flow_and_replaces_different_server() {
+        let _one = one_sheet();
+        cancel();
+        let hub = hub();
+        let heard_a = Arc::new(Mutex::new(Heard::default()));
+        let base_a = server(heard_a.clone());
+        let heard_b = Arc::new(Mutex::new(Heard::default()));
+        let base_b = server(heard_b.clone());
+        let open_a = heard_a.clone();
+        let open_b = heard_b.clone();
+
+        let step_a = step_with_target(
+            &hub,
+            None,
+            Some(Target { server: base_a.clone(), plain_http_ok: false }),
+            adopt(),
+            || Browser {
+                open: Arc::new(move |url: &str| {
+                    open_a.lock().unwrap().opened.push(url.to_owned());
+                    Ok(())
+                }),
+                patience: Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        assert!(matches!(step_a, SignInStep::Browser { waiting: true, .. }));
+        assert_eq!(heard_a.lock().unwrap().opened.len(), 1);
+
+        // Re-reading the same target (e.g. Wait reset) must NOT launch a second browser tab.
+        let again = step_with_target(
+            &hub,
+            None,
+            Some(Target { server: base_a.clone(), plain_http_ok: false }),
+            adopt(),
+            Browser::system,
+        )
+        .unwrap();
+        assert_eq!(again, step_a);
+        assert_eq!(heard_a.lock().unwrap().opened.len(), 1);
+
+        // Switching to a different expired server replaces the active flow.
+        let step_b = step_with_target(
+            &hub,
+            None,
+            Some(Target { server: base_b.clone(), plain_http_ok: false }),
+            adopt(),
+            || Browser {
+                open: Arc::new(move |url: &str| {
+                    open_b.lock().unwrap().opened.push(url.to_owned());
+                    Ok(())
+                }),
+                patience: Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            step_b,
+            SignInStep::Browser {
+                server: base_b,
+                provider: "Tinyauth".into(),
+                waiting: true,
+                problem: None,
+            }
+        );
+        assert_eq!(heard_b.lock().unwrap().opened.len(), 1);
+        cancel();
+    }
+
+    #[test]
+    fn reauth_target_unconfirmed_open_plain_http_still_asks_first() {
+        let _one = one_sheet();
+        cancel();
+        let hub = hub();
+        let got = step_with_target(
+            &hub,
+            None,
+            Some(Target {
+                server: "http://chat.example".into(),
+                plain_http_ok: false,
+            }),
+            adopt(),
+            Browser::system,
+        )
+        .unwrap();
+        match got {
+            SignInStep::Server { problem: Some(SignInProblem::Other { reason }) } => {
+                assert!(reason.contains(CONFIRM_PLAIN_HTTP), "{reason}");
+            }
+            other => panic!("expected plain-http confirmation gate, got {other:?}"),
+        }
+        cancel();
+    }
+
+    #[test]
+    fn saved_server_in_finds_single_and_multi_server_origins() {
+        let one = r#"{"base_url":"https://one.example:8443","token":"t1","user_id":"u1","display_name":"Ada","role":"member"}"#;
+        assert_eq!(
+            super::super::saved_server_in(one, "u1"),
+            Some(("https://one.example:8443".into(), false))
+        );
+        assert_eq!(super::super::saved_server_in(one, "u2"), None);
+
+        let two = r#"[
+            {"base_url":"https://one.example","token":"t1","user_id":"u1","display_name":"Ada","role":"member"},
+            {"base_url":"http://192.168.1.20:8080","token":"t2","user_id":"u2","display_name":"Ada","role":"owner","plain_http_ok":true}
+        ]"#;
+        assert_eq!(
+            super::super::saved_server_in(two, "u2"),
+            Some(("http://192.168.1.20:8080".into(), true))
+        );
     }
 }

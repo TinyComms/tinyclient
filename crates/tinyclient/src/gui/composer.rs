@@ -5002,10 +5002,10 @@ impl Composer {
     // Drawing.
 
     fn sign_in(&mut self, cx: &mut Context<Self>) {
-        let Some(network) = self.target.as_ref().map(|target| target.key.network) else {
+        let Some(account) = self.target.as_ref().map(|target| target.key.account()) else {
             return;
         };
-        let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
+        let _ = self.shell.update(cx, |shell, cx| shell.sign_in_account(account, cx));
     }
 
     /// Subscribe on a Telegram channel. Join on a Telegram group. Other networks keep the old label.
@@ -5168,7 +5168,25 @@ impl Composer {
                     },
                 )));
         }
-        let name = network.label();
+        let name = if network == Network::Tiny {
+            self.target
+                .as_ref()
+                .and_then(|target| {
+                    let key = target.key.account();
+                    self.shell.upgrade().and_then(|shell| {
+                        shell
+                            .read(cx)
+                            .snapshot
+                            .as_ref()
+                            .and_then(|s| s.account(&key))
+                            .map(|status| protocol::join_host(&status.name))
+                            .filter(|host| !host.is_empty())
+                    })
+                })
+                .unwrap_or_else(|| network.label().to_owned())
+        } else {
+            network.label().to_owned()
+        };
         let (icon, words, action) = match locked {
             Locked::SignedOut => ("icons/lock.svg", format!("{name} is signed out."), Some("Sign in")),
             Locked::Expired => (

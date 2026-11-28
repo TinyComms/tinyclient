@@ -331,6 +331,8 @@ impl World {
         let request = match input {
             None => Request::SignInBegin {
                 network: Network::Messages,
+                account: None,
+                server: None,
             },
             Some(input) => Request::SignInAnswer {
                 network: Network::Messages,

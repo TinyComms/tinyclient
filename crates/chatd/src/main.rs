@@ -19,6 +19,14 @@ fn main() -> io::Result<()> {
         eprintln!("prove-tiny-reauth-history:0");
         return Ok(());
     }
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-reauth-account-ux") {
+        if let Err(err) = chatd::adapters::tiny::prove_tiny_reauth_account_ux() {
+            eprintln!("tiny-reauth-account-ux: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-tiny-reauth-account-ux:0");
+        return Ok(());
+    }
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-direct-created") {
         if let Err(err) = chatd::adapters::tiny::prove_tiny_direct_created() {
             eprintln!("tiny-direct-created: {err}");

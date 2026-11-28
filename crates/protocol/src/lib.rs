@@ -3265,8 +3265,15 @@ pub enum Request {
     },
     /// Begins, or reads again, a sign-in the shell draws itself (`signin.rs`). Answers with the
     /// step to draw. For a network that signs in through a web page this is `Unsupported`.
+    ///
+    /// When `account` or `server` is provided for `Network::Tiny`, chatd resolves that server's
+    /// saved origin and launches browser sign-in directly instead of prompting for a host/invite.
     SignInBegin {
         network: Network,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
     },
     /// What the user did about the step on show. Answers with the step to draw next.
     SignInAnswer {
