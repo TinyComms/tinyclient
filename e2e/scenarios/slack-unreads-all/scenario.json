@@ -1,0 +1,12 @@
+{
+  "id": "slack-unreads-all",
+  "title": "Slack's show-only-unreads setting no longer hides channels under All",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The phone's list is not the desktop sidebar tree.",
+    "ios": "The phone proof build does not run the desktop window. The phone's list is not the desktop sidebar tree."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

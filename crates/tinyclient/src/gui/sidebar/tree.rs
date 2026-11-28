@@ -217,9 +217,8 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
                 // A to Z without the `#`, muted last (Slack's own order).
                 members.sort_by_cached_key(|c| (c.muted, c.kind.is_direct(), c.title.trim_start_matches('#').to_lowercase()));
             }
-            if group.unread_only {
-                members.retain(|c| needs_me(c, open) || c.starred);
-            }
+            // Slack's own "show only unreads" (`group.unread_only`) is not applied here: the
+            // Unread segment is the one filter, so All lists every channel.
         }
         if rules.unread {
             members.retain(|c| needs_me(c, open) || c.starred);
@@ -299,6 +298,24 @@ pub fn walk(rows: &[Row], from: Option<usize>, down: bool, unread_only: bool) ->
     } else {
         let end = from.unwrap_or(rows.len());
         (0..end).rev().find(|ix| wanted(&rows[*ix]))
+    }
+}
+
+/// The lab's slack-unreads-all driver: a Slack section set to "show only unreads" still lists its
+/// read channels, because the Unread segment is the one filter and All shows every channel.
+pub fn prove_slack_unreads_all() -> Result<(), &'static str> {
+    let key = |id: &str| Key { network: Network::Slack, account: "me".into(), id: id.into() };
+    let mut section = Group::new("chan", "chan", 0);
+    section.unread_only = true;
+    let mut read = Conversation::new(key("read"), ConversationKind::Channel, "read");
+    (read.space, read.group) = (Some("s".into()), Some("chan".into()));
+    let conversations = [Rc::new(read)];
+    let rules = Rules { network: Some(Network::Slack), ..Rules::default() };
+    let rows = flatten(&key("s"), &[section], &conversations, None, 0, &rules);
+    if rows.iter().any(|row| row.conversation().is_some_and(|c| c.key.id == "read")) {
+        Ok(())
+    } else {
+        Err("Slack's show-only-unreads setting hides a read channel under All")
     }
 }
 
@@ -529,7 +546,7 @@ mod tests {
         let all = [read, news, channel("zeta", Some("chan"), Channel), muted, quiet, channel("beta", Some("chan"), Channel), mara, dev, me, github, thread];
         let rules = Rules { network: Some(Network::Slack), ..Rules::default() };
         let got = rows_with(&[unread_only, group("chan", 1, false), directs], all.into_iter().map(slack).collect(), None, &rules);
-        assert_eq!(got, ["vstarred", "news", "vchan", "beta", "zeta", "alpha", "1 quiet channel", "vdms", "me", "dev", "mara", ">apps*"]);
+        assert_eq!(got, ["vstarred", "news", "read", "vchan", "beta", "zeta", "alpha", "1 quiet channel", "vdms", "me", "dev", "mara", ">apps*"]);
     }
 
     #[test]
