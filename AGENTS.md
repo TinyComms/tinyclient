@@ -31,6 +31,7 @@ The captain's check prints an `e2e:` line: the lab's recorded release suite on t
 
 - Exit 0: ready. Exit 1: blocked, each reason is a `BLOCK` line. Exit 2: it could not work out the cut.
 - `--apply --summary "<one line from the cut>"` makes the release commit and the tag and pushes both in one push. Pass it only when Justin asked to ship, cut, or release.
+- `--wait X.Y.Z` polls the GitHub release every 15s (up to 30m) until `tinyclient-windows-x86_64-setup.exe` and `SHA256SUMS` are present.
 - `--check-release X.Y.Z` confirms the GitHub release has its files.
 
 ### The cut
@@ -59,7 +60,7 @@ The shared checkout at `tiny/tinyclient` is often on someone's branch with uncom
 1. The next version is a patch unless Justin names a minor (`--minor`) or a major (`--major`).
 2. On an up-to-date `main`: bump the workspace `version` in `Cargo.toml`, run `cargo check` so `Cargo.lock` follows, commit `Release X.Y.Z: <one line from the cut>`, push that one commit to `main`. `release-cut.sh --apply` does exactly this.
 3. The tag is `vX.Y.Z` and must match `Cargo.toml`. `packaging/ci-label.sh` fails the release run otherwise.
-4. Watch `.github/workflows/release.yml` on the tag (`gh run watch <id> --exit-status`, in the background, never a sleep loop).
+4. Wait for the primary desktop release assets (`packaging/release-cut.sh --wait X.Y.Z`, in the background; secondary desktop architectures and phones attach asynchronously after the primary publish).
 5. Confirm the GitHub release has `tinyclient-windows-x86_64-setup.exe` and `SHA256SUMS`: `packaging/release-cut.sh --check-release X.Y.Z`.
 6. Discord: a published release posts to #releases from the release workflow when the webhook is set. A separate post is the `announce` input of `release.yml` (`workflow_dispatch`). Do not run it unless Justin asked.
 

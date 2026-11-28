@@ -8,6 +8,7 @@
 #
 #   packaging/release-cut.sh                          dry run
 #   packaging/release-cut.sh --apply --summary TEXT   release commit, vX.Y.Z tag, one push
+#   packaging/release-cut.sh --wait X.Y.Z             wait (up to 30m) for primary release assets
 #   packaging/release-cut.sh --check-release X.Y.Z    does the GitHub release have its files?
 #
 # --minor or --major only when Justin named one; the default is a patch. --second-release-today
@@ -24,7 +25,7 @@ repo=TinyComms/tinyclient
 
 die() { echo "release-cut: $*" >&2; exit 2; }
 
-apply= bump=patch summary= second= through= check=
+apply= bump=patch summary= second= through= check= wait_ver=
 while [ $# -gt 0 ]; do
     case "$1" in
         --apply) apply=1 ;;
@@ -34,11 +35,29 @@ while [ $# -gt 0 ]; do
         --second-release-today) second=1 ;;
         --through-freeze) through=1 ;;
         --check-release) [ $# -ge 2 ] || die "--check-release needs X.Y.Z"; check=$2; shift ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --wait) [ $# -ge 2 ] || die "--wait needs X.Y.Z"; wait_ver=$2; shift ;;
+        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
     shift
 done
+
+if [ -n "$wait_ver" ]; then
+    deadline=$(($(date +%s) + 1800))
+    while :; do
+        assets=$(gh release view "v$wait_ver" -R "$repo" --json assets --jq '.assets[].name' 2>/dev/null || true)
+        if printf '%s\n' "$assets" | grep -qx 'tinyclient-windows-x86_64-setup.exe' &&
+           printf '%s\n' "$assets" | grep -qx 'SHA256SUMS'; then
+            echo "ready    v$wait_ver (tinyclient-windows-x86_64-setup.exe and SHA256SUMS present)"
+            exit 0
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "release-cut: timed out after 30m waiting for v$wait_ver desktop assets" >&2
+            exit 1
+        fi
+        sleep 15
+    done
+fi
 
 if [ -n "$check" ]; then
     assets=$(gh release view "v$check" -R "$repo" --json assets --jq '.assets[].name') ||
@@ -233,7 +252,6 @@ git tag "v$next"
 git push --atomic origin HEAD:main "v$next"
 echo
 echo "Pushed $(git log -1 --format='%h %s') and v$next."
-echo "Next: watch the Release run, then confirm its files:"
-echo "  gh run list -R $repo --workflow release.yml --branch v$next -L 1"
-echo "  gh run watch <id> -R $repo --exit-status"
+echo "Next: wait for desktop assets on the GitHub release, then confirm:"
+echo "  packaging/release-cut.sh --wait $next"
 echo "  packaging/release-cut.sh --check-release $next"
