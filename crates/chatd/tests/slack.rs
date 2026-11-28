@@ -1184,62 +1184,83 @@ impl Fake {
                 self.fixture(token, &format!("conversations.history.{channel}{page}"))
             }
             "conversations.replies" => self.fixture(token, &format!("conversations.replies.{channel}")),
-            "activity.feed" => {
+            // Slack's own web client sends `mode`, `types` and the filter flags, and Slack refuses a call
+            // without them as `invalid_arguments`. An item names its message by channel and timestamp
+            // (a thread or an app bundle keeps them under `bundle_info`) and carries no text: the
+            // client asks `messages.list` for that. The shapes are those of a captured feed.
+            "activity.feed" => Some(if param("mode") != "chrono_v1" || param("types").is_empty() || param("is_activity_inbox") != "true" {
+                json!({"ok": false, "error": "invalid_arguments"})
+            } else {
+                let wanted: Vec<&str> = param("types").split(',').collect();
                 let all = vec![
                     json!({
-                        "id": "act-1",
                         "feed_ts": "1760000900.000100",
                         "is_unread": true,
                         "item": {
-                            "type": "at_mention",
-                            "message": {
-                                "channel": "C0GEN",
-                                "ts": "1760000900.000100",
-                                "user": "U0ANA",
-                                "text": "hey <@U0ME> check this"
-                            }
+                            "type": "at_user",
+                            "message": {"author_user_id": "U0ANA", "channel": "C0GEN", "is_broadcast": false, "ts": "1760000900.000100"}
                         }
                     }),
                     json!({
-                        "id": "act-2",
                         "feed_ts": "1760000901.000100",
                         "is_unread": true,
                         "item": {
                             "type": "thread_v2",
-                            "message": {
-                                "channel": "C0GEN",
-                                "ts": "1760000901.000100",
-                                "thread_ts": ROOT,
-                                "user": "U0BEN",
-                                "text": "following up in thread"
-                            }
+                            "bundle_info": {"payload": {"thread_entry": {
+                                "channel_id": "C0GEN", "latest_ts": "1760000901.000100", "thread_ts": ROOT, "unread_msg_count": 1
+                            }}}
                         }
                     }),
                     json!({
-                        "id": "act-3",
                         "feed_ts": "1760000902.000100",
                         "is_unread": true,
                         "item": {
-                            "type": "reaction",
-                            "reaction": {
-                                "channel": "C0GEN",
-                                "item_ts": ROOT,
-                                "user": "U0ANA",
-                                "name": "+1"
-                            },
-                            "message": {
-                                "channel": "C0GEN",
-                                "ts": ROOT,
-                                "text": "first message"
-                            }
+                            "type": "message_reaction",
+                            "message": {"channel": "C0GEN", "ts": ROOT},
+                            "reaction": {"name": "+1", "user": "U0ANA"}
+                        }
+                    }),
+                    json!({
+                        "feed_ts": "1760000903.000100",
+                        "is_unread": true,
+                        "is_bot": true,
+                        "item": {
+                            "type": "bot_dm_bundle",
+                            "bundle_info": {"payload": {"message": {"channel": "D0ANA", "ts": "1760000903.000100"}}, "unread_count": 1}
                         }
                     }),
                 ];
-                Some(json!({
-                    "ok": true,
-                    "items": all,
-                    "response_metadata": {"next_cursor": ""}
-                }))
+                let items: Vec<Value> = all.into_iter().filter(|item| wanted.contains(&item["item"]["type"].as_str().unwrap_or(""))).collect();
+                json!({"ok": true, "items": items, "response_metadata": {"next_cursor": ""}})
+            }),
+            // The messages of a page of the feed, in one call: `message_ids` is a JSON list of
+            // channels with the timestamps wanted in each.
+            "messages.list" => {
+                let asked: Vec<Value> = serde_json::from_str(param("message_ids")).unwrap_or_default();
+                let mut data = serde_json::Map::new();
+                for group in asked {
+                    let messages: Vec<Value> = group["timestamps"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|ts| {
+                            let ts = ts.as_str()?;
+                            let (user, text) = match ts {
+                                "1760000900.000100" => ("U0ANA", "hey <@U0ME> check this"),
+                                "1760000901.000100" => ("U0BEN", "following up in thread"),
+                                ROOT => ("U0ME", "first message"),
+                                "1760000903.000100" => ("U0BEN", "Your report is ready"),
+                                _ => return None,
+                            };
+                            Some(json!({"type": "message", "ts": ts, "user": user, "text": text}))
+                        })
+                        .collect();
+                    data.insert(
+                        group["channel"].as_str().unwrap_or("").to_owned(),
+                        json!({"messages": messages, "latest_updates": {}, "unchanged_messages": []}),
+                    );
+                }
+                Some(json!({"ok": true, "messages": {}, "messages_data": data}))
             }
             "activity.mark" => Some(json!({"ok": true})),
             "bookmarks.list" => {
@@ -4226,32 +4247,54 @@ fn slack_activity_feed_lists_mentions_threads_reactions_and_marks_read() {
     let account = AccountKey { network: Network::Slack, account: "T01ALPHA".into() };
     assert!(world.account("T01ALPHA").can.activity_feed, "Slack should advertise activity_feed");
 
-    // Fetch unfiltered activity feed: mention, thread reply, and reaction.
+    // The unfiltered feed: a mention, a thread reply, a reaction and an app message. Slack's feed
+    // carries no text, so the rows have it only if chatd fetched the messages.
     let Response::ActivityFeed { items, cursor } = world.ask(Request::ActivityFeed {
         account: account.clone(),
         kind: None,
         cursor: None,
         limit: 20,
     }) else {
-        panic!("expected Response::ActivityFeed");
+        panic!("expected Response::ActivityFeed, Slack refused the request");
     };
     assert!(cursor.is_none());
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 4);
     assert_eq!(items[0].kind, protocol::ActivityItemKind::Mention);
     assert_eq!(items[0].conversation, alpha("C0GEN"));
     assert_eq!(items[0].message_id, "1760000900.000100");
     assert_eq!(items[0].actor, "Ana");
+    assert!(items[0].text.contains("check this"), "{:?}", items[0].text);
     assert!(items[0].unread);
 
+    // A thread row names its message inside `bundle_info`; the author comes with the text.
     assert_eq!(items[1].kind, protocol::ActivityItemKind::ThreadReply);
+    assert_eq!(items[1].conversation, alpha("C0GEN"));
     assert_eq!(items[1].thread_id.as_deref(), Some(format!("C0GEN:{ROOT}").as_str()));
+    assert_eq!(items[1].actor, "Ben Ito");
+    assert_eq!(items[1].text, "following up in thread");
 
     assert_eq!(items[2].kind, protocol::ActivityItemKind::Reaction);
     assert_eq!(items[2].emoji, "👍");
     assert_eq!(items[2].message_id, ROOT);
     assert_eq!(items[2].actor, "Ana");
+    assert_eq!(items[2].text, "first message");
 
-    // Filter by Reaction returns only the reaction row.
+    assert_eq!(items[3].kind, protocol::ActivityItemKind::App);
+    assert_eq!(items[3].conversation, alpha("D0ANA"));
+    assert_eq!(items[3].text, "Your report is ready");
+
+    // The request is the one Slack's web client sends, and one `messages.list` fetched all four.
+    let feeds = world.fake.calls(ALPHA, "activity.feed");
+    assert_eq!(feeds.len(), 1);
+    assert_eq!(feeds[0].params.get("mode").map(String::as_str), Some("chrono_v1"));
+    assert!(feeds[0].params.get("types").is_some_and(|types| types.contains("thread_v2") && types.contains("at_user")));
+    let lists = world.fake.calls(ALPHA, "messages.list");
+    assert_eq!(lists.len(), 1, "a page of rows costs one call, not one per row");
+    let asked: Vec<Value> = serde_json::from_str(&lists[0].params["message_ids"]).unwrap();
+    let wanted: usize = asked.iter().map(|group| group["timestamps"].as_array().map_or(0, Vec::len)).sum();
+    assert_eq!(wanted, 4);
+
+    // Filter by Reaction: Slack is asked for reactions only, and answers just that row.
     let Response::ActivityFeed { items: reactions, .. } = world.ask(Request::ActivityFeed {
         account: account.clone(),
         kind: Some(protocol::ActivityItemKind::Reaction),
@@ -4261,18 +4304,20 @@ fn slack_activity_feed_lists_mentions_threads_reactions_and_marks_read() {
         panic!("expected Response::ActivityFeed");
     };
     assert_eq!(reactions.len(), 1);
-    assert_eq!(reactions[0].id, "act-3");
+    assert_eq!(reactions[0].id, "1760000902.000100");
+    let feeds = world.fake.calls(ALPHA, "activity.feed");
+    assert_eq!(feeds[1].params.get("types").map(String::as_str), Some("message_reaction"));
 
     // Mark one item read calls activity.mark with item_id.
     let Response::Ok = world.ask(Request::ActivityMarkRead {
         account,
-        item_id: Some("act-3".into()),
+        item_id: Some("1760000902.000100".into()),
     }) else {
         panic!("expected Response::Ok");
     };
     let mark = world.fake.calls(ALPHA, "activity.mark");
     assert_eq!(mark.len(), 1);
-    assert_eq!(mark[0].params.get("item_id").map(String::as_str), Some("act-3"));
+    assert_eq!(mark[0].params.get("item_id").map(String::as_str), Some("1760000902.000100"));
 }
 
 #[test]
