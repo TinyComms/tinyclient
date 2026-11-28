@@ -976,6 +976,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-slack-call-cards:0");
         return Ok(());
     }
+    // The lab's slack-activity-feed driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-activity-feed") {
+        if let Err(err) = chatd::adapters::prove_slack_activity_feed() {
+            eprintln!("slack-activity-feed: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-slack-activity-feed:0");
+        return Ok(());
+    }
     // The lab's slack-rich-text driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("slack-rich-text") {
         if let Err(err) = chatd::adapters::prove_slack_rich_text() {

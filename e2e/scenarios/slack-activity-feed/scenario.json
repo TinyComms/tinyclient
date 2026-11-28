@@ -1,0 +1,12 @@
+{
+  "id": "slack-activity-feed",
+  "title": "Slack's Activity feed is asked the way its web client asks, and its items are read where Slack puts them",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window.",
+    "ios": "The phone proof build does not run the desktop window."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

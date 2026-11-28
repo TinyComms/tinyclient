@@ -3731,6 +3731,11 @@ fn conversation_star(event: &Value) -> Option<(String, bool)> {
     Some((id.to_owned(), starred))
 }
 
+/// What the slack-activity-feed driver checks. See `info::prove_activity_feed`.
+pub(crate) fn prove_activity_feed() -> Result<(), String> {
+    info::prove_activity_feed()
+}
+
 /// What the slack-star-channel driver checks, with no workspace and no socket.
 pub(crate) fn prove_channel_star() -> Result<(), String> {
     if star_method(true) != "stars.add" || star_method(false) != "stars.remove" {

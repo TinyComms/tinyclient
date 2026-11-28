@@ -4470,6 +4470,12 @@ pub fn prove_slack_profile_fields() -> Result<(), String> {
     slack::prove_profile_fields()
 }
 
+/// The lab's slack-activity-feed driver. Slack's Activity feed is asked the way its web client asks,
+/// and its items are read where Slack puts them.
+pub fn prove_slack_activity_feed() -> Result<(), String> {
+    slack::prove_activity_feed()
+}
+
 /// The lab's slack-star-channel driver. Starring a Slack conversation is `stars.add` on the
 /// channel, a `star_removed` event clears it, and a message star is not the channel's.
 pub fn prove_slack_channel_star() -> Result<(), String> {

@@ -851,44 +851,7 @@ impl Slack {
         limit: u32,
     ) -> Result<ActivityPage, Fault> {
         let count = limit.clamp(1, 50).to_string();
-        let mut params = vec![("limit", count.as_str())];
-        if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
-            params.push(("cursor", cursor));
-        }
-        // Mentions, Threads and All are the web client's own `types` values, captured from its
-        // Activity page. Reactions, Apps and Invites are picked out of the All list, unverified.
-        let types = match kind {
-            Some(ActivityItemKind::Mention) => {
-                "at_user,unjoined_channel_mention,at_user_group,at_channel,at_everyone,keyword"
-            }
-            Some(ActivityItemKind::ThreadReply) => "thread_v2",
-            Some(ActivityItemKind::Reaction) => "message_reaction",
-            Some(ActivityItemKind::App) => "bot_dm_bundle",
-            Some(ActivityItemKind::Invite) => {
-                "internal_channel_invite,external_channel_invite,external_dm_invite,quietly_added_to_channel"
-            }
-            Some(ActivityItemKind::MissedCall | ActivityItemKind::Other) | None => {
-                "at_user,at_user_group,at_channel,at_everyone,keyword,list_record_assigned,\
-                 list_user_mentioned,list_todo_notification,list_approval_request,\
-                 list_approval_reviewed,unjoined_channel_mention,thread_v2,message_reaction,\
-                 bot_dm_bundle,dm,prejoin_dm_welcome_party_alert,internal_channel_invite,\
-                 external_channel_invite,external_dm_invite,quietly_added_to_channel,channel,\
-                 saved_reminder,list_record_edited"
-            }
-        };
-        params.push(("types", types));
-        params.push(("mode", "chrono_v1"));
-        for flag in [
-            "archive_only",
-            "unread_only",
-            "priority_only",
-            "only_salesforce_channels",
-            "exclude_automations",
-            "automations_only",
-        ] {
-            params.push((flag, "false"));
-        }
-        params.push(("is_activity_inbox", "true"));
+        let params = activity_params(kind, &count, cursor);
         let feed = self.api("activity.feed", &params)?;
         let raw_items = feed["items"].as_array().map_or(&[][..], Vec::as_slice);
         let mut items = Vec::with_capacity(raw_items.len());
@@ -965,38 +928,14 @@ impl Slack {
             .as_str()
             .or_else(|| entry["type"].as_str())
             .unwrap_or("");
-        let kind = match raw_type {
-            "at_mention" | "mention" | "broadcast" | "keyword" | "at_channel" | "at_here" | "at_everyone" | "usergroup_mention"
-            | "at_user" | "at_user_group" | "unjoined_channel_mention" => ActivityItemKind::Mention,
-            "thread_v2" | "thread" | "thread_reply" => ActivityItemKind::ThreadReply,
-            "reaction" | "reaction_added" | "message_reaction" => ActivityItemKind::Reaction,
-            "app_mention" | "app_home" | "bot_dm" | "workflow" | "app" | "bot_dm_bundle" => ActivityItemKind::App,
-            "channel_invite" | "invite" | "internal_channel_invite" | "external_channel_invite" | "external_dm_invite"
-            | "quietly_added_to_channel" => ActivityItemKind::Invite,
-            _ => ActivityItemKind::Other,
-        };
+        let kind = activity_kind(raw_type);
         // Bundled items (threads, bot DMs) carry their coordinates under `bundle_info.payload`.
         let payload = &inner["bundle_info"]["payload"];
         let thread_entry = &payload["thread_entry"];
         let msg = if inner["message"].is_object() { &inner["message"] } else { &payload["message"] };
         let react = &inner["reaction"];
-        let channel = msg["channel"]
-            .as_str()
-            .or_else(|| thread_entry["channel_id"].as_str())
-            .or_else(|| react["channel"].as_str())
-            .or_else(|| inner["channel"].as_str())
-            .or_else(|| entry["channel"].as_str())
-            .filter(|c| !c.is_empty())?;
-        let message_id = msg["ts"]
-            .as_str()
-            .or_else(|| thread_entry["latest_ts"].as_str())
-            .or_else(|| react["item_ts"].as_str())
-            .or_else(|| react["ts"].as_str())
-            .or_else(|| inner["message_ts"].as_str())
-            .or_else(|| inner["ts"].as_str())
-            .or_else(|| entry["ts"].as_str())
-            .unwrap_or("")
-            .to_owned();
+        let (channel, message_id) = activity_message(entry)?;
+        let message_id = message_id.to_owned();
         let thread_ts = msg["thread_ts"]
             .as_str()
             .or_else(|| thread_entry["thread_ts"].as_str())
@@ -1773,6 +1712,138 @@ impl Slack {
         }
         Ok(groups)
     }
+}
+
+/// What a tab of Slack's Activity page asks for. These are the web client's own `types` values, read
+/// from its requests: the tabs All, Mentions and Threads, and the Reactions, Apps and Invitations
+/// boxes of its filter menu. Calls have no Slack filter and ask for everything.
+fn activity_types(kind: Option<ActivityItemKind>) -> &'static str {
+    match kind {
+        Some(ActivityItemKind::Mention) => "at_user,unjoined_channel_mention,at_user_group,at_channel,at_everyone,keyword",
+        Some(ActivityItemKind::ThreadReply) => "thread_v2",
+        Some(ActivityItemKind::Reaction) => "message_reaction",
+        Some(ActivityItemKind::App) => "bot_dm_bundle",
+        Some(ActivityItemKind::Invite) => {
+            "internal_channel_invite,external_channel_invite,external_dm_invite,quietly_added_to_channel"
+        }
+        Some(ActivityItemKind::MissedCall | ActivityItemKind::Other) | None => {
+            "at_user,at_user_group,at_channel,at_everyone,keyword,list_record_assigned,\
+             list_user_mentioned,list_todo_notification,list_approval_request,\
+             list_approval_reviewed,unjoined_channel_mention,thread_v2,message_reaction,\
+             bot_dm_bundle,dm,prejoin_dm_welcome_party_alert,internal_channel_invite,\
+             external_channel_invite,external_dm_invite,quietly_added_to_channel,channel,\
+             saved_reminder,list_record_edited"
+        }
+    }
+}
+
+/// The arguments of `activity.feed` that Slack's web client sends for its Activity page. Slack
+/// refuses the call without `mode` and `types` as `invalid_arguments`.
+fn activity_params<'a>(
+    kind: Option<ActivityItemKind>,
+    count: &'a str,
+    cursor: Option<&'a str>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut params = vec![("limit", count)];
+    if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
+        params.push(("cursor", cursor));
+    }
+    params.push(("types", activity_types(kind)));
+    params.push(("mode", "chrono_v1"));
+    for flag in [
+        "archive_only",
+        "unread_only",
+        "priority_only",
+        "only_salesforce_channels",
+        "exclude_automations",
+        "automations_only",
+    ] {
+        params.push((flag, "false"));
+    }
+    params.push(("is_activity_inbox", "true"));
+    params
+}
+
+/// The row kind of a feed item's `type`.
+fn activity_kind(raw_type: &str) -> ActivityItemKind {
+    match raw_type {
+        "at_mention" | "mention" | "broadcast" | "keyword" | "at_channel" | "at_here" | "at_everyone"
+        | "usergroup_mention" | "at_user" | "at_user_group" | "unjoined_channel_mention" => ActivityItemKind::Mention,
+        "thread_v2" | "thread" | "thread_reply" => ActivityItemKind::ThreadReply,
+        "reaction" | "reaction_added" | "message_reaction" => ActivityItemKind::Reaction,
+        "app_mention" | "app_home" | "bot_dm" | "workflow" | "app" | "bot_dm_bundle" => ActivityItemKind::App,
+        "channel_invite" | "invite" | "internal_channel_invite" | "external_channel_invite" | "external_dm_invite"
+        | "quietly_added_to_channel" => ActivityItemKind::Invite,
+        _ => ActivityItemKind::Other,
+    }
+}
+
+/// The channel and timestamp of the message a feed entry names. The feed carries no text, only this.
+/// A thread or an app bundle keeps them under `bundle_info.payload`.
+fn activity_message(entry: &Value) -> Option<(&str, &str)> {
+    let inner = if entry["item"].is_object() { &entry["item"] } else { entry };
+    let payload = &inner["bundle_info"]["payload"];
+    let thread_entry = &payload["thread_entry"];
+    let msg = if inner["message"].is_object() { &inner["message"] } else { &payload["message"] };
+    let react = &inner["reaction"];
+    let channel = msg["channel"]
+        .as_str()
+        .or_else(|| thread_entry["channel_id"].as_str())
+        .or_else(|| react["channel"].as_str())
+        .or_else(|| inner["channel"].as_str())
+        .or_else(|| entry["channel"].as_str())
+        .filter(|c| !c.is_empty())?;
+    let message_id = msg["ts"]
+        .as_str()
+        .or_else(|| thread_entry["latest_ts"].as_str())
+        .or_else(|| react["item_ts"].as_str())
+        .or_else(|| react["ts"].as_str())
+        .or_else(|| inner["message_ts"].as_str())
+        .or_else(|| inner["ts"].as_str())
+        .or_else(|| entry["ts"].as_str())
+        .unwrap_or("");
+    Some((channel, message_id))
+}
+
+/// What the slack-activity-feed driver checks, with no workspace and no socket: the request is the
+/// one Slack's web client sends, and the items it answers with are read where Slack puts things.
+pub(crate) fn prove_activity_feed() -> Result<(), String> {
+    let all = activity_params(None, "30", None);
+    let has = |name: &str, want: &str| all.iter().any(|(key, value)| *key == name && *value == want);
+    if !has("mode", "chrono_v1") || !has("is_activity_inbox", "true") || !has("limit", "30") {
+        return Err("the feed request lacks the mode or the Activity flag Slack asks for".to_owned());
+    }
+    if !all.iter().any(|(key, value)| *key == "types" && value.contains("thread_v2") && value.contains("bot_dm_bundle")) {
+        return Err("the unfiltered feed does not ask for threads and app messages".to_owned());
+    }
+    if activity_types(Some(ActivityItemKind::Reaction)) != "message_reaction" {
+        return Err("the Reactions tab does not ask for message_reaction".to_owned());
+    }
+    if !activity_params(None, "30", Some("c1")).contains(&("cursor", "c1")) {
+        return Err("a later page does not carry its cursor".to_owned());
+    }
+    for (raw, want) in [
+        ("at_user", ActivityItemKind::Mention),
+        ("thread_v2", ActivityItemKind::ThreadReply),
+        ("message_reaction", ActivityItemKind::Reaction),
+        ("bot_dm_bundle", ActivityItemKind::App),
+        ("internal_channel_invite", ActivityItemKind::Invite),
+        ("a_type_slack_adds_later", ActivityItemKind::Other),
+    ] {
+        if activity_kind(raw) != want {
+            return Err(format!("{raw} is not read as {want:?}"));
+        }
+    }
+    let mention = json!({"feed_ts": "1.1", "item": {"type": "at_user", "message": {"author_user_id": "U1", "channel": "C1", "ts": "1.1"}}});
+    let thread = json!({"feed_ts": "2.2", "item": {"type": "thread_v2", "bundle_info": {"payload": {"thread_entry": {"channel_id": "C2", "latest_ts": "2.2", "thread_ts": "2.0"}}}}});
+    let app = json!({"feed_ts": "3.3", "item": {"type": "bot_dm_bundle", "bundle_info": {"payload": {"message": {"channel": "D3", "ts": "3.3"}}}}});
+    let reaction = json!({"feed_ts": "4.4", "item": {"type": "message_reaction", "message": {"channel": "C4", "ts": "4.0"}, "reaction": {"name": "+1", "user": "U1"}}});
+    for (entry, want) in [(&mention, ("C1", "1.1")), (&thread, ("C2", "2.2")), (&app, ("D3", "3.3")), (&reaction, ("C4", "4.0"))] {
+        if activity_message(entry) != Some(want) {
+            return Err(format!("{entry} names {:?}, not {want:?}", activity_message(entry)));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn builtin_slash_commands() -> Vec<SlashCommand> {
