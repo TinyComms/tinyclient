@@ -196,6 +196,12 @@ pub(crate) fn prove_command_palette() -> Result<(), &'static str> {
     keymap::prove()
 }
 
+/// The lab's shortcut-no-key driver. A shortcut can be left with no key and stays that way
+/// after a restart.
+pub(crate) fn prove_shortcut_no_key() -> Result<(), &'static str> {
+    keymap::prove_no_key()
+}
+
 /// The lab's screen-lock driver. Idle past the timeout covers the window and a message names nothing.
 pub(crate) fn prove_screen_lock() -> Result<(), &'static str> {
     lock::prove()

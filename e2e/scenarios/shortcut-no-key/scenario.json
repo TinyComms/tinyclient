@@ -1,0 +1,16 @@
+{
+  "id": "shortcut-no-key",
+  "title": "A shortcut can be set to no key in Settings and stays unset after a restart",
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. Phones have no Settings > Shortcuts page.",
+    "ios": "The phone proof build does not run the desktop window. Phones have no Settings > Shortcuts page."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
