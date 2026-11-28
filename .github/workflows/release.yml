@@ -1,21 +1,15 @@
 name: Release
 
-# A v* tag builds every download, installs each one on a clean system to prove it works, and
-# publishes them as that tag's GitHub release. Run by hand on a branch, it builds and tests the
-# same files without publishing (`gh workflow run release.yml --ref BRANCH`); they are kept as the
-# run's `release-all` artifact.
+# A v* tag builds the primary desktop downloads (Windows x86_64, macOS arm64, Linux x86_64),
+# smoke-tests each one inline on the same runner, and publishes them as that tag's GitHub release
+# in ~3-5 minutes. Secondary desktop architectures (Windows arm64, macOS x86_64, Linux aarch64)
+# and phone packages start at T+0 in parallel and attach asynchronously to the same release once
+# ready without blocking the primary publish.
 #
-# A release is promoted from the commit's run on main rather than built from scratch. The tag
-# and the main push of a commit start together, so the first job finds the CI run (ci.yml) that
-# main's push started and waits for it. If that run fails, nothing is published. If it passes,
-# each platform takes its programs from that run's packages and only packages and signs them
-# here; a platform whose package the run lacks compiles as before. A commit main's CI never
-# looked at (only docs changed, or a branch run by hand) has no run to wait for, and every
-# platform compiles.
-#
-# The phones come from the Mobile run (mobile.yml) of the same commit in the same way. Mobile
-# only runs on main when the app's code changed, so when there is no such run this workflow
-# starts one on the tag and waits for it. A phone build that fails fails the release.
+# All build jobs start immediately on tag push with no wait-for-ci gate because
+# packaging/release-cut.sh already enforced green CI on origin/main before cutting `Release X.Y.Z:`.
+# Run by hand on a branch (`gh workflow run release.yml --ref BRANCH`), it builds and tests the
+# primary files without publishing and keeps them as the run's `release-all` artifact.
 on:
   push:
     tags:
@@ -51,21 +45,402 @@ jobs:
           RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ inputs.announce }}
         run: packaging/release-note.sh
 
-  # One job waits for CI on behalf of every desktop build. The waits are long
-  # because macOS runners can queue for over an hour: a dispatched Mobile run took 2h24m.
-  wait-for-ci:
+  windows:
     if: github.event_name == 'push' || inputs.announce == ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    outputs:
-      run: ${{ steps.ci.outputs.run }}
+    runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
-      - name: Wait for main's CI run of this commit
-        id: ci
+      - name: Name the files
+        shell: bash
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release
+      - name: Build release
+        shell: pwsh
+        env:
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
+        run: |
+          if ((rustc -vV) -notcontains "host: x86_64-pc-windows-msvc") {
+            throw "Rust toolchain does not match Windows x86_64"
+          }
+          cargo build --release `
+            -p tinyclient --features tinyclient/gui `
+            -p chatd -p mediad -p login
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Installer and portable zip
+        shell: pwsh
+        run: packaging/windows.ps1 -NoBuild -Label $env:LABEL -Arch x86_64
+      - name: Smoke test the installer and the zip
+        shell: pwsh
+        run: packaging/windows/smoke.ps1 -Label $env:LABEL -Version $env:VERSION -Arch x86_64
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-windows
+          path: dist/*
+
+  macos:
+    if: github.event_name == 'push' || inputs.announce == ''
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release
+      - name: Build release
+        env:
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
+        run: |
+          rustc -vV | grep -Fx 'host: aarch64-apple-darwin'
+          cargo build --release \
+            -p tinyclient --features tinyclient/gui \
+            -p chatd -p mediad -p login
+      - name: Bundle tinyclient.app
+        run: packaging/bundle.sh --no-build
+      - name: Zip and disk image
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent target/release/tinyclient.app "dist/tinyclient-$LABEL-macos.zip"
+          packaging/dmg.sh "dist/tinyclient-$LABEL-macos.dmg"
+      - name: Smoke test the disk image and updater zip
+        run: |
+          test "$(uname -m)" = "arm64"
+          mnt=$(mktemp -d)
+          stage=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "dist/tinyclient-$LABEL-macos.dmg"
+          trap 'hdiutil detach "$mnt"; rm -rf "$stage"' EXIT
+          test "$(readlink "$mnt/Applications")" = /Applications
+          ditto "$mnt/tinyclient.app" "$stage/Applications/tinyclient.app"
+          ditto -x -k "dist/tinyclient-$LABEL-macos.zip" "$stage/portable"
+          for app in "$stage/Applications/tinyclient.app" "$stage/portable/tinyclient.app"; do
+            codesign --verify --deep --strict --verbose=2 "$app"
+            codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'
+            for program in tinyclient chatd mediad tinyclient-login; do
+              bin="$app/Contents/MacOS/$program"
+              lipo "$bin" -verify_arch arm64
+              out=$("$bin" --version)
+              echo "$out"
+              test "$out" = "$program $VERSION"
+            done
+          done
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-macos
+          path: dist/*
+
+  # The oldest supported Ubuntu: the packages need the glibc they were built against or newer.
+  linux:
+    if: github.event_name == 'push' || inputs.announce == ''
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release
+      - name: Build release
+        env:
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
+        run: |
+          cargo build --release \
+            -p tinyclient --features tinyclient/gui \
+            -p chatd -p mediad -p login
+      - name: Package .deb, .rpm, AppImage and .tar.gz
+        run: |
+          eval "$(packaging/linux/tools.sh)"
+          packaging/linux.sh --no-build "$LABEL"
+      # Each Linux package installed on clean systems that never saw the build: the package manager
+      # must find every library from the package's own dependencies, or the programs do not start.
+      - name: Smoke test on clean distros
+        run: |
+          set -u
+          logs=$(mktemp -d)
+          pids=()
+          names=()
+          run_smoke() {
+            local name="$1" image="$2" kind="$3"
+            docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=x86_64 "$image" packaging/linux/smoke.sh "$kind" > "$logs/$name.log" 2>&1 &
+            pids+=("$!")
+            names+=("$name")
+          }
+          run_smoke ubuntu-24.04 ubuntu:24.04 deb-full
+          run_smoke debian-12 debian:12 deb
+          run_smoke fedora fedora:latest rpm
+          run_smoke tumbleweed opensuse/tumbleweed rpm
+          failed=0
+          for i in "${!pids[@]}"; do
+            rc=0
+            wait "${pids[$i]}" || rc=$?
+            echo "::group::smoke ${names[$i]} (exit $rc)"
+            cat "$logs/${names[$i]}.log"
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::Linux smoke failed on ${names[$i]} (exit $rc)"
+              failed=1
+            fi
+          done
+          rm -rf "$logs"
+          exit "$failed"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-linux-x86_64
+          path: dist/*
+
+  publish:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-assets-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      # Each package also goes up without the version in its name, so a fixed address
+      # (releases/latest/download/tinyclient-macos.dmg, which tinyclient.io/download/macos points
+      # at) always serves the newest one. SHA256SUMS covers both names.
+      - name: Unversioned copies and checksums
+        working-directory: dist
+        run: |
+          for f in "tinyclient-$LABEL-"*; do
+            cp "$f" "tinyclient-${f#"tinyclient-$LABEL-"}"
+          done
+          sha256sum tinyclient-* | sort -k2 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -l
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-all
+          path: dist/*
+      - id: release
+        uses: softprops/action-gh-release@v3
+        if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.publish)
+        with:
+          files: dist/*
+          # Notes from the merged PRs since the last tag, so a release never ships with an empty body.
+          generate_release_notes: true
+      # The release lands in the community's #releases channel once the webhook's URL sits in
+      # the DISCORD_WEBHOOK_URL secret (an admin sets it). Nothing posts while it is unset, and
+      # a Discord hiccup does not fail a published release.
+      - name: Post the release to Discord
+        if: steps.release.outputs.url != ''
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+        run: packaging/release-note.sh
+
+  windows-aarch64:
+    if: github.event_name == 'push' || inputs.announce == ''
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        shell: bash
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: none
+      - name: Build release
+        shell: pwsh
+        env:
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
+        run: |
+          if ((rustc -vV) -notcontains "host: aarch64-pc-windows-msvc") {
+            throw "Rust toolchain does not match Windows aarch64"
+          }
+          cargo build --release `
+            -p tinyclient --features tinyclient/gui `
+            -p chatd -p mediad -p login
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Installer and portable zip
+        shell: pwsh
+        run: packaging/windows.ps1 -NoBuild -Label $env:LABEL -Arch aarch64
+      - name: Smoke test the installer and the zip
+        shell: pwsh
+        run: packaging/windows/smoke.ps1 -Label $env:LABEL -Version $env:VERSION -Arch aarch64
+      - uses: actions/upload-artifact@v6
+        with:
+          name: secondary-windows-aarch64
+          path: dist/*
+
+  macos-x86_64:
+    if: github.event_name == 'push' || inputs.announce == ''
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: none
+      - name: Build release
+        env:
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
+        run: |
+          rustc -vV | grep -Fx 'host: x86_64-apple-darwin'
+          cargo build --release \
+            -p tinyclient --features tinyclient/gui \
+            -p chatd -p mediad -p login
+      - name: Bundle tinyclient.app
+        run: packaging/bundle.sh --no-build
+      - name: Zip and disk image
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent target/release/tinyclient.app "dist/tinyclient-$LABEL-macos-x86_64.zip"
+          packaging/dmg.sh "dist/tinyclient-$LABEL-macos-x86_64.dmg"
+      - name: Smoke test the disk image and updater zip
+        run: |
+          test "$(uname -m)" = "x86_64"
+          mnt=$(mktemp -d)
+          stage=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "dist/tinyclient-$LABEL-macos-x86_64.dmg"
+          trap 'hdiutil detach "$mnt"; rm -rf "$stage"' EXIT
+          test "$(readlink "$mnt/Applications")" = /Applications
+          ditto "$mnt/tinyclient.app" "$stage/Applications/tinyclient.app"
+          ditto -x -k "dist/tinyclient-$LABEL-macos-x86_64.zip" "$stage/portable"
+          for app in "$stage/Applications/tinyclient.app" "$stage/portable/tinyclient.app"; do
+            codesign --verify --deep --strict --verbose=2 "$app"
+            codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'
+            for program in tinyclient chatd mediad tinyclient-login; do
+              bin="$app/Contents/MacOS/$program"
+              lipo "$bin" -verify_arch x86_64
+              out=$("$bin" --version)
+              echo "$out"
+              test "$out" = "$program $VERSION"
+            done
+          done
+          python3 packaging/ci/microphone-smoke.py "$stage/Applications/tinyclient.app/Contents/MacOS/mediad"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: secondary-macos-x86_64
+          path: dist/*
+
+  linux-aarch64:
+    if: github.event_name == 'push' || inputs.announce == ''
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: none
+      - name: Build release
+        env:
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
+        run: |
+          cargo build --release \
+            -p tinyclient --features tinyclient/gui \
+            -p chatd -p mediad -p login
+      - name: Package .deb, .rpm, AppImage and .tar.gz
+        run: |
+          eval "$(packaging/linux/tools.sh)"
+          packaging/linux.sh --no-build "$LABEL"
+      - name: Smoke test on clean distros
+        run: |
+          set -u
+          logs=$(mktemp -d)
+          pids=()
+          names=()
+          run_smoke() {
+            local name="$1" image="$2" kind="$3"
+            docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=aarch64 "$image" packaging/linux/smoke.sh "$kind" > "$logs/$name.log" 2>&1 &
+            pids+=("$!")
+            names+=("$name")
+          }
+          run_smoke ubuntu-24.04 ubuntu:24.04 deb-full
+          run_smoke debian-12 debian:12 deb
+          run_smoke fedora fedora:latest rpm
+          run_smoke tumbleweed opensuse/tumbleweed rpm
+          failed=0
+          for i in "${!pids[@]}"; do
+            rc=0
+            wait "${pids[$i]}" || rc=$?
+            echo "::group::smoke ${names[$i]} (exit $rc)"
+            cat "$logs/${names[$i]}.log"
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::Linux smoke failed on ${names[$i]} (exit $rc)"
+              failed=1
+            fi
+          done
+          rm -rf "$logs"
+          exit "$failed"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: secondary-linux-aarch64
+          path: dist/*
+
+  attach-secondary:
+    needs: [publish, windows-aarch64, macos-x86_64, linux-aarch64]
+    if: always() && needs.publish.result == 'success' && github.ref_type == 'tag' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-assets-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: secondary-*
+          path: dist
+          merge-multiple: true
+      - name: Unversioned copies, refresh SHA256SUMS, and upload
         env:
           GH_TOKEN: ${{ github.token }}
-        run: packaging/ci/wait-for-run.sh ci.yml
+        run: |
+          mkdir -p dist
+          cd dist
+          shopt -s nullglob
+          versioned=(tinyclient-"$LABEL"-*)
+          if [ "${#versioned[@]}" -eq 0 ]; then
+            echo "No secondary artifacts to attach."
+            exit 0
+          fi
+          for f in "${versioned[@]}"; do
+            cp "$f" "tinyclient-${f#"tinyclient-$LABEL-"}"
+          done
+          sha256sum tinyclient-* > new.sums
+          gh release download "$GITHUB_REF_NAME" -p SHA256SUMS -O old.sums || touch old.sums
+          cat new.sums old.sums | awk '!seen[$2]++' | sort -k2 > SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" tinyclient-* SHA256SUMS --clobber
 
   # The APK is a debug build; the iOS app is unsigned and only runs once re-signed.
   phones:
@@ -98,297 +473,17 @@ jobs:
           ls -l dist
       - uses: actions/upload-artifact@v6
         with:
-          name: release-phones
+          name: phones
           path: dist/*
           if-no-files-found: error
 
-  macos:
-    needs: wait-for-ci
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - package: macos
-            runner: macos-latest
-            arch: arm64
-          - package: macos-x86_64
-            runner: macos-15-intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - name: Name the files
-        run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - name: Reuse binaries built by CI
-        id: reuse
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_RUN: ${{ needs.wait-for-ci.outputs.run }}
-        run: packaging/ci/reuse-binaries.sh ${{ matrix.package }} "$CI_RUN"
-      - uses: ./.github/actions/setup-rust
-        if: steps.reuse.outputs.found != 'true'
-        with:
-          cache-key: ${{ matrix.arch == 'x86_64' && 'none' || 'release' }}
-      - name: Build release
-        if: steps.reuse.outputs.found != 'true'
-        env:
-          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
-          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
-        run: |
-          rustc -vV | grep -Fx 'host: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}-apple-darwin'
-          cargo build --release \
-            -p tinyclient --features tinyclient/gui \
-            -p chatd -p mediad -p login
-      - name: Bundle tinyclient.app
-        run: packaging/bundle.sh --no-build
-      - name: Zip and disk image
-        run: |
-          mkdir -p dist
-          ditto -c -k --keepParent target/release/tinyclient.app "dist/tinyclient-$LABEL-${{ matrix.package }}.zip"
-          packaging/dmg.sh "dist/tinyclient-$LABEL-${{ matrix.package }}.dmg"
-      - uses: actions/upload-artifact@v6
-        with:
-          name: release-${{ matrix.package }}
-          path: dist/*
-
-  macos-smoke:
-    needs: macos
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - package: macos
-            runner: macos-latest
-            arch: arm64
-          - package: macos-x86_64
-            runner: macos-15-intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-      - name: Name the files
-        run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v7
-        with:
-          name: release-${{ matrix.package }}
-          path: dist
-      - name: Install and run the disk image and updater zip
-        run: |
-          test "$(uname -m)" = "${{ matrix.arch }}"
-          mnt=$(mktemp -d)
-          stage=$(mktemp -d)
-          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "dist/tinyclient-$LABEL-${{ matrix.package }}.dmg"
-          trap 'hdiutil detach "$mnt"; rm -rf "$stage"' EXIT
-          test "$(readlink "$mnt/Applications")" = /Applications
-          ditto "$mnt/tinyclient.app" "$stage/Applications/tinyclient.app"
-          ditto -x -k "dist/tinyclient-$LABEL-${{ matrix.package }}.zip" "$stage/portable"
-          for app in "$stage/Applications/tinyclient.app" "$stage/portable/tinyclient.app"; do
-            codesign --verify --deep --strict --verbose=2 "$app"
-            codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'
-            for program in tinyclient chatd mediad tinyclient-login; do
-              bin="$app/Contents/MacOS/$program"
-              lipo "$bin" -verify_arch ${{ matrix.arch }}
-              out=$("$bin" --version)
-              echo "$out"
-              test "$out" = "$program $VERSION"
-            done
-          done
-          if [ "${{ matrix.arch }}" = x86_64 ]; then
-            python3 packaging/ci/microphone-smoke.py "$stage/Applications/tinyclient.app/Contents/MacOS/mediad"
-          fi
-
-  linux:
-    needs: wait-for-ci
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # The oldest supported Ubuntu: the packages need the glibc they were built against or newer.
-          - arch: x86_64
-            runner: ubuntu-22.04
-            artifact: linux-x86_64
-          - arch: aarch64
-            runner: ubuntu-22.04-arm
-            artifact: linux-aarch64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - name: Name the files
-        run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - name: Reuse binaries built by CI
-        id: reuse
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_RUN: ${{ needs.wait-for-ci.outputs.run }}
-        run: packaging/ci/reuse-binaries.sh ${{ matrix.artifact }} "$CI_RUN"
-      # Packaging reads the linked libraries even when the programs themselves came from CI.
-      - name: Install packaging dependencies
-        if: steps.reuse.outputs.found == 'true'
-        run: packaging/ci/apt.sh
-      - uses: ./.github/actions/setup-rust
-        if: steps.reuse.outputs.found != 'true'
-        with:
-          cache-key: release
-      - name: Build release
-        if: steps.reuse.outputs.found != 'true'
-        env:
-          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
-          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
-        run: |
-          cargo build --release \
-            -p tinyclient --features tinyclient/gui \
-            -p chatd -p mediad -p login
-      - name: Package .deb, .rpm, AppImage and .tar.gz
-        run: |
-          eval "$(packaging/linux/tools.sh)"
-          packaging/linux.sh --no-build "$LABEL"
-      - uses: actions/upload-artifact@v6
-        with:
-          name: release-linux-${{ matrix.arch }}
-          path: dist/*
-
-  # Each Linux package installed on clean systems that never saw the build: the package manager
-  # must find every library from the package's own dependencies, or the programs do not start.
-  linux-smoke:
-    needs: linux
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-            image: ubuntu:24.04
-            kind: deb-full
-          - arch: x86_64
-            runner: ubuntu-24.04
-            image: debian:12
-            kind: deb
-          - arch: x86_64
-            runner: ubuntu-24.04
-            image: fedora:latest
-            kind: rpm
-          - arch: x86_64
-            runner: ubuntu-24.04
-            image: opensuse/tumbleweed
-            kind: rpm
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            image: ubuntu:24.04
-            kind: deb-full
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            image: debian:12
-            kind: deb
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            image: fedora:latest
-            kind: rpm
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            image: opensuse/tumbleweed
-            kind: rpm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - name: Name the files
-        run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v7
-        with:
-          name: release-linux-${{ matrix.arch }}
-          path: dist
-      - name: Install on ${{ matrix.image }}
-        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} ${{ matrix.image }} packaging/linux/smoke.sh ${{ matrix.kind }}
-
-  windows:
-    needs: wait-for-ci
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: windows-latest
-            artifact: windows
-          - arch: aarch64
-            runner: windows-11-arm
-            artifact: windows-aarch64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - name: Name the files
-        shell: bash
-        run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - name: Reuse binaries built by CI
-        id: reuse
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_RUN: ${{ needs.wait-for-ci.outputs.run }}
-        run: packaging/ci/reuse-binaries.sh ${{ matrix.artifact }} "$CI_RUN"
-      - uses: ./.github/actions/setup-rust
-        if: steps.reuse.outputs.found != 'true'
-        with:
-          cache-key: ${{ matrix.arch == 'aarch64' && 'none' || 'release' }}
-      - name: Build release
-        if: steps.reuse.outputs.found != 'true'
-        env:
-          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
-          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
-        run: |
-          if ((rustc -vV) -notcontains "host: ${{ matrix.arch }}-pc-windows-msvc") {
-            throw "Rust toolchain does not match Windows ${{ matrix.arch }}"
-          }
-          cargo build --release `
-            -p tinyclient --features tinyclient/gui `
-            -p chatd -p mediad -p login
-      - name: Install Inno Setup
-        shell: pwsh
-        run: |
-          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
-            choco install innosetup -y --no-progress
-          }
-      - name: Installer and portable zip
-        shell: pwsh
-        run: packaging/windows.ps1 -NoBuild -Label $env:LABEL -Arch ${{ matrix.arch }}
-      - uses: actions/upload-artifact@v6
-        with:
-          name: release-${{ matrix.artifact }}
-          path: dist/*
-
-  windows-smoke:
-    needs: windows
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: windows-latest
-            artifact: windows
-          - arch: aarch64
-            runner: windows-11-arm
-            artifact: windows-aarch64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-      - name: Name the files
-        shell: bash
-        run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v7
-        with:
-          name: release-${{ matrix.artifact }}
-          path: dist
-      - name: Smoke test the installer and the zip
-        shell: pwsh
-        run: packaging/windows/smoke.ps1 -Label $env:LABEL -Version $env:VERSION -Arch ${{ matrix.arch }}
-
-  publish:
-    needs: [macos-smoke, linux-smoke, windows-smoke, phones]
+  attach-phones:
+    needs: [publish, phones]
+    if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.publish)
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-assets-${{ github.ref_name }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -397,40 +492,17 @@ jobs:
         run: packaging/ci-label.sh >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v7
         with:
-          pattern: release-*
+          name: phones
           path: dist
-          merge-multiple: true
-      # Each package also goes up without the version in its name, so a fixed address
-      # (releases/latest/download/tinyclient-macos.dmg, which tinyclient.io/download/macos points
-      # at) always serves the newest one. The phone files get one too, such as
-      # tinyclient-android-debug.apk. SHA256SUMS covers both names.
-      - name: Unversioned copies and checksums
-        working-directory: dist
+      - name: Unversioned copies, refresh SHA256SUMS, and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          cd dist
           for f in "tinyclient-$LABEL-"*; do
             cp "$f" "tinyclient-${f#"tinyclient-$LABEL-"}"
           done
-          sha256sum tinyclient-* > SHA256SUMS
-          sha256sum -c SHA256SUMS
-          ls -l
-      - uses: actions/upload-artifact@v6
-        with:
-          name: release-all
-          path: dist/*
-      - id: release
-        uses: softprops/action-gh-release@v3
-        if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.publish)
-        with:
-          files: dist/*
-          # Notes from the merged PRs since the last tag, so a release never ships with an empty body.
-          generate_release_notes: true
-      # The release lands in the community's #releases channel once the webhook's URL sits in
-      # the DISCORD_WEBHOOK_URL secret (an admin sets it). Nothing posts while it is unset, and
-      # a Discord hiccup does not fail a published release.
-      - name: Post the release to Discord
-        if: steps.release.outputs.url != ''
-        continue-on-error: true
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          RELEASE_URL: ${{ steps.release.outputs.url }}
-        run: packaging/release-note.sh
+          sha256sum tinyclient-* > new.sums
+          gh release download "$GITHUB_REF_NAME" -p SHA256SUMS -O old.sums || touch old.sums
+          cat new.sums old.sums | awk '!seen[$2]++' | sort -k2 > SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" tinyclient-* SHA256SUMS --clobber

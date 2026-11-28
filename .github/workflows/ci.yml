@@ -46,6 +46,7 @@ jobs:
   # `hash` keeps a test in the same shard from run to run.
   test:
     name: test (${{ matrix.os }} ${{ matrix.shard }}/${{ matrix.shards }})
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Release ')
     strategy:
       fail-fast: false
       matrix:
@@ -85,6 +86,7 @@ jobs:
   # arms. It runs beside the test shards and shares their cache.
   extras:
     name: doc tests and mobile check
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Release ')
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     steps:
@@ -129,13 +131,14 @@ jobs:
   package:
     name: package (${{ matrix.artifact }})
     needs: [changes]
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.packaging == 'true') }}
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'Release ')) || (github.event_name == 'pull_request' && needs.changes.outputs.packaging == 'true')) }}
     strategy:
       fail-fast: false
       matrix:
-        # Packaging changes exercise Linux x86_64 and the new desktop architectures on PRs.
-        # Main builds every package for a later tag to reuse.
-        artifact: ${{ fromJSON(github.event_name != 'pull_request' && '["linux-x86_64","linux-aarch64","macos","macos-x86_64","windows","windows-aarch64"]' || '["linux-x86_64","macos-x86_64","windows-aarch64"]') }}
+        # Packaging changes exercise Linux x86_64 and the secondary desktop architectures on PRs.
+        # Main builds the 3 warm-cached primary desktop targets; secondary architectures build
+        # asynchronously in release.yml.
+        artifact: ${{ fromJSON(github.event_name != 'pull_request' && '["linux-x86_64","macos","windows"]' || '["linux-x86_64","macos-x86_64","windows-aarch64"]') }}
     # Ubuntu 22.04 is the oldest glibc the release packages promise.
     runs-on: ${{ fromJSON('{"linux-x86_64":"ubuntu-22.04","linux-aarch64":"ubuntu-22.04-arm","macos":"macos-latest","macos-x86_64":"macos-15-intel","windows":"windows-latest","windows-aarch64":"windows-11-arm"}')[matrix.artifact] }}
     # The macOS release build of the workspace alone passed 30 minutes once waves 7-10 landed,
